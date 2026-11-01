@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::lyric::{LyricMissReason, Lyrics};
 use crate::media::{FallbackInfo, Ms, NowPlaying, Track, TrackId};
 use crate::platform::wake::EventSink;
-use crate::render::theme::{BackgroundMode, BlurBuffer, Theme};
+use crate::render::theme::{BackgroundMode, Theme};
 use crate::taskbar::geometry::TaskbarGeometry;
 
 /// 工作线程 → UI 线程的事件。
@@ -55,7 +55,6 @@ pub enum AppEvent {
     BackdropReady {
         epoch: u64,
         theme: Theme,
-        blur: Option<Arc<BlurBuffer>>,
     },
 
     // ---------------- 任务栏（watcher → T0） ----------------
@@ -159,8 +158,6 @@ pub enum Effect {
     ResizeTarget { w: i32, h: i32, dpi: u32 },
     /// 请求背景采样
     RequestBackdrop { epoch: u64 },
-    /// 释放模糊背景
-    DropBackdrop,
     /// 向媒体线程发命令
     Media(MediaCommand),
     /// 向歌词线程发请求

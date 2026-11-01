@@ -80,8 +80,9 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
         "appearance.background_mode" => {
             let Some(s) = value.as_str() else { return false };
             cfg.appearance.background_mode = match s {
-                "translucent" | "Translucent" => BackgroundMode::Translucent,
-                _ => BackgroundMode::Blur,
+                "transparent" | "Transparent" => BackgroundMode::Transparent,
+                // "blur" = v1.1.11 删除模糊前的旧值，迁移为半透明
+                _ => BackgroundMode::Translucent,
             };
             true
         }
@@ -331,6 +332,19 @@ mod tests {
             &mut c,
             "appearance.background_mode",
             &json!("Translucent")
+        ));
+        assert_eq!(c.appearance.background_mode, BackgroundMode::Translucent);
+        // v1.1.11：透明档 + 旧 blur 值迁移为半透明
+        assert!(apply_set(
+            &mut c,
+            "appearance.background_mode",
+            &json!("transparent")
+        ));
+        assert_eq!(c.appearance.background_mode, BackgroundMode::Transparent);
+        assert!(apply_set(
+            &mut c,
+            "appearance.background_mode",
+            &json!("blur")
         ));
         assert_eq!(c.appearance.background_mode, BackgroundMode::Translucent);
     }

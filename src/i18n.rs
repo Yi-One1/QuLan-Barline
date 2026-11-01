@@ -90,10 +90,10 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         // ---------------- 右键菜单（M2/T08） ----------------
         (Lang::Zh, "menu.toggle_lyrics") => "显示歌词",
         (Lang::En, "menu.toggle_lyrics") => "Show lyrics",
-        (Lang::Zh, "menu.bg_blur") => "背景：模糊",
-        (Lang::En, "menu.bg_blur") => "Background: Blur",
         (Lang::Zh, "menu.bg_translucent") => "背景：半透明",
         (Lang::En, "menu.bg_translucent") => "Background: Translucent",
+        (Lang::Zh, "menu.bg_transparent") => "背景：始终透明",
+        (Lang::En, "menu.bg_transparent") => "Background: Transparent",
         (Lang::Zh, "menu.shuffle") => "随机播放",
         (Lang::En, "menu.shuffle") => "Shuffle",
         (Lang::Zh, "menu.repeat") => "循环播放",

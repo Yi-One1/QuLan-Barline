@@ -51,10 +51,6 @@ pub const TIMER_GEOM_MS: u32 = 1_000;
 pub const TIMER_ANIM: usize = 2;
 /// 单击判定定时器（250ms，仅在有一次待判定单击时存在）。
 pub const TIMER_CLICK: usize = 3;
-/// 悬停期间模糊背景刷新定时器（250ms，仅「悬停 + 模糊模式」时存在）。
-pub const TIMER_BLUR: usize = 4;
-/// 悬停期间模糊背景刷新周期（§11.3：悬停持续时每 250ms 重新抓屏）。
-pub const TIMER_BLUR_MS: u32 = 250;
 /// 歌词推进定时器（T12：逐字扫光需要连续重绘）。
 pub const TIMER_LYRIC: usize = 5;
 /// 歌词推进周期（40ms ≈ 25fps）。

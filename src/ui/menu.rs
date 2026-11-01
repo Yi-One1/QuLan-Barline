@@ -1,10 +1,10 @@
 //! 小组件右键上下文菜单（PRD §4.3 / T08 第 6 条）。
 //!
-//! 菜单项（v1.1.1 起行数固定单行，「单行/双行歌词」两项删除）：
+//! 菜单项（v1.1.1 起行数固定单行，「单行/双行歌词」两项删除；v1.1.11 起背景无模糊）：
 //! ```text
 //! ✓ 显示歌词            ← ToggleLyrics
 //! ─────────────────
-//!   ● 背景：模糊 / ○ 背景：半透明  ← BgBlur / BgTranslucent
+//!   ● 背景：半透明 / ○ 背景：始终透明  ← BgTranslucent / BgTransparent
 //! ✓ 随机播放（不支持时置灰）      ← ToggleShuffle
 //!   循环播放（不支持时置灰）        ← CycleRepeat
 //! ─────────────────
@@ -36,8 +36,8 @@ use crate::render::theme::BackgroundMode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
     ToggleLyrics,
-    BgBlur,
     BgTranslucent,
+    BgTransparent,
     ToggleShuffle,
     CycleRepeat,
     OpenSettings,
@@ -50,8 +50,8 @@ impl MenuCommand {
     pub fn id(self) -> usize {
         match self {
             MenuCommand::ToggleLyrics => 1,
-            MenuCommand::BgBlur => 2,
-            MenuCommand::BgTranslucent => 3,
+            MenuCommand::BgTranslucent => 2,
+            MenuCommand::BgTransparent => 3,
             MenuCommand::ToggleShuffle => 4,
             MenuCommand::CycleRepeat => 5,
             MenuCommand::OpenSettings => 6,
@@ -63,8 +63,8 @@ impl MenuCommand {
     pub fn from_id(id: i32) -> Option<Self> {
         Some(match id {
             1 => MenuCommand::ToggleLyrics,
-            2 => MenuCommand::BgBlur,
-            3 => MenuCommand::BgTranslucent,
+            2 => MenuCommand::BgTranslucent,
+            3 => MenuCommand::BgTransparent,
             4 => MenuCommand::ToggleShuffle,
             5 => MenuCommand::CycleRepeat,
             6 => MenuCommand::OpenSettings,
@@ -90,14 +90,26 @@ pub fn show(
         let menu: HMENU = CreatePopupMenu().ok()?;
 
         let lyrics_on = config.lyrics.enabled;
-        let blur = config.appearance.background_mode == BackgroundMode::Blur;
+        let translucent = config.appearance.background_mode == BackgroundMode::Translucent;
 
         add(menu, i18n::t(lang, "menu.toggle_lyrics"), MenuCommand::ToggleLyrics, true, lyrics_on);
 
         separator(menu);
 
-        add(menu, i18n::t(lang, "menu.bg_blur"), MenuCommand::BgBlur, true, blur);
-        add(menu, i18n::t(lang, "menu.bg_translucent"), MenuCommand::BgTranslucent, true, !blur);
+        add(
+            menu,
+            i18n::t(lang, "menu.bg_translucent"),
+            MenuCommand::BgTranslucent,
+            true,
+            translucent,
+        );
+        add(
+            menu,
+            i18n::t(lang, "menu.bg_transparent"),
+            MenuCommand::BgTransparent,
+            true,
+            !translucent,
+        );
 
         separator(menu);
 
@@ -189,8 +201,8 @@ pub fn cursor_pos() -> (i32, i32) {
 pub fn command_name(cmd: MenuCommand) -> &'static str {
     match cmd {
         MenuCommand::ToggleLyrics => "ToggleLyrics",
-        MenuCommand::BgBlur => "BgBlur",
         MenuCommand::BgTranslucent => "BgTranslucent",
+        MenuCommand::BgTransparent => "BgTransparent",
         MenuCommand::ToggleShuffle => "ToggleShuffle",
         MenuCommand::CycleRepeat => "CycleRepeat",
         MenuCommand::OpenSettings => "OpenSettings",
@@ -210,8 +222,8 @@ mod tests {
     fn ids_are_unique_and_roundtrip() {
         let all = [
             MenuCommand::ToggleLyrics,
-            MenuCommand::BgBlur,
             MenuCommand::BgTranslucent,
+            MenuCommand::BgTransparent,
             MenuCommand::ToggleShuffle,
             MenuCommand::CycleRepeat,
             MenuCommand::OpenSettings,

@@ -42,14 +42,14 @@ use crate::platform::wide::to_wide;
 use crate::render::layout::{self, WidgetForm, WidgetLayout};
 use crate::render::sampler::{CoverageMap, SampleRequest, Sampler};
 use crate::render::text::TextKind;
-use crate::render::theme::{BackgroundMode, BlurBuffer, Theme};
+use crate::render::theme::{BackgroundMode, Theme};
 use crate::render::Renderer;
 use crate::taskbar::geometry::{self, TaskbarGeometry};
 use crate::taskbar::host::TaskbarHost;
 use crate::ui::hit::HitTarget;
 use crate::ui::interaction::Interaction;
 use crate::ui::menu::{self, MenuCommand};
-use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_BLUR, TIMER_CLICK, TIMER_LYRIC};
+use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_CLICK, TIMER_LYRIC};
 
 /// 交互修饰态（PRD 机器 C）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,8 +116,6 @@ pub struct AppState {
     pub optimistic: Option<OptimisticOverride>,
     /// 几何代次，尺寸 / 位置变化时 +1，用于丢弃过期背景
     pub geometry_epoch: u64,
-    /// 模糊背景（仅 Hover 且 mode=Blur 时非 None）
-    pub blur: Option<Arc<BlurBuffer>>,
     /// 切歌瞬间的旧歌词转场：`(当前行, 开始时刻)`，150ms 后清空。
     /// 转场 = 120ms 淡出 + 150ms 上移（M3 遗留 P2）。v1.1.1 起没有下一行。
     ///
@@ -213,9 +211,8 @@ pub struct App {
     started: Instant,
     /// 上一帧的 alpha 覆盖率图（交给采样线程剔除自遮挡）
     last_coverage: Option<Arc<CoverageMap>>,
-    /// 动画 / 模糊定时器当前是否已挂
+    /// 动画定时器当前是否已挂
     anim_timer_on: bool,
-    blur_timer_on: bool,
     /// 歌词推进定时器当前是否已挂（仅在「播放中 + 歌词就绪」时存在）
     lyric_timer_on: bool,
     /// 歌词区当前宽度（逻辑像素，**动画中间值** 0..=160）
@@ -349,7 +346,6 @@ impl App {
             started: Instant::now(),
             last_coverage: None,
             anim_timer_on: false,
-            blur_timer_on: false,
             lyric_timer_on: false,
             lyric_w,
             lyric_anim: None,
@@ -505,7 +501,7 @@ impl App {
         // 这里按 1s 心跳补一次；采样线程自身有 300ms 节流，抓的只是小组件大小的
         // 一小块像素，空闲 CPU 仍是 0 量级（实测 < 0.3%）。
         if self.state.visible && !self.is_hovering() {
-            self.request_backdrop(false);
+            self.request_backdrop();
         }
     }
 
@@ -515,7 +511,7 @@ impl App {
     /// 所以这里必须**立刻**投递请求，不能等 1 秒心跳。
     pub fn on_setting_changed(&mut self) {
         crate::log_debug!("系统设置 / 主题变化 → 重新采样背景");
-        self.request_backdrop(self.is_hovering());
+        self.request_backdrop();
     }
 
     /// `TaskbarCreated` 广播（Explorer 重启）。
@@ -685,12 +681,6 @@ impl App {
                     self.dispatch(inputs);
                 } else if id == TIMER_LYRIC {
                     self.on_lyric_tick();
-                } else if id == TIMER_BLUR {
-                    if self.is_hovering() {
-                        self.request_backdrop(true);
-                    } else {
-                        self.kill_widget_timer(TIMER_BLUR);
-                    }
                 }
                 Some(LRESULT(0))
             }
@@ -921,18 +911,13 @@ impl App {
             AppEvent::SessionCleared => {
                 crate::log_info!("会话已清空，小组件隐藏");
                 self.state.playing = NowPlaying::default();
-                self.state.blur = None;
                 self.state.lyrics = LyricView::default();
                 self.interact.reset();
                 self.sync_interaction();
                 vec![Effect::Relayout]
             }
-            AppEvent::BackdropReady {
-                epoch,
-                theme,
-                blur,
-            } => {
-                // 代次不匹配 → 丢弃（尺寸 / 位置已变，模糊图对不上）
+            AppEvent::BackdropReady { epoch, theme } => {
+                // 代次不匹配 → 丢弃（尺寸 / 位置已变，采样对不上）
                 if epoch != self.state.geometry_epoch {
                     crate::log_debug!(
                         "丢弃过期背景（epoch {epoch} ≠ {}）",
@@ -941,31 +926,19 @@ impl App {
                     return Vec::new();
                 }
                 crate::log_debug!(
-                    "主题更新：luma={:.3} on_light={} contrast={:.2} blur={}",
+                    "主题更新：luma={:.3} on_light={} contrast={:.2}",
                     theme.backdrop_luma,
                     theme.on_light,
-                    theme.text_contrast(),
-                    blur.is_some()
+                    theme.text_contrast()
                 );
-                // 只有主题或模糊缓冲**真的变了**才重绘。
+                // 只有主题**真的变了**才重绘。
                 //
                 // 1s 心跳会周期性重新采样（见 `on_timer`），背景静止时结果完全一样；
                 // 无脑重绘等于每秒白跑一帧 D2D + WIC 回读 + UpdateLayeredWindow，
                 // 空闲 CPU 会从 ~0 涨到 0.5%（PRD P0-14 的硬指标就是 0.5%）。
-                // 模糊缓冲每次都是新的 `Arc`，所以用指针相等判断内容是否更新。
-                let blur_changed = match (blur.as_ref(), self.state.blur.as_ref()) {
-                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-                    (None, None) => false,
-                    _ => true,
-                };
-                let changed = !theme.same_paint(&self.state.theme) || blur_changed;
+                let changed = !theme.same_paint(&self.state.theme);
                 self.state.theme = theme;
-                self.state.blur = blur;
-                if changed {
-                    vec![Effect::Redraw]
-                } else {
-                    Vec::new()
-                }
+                if changed { vec![Effect::Redraw] } else { Vec::new() }
             }
             AppEvent::CommandResult { kind, ok } => {
                 if !ok {
@@ -1502,7 +1475,7 @@ impl App {
     fn reduce_input(&mut self, input: WidgetInput) -> Vec<Effect> {
         match input {
             WidgetInput::HoverEnter => {
-                self.request_backdrop(self.config.appearance.background_mode == BackgroundMode::Blur);
+                self.request_backdrop();
                 vec![Effect::Redraw]
             }
             WidgetInput::HoverLeave => vec![Effect::Redraw],
@@ -1559,6 +1532,9 @@ impl App {
             }
             WidgetInput::SetBackgroundMode(mode) => {
                 self.config.appearance.background_mode = mode;
+                // 立即重采样：hover_bg 随模式变化（透明档 alpha=0），
+                // 新主题经 BackdropReady 回来后重绘
+                self.request_backdrop();
                 let mut effects = self.commit_config();
                 effects.push(Effect::Redraw);
                 effects
@@ -1643,11 +1619,7 @@ impl App {
                         crate::log_err!("保存配置失败：{e}");
                     }
                 }
-                Effect::RequestBackdrop { .. } => self.request_backdrop(self.is_hovering()),
-                Effect::DropBackdrop => {
-                    self.state.blur = None;
-                    self.redraw();
-                }
+                Effect::RequestBackdrop { .. } => self.request_backdrop(),
                 Effect::Quit => {
                     crate::log_info!("收到 Quit，准备退出");
                     // SAFETY: PostQuitMessage 只投递一条 WM_QUIT，可在任意线程调用。
@@ -1769,7 +1741,7 @@ impl App {
         self.redraw();
         self.sync_visibility();
         self.sync_lyric_timer();
-        self.request_backdrop(self.is_hovering());
+        self.request_backdrop();
     }
 
     /// 只重绘（布局不变）。
@@ -1875,7 +1847,6 @@ impl App {
             st.theme.track_bg.packed(),
             st.theme.dim_alpha as u32,
             st.theme.needs_outline as u32,
-            st.theme.use_blur as u32,
         ];
         theme.hash(&mut h);
 
@@ -1922,11 +1893,6 @@ impl App {
             t.hash(&mut h);
             old_cur.hash(&mut h);
         }
-        // 模糊缓冲：内容每 250ms 换一份，必须进指纹（否则悬停背景会冻住）
-        st.blur
-            .as_ref()
-            .map(|b| Arc::as_ptr(b) as usize)
-            .hash(&mut h);
 
         h.finish()
     }
@@ -1945,7 +1911,6 @@ impl App {
             self.interact.reset();
             self.sync_interaction();
             self.kill_widget_timer(TIMER_ANIM);
-            self.kill_widget_timer(TIMER_BLUR);
             widget_wnd::uninstall_wheel_hook();
             self.interact.wheel_hooked = false;
             self.kill_widget_timer(TIMER_LYRIC);
@@ -1953,8 +1918,8 @@ impl App {
         }
     }
 
-    /// 请求背景采样（亮度 + 可选模糊）。
-    fn request_backdrop(&mut self, need_blur: bool) {
+    /// 请求背景采样（亮度 → 文字对比度主题）。
+    fn request_backdrop(&mut self) {
         if self.geometry.is_none() {
             return;
         }
@@ -1962,12 +1927,11 @@ impl App {
             return;
         };
         let scale = self.state.layout.effective_scale();
-        let mode = self.config.appearance.background_mode;
         let req = SampleRequest {
             epoch: self.state.geometry_epoch,
             rect: self.target_rect,
             scale,
-            mode,
+            mode: self.config.appearance.background_mode,
             accent: self.state.theme.accent,
             coverage: self.last_coverage.clone(),
             text_rects: vec![
@@ -1980,8 +1944,6 @@ impl App {
                     crate::config::defaults::limits::SAMPLE_TEXT_WEIGHT,
                 ),
             ],
-            corner_radius: 8.0 * scale,
-            need_blur: need_blur && mode == BackgroundMode::Blur,
         };
         sampler.request(req);
     }
@@ -2008,28 +1970,12 @@ impl App {
             self.kill_widget_timer(TIMER_ANIM);
         }
 
-        // 250ms 模糊刷新定时器：悬停 + 模糊模式
-        let want_blur = self.is_hovering()
-            && self.config.appearance.background_mode == BackgroundMode::Blur;
-        if want_blur {
-            if !self.blur_timer_on {
-                self.start_widget_timer(TIMER_BLUR, widget_wnd::TIMER_BLUR_MS);
-            }
-        } else if self.blur_timer_on {
-            self.kill_widget_timer(TIMER_BLUR);
-        }
-
         // 250ms 单击判定定时器
         if self.interact.take_click_timer_wanted() {
             self.start_widget_timer(
                 TIMER_CLICK,
                 crate::config::defaults::limits::CLICK_DELAY_MS,
             );
-        }
-
-        // 淡出结束后释放模糊缓冲（PRD：淡出不重新抓屏，但结束后可以丢弃）
-        if self.interact.hover == HoverState::Idle && !self.interact.animating() {
-            self.state.blur = None;
         }
     }
 
@@ -2043,7 +1989,6 @@ impl App {
         }
         match id {
             TIMER_ANIM => self.anim_timer_on = true,
-            TIMER_BLUR => self.blur_timer_on = true,
             TIMER_LYRIC => self.lyric_timer_on = true,
             _ => {}
         }
@@ -2058,7 +2003,6 @@ impl App {
         }
         match id {
             TIMER_ANIM => self.anim_timer_on = false,
-            TIMER_BLUR => self.blur_timer_on = false,
             TIMER_LYRIC => self.lyric_timer_on = false,
             _ => {}
         }
@@ -2163,14 +2107,15 @@ impl App {
                 let effects = self.commit_config();
                 self.apply(effects);
             }
-            MenuCommand::BgBlur => {
-                self.config.appearance.background_mode = BackgroundMode::Blur;
+            MenuCommand::BgTranslucent => {
+                self.config.appearance.background_mode = BackgroundMode::Translucent;
+                self.request_backdrop();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
-            MenuCommand::BgTranslucent => {
-                self.config.appearance.background_mode = BackgroundMode::Translucent;
-                self.state.blur = None;
+            MenuCommand::BgTransparent => {
+                self.config.appearance.background_mode = BackgroundMode::Transparent;
+                self.request_backdrop();
                 let effects = self.commit_config();
                 self.apply(effects);
             }

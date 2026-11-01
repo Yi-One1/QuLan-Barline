@@ -1,4 +1,4 @@
-//! 主题与背景数据（`ARCHITECTURE.md` §7.4 / §11.2 / §11.4）。
+﻿//! 主题与背景数据（`ARCHITECTURE.md` §7.4 / §11.2 / §11.4）。
 //!
 //! 本模块只做**纯计算**：给定背景相对亮度与强调色，算出「最终可画」的颜色集合。
 //! 抓屏与模糊在 [`crate::render::sampler`]（T3 线程），绘制在
@@ -63,22 +63,27 @@ impl Rgba {
 }
 
 /// 背景模式。
+///
+/// v1.1.11（问题 2）：**删除模糊背景**（抓屏 + 自研 box blur 整链移除），
+/// 只保留半透明 / 始终透明两档。旧配置里的 `"blur"` 由
+/// [`serde(alias)`] 迁移为半透明。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundMode {
-    /// 悬停时显示「抓屏 + 自研 box blur」的模糊背景（§11.3）
+    /// 悬停时显示半透明纯色（70% 不透明度，PRD §4.2）——默认
     #[default]
-    Blur,
-    /// 悬停时显示半透明纯色（70% 不透明度，PRD §4.2）
+    #[serde(alias = "blur")]
     Translucent,
+    /// 始终全透明（悬停也不画背景）
+    Transparent,
 }
 
 impl BackgroundMode {
-    /// 日志 / 菜单友好名。
+    /// 日志友好名。
     pub fn as_str(self) -> &'static str {
         match self {
-            BackgroundMode::Blur => "Blur",
             BackgroundMode::Translucent => "Translucent",
+            BackgroundMode::Transparent => "Transparent",
         }
     }
 }
@@ -105,8 +110,6 @@ pub struct Theme {
     pub hover_bg: Rgba,
     /// 进度条轨道色
     pub track_bg: Rgba,
-    /// 是否使用模糊背景
-    pub use_blur: bool,
     /// 对比度推到极端仍不达标（背景正好是中灰）→ 文字需要 1px 反色描边
     pub needs_outline: bool,
 }
@@ -114,7 +117,7 @@ pub struct Theme {
 impl Default for Theme {
     /// 兜底主题：深色壁纸假设（首帧还没有采样结果时用）。
     fn default() -> Self {
-        Self::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur)
+        Self::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent)
     }
 }
 
@@ -154,8 +157,11 @@ impl Theme {
 
         let accent = normalize_accent(accent);
 
-        // 半透明背景色：浅背景用白、深背景用近黑，alpha = 70%（PRD §4.2）
-        let hover_bg = if on_light {
+        // 半透明背景色：浅背景用白、深背景用近黑，alpha = 70%（PRD §4.2）。
+        // 「始终透明」模式 alpha 归零——悬停也不画背景（绘制层见 alpha==0 跳过）。
+        let hover_bg = if mode == BackgroundMode::Transparent {
+            Rgba::new(0, 0, 0, 0)
+        } else if on_light {
             Rgba::new(0xF2, 0xF2, 0xF4, 0xB3)
         } else {
             Rgba::new(0x1A, 0x1A, 0x1E, 0xB3)
@@ -177,7 +183,6 @@ impl Theme {
             accent,
             hover_bg,
             track_bg,
-            use_blur: mode == BackgroundMode::Blur,
             needs_outline,
         }
     }
@@ -200,7 +205,6 @@ impl Theme {
             && self.accent == other.accent
             && self.hover_bg == other.hover_bg
             && self.track_bg == other.track_bg
-            && self.use_blur == other.use_blur
             && self.needs_outline == other.needs_outline
     }
 }
@@ -223,21 +227,6 @@ pub fn dim_alpha_for(fg: Rgb, bg: Rgb) -> u8 {
         a += 1.0 / 64.0;
     }
     0xFF
-}
-
-/// 背景模糊结果。由 T3（[`crate::render::sampler`]）生产，UI 线程只读。
-///
-/// 注：`ARCHITECTURE.md` 把本类型标注在 `render/sampler.rs`，M1 为了先定义
-/// `AppEvent::BackdropReady` 放在本文件；M2 沿用（避免无谓的搬动），
-/// 语义与字段与契约逐字一致。
-#[derive(Debug, Clone)]
-pub struct BlurBuffer {
-    pub width: u32,
-    pub height: u32,
-    /// 预乘 alpha 的 BGRA，尺寸 = 窗口物理尺寸
-    pub bgra: Vec<u8>,
-    /// 该缓冲对应的几何代次，避免用到过期背景
-    pub geometry_epoch: u64,
 }
 
 /// sRGB 分量（0..=1）→ 线性分量。
@@ -328,7 +317,7 @@ mod tests {
 
     #[test]
     fn dark_backdrop_gets_light_text() {
-        let t = Theme::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+        let t = Theme::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
         assert!(!t.on_light);
         assert_eq!(t.text, Theme::LIGHT_TEXT);
         assert!(t.text_contrast() >= 4.5);
@@ -336,7 +325,7 @@ mod tests {
 
     #[test]
     fn light_backdrop_gets_dark_text() {
-        let t = Theme::from_backdrop(1.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+        let t = Theme::from_backdrop(1.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
         assert!(t.on_light);
         assert_eq!(t.text, Theme::DARK_TEXT);
         assert!(t.text_contrast() >= 4.5);
@@ -346,7 +335,7 @@ mod tests {
     #[test]
     fn mid_gray_picks_the_readable_side() {
         let luma = relative_luminance(Rgb::new(0x80, 0x80, 0x80));
-        let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+        let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
         assert!(t.on_light, "中灰必须选深色文字");
         assert!(
             t.text_contrast() >= 4.5,
@@ -370,10 +359,31 @@ mod tests {
         }
     }
 
+    /// v1.1.11：半透明模式悬停背景 70% 不透明度；透明模式 alpha = 0。
     #[test]
-    fn translucent_mode_disables_blur() {
+    fn background_mode_controls_hover_bg_alpha() {
         let t = Theme::from_backdrop(0.2, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
-        assert!(!t.use_blur);
+        assert_eq!(t.hover_bg.a, 0xB3, "半透明模式悬停背景 70% 不透明度");
+        let t2 = Theme::from_backdrop(0.2, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Transparent);
+        assert_eq!(t2.hover_bg.a, 0, "始终透明模式悬停背景全透明");
+        assert_ne!(t.hover_bg, t2.hover_bg, "模式切换必须改变 same_paint 判定");
+    }
+
+    /// v1.1.11：旧配置里的 `"blur"` 反序列化为半透明（serde alias 迁移）。
+    #[test]
+    fn legacy_blur_value_migrates_to_translucent() {
+        let s = r#"{"appearance":{"background_mode":"blur"}}"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).expect("旧 blur 值必须能读入");
+        assert_eq!(
+            cfg.appearance.background_mode,
+            BackgroundMode::Translucent
+        );
+        // 序列化出口只写新值
+        let out = serde_json::to_string(&cfg.appearance.background_mode).unwrap();
+        assert_eq!(out, r#""translucent""#);
+        let t = r#"{"appearance":{"background_mode":"transparent"}}"#;
+        let cfg: crate::config::Config = serde_json::from_str(t).expect("transparent 必须能读入");
+        assert_eq!(cfg.appearance.background_mode, BackgroundMode::Transparent);
     }
 
     #[test]
@@ -396,7 +406,7 @@ mod tests {
     #[test]
     fn dim_alpha_meets_contrast_on_light_and_dark() {
         for luma in [0.0f32, 0.05, 0.2, 0.5, 0.9, 1.0] {
-            let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+            let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
             let bg = luma_to_srgb_gray(luma);
             let composite = mix_rgb(bg, t.text_dim, t.dim_alpha as f32 / 255.0);
             let c = contrast_ratio(composite, bg);
@@ -416,7 +426,7 @@ mod tests {
     /// `same_paint` 必须忽略 luma 抖动，否则 1s 心跳采样会让空闲 CPU 涨到 1%。
     #[test]
     fn same_paint_ignores_luma_jitter() {
-        let a = Theme::from_backdrop(0.20, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+        let a = Theme::from_backdrop(0.20, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
         let mut b = a;
         b.backdrop_luma = 0.200_4;
         assert_ne!(a, b, "整体 PartialEq 会认为不同");
@@ -426,8 +436,8 @@ mod tests {
     /// 文字颜色真的变了就必须判定为不同（否则黑字会留在深色背景上）。
     #[test]
     fn same_paint_detects_text_flip() {
-        let dark = Theme::from_backdrop(0.02, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
-        let light = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+        let dark = Theme::from_backdrop(0.02, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let light = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
         assert!(!dark.same_paint(&light));
     }
 }

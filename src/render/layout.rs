@@ -290,8 +290,11 @@ pub fn compute_full(
     // v1.1.2 紧凑排列：歌名自然宽 + 固定间隔 + 歌手自然宽，歌手**不从右侧锚定**。
     // 信息区宽 = max(紧凑总宽, 信息区最小宽)，钳到 340*s 上限；
     // 只有紧凑总宽超出上限（放不下）时才截断：歌手钳到一半、歌名占其余并省略。
-    let title_nat = (title_w.max(0.0) * s).round();
-    let artist_nat = (artist_w.max(0.0) * s).round();
+    // v1.1.11（问题 10）：**ceil 而不是 round**——矩形宽必须 ≥ 实测自然宽，
+    // 否则 prepare_text 的省略判定（measure ≤ max_w）会被 0.x px 的取整损失
+    // 误判为「放不下」，把放得下的歌名截成「主…」。
+    let title_nat = (title_w.max(0.0) * s).ceil();
+    let artist_nat = (artist_w.max(0.0) * s).ceil();
     let text_nat = title_nat + if artist_nat > 0.5 { ta_gap + artist_nat } else { 0.0 };
     let info_w = text_nat
         .max(lyric_w_px)
@@ -619,6 +622,19 @@ mod tests {
         assert!(l.artist.x >= l.title.right() - 0.01);
         assert!(l.title.w < l.artist.w * 4.0, "歌名仍占主导");
         assert!(l.title.right() <= l.btn_prev.x + 0.01);
+    }
+
+    /// v1.1.11（问题 10）：带小数的自然宽必须 ceil 而不是 round——
+    /// 矩形宽一旦小于实测自然宽，`prepare_text` 的省略判定会把
+    /// 放得下的歌名误截成「主…」（歌名"主动"+歌手"加木"的实际案例）。
+    #[test]
+    fn fractional_natural_width_is_not_truncated() {
+        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 60.4, 40.3);
+        assert!((l.title.w - 61.0).abs() < 0.001, "title.w = {}", l.title.w);
+        assert!((l.artist.w - 41.0).abs() < 0.001, "artist.w = {}", l.artist.w);
+        // 矩形宽 ≥ 实测自然宽 → 省略判定（measure ≤ max_w）必然通过
+        assert!(l.title.w >= 60.4);
+        assert!(l.artist.w >= 40.3);
     }
 
     /// 歌词行上移量（v1.1.2）：y = 行位 − LYRIC_LIFT，底部仍在条带内。

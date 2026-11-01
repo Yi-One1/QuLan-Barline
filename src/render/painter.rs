@@ -145,59 +145,26 @@ pub fn paint(
 
 // ------------------------------------------------------------------ 背景
 
-/// 悬停背景：优先画模糊位图，退化为半透明纯色。
+/// 悬停背景：半透明纯色（`hover_bg`）。
+///
+/// v1.1.11（问题 2）：模糊背景已删除——「始终透明」模式 `hover_bg` alpha 为 0，
+/// 直接跳过绘制。
 fn draw_background(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
     ctx: &Ctx<'_>,
     alpha: f32,
 ) -> Result<()> {
-    let (state, theme, s) = (ctx.state, &ctx.theme, ctx.scale);
+    let (theme, s) = (&ctx.theme, ctx.scale);
     let w = frame.width as f32;
     let h = frame.height as f32;
-    let radius = (8.0 * s).min(h * 0.5);
 
-    if theme.use_blur {
-        // 只接受「代次与尺寸都对得上」的缓冲（§11.3：geometry_epoch 不匹配直接丢弃）
-        let usable = state.blur.as_ref().filter(|b| {
-            b.geometry_epoch == state.geometry_epoch
-                && b.width == frame.width
-                && b.height == frame.height
-        });
-
-        if let Some(buf) = usable {
-            let key = (buf.geometry_epoch, std::sync::Arc::as_ptr(buf) as usize);
-            let need_new = match &frame.blur {
-                Some((e, p, _)) => (*e, *p) != key,
-                None => true,
-            };
-            if need_new {
-                // SAFETY: 缓冲由采样线程按 (width, height) 生成，长度自洽。
-                match frame.bitmap_from_bgra(&buf.bgra, buf.width, buf.height) {
-                    Ok(bmp) => frame.blur = Some((key.0, key.1, bmp)),
-                    Err(e) => {
-                        crate::log_warn!("模糊背景位图创建失败：{e}");
-                        frame.blur = None;
-                    }
-                }
-            }
-            if let Some((_, _, bmp)) = frame.blur.as_ref() {
-                // SAFETY: bmp 属于本帧的渲染目标；destination 覆盖整块客户区。
-                unsafe {
-                    rt.DrawBitmap(
-                        bmp,
-                        Some(&d2d_rect(0.0, 0.0, w, h)),
-                        alpha,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                        None,
-                    );
-                }
-                return Ok(());
-            }
-        }
+    // 始终透明（或淡出结束）：什么都不画
+    if theme.hover_bg.a == 0 || alpha <= 0.0 {
+        return Ok(());
     }
 
-    // 半透明纯色（或模糊尚未就绪时的兜底，避免悬停时闪一下全透）
+    let radius = (8.0 * s).min(h * 0.5);
     let bg = theme.hover_bg.with_alpha_scale(alpha);
     let brush = frame.brush(bg)?;
     // SAFETY: 栈上圆角矩形；brush 由本帧持有。

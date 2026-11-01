@@ -103,14 +103,6 @@ pub mod limits {
     pub const SAMPLE_MIN_VALID_RATIO: f32 = 0.30;
     /// 文本区域块的亮度权重倍数（§11.2 第 3 步）
     pub const SAMPLE_TEXT_WEIGHT: f32 = 3.0;
-    /// 模糊盒半径（块空间，块 = 4 物理像素 → 半径 3 ≈ 12 物理像素）
-    pub const BLUR_RADIUS: i32 = 3;
-    /// 模糊遍数（3 次 box ≈ 高斯）
-    pub const BLUR_PASSES: u32 = 3;
-    /// 模糊结果的整体不透明度（acrylic 观感：略透）
-    pub const BLUR_ALPHA: u8 = 0xE6;
-    /// 模糊结果上叠加的强调色色调 alpha（§11.3 第 5 步的 0x1A）
-    pub const BLUR_TINT_ALPHA: u8 = 0x1A;
     /// 与系统媒体控件之间的间距
     /// 主文字候选色（深 / 浅）
     pub const TEXT_DARK: u8 = 0x0A;
@@ -173,7 +165,7 @@ impl Default for Config {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            background_mode: BackgroundMode::Blur,
+            background_mode: BackgroundMode::Translucent,
             accent_source: AccentSource::Cover,
             accent_custom: String::from("#0078D4"),
             ui_scale: 1.0,

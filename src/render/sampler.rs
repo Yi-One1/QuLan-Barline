@@ -1,6 +1,8 @@
-//! 背景采样线程（T3）：抓屏 → alpha 掩码剔除 → 加权亮度 → 主题 + 模糊背景。
+//! 背景采样线程（T3）：抓屏 → alpha 掩码剔除 → 加权亮度 → 主题。
 //!
-//! 对应 `ARCHITECTURE.md` §11.2（亮度自适应）与 §11.3（悬停模糊）。
+//! 对应 `ARCHITECTURE.md` §11.2（亮度自适应）。v1.1.11（问题 2）起
+//! **不再生产模糊背景**——悬停背景只有半透明/透明两档，本线程只负责
+//! 「壁纸亮度 → 文字对比度」的主题推导。
 //!
 //! ## 核心难点 H3 / 风险 R5：抓屏会抓到自己
 //!
@@ -19,7 +21,7 @@
 //!
 //! ## CPU 预算
 //!
-//! 窗口最大 510×135 物理像素 → 128×34 个块。块级 hole-fill + box blur + 双线性放大
+//! 窗口最大 510×135 物理像素 → 128×34 个块。块级加权亮度统计
 //! 合计 < 0.3 ms，且**只在收到请求时**运行；空闲时阻塞在 `recv_timeout` 上，CPU ≈ 0。
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
@@ -37,11 +39,8 @@ use crate::config::defaults::limits;
 use crate::event::AppEvent;
 use crate::media::Rgb;
 use crate::platform::wake::EventSink;
-use crate::render::blur;
 use crate::render::layout::RectF;
-use crate::render::theme::{
-    luma_to_srgb_gray, srgb8_to_linear, BackgroundMode, BlurBuffer, Rgba, Theme,
-};
+use crate::render::theme::{luma_to_srgb_gray, srgb8_to_linear, BackgroundMode, Theme};
 
 /// 上一帧的 alpha 覆盖率图（4×4 块粒度）。
 ///
@@ -121,16 +120,12 @@ pub struct SampleRequest {
     pub rect: RECT,
     pub scale: f32,
     pub mode: BackgroundMode,
-    /// 当前强调色（用于模糊结果的色调层）
+    /// 当前强调色（主题推导用）
     pub accent: Rgb,
     /// 上一帧的覆盖率图；`None` 时退化为「全块平均」
     pub coverage: Option<Arc<CoverageMap>>,
     /// 文本区域（客户区坐标 + 权重倍数），这些块在亮度统计里加权
     pub text_rects: Vec<(RectF, f32)>,
-    /// 模糊背景的圆角半径（物理像素）
-    pub corner_radius: f32,
-    /// 是否需要生产模糊背景（半透明模式下只需要亮度）
-    pub need_blur: bool,
 }
 
 /// 采样线程门面。
@@ -214,19 +209,17 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
 
         if slot.is_some() && last_done.elapsed() >= throttle {
             if let Some(req) = slot.take() {
-                if let Some((theme, blur_buf)) = sample(&req) {
+                if let Some(theme) = sample(&req) {
                     sampled += 1;
                     crate::log_debug!(
-                        "采样 #{sampled}：luma={:.3} on_light={} blur={} epoch={}",
+                        "采样 #{sampled}：luma={:.3} on_light={} epoch={}",
                         theme.backdrop_luma,
                         theme.on_light,
-                        blur_buf.is_some(),
                         req.epoch
                     );
                     sink.send(AppEvent::BackdropReady {
                         epoch: req.epoch,
                         theme,
-                        blur: blur_buf.map(Arc::new),
                     });
                 }
                 last_done = Instant::now();
@@ -237,8 +230,8 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
     crate::log_info!("采样线程退出（共采样 {sampled} 次）");
 }
 
-/// 抓屏 + 统计 + 模糊。返回 `(主题, 模糊缓冲)`。
-fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
+/// 抓屏 + 统计 → 主题。
+fn sample(req: &SampleRequest) -> Option<Theme> {
     let w = (req.rect.right - req.rect.left).max(1) as u32;
     let h = (req.rect.bottom - req.rect.top).max(1) as u32;
     // 防御：异常大的矩形直接拒绝，避免一次分配几十 MB
@@ -310,14 +303,7 @@ fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
     };
     let theme = compute_theme(&grid, req);
 
-    // ---- 3. 模糊背景 ----
-    let blur_buf = if req.need_blur && req.mode == BackgroundMode::Blur {
-        Some(build_blur(req, &mut block, &valid, bw, bh, w, h))
-    } else {
-        None
-    };
-
-    Some((theme, blur_buf))
+    Some(theme)
 }
 
 /// 一次采样里「块网格 + 请求参数」的聚合体。
@@ -424,67 +410,6 @@ fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
     theme
 }
 
-/// 块级空洞填充 → box blur ×3 → 双线性放大 → 色调 + 圆角遮罩。
-fn build_blur(
-    req: &SampleRequest,
-    block: &mut [u8],
-    valid: &[bool],
-    bw: u32,
-    bh: u32,
-    w: u32,
-    h: u32,
-) -> BlurBuffer {
-    // 1. 用同行 / 同列最近的有效块填补「我们画过」的块，避免自己的文字被模糊成一团灰影
-    blur::fill_holes(block, bw, bh, valid);
-
-    // 2. 3 次可分离 box blur（在块空间做，块 = 4 物理像素 → 半径 3 ≈ 12 物理像素）
-    blur::box_blur(block, bw, bh, limits::BLUR_RADIUS, limits::BLUR_PASSES);
-
-    // 3. 放大回窗口尺寸
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    blur::upsample_bilinear(block, bw, bh, &mut out, w, h);
-
-    // 4. 色调层 + 圆角遮罩 + 预乘
-    let tint = Rgba::from_rgb(req.accent, limits::BLUR_TINT_ALPHA);
-    let ta = tint.a as f32 / 255.0;
-    let alpha = limits::BLUR_ALPHA;
-    let radius = req.corner_radius.max(0.0);
-
-    for y in 0..h {
-        for x in 0..w {
-            let p = (y as usize * w as usize + x as usize) * 4;
-            // 圆角遮罩：不在圆角矩形内的像素 alpha 归零
-            if !inside_rounded(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, radius) {
-                out[p] = 0;
-                out[p + 1] = 0;
-                out[p + 2] = 0;
-                out[p + 3] = 0;
-                continue;
-            }
-            let b = out[p] as f32;
-            let g = out[p + 1] as f32;
-            let r = out[p + 2] as f32;
-            // 叠色调（直通 alpha 混合）
-            let r2 = r * (1.0 - ta) + tint.r as f32 * ta;
-            let g2 = g * (1.0 - ta) + tint.g as f32 * ta;
-            let b2 = b * (1.0 - ta) + tint.b as f32 * ta;
-            // 预乘（UpdateLayeredWindow 要求 PBGRA）
-            let k = alpha as f32 / 255.0;
-            out[p] = (b2 * k).round().clamp(0.0, 255.0) as u8;
-            out[p + 1] = (g2 * k).round().clamp(0.0, 255.0) as u8;
-            out[p + 2] = (r2 * k).round().clamp(0.0, 255.0) as u8;
-            out[p + 3] = alpha;
-        }
-    }
-
-    BlurBuffer {
-        width: w,
-        height: h,
-        bgra: out,
-        geometry_epoch: req.epoch,
-    }
-}
-
 /// 点是否落在 `w × h`、圆角 `r` 的矩形内（像素中心采样）。
 pub fn inside_rounded(px: f32, py: f32, w: f32, h: f32, r: f32) -> bool {
     let r = r.max(0.0).min(w * 0.5).min(h * 0.5);
@@ -580,18 +505,16 @@ fn capture(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// 测试用的最小 `SampleRequest`（只关心 compute_theme 用到的四个字段）。
+    /// 测试用的最小 `SampleRequest`（只关心 compute_theme 用到的字段）。
     fn sample_req(text_rects: Vec<(RectF, f32)>) -> SampleRequest {
         SampleRequest {
             epoch: 0,
             rect: RECT::default(),
             scale: 1.0,
-            mode: BackgroundMode::Blur,
+            mode: BackgroundMode::Translucent,
             accent: Rgb::SYSTEM_ACCENT_FALLBACK,
             coverage: None,
             text_rects,
-            corner_radius: 0.0,
-            need_blur: false,
         }
     }
 

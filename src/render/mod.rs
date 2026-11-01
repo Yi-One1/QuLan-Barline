@@ -6,7 +6,6 @@
 //!
 //! 渲染层**只读** `AppState`，不持有任何业务状态（§3.3 表现层约束）。
 
-pub mod blur;
 pub mod cover_cache;
 pub mod d2d;
 pub mod layout;

@@ -195,10 +195,10 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
       <div class="card">
         <div class="row">
           <div><div class="label" data-i18n="appearance.bg">悬停背景</div>
-            <div class="desc" data-i18n="appearance.bg.desc">模糊会在悬停时实时抓取任务栏背后的画面。</div></div>
+            <div class="desc" data-i18n="appearance.bg.desc">半透明：悬停时显示 70% 不透明度的底色；始终透明：不显示任何背景。</div></div>
           <div class="right"><select id="bg-mode">
-            <option value="blur" data-i18n="appearance.bg.blur">模糊</option>
             <option value="translucent" data-i18n="appearance.bg.trans">半透明</option>
+            <option value="transparent" data-i18n="appearance.bg.transparent">始终透明</option>
           </select></div>
         </div>
         <div class="row">
@@ -368,8 +368,8 @@ const I18N = {
     "nav.appearance": "外观", "nav.lyrics": "歌词", "nav.volume": "音量",
     "nav.hotkeys": "快捷键", "nav.general": "通用", "nav.about": "关于",
     "appearance.sub": "小组件的背景、缩放与显示位置。",
-    "appearance.bg": "悬停背景", "appearance.bg.desc": "模糊会在悬停时实时抓取任务栏背后的画面。",
-    "appearance.bg.blur": "模糊", "appearance.bg.trans": "半透明",
+    "appearance.bg": "悬停背景", "appearance.bg.desc": "半透明：悬停时显示 70% 不透明度的底色；始终透明：不显示任何背景。",
+    "appearance.bg.trans": "半透明", "appearance.bg.transparent": "始终透明",
     "appearance.scale": "界面缩放", "appearance.scale.desc": "默认跟随显示器 DPI。",
     "appearance.monitor": "显示显示器", "appearance.monitor.desc": "多显示器时小组件贴在哪块屏的任务栏上。",
     "appearance.monitor.primary": "主显示器",
@@ -408,8 +408,8 @@ const I18N = {
     "nav.appearance": "Appearance", "nav.lyrics": "Lyrics", "nav.volume": "Volume",
     "nav.hotkeys": "Hotkeys", "nav.general": "General", "nav.about": "About",
     "appearance.sub": "Background, scaling and where the widget shows up.",
-    "appearance.bg": "Hover background", "appearance.bg.desc": "Blur samples the screen behind the taskbar on hover.",
-    "appearance.bg.blur": "Blur", "appearance.bg.trans": "Translucent",
+    "appearance.bg": "Hover background", "appearance.bg.desc": "Translucent: 70% opaque panel on hover. Transparent: no background at all.",
+    "appearance.bg.trans": "Translucent", "appearance.bg.transparent": "Transparent",
     "appearance.scale": "UI scale", "appearance.scale.desc": "Follows monitor DPI by default.",
     "appearance.monitor": "Monitor", "appearance.monitor.desc": "Which taskbar the widget attaches to.",
     "appearance.monitor.primary": "Primary",

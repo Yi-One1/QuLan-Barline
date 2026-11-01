@@ -27,9 +27,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Brush, ID2D1Factory, ID2D1GradientStopCollection,
+    D2D1CreateFactory, ID2D1Brush, ID2D1Factory, ID2D1GradientStopCollection,
     ID2D1LinearGradientBrush, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BITMAP_PROPERTIES, D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
     D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
@@ -124,7 +124,6 @@ impl D2d {
             wic: self.wic.clone(),
             brushes: BrushCache::new(),
             grad: None,
-            blur: None,
         })
     }
 }
@@ -141,11 +140,6 @@ pub struct Frame {
     pub brushes: BrushCache,
     /// 封面渐变占位笔刷缓存：`(accent 打包值, 笔刷)`
     pub grad: Option<(u32, ID2D1LinearGradientBrush)>,
-    /// 悬停模糊背景位图缓存：`(几何代次, 缓冲地址, 位图)`
-    ///
-    /// 键里带「缓冲地址」是因为同一个 `geometry_epoch` 下模糊缓冲会每 250ms 换一份
-    /// （悬停时背景在变），只用 epoch 会一直画第一帧的模糊图。
-    pub blur: Option<(u64, usize, ID2D1Bitmap)>,
 }
 
 /// 实色笔刷缓存。
@@ -248,26 +242,6 @@ impl Frame {
     pub fn gradient_base(&mut self, accent: Rgba) -> Result<ID2D1Brush> {
         let g = self.gradient(accent)?;
         g.cast::<ID2D1Brush>()
-    }
-
-    /// 把一张外部 BGRA（预乘）缓冲变成 D2D 位图。用于悬停模糊背景。
-    pub fn bitmap_from_bgra(&self, bgra: &[u8], w: u32, h: u32) -> Result<ID2D1Bitmap> {
-        let stride = w * 4;
-        // SAFETY: 缓冲长度由调用方保证（BlurBuffer 与宽高自洽）；GUID 是静态常量。
-        let wic_bmp = unsafe {
-            self.wic
-                .CreateBitmapFromMemory(w, h, &GUID_WICPixelFormat32bppPBGRA, stride, bgra)?
-        };
-        let props = D2D1_BITMAP_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-        };
-        // SAFETY: wic_bmp 合法；props 栈上。
-        unsafe { self.rt.CreateBitmapFromWicBitmap(&wic_bmp, Some(&props)) }
     }
 }
 

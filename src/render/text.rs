@@ -119,6 +119,10 @@ impl TextFormats {
     /// 测量一段文本在给定最大宽度下的实际宽度（DIP）。
     ///
     /// 只在布局 / 文本变化时调用（不是渲染热路径）。
+    ///
+    /// v1.1.11（问题 10）：换行 = 放不下。此前只看 `widthIncludingTrailingWhitespace`，
+    /// 被换行拆短的多行布局会误报「放得下」；现在 `lineCount > 1` 一律返回
+    /// `max_w * 2`（保证 > max_w），「放得下」判定从此精确。
     pub fn measure(
         &self,
         dwrite: &IDWriteFactory,
@@ -136,7 +140,17 @@ impl TextFormats {
         let Ok(layout) = layout else {
             return 0.0;
         };
-        metrics_width(&layout)
+        let mut m = DWRITE_TEXT_METRICS::default();
+        // SAFETY: m 是本地栈结构体，GetMetrics 只写出它。
+        let _ = unsafe { layout.GetMetrics(&mut m) };
+        if m.lineCount > 1 {
+            return max_w * 2.0;
+        }
+        if m.widthIncludingTrailingWhitespace.is_finite() {
+            m.widthIncludingTrailingWhitespace
+        } else {
+            m.width
+        }
     }
 
     /// 单行省略：超宽时**二分**回退并补 `…`。
