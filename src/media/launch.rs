@@ -47,10 +47,14 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{
     ApplicationActivationManager, IApplicationActivationManager, ShellExecuteW, ACTIVATEOPTIONS,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, IsWindowEnabled, SetActiveWindow, SetFocus,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
-    GWL_EXSTYLE, GW_OWNER, SW_RESTORE, SW_SHOWNORMAL, SW_SHOW, WS_EX_TOOLWINDOW,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    SetForegroundWindow, ShowWindow, SwitchToThisWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
+    SW_SHOWNORMAL, WS_EX_TOOLWINDOW,
 };
 
 use windows::Win32::Media::Audio::{
@@ -379,29 +383,53 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core
     windows::core::BOOL(1)
 }
 
-/// 恢复 / 显示窗口后再抢前台（v1.1.16：托盘最小化的窗口是隐藏的）。
+/// 恢复 / 显示窗口后再抢前台（v1.1.18 重写）。
 ///
-/// 最小化（`IsIconic`）→ `SW_RESTORE`；隐藏（托盘化 `Hide()`）→ `SW_SHOW`；
-/// 然后走 [`force_foreground`] 的 AttachThreadInput 重试链。
+/// v1.1.17 实测缺陷：汽水托盘隐藏窗口用 `SW_SHOW` 显示——它**只显示不激活**，
+/// CEF/Electron 应用收不到 `WM_ACTIVATE` 就会挂起输入层，表现为「窗口能拖动
+/// （NC 区系统处理）但内容全部不可点击」。修复：
+/// 1. 隐藏窗口改用 `SW_RESTORE`（带激活语义，任务栏点击同款）；
+/// 2. 显示后检查 `IsWindowEnabled`——应用 hide 时可能禁用了窗口输入，
+///    外部显示必须恢复（禁用窗口的症状同样是「能拖不能点」）；
+/// 3. [`force_foreground`] 失败时用 `SwitchToThisWindow` 兜底（任务栏切窗口
+///    同款 API，绕前台锁且完全不碰输入队列）。
 fn show_and_foreground(hwnd: HWND) -> bool {
     // SAFETY: 标准窗口操作。
     unsafe {
-        if IsIconic(hwnd).as_bool() {
+        if IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+            // 最小化 / 托盘隐藏：SW_RESTORE = 激活 + 显示 + 恢复（而不是只显示）
             let _ = ShowWindow(hwnd, SW_RESTORE);
-        } else if !IsWindowVisible(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        if !IsWindowEnabled(hwnd).as_bool() {
+            crate::log_info!("目标窗口被禁用输入（应用托盘化常见），恢复 EnableWindow");
+            let _ = EnableWindow(hwnd, true);
         }
     }
-    force_foreground(hwnd)
+    if force_foreground(hwnd) {
+        // SetForegroundWindow 返回 true 只表示「请求被接受」——记录前台是否
+        // 真的切过去了（v1.1.17 汽水卡死排查经验：返回 true ≠ 激活生效）
+        // SAFETY: 纯查询。
+        if unsafe { GetForegroundWindow() } != hwnd {
+            crate::log_warn!("置前返回成功但前台并非目标窗口，激活可能未生效");
+        }
+        return true;
+    }
+    // 兜底：任务栏切窗口同款，绕前台锁且不污染输入队列
+    // SAFETY: 标准窗口操作；fAltTab=false 不触发任务切换 UI。
+    unsafe {
+        SwitchToThisWindow(hwnd, false);
+    }
+    // SAFETY: 纯查询。
+    unsafe { GetForegroundWindow() == hwnd }
 }
 
 /// 把窗口拉到前台。失败时用 `AttachThreadInput` 绕过前台锁，最多 3 次。
+///
+/// 显示 / 恢复已由 [`show_and_foreground`] 处理——这里只管激活，避免对已
+/// 可见窗口重复 `SW_RESTORE` 造成闪屏（v1.1.18）。
 fn force_foreground(hwnd: HWND) -> bool {
     // SAFETY: 标准窗口操作。
     unsafe {
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-        }
         if SetForegroundWindow(hwnd).as_bool() {
             return true;
         }
@@ -412,7 +440,10 @@ fn force_foreground(hwnd: HWND) -> bool {
             if target_tid != 0 && target_tid != self_tid {
                 let _ = AttachThreadInput(self_tid, target_tid, true);
             }
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // 附加输入队列期间把焦点显式还给目标窗口——前台锁下仅
+            // SetForegroundWindow 可能不够，SetFocus/SetActiveWindow 补齐
+            let _ = SetFocus(Some(hwnd));
+            let _ = SetActiveWindow(hwnd);
             let ok = SetForegroundWindow(hwnd).as_bool();
             if target_tid != 0 && target_tid != self_tid {
                 let _ = AttachThreadInput(self_tid, target_tid, false);
