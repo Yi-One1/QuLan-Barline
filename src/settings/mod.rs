@@ -150,19 +150,26 @@ impl SettingsService {
     /// 关窗（销毁窗口 + 释放 WebView2）。
     ///
     /// 幂等：`WM_CLOSE` 与 `WM_DESTROY` 都会调进来，只有第一次真正做事。
+    ///
+    /// **顺序是 QA-M4 缺陷 #2 的修复点**：必须**先**释放 WebView2（slot → None，
+    /// 触发 `SettingsWebView::drop`：摘事件 → `controller.Close()` → 释放
+    /// webview/env），**再** `DestroyWindow`。旧实现反过来——父窗口先于
+    /// controller 消失，WebView2 的宿主侧关联资源回收不掉，实测私有内存恒定
+    /// 停留在 ~44MB 不回落（3 轮开关无增长但不回落）。
     pub fn close(&mut self) {
+        // 第一步：无条件先放掉 WebView2（borrow_mut 置 None 是幂等的）。
+        *self.slot.borrow_mut() = None;
+        // 第二步：销毁窗口。hwnd 已被 take，WM_DESTROY 里的二次 close() 走
+        // `hwnd == None` 分支直接返回，不会递归 DestroyWindow。
         let Some(h) = self.hwnd.take() else {
-            // 已经关过了：只需确保 WebView2 槽是空的
-            *self.slot.borrow_mut() = None;
             return;
         };
         if unsafe_is_window(h) {
-            // SAFETY: h 有效；DestroyWindow 会触发 WM_DESTROY（本函数幂等，不会递归）。
+            // SAFETY: h 有效且尚未开始销毁；WM_DESTROY 由本次调用同步触发。
             unsafe {
                 let _ = DestroyWindow(h);
             }
         }
-        *self.slot.borrow_mut() = None;
         crate::log_info!("设置窗口已关闭，WebView2 已释放");
     }
 

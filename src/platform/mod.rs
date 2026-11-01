@@ -47,6 +47,41 @@ pub fn barline_dir() -> PathBuf {
     local_app_data_dir().join("Barline")
 }
 
+/// 系统的「应用模式」明暗设置（HKCU\...\Themes\Personalize\AppsUseLightTheme）。
+///
+/// 为什么不沿用小组件的壁纸采样结果（QA-M4 缺陷 #3）：设置页内容跟随系统的
+/// `prefers-color-scheme`（CSS 媒体查询），标题栏必须与它**同源**，否则浅色系统 +
+/// 深壁纸时出现「深标题栏 + 浅内容」。用 `RegGetValueW` 直接读 API（不走 reg.exe
+/// 命令行——本机安全钩子会拦截）。读不到（老系统 / 值缺失）按浅色处理，
+/// 即 Windows 出厂默认 `AppsUseLightTheme = 1`。
+pub fn system_app_theme_dark() -> bool {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+
+    let subkey = crate::platform::wide::to_wide(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    let value = crate::platform::wide::to_wide("AppsUseLightTheme");
+    let mut data: u32 = 1; // 缺省 = 浅色
+    let mut size = core::mem::size_of::<u32>() as u32;
+    // SAFETY: 两个宽字符串以 NUL 结尾且在本调用期间存活；出参都是本地变量。
+    let hr = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(subkey.as_ptr()),
+            windows::core::PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    if hr != ERROR_SUCCESS {
+        return false;
+    }
+    data == 0 // 0 = 深色应用模式
+}
+
 /// 把窗口强行提到前台。
 ///
 /// `SetForegroundWindow` 在「用户正在操作别的程序」时会被系统拒绝（返回 false）。

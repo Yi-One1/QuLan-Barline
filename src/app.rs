@@ -26,8 +26,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, MessageBoxW, PostQuitMessage, SetTimer, MB_ICONINFORMATION, MB_SETFOREGROUND,
-    MB_TOPMOST,
+    KillTimer, MessageBoxW, PostQuitMessage, SetTimer, IDYES, MB_ICONWARNING, MB_ICONINFORMATION,
+    MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
 };
 
 use crate::config::{Config, LyricModeSerde};
@@ -1159,17 +1159,28 @@ impl App {
     }
 
     /// WebView2 不可用时的原生兜底提示（不静默失败）。
+    ///
+    /// 顺带把 `webview::runtime_version` / `open_runtime_download` 两个兜底工具
+    /// 接上（QA 复核发现它们原本是无调用点的死代码）：版本号进日志便于定位
+    /// 「装了但创建失败」的情况；对话框问一句「是否打开下载页」。
     fn show_webview_missing(&self) {
+        match crate::settings::webview::runtime_version() {
+            Some(v) => crate::log_info!("WebView2 运行时存在（{v}）但创建失败，可能被策略拦截"),
+            None => crate::log_warn!("未检测到 WebView2 运行时"),
+        }
         let title = to_wide(i18n::t(self.lang, "settings.webview_missing_title"));
         let body = to_wide(i18n::t(self.lang, "settings.webview_missing_body"));
         // SAFETY: 两个缓冲都是 NUL 结尾且在本调用期间存活。
-        unsafe {
+        let choice = unsafe {
             MessageBoxW(
                 None,
                 windows::core::PCWSTR(body.as_ptr()),
                 windows::core::PCWSTR(title.as_ptr()),
-                MB_ICONINFORMATION | MB_SETFOREGROUND,
-            );
+                MB_ICONWARNING | MB_SETFOREGROUND | MB_YESNO,
+            )
+        };
+        if choice == IDYES {
+            crate::settings::webview::open_runtime_download();
         }
     }
 
@@ -1312,7 +1323,10 @@ impl App {
                 },
                 Effect::OpenSettings => {
                     let json = self.settings_state_json();
-                    let dark = !self.state.theme.on_light;
+                    // 标题栏明暗必须与页面内容同源（QA-M4 缺陷 #3）：页面 CSS 跟随
+                    // 系统 prefers-color-scheme，所以这里读系统设置而不是小组件的
+                    // 壁纸采样结果（浅色系统 + 深壁纸时两者会不一致）。
+                    let dark = crate::platform::system_app_theme_dark();
                     self.settings.open(
                         self.hinstance,
                         self.sink.clone(),

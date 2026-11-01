@@ -69,8 +69,10 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::Zh, "tray.tip") => "曲栏 Barline",
         (Lang::Zh, "settings.webview_missing_title") => "需要 WebView2 运行时",
         (Lang::En, "settings.webview_missing_title") => "WebView2 Runtime required",
-        (Lang::Zh, "settings.webview_missing_body") => "设置页需要 Microsoft Edge WebView2 运行时。\n请安装后重试；小组件本身不受影响。",
-        (Lang::En, "settings.webview_missing_body") => "The settings page needs the Microsoft Edge WebView2 Runtime.\nInstall it and try again. The widget itself keeps working.",
+        (Lang::Zh, "settings.webview_missing_body") => "设置页需要 Microsoft Edge WebView2 运行时，小组件本身不受影响。\n\n是否现在打开下载页？",
+        (Lang::En, "settings.webview_missing_body") => {
+            "The settings page needs the Microsoft Edge WebView2 Runtime. The widget itself keeps working.\n\nOpen the download page now?"
+        }
         (Lang::Zh, "tray.conflict_title") => "曲栏",
         (Lang::En, "tray.conflict_title") => "Barline",
         (Lang::Zh, "tray.conflict_text") => "部分快捷键被其他程序占用，可在设置中改绑",

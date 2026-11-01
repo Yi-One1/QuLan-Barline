@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
-    ICoreWebView2Environment,
+    ICoreWebView2Environment, ICoreWebView2WebMessageReceivedEventArgs,
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
@@ -193,19 +193,11 @@ fn build_webview(
         let sink2 = sink.clone();
         let handler = WebMessageReceivedEventHandler::create(Box::new(
             move |_sender: Option<ICoreWebView2>,
-                  args: Option<
-                webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2WebMessageReceivedEventArgs,
-            >| {
+                  args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
                 if let Some(args) = args {
-                    let mut pwstr = PWSTR::null();
-                    // SAFETY: 出参是本地变量；args 由 WebView2 提供，调用期间有效。
-                    if args.TryGetWebMessageAsString(&mut pwstr).is_ok() && !pwstr.is_null() {
-                        // SAFETY: pwstr 是 WebView2 分配的 NUL 结尾宽字符串，读成 String 后归还。
-                        let text = pwstr.to_string().unwrap_or_default();
-                        CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
-                        if !text.is_empty() {
-                            sink2.send(AppEvent::SettingsMessage(text));
-                        }
+                    // SAFETY: args 由 WebView2 提供，本回调期间有效。
+                    if let Some(text) = web_message_text(&args) {
+                        sink2.send(AppEvent::SettingsMessage(text));
                     }
                 }
                 Ok(())
@@ -221,6 +213,41 @@ fn build_webview(
             token,
             _env: env,
         })
+    }
+}
+
+/// 从 `WebMessageReceived` 事件参数里取出消息文本（QA-M4 缺陷 #1 的修复点）。
+///
+/// 页面有两种发法，对应两条**互斥**的读取通道：
+/// * `chrome.webview.postMessage("字符串")` → 只有 `TryGetWebMessageAsString` 能拿到；
+/// * `chrome.webview.postMessage({...})`   → **AsString 必然失败且静默丢弃**
+///   （设置页 JS 全部用对象消息，这正是「开关不落盘」的根因），必须回退
+///   `TryGetWebMessageAsJson`。
+///
+/// 两条路径都归一成 `String` 交给 `AppEvent::SettingsMessage`；都拿不到返回 `None`。
+///
+/// # Safety
+/// `args` 必须是 WebView2 正在回调期间给出的有效事件参数。
+unsafe fn web_message_text(args: &ICoreWebView2WebMessageReceivedEventArgs) -> Option<String> {
+    let mut pwstr = PWSTR::null();
+    // SAFETY: 出参是本地变量；args 由 WebView2 提供，调用期间有效。
+    let as_string = args.TryGetWebMessageAsString(&mut pwstr).is_ok() && !pwstr.is_null();
+    if !as_string {
+        // 对象消息：回退 JSON 通道（本版绑定的 getter 名为 WebMessageAsJson）
+        pwstr = PWSTR::null();
+        // SAFETY: 同上。
+        if args.WebMessageAsJson(&mut pwstr).is_err() || pwstr.is_null() {
+            return None;
+        }
+    }
+    // SAFETY: pwstr 是 WebView2 分配的 NUL 结尾宽字符串，读成 String 后立刻归还。
+    let text = unsafe { pwstr.to_string() }.unwrap_or_default();
+    // SAFETY: 归还给 COM 分配器。
+    unsafe { CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void)) };
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
