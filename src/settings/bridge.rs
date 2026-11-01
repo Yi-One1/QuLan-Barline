@@ -4,7 +4,7 @@
 //! ```text
 //! Rust → JS : { "type": "state", "payload": { config, version, conflicts, logDir } }
 //!             { "type": "toast", "payload": { "level": "info", "text": "..." } }
-//! JS → Rust : { "type": "set",    "payload": { "path": "lyrics.mode", "value": "TwoLine" } }
+//! JS → Rust : { "type": "set",    "payload": { "path": "lyrics.enabled", "value": true } }
 //!             { "type": "action", "payload": "openLogDir" }
 //!             { "type": "record", "payload": "start" | "stop" }
 //! ```
@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::config::{Config, HotkeyBinding, LangSerde, LyricModeSerde, VolumeScope};
+use crate::config::{Config, HotkeyBinding, LangSerde, VolumeScope};
 use crate::render::theme::BackgroundMode;
 
 /// JS → Rust 的一条消息。
@@ -97,17 +97,11 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             true
         }
         // ---------------- 歌词 ----------------
+        // v1.1.1：行数固定单行，`lyrics.mode` 已从白名单删除——设置页不再发送，
+        // 旧页面残留的 set 请求走兜底分支返回 false（等于忽略，不报错）。
         "lyrics.enabled" => {
             let Some(v) = value.as_bool() else { return false };
             cfg.lyrics.enabled = v;
-            true
-        }
-        "lyrics.mode" => {
-            let Some(s) = value.as_str() else { return false };
-            cfg.lyrics.mode = match s {
-                "one_line" | "OneLine" => LyricModeSerde::OneLine,
-                _ => LyricModeSerde::TwoLine,
-            };
             true
         }
         "lyrics.karaoke_sweep" => {
@@ -265,12 +259,12 @@ mod tests {
 
     #[test]
     fn parse_set_message() {
-        let m = parse(r#"{"type":"set","payload":{"path":"lyrics.mode","value":"OneLine"}}"#);
+        let m = parse(r#"{"type":"set","payload":{"path":"lyrics.enabled","value":true}}"#);
         assert_eq!(
             m,
             Some(Incoming::Set {
-                path: "lyrics.mode".into(),
-                value: json!("OneLine")
+                path: "lyrics.enabled".into(),
+                value: json!(true)
             })
         );
     }
@@ -301,8 +295,6 @@ mod tests {
     #[test]
     fn apply_set_whitelisted_paths() {
         let mut c = Config::default();
-        assert!(apply_set(&mut c, "lyrics.mode", &json!("OneLine")));
-        assert_eq!(c.lyrics.mode, LyricModeSerde::OneLine);
         assert!(apply_set(&mut c, "lyrics.enabled", &json!(false)));
         assert!(!c.lyrics.enabled);
         assert!(apply_set(
@@ -311,6 +303,15 @@ mod tests {
             &json!("Translucent")
         ));
         assert_eq!(c.appearance.background_mode, BackgroundMode::Translucent);
+    }
+
+    /// v1.1.1：行数固定单行，`lyrics.mode` 不再在白名单里——旧页面/旧脚本的
+    /// set 请求必须被静默拒绝（返回 false，不 panic、不改配置）。
+    #[test]
+    fn apply_set_rejects_removed_lyrics_mode() {
+        let mut c = Config::default();
+        assert!(!apply_set(&mut c, "lyrics.mode", &json!("OneLine")));
+        assert!(!apply_set(&mut c, "lyrics.mode", &json!("two_line")));
     }
 
     #[test]

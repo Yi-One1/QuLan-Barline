@@ -946,24 +946,15 @@ pub enum TaskbarEdge {
     Right,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LyricMode {
-    Off,
-    #[default]
-    TwoLine,
-    OneLine,
-}
-
-/// 小组件形态：决定歌词区宽度（v1.1 起不再决定高度——高度恒为条带厚度）
+/// 小组件形态：决定信息区最小宽度（v1.1 起不再决定高度——高度恒为条带厚度；
+/// v1.1.1 起行数固定单行，原 LyricMode 枚举删除）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WidgetForm {
-    /// 无歌词：歌词区宽度 = 0（小组件不加长）
-    Compact,
-    /// 单行歌词：只显示当前行，歌词区宽 = 160 * scale
-    OneLine,
-    /// 双行歌词：当前行 + 下一行，歌词区宽 = 160 * scale
+    /// 无歌词：信息区宽 = 歌名+歌手自然宽（不加长）
     #[default]
-    TwoLine,
+    Compact,
+    /// 歌词开启：信息区宽至少 160 * scale，下行显示当前行歌词
+    Lyric,
 }
 
 /// 布局结果。所有坐标都是**窗口客户区逻辑坐标**（未乘 DPI 的部分已乘好 scale）。
@@ -976,20 +967,20 @@ pub struct WidgetLayout {
     /// 逻辑宽高（已含 scale），= 物理像素尺寸（因为 DPI 感知下 1 逻辑像素 = 1 物理像素）
     pub width: i32,
     pub height: i32,
-    /// 主行区域（封面+标题+按钮）
+    /// 主行区域（封面+文本+按钮）
     pub main_row: RectF,
     pub cover: RectF,
+    /// 上行歌名（歌手名在其右侧同排）
     pub title: RectF,
+    /// 上行歌手名（自然宽超信息区一半时省略）
     pub artist: RectF,
     pub btn_prev: RectF,
     pub btn_toggle: RectF,
     pub btn_next: RectF,
     /// 进度条（悬停时 4px，否则 2px；这里给的是悬停态完整矩形，绘制时按高度收缩）
     pub progress: RectF,
-    /// 歌词当前行 / 下一行（横向块，位于文本区与上一首按钮之间；
-    /// form == Compact 或宽度动画未展开时二者为空矩形）
+    /// 下行单行歌词（form == Compact 或宽度动画未展开时为空矩形；v1.1.1 起无 lyric_next）
     pub lyric_cur: RectF,
-    pub lyric_next: RectF,
     /// 命中区（比视觉区大，保证 ≥ 28×28 * scale，PRD §4.3 通用误触保护）
     pub hit_prev: RectF,
     pub hit_toggle: RectF,
@@ -1212,12 +1203,14 @@ pub mod limits {
     pub const WIDGET_MAX_W: f32 = 340.0;
     /// 与托盘区左边缘的间距
     pub const TRAY_GAP: f32 = 8.0;
-    /// 歌词区固定宽度（逻辑像素，v1.1：歌词区内嵌条带，开歌词整体加长此宽）
+    /// 信息区最小宽度（逻辑像素；v1.1.1：信息区宽 = max(歌名+歌手自然宽, 此值)）
     pub const LYRIC_W: f32 = 160.0;
-    /// 歌词区单行矩形高度（逻辑像素；48px 条带 = 2 + 22 + 22 + 2 双行压缩）
+    /// 上行 / 下行行高（逻辑像素；48px 条带 = 2 + 22 + 22 + 2）
     pub const LYRIC_LINE_H: f32 = 22.0;
-    /// 歌词区上下边距（逻辑像素）
+    /// 上下行边距（逻辑像素）
     pub const LYRIC_PAD: f32 = 2.0;
+    /// 上行内歌名与歌手名的横向间隔（逻辑像素）
+    pub const TITLE_ARTIST_GAP: f32 = 6.0;
     /// 命中区最小边长
     pub const HIT_MIN: f32 = 28.0;
     /// 双击判定窗口
@@ -1412,7 +1405,6 @@ classDiagram
         +RectF artist
         +RectF progress
         +RectF lyric_cur
-        +RectF lyric_next
         +RectF hit_prev
         +RectF hit_toggle
         +RectF hit_next
@@ -2016,7 +2008,9 @@ pub fn probe() -> Option<TaskbarGeometry> { /* 见下方算法 */ }
    否则 collapsed = false
 7. dpi = GetDpiForWindow(tray)（任务栏的 DPI 就是该显示器的 DPI）
 8. 目标矩形（以 Bottom 为例，其余方位见 §10.4）：
-     w = clamp(内容自然宽度 * scale, 200*scale, 340*scale) + 歌词区宽（开歌词 +160*scale）
+     w = 固定件(边距+封面+间距+三键 ≈162*scale) + 信息区宽，
+         信息区宽 = max(歌名+间隔+歌手自然宽, 歌词最小宽 160*scale)，上限 340*scale；
+         整体下限 200*scale          ← v1.1.1
      h = bar_rect.height          ← v1.1：高度恒为条带厚度，歌词区双行压缩在条带内
      x = tray_rect.left - round(8 * scale) - w
      y = bar_rect.top
@@ -2575,7 +2569,7 @@ GET https://lrclib.net/api/get?track_name=<t>&artist_name=<a>&album_name=<al>&du
 
 **高度不变保证（PRD P0-16，v1.1 修订）**：
 - 小组件高度恒为任务栏条带厚度，**与 `LyricStatus`、`LyricMode` 都无关**；
-  歌词开/关只改变歌词区宽度（0 ↔ 160 * scale，200ms 缓动）与总宽。
+  歌词开/关只改变信息区最小宽（0 ↔ 160 * scale，200ms 宽度缓动 + 同步淡入淡出）。
 - `LyricLoading` / `NotFound` / `NetworkError` 都渲染同一占位文案（歌词区宽度不变）。
 - 切歌时：旧歌词淡出 120ms → 立即切到 `Loading` 占位 → 新歌词淡入（歌词区尺寸全程不变）。
 - 唯一的几何变化路径是歌词开/关，走 200ms **宽度**缓动（v1.1 起取代旧的 200ms 高度缓动）。
@@ -2932,7 +2926,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check
 | **A2** | PRD §7.4 的"5 行"是笔误，实际是 **6 组**热键（与主理人 §一"6 组可自定义"一致） | 设置页布局、`HotkeyConfig` 字段数 | 若确为 5 组，删掉 `mute` 或 `toggle_widget` 之一即可（改 3 个文件） |
 | **A3** | Win11 任务栏实际上只有**上/下**两个方位（左右已被系统移除） | P0-15 的四方位实现优先级 | 左右分支按 §10.4 实现但排到最后（M4 末尾），允许降级 |
 | **A4** | 悬停背景的"模糊"用**自研 CPU box blur**，不是 DWM acrylic（分层窗口用不了） | P0-07 悬停视觉 | 若必须用真 acrylic，需要改用 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition 方案，工作量 +2 周且体积 +300 KB，**不建议** |
-| **A5** | 歌词区尺寸只由 `LyricMode` 决定，与加载状态无关（保证 P0-16 零抖动）；**v1.1 起歌词区为条带内固定 160px 宽横向块，开关只做 200ms 宽度过渡，高度恒为条带厚度** | P0-16 | 无替代方案，这是唯一能同时满足"无抖动"与"有占位文案"的做法 |
+| **A5** | 歌词区尺寸只由「歌词是否启用」决定，与加载状态无关（保证 P0-16 零抖动）；**v1.1.1 起信息区分两行（上行歌名+歌手、下行单行歌词），开关只做 200ms 宽度过渡+淡入淡出，高度恒为条带厚度** | P0-16 | 无替代方案，这是唯一能同时满足"无抖动"与"有占位文案"的做法 |
 | **A6** | 设置页 HTML 在构建期内联为单文件，用 `NavigateToString` | 设置页体积与实现复杂度 | 若将来需要多页面/资源，改自定义 scheme（约 +200 行） |
 | **A7** | WASAPI 兜底用 **2 秒轮询**而不是 `IAudioSessionNotification` 事件 | P1-08 的 2s 时限 | 若轮询 CPU 不可接受（实测不会），再实现 COM 通知接口 |
 | **A8** | 托盘菜单与右键菜单用原生 Win32 菜单（`CreatePopupMenu`），不是自绘 | 视觉一致性（Fluent 风格） | 原生菜单在 Win11 下自动是 Fluent 圆角风格，与系统一致；自绘菜单不值得 |

@@ -271,6 +271,22 @@ mod tests {
         assert_eq!(back.window.lyrics_two_line, cfg.window.lyrics_two_line);
     }
 
+    /// v1.1.1 向后兼容：旧版本配置里的 `lyrics.mode = "two_line"` 与
+    /// `window.lyrics_two_line` 字段必须**读入不报错且忽略**（不迁移、不删除）。
+    #[test]
+    fn legacy_two_line_fields_load_without_error() {
+        let mut cfg = Config::default();
+        cfg.lyrics.mode = LyricModeSerde::TwoLine;
+        cfg.window.lyrics_two_line = true;
+        let json = serde_json::to_vec(&cfg).expect("序列化不应失败");
+        let back: Config = serde_json::from_slice(&json).expect("旧字段反序列化不应失败");
+        // 字段原样读入（不迁移），布局层自行忽略
+        assert_eq!(back.lyrics.mode, LyricModeSerde::TwoLine);
+        assert!(back.window.lyrics_two_line);
+        // 读取路径完全不感知该字段：歌词是否显示只由 enabled 决定
+        assert!(back.lyrics.enabled);
+    }
+
     #[test]
     fn missing_fields_fall_back_to_defaults() {
         // 只给一个字段，其余全靠 #[serde(default)]

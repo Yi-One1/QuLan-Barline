@@ -18,7 +18,6 @@ use crate::config::Config;
 use crate::lyric::{LyricMissReason, Lyrics};
 use crate::media::{FallbackInfo, Ms, NowPlaying, Track, TrackId};
 use crate::platform::wake::EventSink;
-use crate::render::layout::LyricMode;
 use crate::render::theme::{BackgroundMode, BlurBuffer, Theme};
 use crate::taskbar::geometry::TaskbarGeometry;
 
@@ -128,7 +127,6 @@ pub enum WidgetInput {
     Wheel { delta: i32 },
     VolumeHudExpired,
     ToggleLyricsFromMenu,
-    SetLyricMode(LyricMode),
     SetBackgroundMode(BackgroundMode),
     ShowAbout,
 }

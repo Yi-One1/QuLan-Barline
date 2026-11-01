@@ -90,10 +90,6 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         // ---------------- 右键菜单（M2/T08） ----------------
         (Lang::Zh, "menu.toggle_lyrics") => "显示歌词",
         (Lang::En, "menu.toggle_lyrics") => "Show lyrics",
-        (Lang::Zh, "menu.lyric_one_line") => "单行歌词",
-        (Lang::En, "menu.lyric_one_line") => "One line",
-        (Lang::Zh, "menu.lyric_two_line") => "双行歌词",
-        (Lang::En, "menu.lyric_two_line") => "Two lines",
         (Lang::Zh, "menu.bg_blur") => "背景：模糊",
         (Lang::En, "menu.bg_blur") => "Background: Blur",
         (Lang::Zh, "menu.bg_translucent") => "背景：半透明",

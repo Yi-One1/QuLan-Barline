@@ -22,13 +22,15 @@ pub mod limits {
     pub const WIDGET_MAX_W: f32 = 340.0;
     /// 与托盘区左边缘的间距
     pub const TRAY_GAP: f32 = 8.0;
-    /// 歌词区固定宽度（逻辑像素，v1.1 裁决：歌词区移入任务栏条带内、
-    /// 歌名歌手区与上一首按钮之间，小组件整体随之加长）
+    /// 歌词区最小宽度（逻辑像素；v1.1.1：信息区宽 = max(歌名+歌手自然宽, 此值)，
+    /// 歌词开关过渡动画把信息区最小宽在 0 ↔ 此值之间插值）
     pub const LYRIC_W: f32 = 160.0;
-    /// 歌词区单行矩形高度（逻辑像素；条带 48px = 2 + 22 + 22 + 2 双行压缩）
+    /// 歌词区单行矩形高度（逻辑像素；48px 条带 = 2 + 22 + 22 + 2，上行歌名歌手、下行歌词）
     pub const LYRIC_LINE_H: f32 = 22.0;
-    /// 歌词区上下边距（逻辑像素）
+    /// 上下行边距（逻辑像素）
     pub const LYRIC_PAD: f32 = 2.0;
+    /// 上行内歌名与歌手名的横向间隔（逻辑像素）
+    pub const TITLE_ARTIST_GAP: f32 = 6.0;
     /// 命中区最小边长
     pub const HIT_MIN: f32 = 28.0;
     /// 双击判定窗口
@@ -66,12 +68,12 @@ pub mod limits {
     pub const BTN_HIT: f32 = 28.0;
     /// 按钮间距
     pub const BTN_GAP: f32 = 6.0;
-    /// 歌名字号
-    pub const TITLE_PX: f32 = 14.0;
+    /// 歌名字号（v1.1.1：两行结构内歌名最大、歌词略小、歌手最小偏灰）
+    pub const TITLE_PX: f32 = 12.0;
     /// 歌手字号
-    pub const ARTIST_PX: f32 = 11.0;
-    /// 歌词字号（v1.1 双行压缩：两行都压进 48px 条带，字号由 13px 缩到约一半）
-    pub const LYRIC_PX: f32 = 7.0;
+    pub const ARTIST_PX: f32 = 10.0;
+    /// 歌词字号（v1.1.1 单行大字：7 → 11px，用户核心诉求「歌词大一点」）
+    pub const LYRIC_PX: f32 = 11.0;
     /// HUD / 气泡字号
     pub const HUD_PX: f32 = 12.0;
     /// 进度条静止高度
@@ -174,7 +176,9 @@ impl Default for LyricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            mode: LyricModeSerde::TwoLine,
+            // v1.1.1 起行数固定单行：`mode` 字段仅为旧配置反序列化兼容保留，
+            // 布局层不再读取（见 `WidgetForm::from_lyric_enabled`）
+            mode: LyricModeSerde::OneLine,
             karaoke_sweep: true,
             online_enabled: true,
             local_dirs: Vec::new(),

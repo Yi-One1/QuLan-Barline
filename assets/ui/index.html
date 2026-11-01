@@ -221,13 +221,6 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-enabled"><span class="track"></span><span class="knob"></span></label></div>
         </div>
         <div class="row">
-          <div><div class="label" data-i18n="lyrics.mode">行数</div></div>
-          <div class="right"><select id="lyrics-mode">
-            <option value="one_line" data-i18n="lyrics.mode.one">单行</option>
-            <option value="two_line" data-i18n="lyrics.mode.two">双行</option>
-          </select></div>
-        </div>
-        <div class="row">
           <div><div class="label" data-i18n="lyrics.sweep">逐字扫光</div>
             <div class="desc" data-i18n="lyrics.sweep.desc">卡拉OK 效果；关闭后整行同色。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-sweep"><span class="track"></span><span class="knob"></span></label></div>
@@ -362,7 +355,6 @@ const I18N = {
     "appearance.monitor.primary": "主显示器",
     "lyrics.sub": "本地 .lrc 优先，其次 lrclib.net 在线歌词。",
     "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件收合到任务栏高度。",
-    "lyrics.mode": "行数", "lyrics.mode.one": "单行", "lyrics.mode.two": "双行",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时向 lrclib.net 查询。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.empty": "还没有添加目录",
@@ -400,7 +392,6 @@ const I18N = {
     "appearance.monitor.primary": "Primary",
     "lyrics.sub": "Local .lrc first, then lrclib.net.",
     "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off collapses the widget to the taskbar height.",
-    "lyrics.mode": "Lines", "lyrics.mode.one": "One line", "lyrics.mode.two": "Two lines",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Query lrclib.net when no local file exists.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.empty": "No folders yet",
@@ -511,7 +502,6 @@ function render() {
 
   // 歌词
   document.getElementById("lyrics-enabled").checked = c.lyrics.enabled;
-  document.getElementById("lyrics-mode").value = c.lyrics.mode;
   document.getElementById("lyrics-sweep").checked = c.lyrics.karaoke_sweep;
   document.getElementById("lyrics-online").checked = c.lyrics.online_enabled;
   renderDirs(c.lyrics.local_dirs);
@@ -656,7 +646,6 @@ bind("bg-mode", "appearance.background_mode", "str");
 bind("ui-scale", "appearance.ui_scale", "num");
 bind("monitor", "appearance.monitor_index", "int");
 bind("lyrics-enabled", "lyrics.enabled", "bool");
-bind("lyrics-mode", "lyrics.mode", "str");
 bind("lyrics-sweep", "lyrics.karaoke_sweep", "bool");
 bind("lyrics-online", "lyrics.online_enabled", "bool");
 bind("wheel-enabled", "volume.wheel_enabled", "bool");

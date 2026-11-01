@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
 };
 
-use crate::config::{Config, LyricModeSerde};
+use crate::config::Config;
 use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, TrayCommand, WidgetInput};
 use crate::i18n::{self, Lang};
 use crate::lyric::service::LyricService;
@@ -39,7 +39,7 @@ use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState, RepeatMode
 use crate::platform::dpi::scale_for;
 use crate::platform::wake::{EventSink, WakeHwnd};
 use crate::platform::wide::to_wide;
-use crate::render::layout::{self, LyricMode, WidgetForm, WidgetLayout};
+use crate::render::layout::{self, WidgetForm, WidgetLayout};
 use crate::render::sampler::{CoverageMap, SampleRequest, Sampler};
 use crate::render::text::TextKind;
 use crate::render::theme::{BackgroundMode, BlurBuffer, Theme};
@@ -89,6 +89,9 @@ pub struct AppState {
     pub hover: HoverState,
     /// 悬停背景不透明度 0.0..=1.0（M2 新增：淡入 120ms / 淡出 200ms）
     pub hover_alpha: f32,
+    /// 歌词行不透明度 0.0..=1.0（v1.1.1：歌词开关宽度过渡期间同步淡入/淡出），
+    /// 由 `App` 按 `lyric_w / LYRIC_W` 推导后写入，painter 只读
+    pub lyric_alpha: f32,
     /// 当前按下的按钮（M2 新增：画按下态）
     pub pressed: Option<HitTarget>,
     /// 用户是否隐藏（PRD 机器 B 门控 1）
@@ -109,12 +112,12 @@ pub struct AppState {
     pub geometry_epoch: u64,
     /// 模糊背景（仅 Hover 且 mode=Blur 时非 None）
     pub blur: Option<Arc<BlurBuffer>>,
-    /// 切歌瞬间的旧歌词转场：`(当前行, 下一行, 开始时刻)`，150ms 后清空。
-    /// 转场 = 120ms 淡出 + 150ms 上移（M3 遗留 P2）。
+    /// 切歌瞬间的旧歌词转场：`(当前行, 开始时刻)`，150ms 后清空。
+    /// 转场 = 120ms 淡出 + 150ms 上移（M3 遗留 P2）。v1.1.1 起没有下一行。
     ///
     /// 存的是**字符串副本**而不是引用：切歌时 `lyrics` 会被换成 Loading，
     /// 旧那首的 `Arc<Lyrics>` 随时可能被释放。
-    pub lyric_fade: Option<(String, String, Instant)>,
+    pub lyric_fade: Option<(String, Instant)>,
 }
 
 impl AppState {
@@ -309,10 +312,10 @@ impl App {
 
         let target_rect = geometry.as_ref().map(|g| g.target).unwrap_or_default();
 
-        // 歌词区初始宽度 = 配置对应的形态宽度（不做入场动画）
+        // 歌词区初始宽度 = 配置对应的信息区最小宽（不做入场动画）
         let lyric_w = lyric_w_logical(&config);
 
-        let app = Box::new(App {
+        let mut app = Box::new(App {
             state: AppState {
                 theme: Theme::default(),
                 ..Default::default()
@@ -346,6 +349,9 @@ impl App {
             skipped_frames: 0,
             geom_failed: false,
         });
+
+        // 歌词行不透明度与初始宽度同步（歌词默认开启时首帧就是实色）
+        app.sync_lyric_alpha();
 
         let ptr = Box::into_raw(app);
 
@@ -718,7 +724,7 @@ impl App {
         self.state
             .lyric_fade
             .as_ref()
-            .map(|(_, _, t)| t.elapsed().as_secs_f32() < LYRIC_FADE_SECS)
+            .map(|(_, t)| t.elapsed().as_secs_f32() < LYRIC_FADE_SECS)
             .unwrap_or(false)
     }
 
@@ -739,13 +745,21 @@ impl App {
         let (value, done) = anim.value(Instant::now());
         let before = (self.lyric_w * 1000.0) as i32;
         self.lyric_w = value;
+        self.sync_lyric_alpha();
         // 按物理像素取整比较：0.5px 以内的变化重排没有意义，只会抖
         let after = (self.lyric_w * 1000.0) as i32;
         if done {
             self.lyric_anim = None;
             self.lyric_w = anim.to;
+            self.sync_lyric_alpha();
         }
         before != after
+    }
+
+    /// 由当前动画宽度推导歌词行不透明度（宽度展开越多，歌词越实）。
+    fn sync_lyric_alpha(&mut self) {
+        self.state.lyric_alpha = (self.lyric_w / crate::config::defaults::limits::LYRIC_W)
+            .clamp(0.0, 1.0);
     }
 
     /// 让歌词区宽度平滑过渡到配置对应的目标值（v1.1：宽度而非高度）。
@@ -835,9 +849,8 @@ impl App {
                 if track_changed && self.state.lyrics.status == LyricStatus::Ready {
                     // 旧歌词转场 150ms（120ms 淡出 + 上移，M3 遗留 P2），避免"啪"一下消失
                     let draw = self.state.lyric_draw(self.lang);
-                    if !draw.cur.is_empty() || !draw.next.is_empty() {
-                        self.state.lyric_fade =
-                            Some((draw.cur.to_string(), draw.next.to_string(), Instant::now()));
+                    if !draw.cur.is_empty() {
+                        self.state.lyric_fade = Some((draw.cur.to_string(), Instant::now()));
                     }
                 }
                 self.state.playing = *np;
@@ -1071,9 +1084,9 @@ impl App {
                 if !bridge::apply_set(&mut self.config, &path, &value) {
                     return Vec::new();
                 }
-                // 歌词开关 / 行数变化要走高度过渡；快捷键变化要重绑
+                // 歌词开关要走宽度过渡；快捷键变化要重绑
                 let hotkey_changed = path.starts_with("hotkeys.");
-                if path.starts_with("lyrics.") && (path == "lyrics.enabled" || path == "lyrics.mode") {
+                if path == "lyrics.enabled" {
                     self.animate_lyric_width();
                 }
                 let mut effects = vec![
@@ -1275,16 +1288,6 @@ impl App {
                 self.animate_lyric_width();
                 self.commit_config()
             }
-            WidgetInput::SetLyricMode(mode) => {
-                self.config.lyrics.enabled = mode != LyricMode::Off;
-                self.config.lyrics.mode = if mode == LyricMode::OneLine {
-                    LyricModeSerde::OneLine
-                } else {
-                    LyricModeSerde::TwoLine
-                };
-                self.animate_lyric_width();
-                self.commit_config()
-            }
             WidgetInput::SetBackgroundMode(mode) => {
                 self.config.appearance.background_mode = mode;
                 let mut effects = self.commit_config();
@@ -1411,19 +1414,16 @@ impl App {
 
         let scale = scale_for(geo.dpi);
         let bar_thickness = (geo.bar_rect.bottom - geo.bar_rect.top).max(1);
-        let lyric_mode = LyricMode::from_config(
-            self.config.lyrics.enabled,
-            self.config.lyrics.mode == LyricModeSerde::OneLine,
-        );
+        // v1.1.1：行数固定单行，config 里的旧 two_line 字段只读不用于布局
         // 竖排任务栏（左右）在 M4 一律降级为紧凑态：内容旋转（§10.4）尚未实现，
-        // 不降级的话 160px 歌词块会沿条带厚度方向展开，直接压到桌面上。
+        // 不降级的话两行信息区会沿条带厚度方向展开，直接压到桌面上。
         let form = if geo.edge.is_vertical() {
             WidgetForm::Compact
         } else {
-            WidgetForm::from_lyric_mode(lyric_mode)
+            WidgetForm::from_lyric_enabled(self.config.lyrics.enabled)
         };
 
-        // 文本自然宽度 → 决定总宽（200..340 * scale）
+        // 文本自然宽度（歌名 / 歌手分开量）→ 决定信息区宽
         let lang = self.lang;
         let title = self
             .state
@@ -1436,14 +1436,16 @@ impl App {
             .artist_or(i18n::t(lang, "state.unknown_artist"))
             .to_string();
 
-        let text_w = match self.renderer.as_ref() {
-            Some(r) => r
-                .measure(TextKind::Title, &title)
-                .max(r.measure(TextKind::Artist, &artist)),
-            None => 0.0,
+        let (title_w, artist_w) = match self.renderer.as_ref() {
+            Some(r) => (
+                r.measure(TextKind::Title, &title),
+                r.measure(TextKind::Artist, &artist),
+            ),
+            None => (0.0, 0.0),
         };
 
-        let mut lay = layout::compute_full(geo.edge, form, scale, bar_thickness, text_w, self.lyric_w);
+        let mut lay =
+            layout::compute_full(geo.edge, form, scale, bar_thickness, title_w, artist_w, self.lyric_w);
         if let Some(r) = self.renderer.as_mut() {
             r.prepare_text(&mut lay, &title, &artist);
         }
@@ -1479,10 +1481,12 @@ impl App {
         }
 
         crate::log_debug!(
-            "布局：{}×{} form={:?} 文本宽={text_w:.0} target=({},{} {}×{})",
+            "布局：{}×{} form={:?} 文本宽={:.0}/{:.0} target=({},{} {}×{})",
             self.state.layout.width,
             self.state.layout.height,
             form,
+            title_w,
+            artist_w,
             self.target_rect.left,
             self.target_rect.top,
             self.target_rect.right - self.target_rect.left,
@@ -1636,13 +1640,11 @@ impl App {
         ((draw.sweep * 60.0) as u32).hash(&mut h);
         draw.placeholder.hash(&mut h);
         draw.cur.hash(&mut h);
-        draw.next.hash(&mut h);
         // 切歌转场：按 1/16 量化（150ms / 16 ≈ 9.4ms，仍在 25fps 步长内）
-        if let Some((old_cur, old_next, started)) = &st.lyric_fade {
+        if let Some((old_cur, started)) = &st.lyric_fade {
             let t = (started.elapsed().as_secs_f32() / LYRIC_FADE_SECS * 16.0) as u32;
             t.hash(&mut h);
             old_cur.hash(&mut h);
-            old_next.hash(&mut h);
         }
         // 模糊缓冲：内容每 250ms 换一份，必须进指纹（否则悬停背景会冻住）
         st.blur
@@ -1885,20 +1887,6 @@ impl App {
                 let effects = self.commit_config();
                 self.apply(effects);
             }
-            MenuCommand::LyricOneLine => {
-                self.config.lyrics.enabled = true;
-                self.config.lyrics.mode = LyricModeSerde::OneLine;
-                self.animate_lyric_width();
-                let effects = self.commit_config();
-                self.apply(effects);
-            }
-            MenuCommand::LyricTwoLine => {
-                self.config.lyrics.enabled = true;
-                self.config.lyrics.mode = LyricModeSerde::TwoLine;
-                self.animate_lyric_width();
-                let effects = self.commit_config();
-                self.apply(effects);
-            }
             MenuCommand::BgBlur => {
                 self.config.appearance.background_mode = BackgroundMode::Blur;
                 let effects = self.commit_config();
@@ -2114,8 +2102,8 @@ mod tests {
     }
 }
 
-/// 配置 → 歌词区宽度（**逻辑像素**，未乘 scale；v1.1：开关只切 0 ↔ 160，
-/// 单行/双行都压在同一个 160px 条带内块里，不影响宽度）。
+/// 配置 → 信息区最小宽（**逻辑像素**，未乘 scale；v1.1.1：行数固定单行，
+/// 开关只切 0 ↔ 160；config 里的旧 `mode` / `lyrics_two_line` 字段忽略不迁移）。
 ///
 /// 与 `WidgetForm::lyric_w()` 必须保持一致：一个是"当前动画值"，
 /// 一个是"形态默认值"，两者在动画结束时相等。

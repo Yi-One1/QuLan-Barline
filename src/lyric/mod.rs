@@ -187,12 +187,12 @@ impl Default for LyricView {
 }
 
 /// 一帧要画的歌词内容。**纯数据**，由 [`LyricView::draw`] 推导。
+///
+/// v1.1.1 起行数固定单行，不再携带下一行文本。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LyricDraw<'a> {
     /// 当前行文本（占位态时是占位文案）
     pub cur: &'a str,
-    /// 下一行文本（单行模式忽略）
-    pub next: &'a str,
     /// 扫光边界（当前行内的 UTF-16 位置，连续值）
     pub sweep: f32,
     /// 当前行下标（占位 / 首行之前为 `None`）
@@ -205,7 +205,6 @@ impl<'a> LyricDraw<'a> {
     fn placeholder_of(text: &'a str) -> Self {
         Self {
             cur: text,
-            next: "",
             sweep: 0.0,
             line: None,
             placeholder: true,
@@ -214,33 +213,30 @@ impl<'a> LyricDraw<'a> {
 
     /// 是否什么都不用画（歌词关闭且无占位）。
     pub fn is_empty(&self) -> bool {
-        self.cur.is_empty() && self.next.is_empty()
+        self.cur.is_empty()
     }
 }
 
 impl LyricView {
     /// 由当前状态 + 播放位置推出「这一帧画什么」。
     ///
-    /// **高度与它无关**：四种降级态都返回同样结构的数据，布局只看 `LyricMode`
-    /// （PRD P0-16 无抖动的实现方式）。
+    /// **尺寸与它无关**：四种降级态都返回同样结构的数据，布局只看
+    /// 「歌词是否启用」（PRD P0-16 无抖动的实现方式）。
     pub fn draw(&self, t: Ms, lang: Lang) -> LyricDraw<'_> {
         match (self.status, self.lyrics.as_deref()) {
             (LyricStatus::Ready, Some(l)) if !l.lines.is_empty() => match l.line_at(t) {
                 Some(i) => {
                     let line = &l.lines[i];
-                    let next = l.lines.get(i + 1).map(|x| x.text.as_str()).unwrap_or("");
                     LyricDraw {
                         cur: line.text.as_str(),
-                        next,
                         sweep: sweep_offset(line, t),
                         line: Some(i),
                         placeholder: false,
                     }
                 }
-                // 还没唱到第一行：当前行留白，下一行预告第一句
+                // 还没唱到第一行：留白（v1.1.1 起没有下一行预告）
                 None => LyricDraw {
                     cur: "",
-                    next: l.lines.first().map(|x| x.text.as_str()).unwrap_or(""),
                     sweep: 0.0,
                     line: None,
                     placeholder: false,
@@ -375,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_picks_current_and_next_line() {
+    fn draw_picks_current_line_only() {
         let l = Arc::new(Lyrics {
             lines: vec![line(0, 1000, "第一"), line(1000, 2000, "第二"), line(2000, 3000, "第三")],
             ..Default::default()
@@ -387,12 +383,12 @@ mod tests {
         };
         let d = v.draw(1500, Lang::Zh);
         assert_eq!(d.cur, "第二");
-        assert_eq!(d.next, "第三");
         assert!(!d.placeholder);
     }
 
+    /// v1.1.1：还没唱到第一行时整块留白（不再预告下一行）。
     #[test]
-    fn draw_before_first_line_shows_next_as_first() {
+    fn draw_before_first_line_is_blank() {
         let l = Arc::new(Lyrics {
             lines: vec![line(5000, 6000, "第一")],
             ..Default::default()
@@ -404,7 +400,7 @@ mod tests {
         };
         let d = v.draw(0, Lang::Zh);
         assert_eq!(d.cur, "");
-        assert_eq!(d.next, "第一");
+        assert!(d.is_empty());
     }
 
     #[test]
@@ -420,6 +416,5 @@ mod tests {
         };
         let d = v.draw(99_999, Lang::Zh);
         assert_eq!(d.cur, "只有一句");
-        assert_eq!(d.next, "");
     }
 }

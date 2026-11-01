@@ -674,15 +674,18 @@ fn draw_lyrics(
     lyric_layout: Option<(&IDWriteTextLayout, u32)>,
 ) -> Result<()> {
     let (layout, state, theme) = (ctx.layout, ctx.state, &ctx.theme);
-    // v1.1：歌词区是条带内的横向块——关闭（Compact）或宽度动画未展开时直接跳过
+    // v1.1.1：歌词行是歌名/歌手行下方的单行——关闭（Compact）或宽度动画未展开时跳过
     if layout.lyric_cur.is_empty() || lyric.is_empty() {
         return Ok(());
     }
+    // 开关宽度过渡期间的淡入/淡出系数（App 按动画进度写入，稳定态为 1.0）
+    let fade = state.lyric_alpha.clamp(0.0, 1.0);
+    let scale_a = |a: u8| ((a as f32) * fade).round() as u8;
 
     // ---- 切歌瞬间：旧歌词淡出 + 上移（M3 遗留 P2）----
-    // 淡出在前 120ms 内完成（保持原 PRD 观感），上移走满 150ms（ease-out cubic，
-    // 与高度过渡同一族曲线）。这期间不画新内容。
-    if let Some((old_cur, old_next, started)) = &state.lyric_fade {
+    // 淡出在前 120ms 内完成（保持原 PRD 观感），上移走满 150ms（ease-out cubic）。
+    // 这期间不画新内容。v1.1.1 起没有下一行，转场只涉及当前行。
+    if let Some((old_cur, started)) = &state.lyric_fade {
         let t = started.elapsed().as_secs_f32();
         if t < crate::app::LYRIC_FADE_SECS {
             let a = ((1.0 - t / crate::app::LYRIC_FADE_OUT_SECS) * 255.0).clamp(0.0, 255.0) as u8;
@@ -701,21 +704,7 @@ fn draw_lyrics(
                         kind: TextKind::Lyric,
                         text: old_cur,
                         rect: shift(&layout.lyric_cur),
-                        color: Rgba::from_rgb(theme.text, a),
-                        outline: false,
-                    },
-                )?;
-            }
-            if !old_next.is_empty() && !layout.lyric_next.is_empty() {
-                draw_line(
-                    rt,
-                    frame,
-                    ctx,
-                    &TextDraw {
-                        kind: TextKind::Lyric,
-                        text: old_next,
-                        rect: shift(&layout.lyric_next),
-                        color: Rgba::from_rgb(theme.text_dim, ((a as f32) * 0.6) as u8),
+                        color: Rgba::from_rgb(theme.text, scale_a(a)),
                         outline: false,
                     },
                 )?;
@@ -734,27 +723,10 @@ fn draw_lyrics(
                 kind: TextKind::Lyric,
                 text: lyric.cur,
                 rect: layout.lyric_cur,
-                color: Rgba::from_rgb(theme.text_dim, 0xB0),
+                color: Rgba::from_rgb(theme.text_dim, scale_a(0xB0)),
                 outline: false,
             },
         );
-    }
-
-    // ---- 下一行（先画，压在下面也无所谓，两行不重叠）----
-    if !lyric.next.is_empty() && !layout.lyric_next.is_empty() {
-        draw_lyric_line(
-            rt,
-            frame,
-            ctx.text,
-            ctx.scale,
-            &TextDraw {
-                kind: TextKind::Lyric,
-                text: lyric.next,
-                rect: layout.lyric_next,
-                color: Rgba::from_rgb(theme.text_dim, Theme::DIM_ALPHA),
-                outline: false,
-            },
-        )?;
     }
 
     if lyric.cur.is_empty() || layout.lyric_cur.is_empty() {
@@ -762,7 +734,7 @@ fn draw_lyrics(
     }
 
     // ---- 当前行：未唱部分 ----
-    let unsung = Rgba::from_rgb(theme.text_dim, 0x8C);
+    let unsung = Rgba::from_rgb(theme.text_dim, scale_a(0x8C));
     draw_lyric_line(
         rt,
         frame,
@@ -788,7 +760,7 @@ fn draw_lyrics(
                 kind: TextKind::Lyric,
                 text: lyric.cur,
                 rect: layout.lyric_cur,
-                color: Rgba::from_rgb(theme.text, 0xFF),
+                color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
                 outline: false,
             },
         );
@@ -821,7 +793,7 @@ fn draw_lyrics(
             kind: TextKind::Lyric,
             text: lyric.cur,
             rect: layout.lyric_cur,
-            color: Rgba::from_rgb(theme.text, 0xFF),
+            color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
             outline: false,
         },
     );

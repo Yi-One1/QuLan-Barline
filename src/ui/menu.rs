@@ -1,9 +1,8 @@
 //! 小组件右键上下文菜单（PRD §4.3 / T08 第 6 条）。
 //!
-//! 菜单项（与 PRD 逐条对应）：
+//! 菜单项（v1.1.1 起行数固定单行，「单行/双行歌词」两项删除）：
 //! ```text
 //! ✓ 显示歌词            ← ToggleLyrics
-//!   ● 单行歌词 / ○ 双行歌词  ← LyricOneLine / LyricTwoLine
 //! ─────────────────
 //!   ● 背景：模糊 / ○ 背景：半透明  ← BgBlur / BgTranslucent
 //! ✓ 随机播放（不支持时置灰）      ← ToggleShuffle
@@ -37,8 +36,6 @@ use crate::render::theme::BackgroundMode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
     ToggleLyrics,
-    LyricOneLine,
-    LyricTwoLine,
     BgBlur,
     BgTranslucent,
     ToggleShuffle,
@@ -53,30 +50,26 @@ impl MenuCommand {
     pub fn id(self) -> usize {
         match self {
             MenuCommand::ToggleLyrics => 1,
-            MenuCommand::LyricOneLine => 2,
-            MenuCommand::LyricTwoLine => 3,
-            MenuCommand::BgBlur => 4,
-            MenuCommand::BgTranslucent => 5,
-            MenuCommand::ToggleShuffle => 6,
-            MenuCommand::CycleRepeat => 7,
-            MenuCommand::OpenSettings => 8,
-            MenuCommand::ShowAbout => 9,
-            MenuCommand::Quit => 10,
+            MenuCommand::BgBlur => 2,
+            MenuCommand::BgTranslucent => 3,
+            MenuCommand::ToggleShuffle => 4,
+            MenuCommand::CycleRepeat => 5,
+            MenuCommand::OpenSettings => 6,
+            MenuCommand::ShowAbout => 7,
+            MenuCommand::Quit => 8,
         }
     }
 
     pub fn from_id(id: i32) -> Option<Self> {
         Some(match id {
             1 => MenuCommand::ToggleLyrics,
-            2 => MenuCommand::LyricOneLine,
-            3 => MenuCommand::LyricTwoLine,
-            4 => MenuCommand::BgBlur,
-            5 => MenuCommand::BgTranslucent,
-            6 => MenuCommand::ToggleShuffle,
-            7 => MenuCommand::CycleRepeat,
-            8 => MenuCommand::OpenSettings,
-            9 => MenuCommand::ShowAbout,
-            10 => MenuCommand::Quit,
+            2 => MenuCommand::BgBlur,
+            3 => MenuCommand::BgTranslucent,
+            4 => MenuCommand::ToggleShuffle,
+            5 => MenuCommand::CycleRepeat,
+            6 => MenuCommand::OpenSettings,
+            7 => MenuCommand::ShowAbout,
+            8 => MenuCommand::Quit,
             _ => return None,
         })
     }
@@ -97,15 +90,9 @@ pub fn show(
         let menu: HMENU = CreatePopupMenu().ok()?;
 
         let lyrics_on = config.lyrics.enabled;
-        let one_line = matches!(
-            config.lyrics.mode,
-            crate::config::LyricModeSerde::OneLine
-        );
         let blur = config.appearance.background_mode == BackgroundMode::Blur;
 
         add(menu, i18n::t(lang, "menu.toggle_lyrics"), MenuCommand::ToggleLyrics, true, lyrics_on);
-        add(menu, i18n::t(lang, "menu.lyric_one_line"), MenuCommand::LyricOneLine, lyrics_on, lyrics_on && one_line);
-        add(menu, i18n::t(lang, "menu.lyric_two_line"), MenuCommand::LyricTwoLine, lyrics_on, lyrics_on && !one_line);
 
         separator(menu);
 
@@ -202,8 +189,6 @@ pub fn cursor_pos() -> (i32, i32) {
 pub fn command_name(cmd: MenuCommand) -> &'static str {
     match cmd {
         MenuCommand::ToggleLyrics => "ToggleLyrics",
-        MenuCommand::LyricOneLine => "LyricOneLine",
-        MenuCommand::LyricTwoLine => "LyricTwoLine",
         MenuCommand::BgBlur => "BgBlur",
         MenuCommand::BgTranslucent => "BgTranslucent",
         MenuCommand::ToggleShuffle => "ToggleShuffle",
@@ -225,8 +210,6 @@ mod tests {
     fn ids_are_unique_and_roundtrip() {
         let all = [
             MenuCommand::ToggleLyrics,
-            MenuCommand::LyricOneLine,
-            MenuCommand::LyricTwoLine,
             MenuCommand::BgBlur,
             MenuCommand::BgTranslucent,
             MenuCommand::ToggleShuffle,
