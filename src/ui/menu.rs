@@ -1,12 +1,12 @@
 //! 小组件右键上下文菜单（PRD §4.3 / T08 第 6 条）。
 //!
-//! 菜单项（v1.1.1 起行数固定单行，「单行/双行歌词」两项删除；v1.1.11 起背景无模糊）：
+//! 菜单项（v1.1.1 起行数固定单行；v1.1.11 起背景无模糊；**v1.1.16 起删除
+//! 随机/循环两项**——SMTC 远程变更只是「请求」，网易云/汽水等大量播放器
+//! 声明能力却不响应，功能形同虚设）：
 //! ```text
 //! ✓ 显示歌词            ← ToggleLyrics
 //! ─────────────────
 //!   ● 背景：半透明 / ○ 背景：透明  ← BgTranslucent / BgTransparent
-//! ✓ 随机播放（不支持时置灰）      ← ToggleShuffle
-//!   循环播放（不支持时置灰）        ← CycleRepeat
 //! ─────────────────
 //!   显示设置 / 关于 / 退出
 //! ```
@@ -25,10 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HMENU, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
 };
 
-use crate::app::AppState;
 use crate::config::Config;
 use crate::i18n;
-use crate::media::RepeatMode;
 use crate::platform::wide::to_wide;
 use crate::render::theme::BackgroundMode;
 
@@ -38,8 +36,6 @@ pub enum MenuCommand {
     ToggleLyrics,
     BgTranslucent,
     BgTransparent,
-    ToggleShuffle,
-    CycleRepeat,
     OpenSettings,
     ShowAbout,
     Quit,
@@ -52,11 +48,9 @@ impl MenuCommand {
             MenuCommand::ToggleLyrics => 1,
             MenuCommand::BgTranslucent => 2,
             MenuCommand::BgTransparent => 3,
-            MenuCommand::ToggleShuffle => 4,
-            MenuCommand::CycleRepeat => 5,
-            MenuCommand::OpenSettings => 6,
-            MenuCommand::ShowAbout => 7,
-            MenuCommand::Quit => 8,
+            MenuCommand::OpenSettings => 4,
+            MenuCommand::ShowAbout => 5,
+            MenuCommand::Quit => 6,
         }
     }
 
@@ -65,11 +59,9 @@ impl MenuCommand {
             1 => MenuCommand::ToggleLyrics,
             2 => MenuCommand::BgTranslucent,
             3 => MenuCommand::BgTransparent,
-            4 => MenuCommand::ToggleShuffle,
-            5 => MenuCommand::CycleRepeat,
-            6 => MenuCommand::OpenSettings,
-            7 => MenuCommand::ShowAbout,
-            8 => MenuCommand::Quit,
+            4 => MenuCommand::OpenSettings,
+            5 => MenuCommand::ShowAbout,
+            6 => MenuCommand::Quit,
             _ => return None,
         })
     }
@@ -78,13 +70,7 @@ impl MenuCommand {
 /// 弹出菜单并返回用户选择的命令（取消返回 `None`）。
 ///
 /// `screen` 是弹出位置的屏幕坐标（一般是右键点击点）。
-pub fn show(
-    hwnd: HWND,
-    screen: (i32, i32),
-    state: &AppState,
-    config: &Config,
-    lang: i18n::Lang,
-) -> Option<MenuCommand> {
+pub fn show(hwnd: HWND, screen: (i32, i32), config: &Config, lang: i18n::Lang) -> Option<MenuCommand> {
     // SAFETY: 菜单句柄由本函数创建并在末尾销毁；所有字符串缓冲在调用期间保持存活。
     unsafe {
         let menu: HMENU = CreatePopupMenu().ok()?;
@@ -109,24 +95,6 @@ pub fn show(
             MenuCommand::BgTransparent,
             true,
             !translucent,
-        );
-
-        separator(menu);
-
-        // 随机 / 循环：播放器不支持时置灰（T09 第 4 条「不支持时按钮置灰」）
-        add(
-            menu,
-            i18n::t(lang, "menu.shuffle"),
-            MenuCommand::ToggleShuffle,
-            state.playing.can_shuffle,
-            state.playing.shuffle,
-        );
-        add(
-            menu,
-            i18n::t(lang, "menu.repeat"),
-            MenuCommand::CycleRepeat,
-            state.playing.can_repeat,
-            state.playing.repeat != RepeatMode::None,
         );
 
         separator(menu);
@@ -203,8 +171,6 @@ pub fn command_name(cmd: MenuCommand) -> &'static str {
         MenuCommand::ToggleLyrics => "ToggleLyrics",
         MenuCommand::BgTranslucent => "BgTranslucent",
         MenuCommand::BgTransparent => "BgTransparent",
-        MenuCommand::ToggleShuffle => "ToggleShuffle",
-        MenuCommand::CycleRepeat => "CycleRepeat",
         MenuCommand::OpenSettings => "OpenSettings",
         MenuCommand::ShowAbout => "ShowAbout",
         MenuCommand::Quit => "Quit",
@@ -224,8 +190,6 @@ mod tests {
             MenuCommand::ToggleLyrics,
             MenuCommand::BgTranslucent,
             MenuCommand::BgTransparent,
-            MenuCommand::ToggleShuffle,
-            MenuCommand::CycleRepeat,
             MenuCommand::OpenSettings,
             MenuCommand::ShowAbout,
             MenuCommand::Quit,

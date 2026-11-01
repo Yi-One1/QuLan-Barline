@@ -35,7 +35,7 @@ use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, TrayCommand, Wi
 use crate::i18n::{self, Lang};
 use crate::lyric::service::LyricService;
 use crate::lyric::{LyricDraw, LyricStatus, LyricView};
-use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState, RepeatMode};
+use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState};
 use crate::platform::dpi::scale_for;
 use crate::platform::wake::{EventSink, WakeHwnd};
 use crate::platform::wide::to_wide;
@@ -1592,22 +1592,14 @@ impl App {
             == crate::config::VolumeScope::CurrentPlayer;
         let next = if current_player {
             let s = self.state.playing.session.clone();
-            match crate::media::wasapi::session_volume(&s.process_name, &s.aumid) {
-                Some(v) => {
-                    let next = (v + dir * step).clamp(0.0, 1.0);
-                    if !crate::media::wasapi::set_session_volume(
-                        &s.process_name,
-                        &s.aumid,
-                        next,
-                    ) {
-                        return Vec::new();
-                    }
-                    Some(next)
-                }
+            match crate::media::wasapi::step_session_volume(&s.process_name, &s.aumid, dir * step)
+            {
+                Some(v) => Some(v),
                 None => {
-                    crate::log_debug!(
-                        "滚轮：会话音量不可用（播放器未出声或不认识该进程），本次不调整"
-                    );
+                    // HUD 已在 interaction 层弹出（on_wheel 入口先置可见），
+                    // 会话不可用时必须撤掉，否则会拿上一次（往往是系统音量）
+                    // 的旧值一直显示（v1.1.16 修复）。
+                    self.interact.cancel_volume_hud();
                     return Vec::new();
                 }
             }
@@ -2167,7 +2159,7 @@ impl App {
         // v1.1.14 问题 12：菜单打开期间暂停 1s 心跳的 ensure_on_top（见 on_tick），
         // 关闭后无论是否选中都要复位
         self.menu_open = true;
-        let cmd = menu::show(hwnd, screen, &self.state, &self.config, self.lang);
+        let cmd = menu::show(hwnd, screen, &self.config, self.lang);
         self.menu_open = false;
         let Some(cmd) = cmd else {
             return;
@@ -2205,18 +2197,8 @@ impl App {
                 let effects = self.commit_config();
                 self.apply(effects);
             }
-            MenuCommand::ToggleShuffle => {
-                let next = !self.state.playing.shuffle;
-                self.apply(vec![Effect::Media(MediaCommand::Shuffle(next))]);
-            }
-            MenuCommand::CycleRepeat => {
-                let next = match self.state.playing.repeat {
-                    RepeatMode::None => RepeatMode::List,
-                    RepeatMode::List => RepeatMode::Track,
-                    RepeatMode::Track => RepeatMode::None,
-                };
-                self.apply(vec![Effect::Media(MediaCommand::Repeat(next))]);
-            }
+            // v1.1.16（问题 9）：循环/随机菜单项已删除——SMTC 远程变更只是
+            // 「请求」，网易云/汽水等大量播放器声明能力却不响应，功能形同虚设。
             MenuCommand::OpenSettings => {
                 // v1.1.14 问题 8：与托盘菜单同链路——设置页已开则前置，未开则创建
                 self.on_second_instance();

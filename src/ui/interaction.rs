@@ -285,6 +285,18 @@ impl Interaction {
         vec![WidgetInput::Wheel { delta }]
     }
 
+    /// 取消本已弹出的音量 HUD（v1.1.16）。
+    ///
+    /// [`Self::on_wheel`] 在事件进 App **之前**就把 HUD 置为可见；当会话音量
+    /// 不可用、App 侧决定不调整时调用——否则 HUD 会拿上一次（往往是系统音量）
+    /// 的旧值一直显示。
+    pub fn cancel_volume_hud(&mut self) {
+        self.hud_left_ms = 0;
+        if self.hover == HoverState::VolumeHud {
+            self.hover = HoverState::Hover;
+        }
+    }
+
     // ------------------------------------------------------------ 定时器
 
     /// 16ms 动画定时器。返回 HUD 过期事件（如有）。

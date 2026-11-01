@@ -54,15 +54,6 @@ pub enum MediaSource {
     Wasapi,
 }
 
-/// 循环模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RepeatMode {
-    #[default]
-    None,
-    Track,
-    List,
-}
-
 /// 曲目元数据。同时作为歌词缓存 key。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Track {
@@ -159,10 +150,7 @@ pub struct NowPlaying {
     pub can_prev: bool,
     pub can_next: bool,
     pub can_seek: bool,
-    pub can_shuffle: bool,
-    pub can_repeat: bool,
-    pub shuffle: bool,
-    pub repeat: RepeatMode,
+    // v1.1.16：can_shuffle/can_repeat/shuffle/repeat 已随右键菜单两项删除
     pub cover: Option<Arc<CoverImage>>,
 }
 
@@ -178,10 +166,6 @@ impl Default for NowPlaying {
             can_prev: false,
             can_next: false,
             can_seek: false,
-            can_shuffle: false,
-            can_repeat: false,
-            shuffle: false,
-            repeat: RepeatMode::None,
             cover: None,
         }
     }
@@ -272,7 +256,8 @@ mod match_tests {
             ),
             "Edge AUMID → msedge.exe"
         );
-        assert!(session_matches("qishui.exe", "", "com.sesame.qishui.desktop"), "汽水");
+        assert!(session_matches("sodamusic.exe", "", "com.sesame.qishui.desktop"), "汽水（v1.1.16：真实进程 SodaMusic.exe）");
+        assert!(session_matches("SodaMusic.exe", "", "SodaMusic.exe"), "汽水直查");
         assert!(session_matches("cloudmusic.exe", "", "NeteaseCloudMusic!App"), "网易云");
         // 未知播放器：进程名直查兜底
         assert!(session_matches("foobar2000.exe", "foobar2000.exe", ""));

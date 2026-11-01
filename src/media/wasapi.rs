@@ -105,13 +105,33 @@ pub fn toggle_system_mute() -> bool {
 
 // ------------------------------------------------------------------ 会话音量
 
-/// 找「当前播放器」的会话音量接口并读当前值（v1.1.15 问题 6）。
+/// 「没有匹配会话」的限流日志：最多每 5 秒一条（滚轮会连发，不能刷屏）。
+fn log_no_match_throttled(want_process: &str, want_aumid: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(LAST_MS.load(Ordering::Relaxed)) < 5_000 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
+    crate::log_info!(
+        "会话音量：没有匹配的音频会话（process={want_process:?} aumid={want_aumid:?}）——播放器没在出声，或映射表未收录该播放器"
+    );
+}
+
+/// 找「当前播放器」的会话音量接口（v1.1.16 重写）。
 ///
 /// 匹配规则见 [`crate::media::session_matches`]（进程名直查 + player_map
-/// 反查）。`ISimpleAudioVolume` 必须按**会话 GUID** 从
-/// `IAudioSessionManager2::GetSimpleAudioVolume` 取，GUID 是
-/// `IAudioSessionControl2::GetSessionInstanceIdentifier` 返回串的最后一段
-/// （`…|{GUID}`，与 EarTrumpet 同款做法）。
+/// 反查）。三条硬规则（v1.1.15 的三个教训）：
+/// 1. **会话 GUID 必须取自 `GetSessionIdentifier` 尾段**——`GetSimpleAudioVolume`
+///    只认它；`GetSessionInstanceIdentifier` 给的是**实例 GUID**，传进去会
+///    静默创建一个「幽灵会话」（读到 1.0、写了个寂寞）。与 EarTrumpet 同款。
+/// 2. **单个会话失败只跳过该会话**——系统会话不支持 identifier 之类的情况
+///    不能让整个查找提前返回 `None`（v1.1.15 的 `?` 提前返回 bug）。
+/// 3. 同名会话可能多个（浏览器每个标签一个）：**优先 Active 状态**的。
 fn session_simple_volume(
     want_process: &str,
     want_aumid: &str,
@@ -120,7 +140,7 @@ fn session_simple_volume(
     use windows::Win32::System::Com::CoTaskMemFree;
 
     // SAFETY: 所有 COM 对象在函数作用域内释放；PWSTR 由 CoTaskMemFree 归还。
-    unsafe {
+    let matched: Vec<_> = unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
@@ -128,6 +148,7 @@ fn session_simple_volume(
         let sessions = mgr.GetSessionEnumerator().ok()?;
         let count = sessions.GetCount().unwrap_or(0);
 
+        let mut matched = Vec::new();
         for i in 0..count {
             let Ok(ctrl) = sessions.GetSession(i) else {
                 continue;
@@ -145,7 +166,12 @@ fn session_simple_volume(
             if !crate::media::session_matches(&name, want_process, want_aumid) {
                 continue;
             }
-            let pw = ctl2.GetSessionInstanceIdentifier().ok()?;
+            let active = ctrl.GetState().map(|s| s.0 == 1).unwrap_or(false);
+            // identifier 取「会话 GUID」（尾段）而不是实例 GUID（教训 1）
+            let Ok(pw) = ctl2.GetSessionIdentifier() else {
+                crate::log_debug!("会话 pid={pid} 没有 SessionIdentifier，跳过");
+                continue;
+            };
             let s = if pw.0.is_null() {
                 String::new()
             } else {
@@ -157,42 +183,58 @@ fn session_simple_volume(
             }
             let guid_str = s.rsplit('|').next().unwrap_or("").trim();
             let Some(guid) = parse_guid(guid_str) else {
-                crate::log_debug!("会话 GUID 解析失败：{guid_str}");
+                crate::log_debug!("会话 pid={pid} GUID 解析失败：{guid_str}");
                 continue;
             };
-            let vol = mgr.GetSimpleAudioVolume(Some(&guid), 0).ok()?;
-            let v = vol.GetMasterVolume().ok()?;
-            return Some((vol, v));
+            matched.push((guid, active));
         }
+        matched
+    };
+
+    if matched.is_empty() {
+        log_no_match_throttled(want_process, want_aumid);
+        return None;
     }
-    None
+    // 活跃会话优先（教训 3）
+    let guid = matched
+        .iter()
+        .find(|(_, active)| *active)
+        .or(matched.first())
+        .map(|(g, _)| *g)?;
+
+    // SAFETY: COM 对象在作用域内；GUID 来自上面匹配到的会话。
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
+        let mgr: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None).ok()?;
+        let vol = mgr.GetSimpleAudioVolume(Some(&guid), 0).ok()?;
+        let v = vol.GetMasterVolume().ok()?;
+        Some((vol, v))
+    }
 }
 
-/// 读「当前播放器」的会话音量（0.0..=1.0）。找不到匹配会话返回 `None`。
-pub fn session_volume(want_process: &str, want_aumid: &str) -> Option<f32> {
-    session_simple_volume(want_process, want_aumid).map(|(_, v)| v)
-}
-
-/// 写「当前播放器」的会话音量。找不到匹配会话返回 `false`（**不改系统音量**）。
-pub fn set_session_volume(want_process: &str, want_aumid: &str, v: f32) -> bool {
-    let v = v.clamp(0.0, 1.0);
-    match session_simple_volume(want_process, want_aumid) {
-        Some((vol, old)) => {
-            // SAFETY: 事件上下文传 null 表示不需要通知来源。
-            match unsafe { vol.SetMasterVolume(v, core::ptr::null()) } {
-                Ok(()) => {
-                    crate::log_info!("会话音量（{want_process}）{:.0}% → {:.0}%", old * 100.0, v * 100.0);
-                    true
-                }
-                Err(e) => {
-                    crate::log_warn!("设置会话音量失败：{e}");
-                    false
-                }
-            }
+/// 「当前播放器」会话音量步进（v1.1.16 问题 6）。
+///
+/// 一次定位会话、读当前值、加步进、写回，返回新值；找不到匹配会话返回
+/// `None`——**绝不触碰系统主音量**，调用方据此不弹 HUD。
+pub fn step_session_volume(want_process: &str, want_aumid: &str, delta: f32) -> Option<f32> {
+    let (vol, old) = session_simple_volume(want_process, want_aumid)?;
+    let next = (old + delta).clamp(0.0, 1.0);
+    // SAFETY: 事件上下文传 null 表示不需要通知来源。
+    match unsafe { vol.SetMasterVolume(next, core::ptr::null()) } {
+        Ok(()) => {
+            let tag = if want_process.is_empty() {
+                want_aumid
+            } else {
+                want_process
+            };
+            crate::log_info!("会话音量（{tag}）{:.0}% → {:.0}%", old * 100.0, next * 100.0);
+            Some(next)
         }
-        None => {
-            crate::log_debug!("没有匹配当前播放器的音频会话，会话音量未改变");
-            false
+        Err(e) => {
+            crate::log_warn!("设置会话音量失败：{e}");
+            None
         }
     }
 }

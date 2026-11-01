@@ -94,10 +94,8 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "menu.bg_translucent") => "Background: Translucent",
         (Lang::Zh, "menu.bg_transparent") => "背景：透明",
         (Lang::En, "menu.bg_transparent") => "Background: Transparent",
-        (Lang::Zh, "menu.shuffle") => "随机播放",
-        (Lang::En, "menu.shuffle") => "Shuffle",
-        (Lang::Zh, "menu.repeat") => "循环播放",
-        (Lang::En, "menu.repeat") => "Repeat",
+        // v1.1.16：menu.shuffle / menu.repeat 已随菜单项删除（播放器普遍拒绝
+        // SMTC 远程循环/随机，功能形同虚设）
         (Lang::Zh, "menu.about") => "关于",
         (Lang::En, "menu.about") => "About",
         (Lang::Zh, "menu.separator") => "-",

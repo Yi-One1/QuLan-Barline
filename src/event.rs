@@ -130,17 +130,13 @@ pub enum WidgetInput {
     ShowAbout,
 }
 
-/// 播控命令种类（用于 `CommandResult` 回滚）。
+/// 播控命令种类（用于 `CommandResult` 回滚）。v1.1.16 起没有 Shuffle/Repeat。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCommandKind {
     PlayPause,
     Next,
     Prev,
     Seek,
-    /// M2/T09 新增：随机播放开关
-    Shuffle,
-    /// M2/T09 新增：循环模式
-    Repeat,
 }
 
 /// UI 线程需要产生的副作用。`reduce()` 保持纯函数，`App::apply()` 执行这些。
@@ -179,9 +175,8 @@ pub enum Effect {
 
 /// 向媒体线程下发的播控命令。
 ///
-/// **M2/T09 扩展**：新增 `Shuffle` / `Repeat` 两个变体（T09 要求
-/// `TryChangeShuffleActiveAsync` / `TryChangeAutoRepeatModeAsync`）。
-/// 这是**追加**，原有 7 个变体的语义与顺序都没变，`smtc.rs` 的 `match` 已全覆盖。
+/// v1.1.16 起**没有** `Shuffle` / `Repeat`——SMTC 远程变更只是「请求」，
+/// 网易云/汽水等大量播放器声明能力却不响应，右键菜单两项已删除。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCommand {
     PlayPause,
@@ -191,10 +186,6 @@ pub enum MediaCommand {
     /// 强制重新读取一次会话（用于乐观更新回滚校验）
     Refresh,
     Mute,
-    /// 设置随机播放开关
-    Shuffle(bool),
-    /// 设置循环模式
-    Repeat(crate::media::RepeatMode),
     Quit,
 }
 

@@ -25,15 +25,13 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
     SessionsChangedEventArgs,
 };
-use windows::Media::MediaPlaybackAutoRepeatMode;
 
 use crate::config::defaults::limits;
 use crate::event::{AppEvent, MediaCommand, MediaCommandKind};
 use crate::media::cover::load_cover;
 use crate::media::player_map;
 use crate::media::{
-    CoverImage, MediaSessionInfo, MediaSource, Ms, NowPlaying, PlaybackState, RepeatMode, Track,
-    TrackId,
+    CoverImage, MediaSessionInfo, MediaSource, Ms, NowPlaying, PlaybackState, Track, TrackId,
 };
 use crate::platform::com::{backoff_ms, timed_join, ComApartment};
 use crate::platform::wake::EventSink;
@@ -289,30 +287,7 @@ fn read_session(
         .unwrap_or(false);
     // SMTC 的 PlaybackControls 不暴露「能否 seek」，用「有总时长」作为代理判据（风险 R9）
     let can_seek = duration_ms > 0;
-    let can_shuffle = controls
-        .as_ref()
-        .and_then(|c| c.IsShuffleEnabled().ok())
-        .unwrap_or(false);
-    let can_repeat = controls
-        .as_ref()
-        .and_then(|c| c.IsRepeatEnabled().ok())
-        .unwrap_or(false);
-
-    let shuffle = playback
-        .as_ref()
-        .and_then(|p| p.IsShuffleActive().ok())
-        .and_then(|r| r.Value().ok())
-        .unwrap_or(false);
-    let repeat = playback
-        .as_ref()
-        .and_then(|p| p.AutoRepeatMode().ok())
-        .and_then(|r| r.Value().ok())
-        .map(|m| match m.0 {
-            1 => RepeatMode::Track,
-            2 => RepeatMode::List,
-            _ => RepeatMode::None,
-        })
-        .unwrap_or(RepeatMode::None);
+    // v1.1.16：can_shuffle/can_repeat/shuffle/repeat 采集已随菜单项删除
 
     let track = Track {
         title,
@@ -342,10 +317,6 @@ fn read_session(
         can_prev,
         can_next,
         can_seek,
-        can_shuffle,
-        can_repeat,
-        shuffle,
-        repeat,
         // 封面按 track_id 记忆：换歌才解码一次（见 CoverMemo）
         cover: cover_memo.get(track_id, &props),
     })
@@ -382,16 +353,12 @@ fn has_changed(prev: &NowPlaying, cur: &NowPlaying) -> bool {
     if prev.state != cur.state
         || prev.track_id != cur.track_id
         || prev.session.aumid != cur.session.aumid
-        || prev.shuffle != cur.shuffle
-        || prev.repeat != cur.repeat
     {
         return true;
     }
     if prev.can_prev != cur.can_prev
         || prev.can_next != cur.can_next
         || prev.can_seek != cur.can_seek
-        || prev.can_shuffle != cur.can_shuffle
-        || prev.can_repeat != cur.can_repeat
     {
         return true;
     }
@@ -430,8 +397,6 @@ fn execute(
         MediaCommand::Next => MediaCommandKind::Next,
         MediaCommand::Prev => MediaCommandKind::Prev,
         MediaCommand::Seek(_) => MediaCommandKind::Seek,
-        MediaCommand::Shuffle(_) => MediaCommandKind::Shuffle,
-        MediaCommand::Repeat(_) => MediaCommandKind::Repeat,
         MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
     };
 
@@ -460,21 +425,6 @@ fn execute(
                 .TryChangePlaybackPositionAsync(ms.saturating_mul(10_000))?
                 .join()
         }),
-        MediaCommand::Shuffle(on) => {
-            timed_join("TryChangeShuffleActiveAsync", || {
-                session.TryChangeShuffleActiveAsync(on)?.join()
-            })
-        }
-        MediaCommand::Repeat(mode) => {
-            let wire = match mode {
-                RepeatMode::None => MediaPlaybackAutoRepeatMode::None,
-                RepeatMode::Track => MediaPlaybackAutoRepeatMode::Track,
-                RepeatMode::List => MediaPlaybackAutoRepeatMode::List,
-            };
-            timed_join("TryChangeAutoRepeatModeAsync", || {
-                session.TryChangeAutoRepeatModeAsync(wire)?.join()
-            })
-        }
         MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
     };
 
@@ -483,16 +433,7 @@ fn execute(
             if accepted {
                 crate::log_info!("命令 {cmd:?} 已下发，播放器接受");
             } else {
-                // v1.1.15（问题 9）：Shuffle/Repeat 的「接受=false」是播放器侧
-                // 决定——SMTC 远程变更（TryChangeShuffleActive/AutoRepeatMode）
-                // 只是**请求**，网易云/汽水等大量播放器声明了能力却不响应。
-                // Windows 无通用强制手段；UI 侧乐观状态已按 CommandResult 回滚。
-                let hint = if matches!(cmd, MediaCommand::Shuffle(_) | MediaCommand::Repeat(_)) {
-                    "（该播放器不支持远程循环/随机，属平台限制）"
-                } else {
-                    ""
-                };
-                crate::log_warn!("命令 {cmd:?} 被播放器拒绝 {hint}");
+                crate::log_warn!("命令 {cmd:?} 被播放器拒绝");
             }
             sink.send(AppEvent::CommandResult {
                 kind,

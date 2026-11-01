@@ -6,7 +6,7 @@
 //! - 传统 win32 常常就是 `CloudMusic.exe`
 //! - 浏览器是 `Chrome` / `MSEdge` 这种裸名
 //!
-//! M1 只需要「显示名」，`fallback_url` 供 T09（M2）点击封面时兜底跳转。
+//! M1 只需要「显示名」；v1.1.16 起不再有网页回退（回退字段已删除）。
 
 /// 一条播放器映射。
 #[derive(Debug, Clone, Copy)]
@@ -15,15 +15,12 @@ pub struct PlayerInfo {
     pub display_name: &'static str,
     /// 进程名（小写，含 `.exe`）；未知时为空串
     pub process_name: &'static str,
-    /// 无法激活窗口时的回退网址；空串表示没有
-    pub fallback_url: &'static str,
 }
 
 /// 未知播放器。
 pub const UNKNOWN: PlayerInfo = PlayerInfo {
     display_name: "未知播放器",
     process_name: "",
-    fallback_url: "",
 };
 
 /// 静态映射表（20 条，覆盖国内主流 + 国际主流 + 浏览器）。
@@ -36,7 +33,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "网易云音乐",
             process_name: "cloudmusic.exe",
-            fallback_url: "https://music.163.com",
         },
     ),
     (
@@ -45,7 +41,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "QQ 音乐",
             process_name: "qqmusic.exe",
-            fallback_url: "https://y.qq.com",
         },
     ),
     (
@@ -54,7 +49,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "QQ 音乐",
             process_name: "qqmusic.exe",
-            fallback_url: "https://y.qq.com",
         },
     ),
     (
@@ -63,25 +57,33 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Spotify",
             process_name: "spotify.exe",
-            fallback_url: "https://open.spotify.com",
+        },
+    ),
+    (
+        // v1.1.16（问题 6/7）：汽水音乐的真实进程名是 SodaMusic.exe（实测
+        // D:\APP\汽水音乐\Soda Music\3.1.2\SodaMusic.exe，多进程），SMTC AUMID
+        // 也不含 "qishui"——旧键匹配不到，导致「未知播放器」与音量/激活全部失联。
+        "sodamusic",
+        "sodamusic.exe",
+        PlayerInfo {
+            display_name: "汽水音乐",
+            process_name: "sodamusic.exe",
         },
     ),
     (
         "qishui",
-        "qishui.exe",
+        "sodamusic.exe",
         PlayerInfo {
             display_name: "汽水音乐",
-            process_name: "qishui.exe",
-            fallback_url: "https://www.douyin.com/music",
+            process_name: "sodamusic.exe",
         },
     ),
     (
         "douyinmusic",
-        "douyinmusic.exe",
+        "sodamusic.exe",
         PlayerInfo {
             display_name: "汽水音乐",
-            process_name: "douyinmusic.exe",
-            fallback_url: "https://www.douyin.com/music",
+            process_name: "sodamusic.exe",
         },
     ),
     (
@@ -90,7 +92,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "酷狗音乐",
             process_name: "kugou.exe",
-            fallback_url: "https://www.kugou.com",
         },
     ),
     (
@@ -99,7 +100,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "酷我音乐",
             process_name: "kwmusic.exe",
-            fallback_url: "https://www.kuwo.cn",
         },
     ),
     (
@@ -108,7 +108,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "酷我音乐",
             process_name: "kuwomusic.exe",
-            fallback_url: "https://www.kuwo.cn",
         },
     ),
     (
@@ -117,7 +116,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Foobar2000",
             process_name: "foobar2000.exe",
-            fallback_url: "https://www.foobar2000.org",
         },
     ),
     (
@@ -126,7 +124,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "PotPlayer",
             process_name: "potplayermini64.exe",
-            fallback_url: "https://potplayer.daum.net",
         },
     ),
     (
@@ -135,7 +132,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "媒体播放器",
             process_name: "music.ui.exe",
-            fallback_url: "https://www.microsoft.com/store/productId/9WZDNCRFJ3PT",
         },
     ),
     (
@@ -144,7 +140,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "电影和电视",
             process_name: "video.ui.exe",
-            fallback_url: "https://www.microsoft.com/store/productId/9WZDNCRFJ3P2",
         },
     ),
     (
@@ -154,7 +149,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Edge",
             process_name: "msedge.exe",
-            fallback_url: "https://www.bing.com",
         },
     ),
     (
@@ -163,7 +157,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Edge",
             process_name: "msedge.exe",
-            fallback_url: "https://www.bing.com",
         },
     ),
     (
@@ -172,7 +165,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Chrome",
             process_name: "chrome.exe",
-            fallback_url: "https://www.google.com",
         },
     ),
     (
@@ -181,7 +173,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Firefox",
             process_name: "firefox.exe",
-            fallback_url: "https://www.mozilla.org",
         },
     ),
     (
@@ -190,7 +181,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Brave",
             process_name: "brave.exe",
-            fallback_url: "https://brave.com",
         },
     ),
     (
@@ -199,7 +189,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "VLC",
             process_name: "vlc.exe",
-            fallback_url: "https://www.videolan.org",
         },
     ),
     (
@@ -208,7 +197,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "AIMP",
             process_name: "aimp.exe",
-            fallback_url: "https://www.aimp.ru",
         },
     ),
     (
@@ -217,7 +205,6 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         PlayerInfo {
             display_name: "Groove 音乐",
             process_name: "groove.exe",
-            fallback_url: "https://www.microsoft.com/store/productId/9WZDNCRFJ3PT",
         },
     ),
 ];
