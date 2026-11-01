@@ -159,8 +159,8 @@ pub fn system_app_theme_dark() -> bool {
 pub fn force_foreground(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, GetForegroundWindow, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
-        SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOSIZE,
+        BringWindowToTop, GetForegroundWindow, SetForegroundWindow, SetWindowPos, HWND_NOTOPMOST,
+        HWND_TOPMOST, SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOSIZE,
     };
 
     // SAFETY: 全是无副作用的窗口/线程查询与置顶调用；句柄都来自本进程或系统。
@@ -174,9 +174,21 @@ pub fn force_foreground(hwnd: windows::Win32::Foundation::HWND) {
         };
         let attached = tid_fg != 0 && tid_fg != tid_cur && AttachThreadInput(tid_cur, tid_fg, true).as_bool();
         let _ = BringWindowToTop(hwnd);
+        // 经典抢前台技巧：先进 TOPMOST 带抬到最前，**立刻降回 NOTOPMOST**——
+        // 窗口保持在普通窗口之上，但不永久钉在 topmost 带（v1.1.14 问题 11：
+        // 此前没有撤销步骤，设置页被永久置顶，遮住其他窗口）。
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
             0,
             0,
             0,

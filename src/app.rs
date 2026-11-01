@@ -227,6 +227,9 @@ pub struct App {
     skipped_frames: u64,
     /// 上一轮几何探测是否失败（避免日志刷屏）
     geom_failed: bool,
+    /// 右键菜单正在打开（v1.1.14 问题 12）：期间暂停 `ensure_on_top`——
+    /// 1s 心跳把 topmost 的小组件抬到菜单之上会遮住菜单内容
+    menu_open: bool,
 }
 
 /// 歌词区宽度过渡动画（v1.1：歌词区移入条带后，收合动画从高度改为宽度）。
@@ -353,6 +356,7 @@ impl App {
             last_frame_hash: None,
             skipped_frames: 0,
             geom_failed: false,
+            menu_open: false,
         });
 
         // 歌词行不透明度与初始宽度同步（歌词默认开启时首帧就是实色）
@@ -491,7 +495,11 @@ impl App {
 
         // 风险 R1 的最小缓解：任务栏与小组件同为 WS_EX_TOPMOST，同层窗口按「最近置顶」排序。
         // 我们从不激活，所以任何被后来置顶的 topmost 窗口都会压住小组件。
-        self.ensure_on_top();
+        // v1.1.14 问题 12：右键菜单打开期间必须暂停——TrackPopupMenuEx 的模态
+        // 循环会照常派发 WM_TIMER，每秒把小组件抬到菜单之上（菜单非 topmost）。
+        if !self.menu_open {
+            self.ensure_on_top();
+        }
 
         // 背景兜底重采样（PRD P0-07「窗口移动时 300ms 内刷新」的近似）。
         //
@@ -2119,7 +2127,11 @@ impl App {
         let origin = (self.target_rect.left, self.target_rect.top);
         let screen = menu::client_to_screen(origin, (cx as i32, cy as i32));
 
+        // v1.1.14 问题 12：菜单打开期间暂停 1s 心跳的 ensure_on_top（见 on_tick），
+        // 关闭后无论是否选中都要复位
+        self.menu_open = true;
         let cmd = menu::show(hwnd, screen, &self.state, &self.config, self.lang);
+        self.menu_open = false;
         let Some(cmd) = cmd else {
             return;
         };
@@ -2169,7 +2181,8 @@ impl App {
                 self.apply(vec![Effect::Media(MediaCommand::Repeat(next))]);
             }
             MenuCommand::OpenSettings => {
-                crate::log_info!("打开设置页：M3/T13 落地，当前记录请求");
+                // v1.1.14 问题 8：与托盘菜单同链路——设置页已开则前置，未开则创建
+                self.on_second_instance();
             }
             MenuCommand::ShowAbout => self.show_about(),
             MenuCommand::Quit => self.apply(vec![Effect::Quit]),
