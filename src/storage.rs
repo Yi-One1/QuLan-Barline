@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 /// - `WebView2`：设置页 WebView2 用户数据（`settings::webview`）
 pub const MIGRATE_DIRS: &[&str] = &["lyrics-cache", "lyrics", "WebView2"];
 
-/// 启动入口：按配置初始化全局数据目录，必要时执行净搬 + 日志搬迁。
+/// 启动入口：按配置初始化全局数据目录，按用户在设置页选择的选项执行
+/// 迁移 / 删除（弹窗选项在改目录时写入 pending_*，这里执行后复位）。
 ///
 /// 必须在 `Config::load` 之后、任何使用 [`crate::platform::data_dir`] 的模块
 /// 初始化之前调用（`App::bootstrap` 满足该顺序）。会把本次实际生效目录
@@ -36,34 +37,119 @@ pub fn init_from_config(config: &mut crate::config::Config) {
         .unwrap_or_else(|| default_root.clone());
     let new_root = data_dir_from_config(&config.storage.data_dir, &default_root);
     crate::platform::set_data_dir(new_root.clone());
+    let mut dirty = false;
     if old_root != new_root {
+        let migrate = config.storage.pending_migrate;
+        let delete_old = config.storage.pending_delete_old;
         crate::log_info!(
-            "数据目录：{} → {}（启动净搬开始）",
+            "数据目录：{} → {}（迁移={} 删除原文件={}）",
             old_root.display(),
-            new_root.display()
+            new_root.display(),
+            migrate,
+            delete_old
         );
-        for line in migrate_dirs(&old_root, &new_root) {
-            crate::log_info!("迁移：{line}");
+        if migrate {
+            for line in migrate_dirs(&old_root, &new_root) {
+                crate::log_info!("迁移：{line}");
+            }
+            // 日志最后搬：迁移期间旧日志仍在写（记录迁移过程本身）
+            crate::log::relocate(&new_root);
+            crate::log_info!("日志已搬迁至 {}", new_root.join("barline.log").display());
+        } else if delete_old {
+            // 不迁移但要删原文件：日志先关再删（否则删不动）
+            crate::log::relocate(&new_root);
         }
-        // 日志最后搬：迁移期间旧日志仍在写（记录迁移过程本身）
-        crate::log::relocate(&new_root);
-        crate::log_info!("日志已搬迁至 {}", new_root.join("barline.log").display());
-        // 腾空后删除旧目录文件夹本身：remove_dir 只删空目录——默认根因
-        // config.json 必然留下（约定），自定义旧目录 A 腾空后即被整个删除
-        match fs::remove_dir(&old_root) {
-            Ok(()) => crate::log_info!("原数据目录已删除：{}", old_root.display()),
-            Err(_) => crate::log_debug!("原数据目录未删除（非空，保留）：{}", old_root.display()),
+        if delete_old {
+            for line in delete_old_contents(&old_root) {
+                crate::log_info!("清理原目录：{line}");
+            }
+            // 腾空后删除旧目录文件夹本身：remove_dir 只删空目录——默认根因
+            // config.json 豁免必然留下（约定），自定义旧目录 A 腾空后即被整个删除
+            match fs::remove_dir(&old_root) {
+                Ok(()) => crate::log_info!("原数据目录已删除：{}", old_root.display()),
+                Err(_) => crate::log_debug!(
+                    "原数据目录未删除（非空，保留）：{}",
+                    old_root.display()
+                ),
+            }
         }
+        if !migrate && !delete_old {
+            crate::log_info!("按用户选择：不迁移、不删除原目录文件");
+        }
+        dirty = true;
     }
-    // 记录本次实际生效目录（下次启动从这里迁出）。落盘失败无碍：
-    // 下次启动 old_root 退化为默认根，那里已搬空，迁移自然跳过。
+    // 复位一次性选项 + 记录本次实际生效目录（下次启动从这里迁出）。
+    // 落盘失败无碍：下次启动 old_root 退化为上次记录，重复执行也是幂等的。
+    if config.storage.pending_migrate || config.storage.pending_delete_old {
+        config.storage.pending_migrate = false;
+        config.storage.pending_delete_old = false;
+        dirty = true;
+    }
     let active = new_root.to_string_lossy().to_string();
     if config.storage.active_data_dir != active {
         config.storage.active_data_dir = active;
+        dirty = true;
+    }
+    if dirty {
         if let Err(e) = config.save() {
-            crate::log_warn!("记录 active_data_dir 失败（不影响本次使用）：{e}");
+            crate::log_warn!("记录存储状态失败（不影响本次使用）：{e}");
         }
     }
+}
+
+/// 删除 `root` 下除配置文件外的全部内容（用户在设置页明确选择后执行）。
+///
+/// 永远豁免：`config.json`、`config.json.tmp`——删掉它们等于丢掉全部设置
+/// （损坏配置的 `.bad` 备份按「删干净」要求一并删除）。其余文件 / 子目录
+/// 一律删除，最后尝试把 `root` 本身也删掉（只有空目录才会成功）。
+pub fn delete_old_contents(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "config.json" || name == "config.json.tmp" {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let r = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match r {
+            Ok(()) => out.push(format!("{name}: 已删除")),
+            Err(e) => out.push(format!("{name}: 删除失败（{e}），已保留")),
+        }
+    }
+    out
+}
+
+/// 把 `src` 目录下（含子目录）的所有 `.lrc` 文件搬进 `dst`，保持相对结构。
+///
+/// 用于「本地歌词目录」改位置时的文件迁移（用户自己的文件，无句柄占用，
+/// 立即执行）。返回移动的文件数；单文件失败不中断（调用方记日志）。
+pub fn move_lrc_files(src: &Path, dst: &Path) -> std::io::Result<u32> {
+    let mut moved = 0u32;
+    if !src.is_dir() {
+        return Ok(0);
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let path = entry.path();
+        if ty.is_dir() {
+            let name = entry.file_name();
+            moved += move_lrc_files(&path, &dst.join(name))?;
+        } else if path.extension().map(|e| e.eq_ignore_ascii_case("lrc")).unwrap_or(false)
+            && move_item(&path, &dst.join(entry.file_name()))?
+        {
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 /// 由配置字符串解析数据目录（`None` = 使用默认根目录）。
@@ -349,5 +435,51 @@ mod tests {
         assert!(!stale.exists());
         let _ = fs::remove_dir_all(&old);
         let _ = fs::remove_dir_all(&new);
+    }
+
+    #[test]
+    fn delete_old_contents_spares_config_only() {
+        // 删干净语义：除 config.json / config.json.tmp 外全部删除，
+        // 连 .bad 备份也删；根目录随后可直接删除
+        let root = tmp("del_old");
+        fs::write(root.join("config.json"), "{}").unwrap();
+        fs::write(root.join("config.json.tmp"), "{}").unwrap();
+        fs::write(root.join("config.bad.2026.json"), "{}").unwrap();
+        fs::write(root.join("barline.log"), "x").unwrap();
+        let sub = root.join("lyrics-cache");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.json"), "{}").unwrap();
+
+        let report = delete_old_contents(&root);
+        assert!(report.iter().any(|l| l.starts_with("barline.log: 已删除")), "{report:?}");
+        assert!(root.join("config.json").exists());
+        assert!(root.join("config.json.tmp").exists());
+        assert!(!root.join("config.bad.2026.json").exists());
+        assert!(!root.join("barline.log").exists());
+        assert!(!sub.exists());
+        // 只剩 config.json / .tmp → remove_dir 删不掉（非空），符合约定
+        assert!(fs::remove_dir(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn move_lrc_files_moves_recursively_only_lrc() {
+        let src = tmp("lrc_src");
+        let dst = tmp("lrc_dst");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.lrc"), "[00:01]a").unwrap();
+        fs::write(src.join("sub").join("b.lrc"), "[00:01]b").unwrap();
+        fs::write(src.join("keep.txt"), "not lyrics").unwrap();
+        fs::write(src.join("c.LRC"), "[00:01]c").unwrap();
+
+        let moved = move_lrc_files(&src, &dst).unwrap();
+        assert_eq!(moved, 3, "a/b/c（含大写扩展名）都应被移动");
+        assert_eq!(fs::read_to_string(dst.join("a.lrc")).unwrap(), "[00:01]a");
+        assert_eq!(fs::read_to_string(dst.join("sub").join("b.lrc")).unwrap(), "[00:01]b");
+        assert_eq!(fs::read_to_string(dst.join("c.LRC")).unwrap(), "[00:01]c");
+        // 非 .lrc 原地不动
+        assert!(src.join("keep.txt").exists());
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
     }
 }

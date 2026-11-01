@@ -1159,6 +1159,14 @@ impl App {
 
     /// 设置页里的「动作」按钮。
     fn run_settings_action(&mut self, action: &str) {
+        // 歌词目录逐行「更改…」：browseLyricsDir:<idx>
+        if let Some(idx) = action
+            .strip_prefix("browseLyricsDir:")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.relocate_lyrics_dir(idx);
+            return;
+        }
         match action {
             "openLogDir" => {
                 let dir = crate::platform::data_dir();
@@ -1176,14 +1184,30 @@ impl App {
                 }
                 crate::log_info!("设置页：打开数据目录 {}", dir.display());
             }
-            // v1.1.5 问题 3：选数据目录 → 存配置 → 重启后自动迁移生效
+            // v1.1.5 问题 3 / v1.1.7：选数据目录 → 弹窗问「迁移？删除原文件？」
+            // → 选项记进配置，重启后由 storage::init_from_config 执行
+            // （WebView2 / 日志句柄占用，运行中搬会损坏，必须延迟到启动）。
             "browseStorageDir" => {
                 let parent = self.settings.hwnd().unwrap_or(self.msg_hwnd);
-                let (title, hint) = match self.lang {
-                    Lang::Zh => ("选择数据目录", "已保存数据目录，重启曲栏后生效，旧文件将自动迁移"),
-                    Lang::En => ("Choose data folder", "Data folder saved. Restart Barline to apply; old files will migrate automatically"),
+                let (caption, pick_t, q_migrate, q_delete, done, same) = match self.lang {
+                    Lang::Zh => (
+                        "数据目录",
+                        "选择数据目录",
+                        "是否把原目录中的文件同步迁移到新目录？\n（选「否」则新目录从空开始）",
+                        "是否删除原目录整个文件夹？\n（删干净；config.json 等配置文件永远保留）",
+                        "已保存数据目录，重启曲栏后生效",
+                        "数据目录未变化",
+                    ),
+                    Lang::En => (
+                        "Data folder",
+                        "Choose data folder",
+                        "Migrate files from the old folder to the new one?\n(No = start empty)",
+                        "Delete the old folder entirely?\n(config.json is always kept)",
+                        "Data folder saved. Restart Barline to apply",
+                        "Data folder unchanged",
+                    ),
                 };
-                match crate::platform::pick_folder(parent, title) {
+                match crate::platform::pick_folder(parent, pick_t) {
                     Some(p) => {
                         let v = serde_json::json!(p.to_string_lossy().to_string());
                         if crate::settings::bridge::apply_set(
@@ -1191,36 +1215,89 @@ impl App {
                             "storage.data_dir",
                             &v,
                         ) {
+                            let (migrate, delete) =
+                                self.ask_migrate_delete(caption, q_migrate, q_delete);
+                            self.config.storage.pending_migrate = migrate;
+                            self.config.storage.pending_delete_old = delete;
                             if let Err(e) = self.config.save() {
                                 crate::log_err!("保存数据目录配置失败：{e}");
                             }
-                            let toast = crate::settings::bridge::toast_json("info", hint);
+                            let toast = crate::settings::bridge::toast_json("info", done);
                             self.settings.push(&toast);
                             let state = self.settings_state_json();
                             self.settings.push(&state);
-                            crate::log_info!("数据目录已改为 {}", p.display());
+                            crate::log_info!(
+                                "数据目录已改为 {}（迁移={migrate} 删除原文件={delete}）",
+                                p.display()
+                            );
+                        } else {
+                            let toast = crate::settings::bridge::toast_json("info", same);
+                            self.settings.push(&toast);
                         }
                     }
                     None => crate::log_debug!("设置页：取消选择数据目录"),
                 }
             }
+            // 恢复默认 = 把目录改回默认根，走同一套弹窗（迁移回默认 / 删除旧自定义目录）
             "resetStorageDir" => {
-                let hint = match self.lang {
-                    Lang::Zh => "已恢复默认数据目录，重启曲栏后生效",
-                    Lang::En => "Data folder reset to default. Restart Barline to apply",
-                };
-                if crate::settings::bridge::apply_set(
-                    &mut self.config,
-                    "storage.data_dir",
-                    &serde_json::json!(""),
-                ) {
-                    if let Err(e) = self.config.save() {
-                        crate::log_err!("保存数据目录配置失败：{e}");
-                    }
-                    let toast = crate::settings::bridge::toast_json("info", hint);
+                if self.config.storage.data_dir.is_empty() {
+                    let t = match self.lang {
+                        Lang::Zh => "数据目录未变化",
+                        Lang::En => "Data folder unchanged",
+                    };
+                    let toast = crate::settings::bridge::toast_json("info", t);
                     self.settings.push(&toast);
-                    let state = self.settings_state_json();
-                    self.settings.push(&state);
+                    return;
+                }
+                let (caption, q_migrate, q_delete, done) = match self.lang {
+                    Lang::Zh => (
+                        "数据目录",
+                        "是否把原目录中的文件同步迁移回默认目录？\n（选「否」则默认目录从空开始）",
+                        "是否删除原目录整个文件夹？\n（删干净；config.json 等配置文件永远保留）",
+                        "已恢复默认数据目录，重启曲栏后生效",
+                    ),
+                    Lang::En => (
+                        "Data folder",
+                        "Migrate files back to the default folder?\n(No = default starts empty)",
+                        "Delete the old folder entirely?\n(config.json is always kept)",
+                        "Data folder reset. Restart Barline to apply",
+                    ),
+                };
+                let (migrate, delete) = self.ask_migrate_delete(caption, q_migrate, q_delete);
+                self.config.storage.data_dir = String::new();
+                self.config.storage.pending_migrate = migrate;
+                self.config.storage.pending_delete_old = delete;
+                if let Err(e) = self.config.save() {
+                    crate::log_err!("保存数据目录配置失败：{e}");
+                }
+                let toast = crate::settings::bridge::toast_json("info", done);
+                self.settings.push(&toast);
+                let state = self.settings_state_json();
+                self.settings.push(&state);
+            }
+            // v1.1.7 问题 4：「添加」改为系统目录选择对话框（新增目录无迁移语义）
+            "addLyricsDirBrowse" => {
+                let parent = self.settings.hwnd().unwrap_or(self.msg_hwnd);
+                let (pick_t, dup) = match self.lang {
+                    Lang::Zh => ("选择歌词目录", "该目录已在列表中"),
+                    Lang::En => ("Choose lyrics folder", "Folder is already in the list"),
+                };
+                match crate::platform::pick_folder(parent, pick_t) {
+                    Some(p) => {
+                        let s = p.to_string_lossy().to_string();
+                        if self.config.lyrics.local_dirs.iter().any(|d| d == &s) {
+                            let toast = crate::settings::bridge::toast_json("info", dup);
+                            self.settings.push(&toast);
+                        } else {
+                            self.config.lyrics.local_dirs.push(s);
+                            if let Err(e) = self.config.save() {
+                                crate::log_err!("保存歌词目录失败：{e}");
+                            }
+                            let state = self.settings_state_json();
+                            self.settings.push(&state);
+                        }
+                    }
+                    None => crate::log_debug!("设置页：取消选择歌词目录"),
                 }
             }
             "openLrclib" => {
@@ -1242,6 +1319,85 @@ impl App {
                 self.settings.on_webview_ready();
             }
             other => crate::log_debug!("设置页未知动作：{other}"),
+        }
+    }
+
+    /// 「迁移？删除原文件？」两个确认弹窗。返回 `(迁移, 删除)`——用户各自决定。
+    fn ask_migrate_delete(&self, caption: &str, q_migrate: &str, q_delete: &str) -> (bool, bool) {
+        let parent = self.settings.hwnd().unwrap_or(self.msg_hwnd);
+        let migrate = crate::platform::confirm_dialog(parent, caption, q_migrate);
+        let delete = crate::platform::confirm_dialog(parent, caption, q_delete);
+        (migrate, delete)
+    }
+
+    /// 歌词目录逐行「更改…」：选新目录 → 弹窗问「迁移 .lrc？删除原 .lrc？」
+    /// → **立即执行**（用户自己的文件，无句柄占用）→ 更新配置项。
+    fn relocate_lyrics_dir(&mut self, idx: usize) {
+        let Some(old) = self.config.lyrics.local_dirs.get(idx).cloned() else {
+            return;
+        };
+        let parent = self.settings.hwnd().unwrap_or(self.msg_hwnd);
+        let (pick_t, dup, q_migrate, q_delete, done) = match self.lang {
+            Lang::Zh => (
+                "更改歌词目录",
+                "新目录已在列表中",
+                "是否把原目录中的 .lrc 歌词文件迁移到新目录？\n（只移动 .lrc，其他文件不动）",
+                "是否删除原目录整个文件夹？\n（含未迁移的其他文件，删干净）",
+                "歌词目录已更改",
+            ),
+            Lang::En => (
+                "Change lyrics folder",
+                "Folder is already in the list",
+                "Move .lrc files from the old folder to the new one?\n(Only .lrc files are touched)",
+                "Delete the old folder entirely?\n(including any non-migrated files)",
+                "Lyrics folder changed",
+            ),
+        };
+        match crate::platform::pick_folder(parent, pick_t) {
+            Some(p) => {
+                let new = p.to_string_lossy().to_string();
+                if new == old
+                    || self
+                        .config
+                        .lyrics
+                        .local_dirs
+                        .iter()
+                        .any(|d| d == &new)
+                {
+                    let toast = crate::settings::bridge::toast_json("info", dup);
+                    self.settings.push(&toast);
+                    return;
+                }
+                let (migrate, delete) = self.ask_migrate_delete(pick_t, q_migrate, q_delete);
+                let old_path = std::path::PathBuf::from(&old);
+                if migrate {
+                    match crate::storage::move_lrc_files(&old_path, &p) {
+                        Ok(n) if n > 0 => crate::log_info!(
+                            "歌词目录迁移：{} → {}（{n} 个 .lrc）",
+                            old,
+                            new
+                        ),
+                        Ok(_) => crate::log_info!("歌词目录迁移：原目录没有 .lrc 文件"),
+                        Err(e) => crate::log_err!("歌词目录迁移失败：{e}"),
+                    }
+                }
+                if delete {
+                    // 用户明确选择：原目录整个文件夹删干净
+                    match std::fs::remove_dir_all(&old_path) {
+                        Ok(()) => crate::log_info!("歌词原目录已删除：{old}"),
+                        Err(e) => crate::log_err!("歌词原目录删除失败：{e}"),
+                    }
+                }
+                self.config.lyrics.local_dirs[idx] = new;
+                if let Err(e) = self.config.save() {
+                    crate::log_err!("保存歌词目录失败：{e}");
+                }
+                let toast = crate::settings::bridge::toast_json("info", done);
+                self.settings.push(&toast);
+                let state = self.settings_state_json();
+                self.settings.push(&state);
+            }
+            None => crate::log_debug!("设置页：取消更改歌词目录"),
         }
     }
 

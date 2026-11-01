@@ -189,14 +189,19 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
         // ---------------- 存储（v1.1.5 问题 3）----------------
         // 浏览对话框 / 恢复默认按钮送来的路径。规范化（剥引号、去尾分隔符、
         // 相对锚定）；等于默认根目录时存空串（配置干净，语义同默认）。
+        // 无实际变化返回 false（调用方据此跳过迁移弹窗）。
         "storage.data_dir" => {
             let Some(s) = value.as_str() else { return false };
             let default_root = crate::platform::barline_dir();
-            match crate::storage::resolve_custom_dir(s, &default_root) {
-                Some(p) if p == default_root => cfg.storage.data_dir = String::new(),
-                Some(p) => cfg.storage.data_dir = p.to_string_lossy().to_string(),
-                None => cfg.storage.data_dir = String::new(),
+            let new_val = match crate::storage::resolve_custom_dir(s, &default_root) {
+                Some(p) if p == default_root => String::new(),
+                Some(p) => p.to_string_lossy().to_string(),
+                None => String::new(),
+            };
+            if cfg.storage.data_dir == new_val {
+                return false;
             }
+            cfg.storage.data_dir = new_val;
             true
         }
         // ---------------- 快捷键 ----------------

@@ -62,6 +62,25 @@ pub fn data_dir() -> PathBuf {
     DATA_DIR.get().cloned().unwrap_or_else(barline_dir)
 }
 
+/// 「是 / 否」询问弹窗（MessageBoxW）。返回 `true` = 用户选了「是」。
+pub fn confirm_dialog(parent: windows::Win32::Foundation::HWND, title: &str, text: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO, IDYES,
+    };
+    let t = windows::core::HSTRING::from(title);
+    let body = windows::core::HSTRING::from(text);
+    // SAFETY: 两个 HSTRING 在调用期间存活；parent 可为空句柄（桌面归属）。
+    unsafe {
+        MessageBoxW(
+            Some(parent),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+        ) == IDYES
+    }
+}
+
 /// 目录选择对话框（v1.1.5 问题 3；IFileOpenDialog，FOS_PICKFOLDERS）。
 ///
 /// 用户取消 / COM 失败一律 `None`（调用方静默忽略即可）。成功返回绝对路径。

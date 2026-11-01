@@ -171,6 +171,12 @@ pub struct StorageConfig {
     /// 迁移源以它为准——支持「自定义 A 切换到 B」时把 A 的数据搬去 B。
     /// 空 = 默认根目录。用户不必手改。
     pub active_data_dir: String,
+    /// 用户在设置页选择的数据目录迁移选项：下次启动是否把旧目录文件
+    /// 迁到新目录（弹窗询问后写入，启动执行后复位）。
+    pub pending_migrate: bool,
+    /// 用户在设置页选择的数据目录删除选项：下次启动迁移/腾空后是否删除
+    /// 原目录里的文件（弹窗询问后写入，启动执行后复位；config.json 永远豁免）。
+    pub pending_delete_old: bool,
 }
 
 /// 全量配置。`#[serde(default)]` 保证缺字段 / 新增字段时都能正常反序列化。
