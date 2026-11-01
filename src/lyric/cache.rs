@@ -28,6 +28,12 @@ const POS_TTL_SECS: i64 = limits::LYRIC_DISK_TTL_DAYS * 86_400;
 const NEG_TTL_SECS: i64 = limits::LYRIC_MISS_TTL_HOURS * 3_600;
 /// 磁盘缓存总大小上限（5 MB）。
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// **内存** LRU 的字节上限（512 KB）。
+///
+/// 为什么不是架构里的 1 MB：QA 实测 M2 常驻工作集已经 38.74 MB，
+/// 离 PRD P0-14 的 40 MB 只剩 1.3 MB 余量；歌词缓存必须在**字节**上封顶，
+/// 而不是"8 条"——8 首 300 行的增强 LRC 轻松超过 1 MB。
+const MEM_BUDGET_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------- 磁盘格式
 
@@ -156,6 +162,8 @@ pub struct Cache {
     /// 内存 LRU 的顺序表（头部最新）
     order: VecDeque<String>,
     map: HashMap<String, Arc<Lyrics>>,
+    /// 内存里这些歌词的大致字节数（用于按预算淘汰）
+    mem_bytes: usize,
 }
 
 impl Cache {
@@ -166,6 +174,7 @@ impl Cache {
             dir,
             order: VecDeque::new(),
             map: HashMap::new(),
+            mem_bytes: 0,
         };
         cache.sweep();
         cache
@@ -283,13 +292,22 @@ impl Cache {
     // ---- 内部 ----
 
     fn insert_mem(&mut self, key: &str, lyrics: Arc<Lyrics>) {
-        self.map.insert(key.to_string(), lyrics);
+        if let Some(old) = self.map.insert(key.to_string(), lyrics.clone()) {
+            self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&old));
+        }
+        self.mem_bytes += approx_bytes(&lyrics);
         self.touch(key);
-        while self.order.len() > limits::LYRIC_LRU_CAP {
-            if let Some(old) = self.order.pop_back() {
-                self.map.remove(&old);
-            } else {
+        // 两条淘汰条件：条数上限（架构 §7.6）与字节预算（QA 要求 512 KB）
+        while self.order.len() > limits::LYRIC_LRU_CAP || self.mem_bytes > MEM_BUDGET_BYTES {
+            // 至少留一条，避免单条超预算时把刚放进去的也踢掉
+            if self.order.len() <= 1 {
                 break;
+            }
+            let Some(old) = self.order.pop_back() else {
+                break;
+            };
+            if let Some(l) = self.map.remove(&old) {
+                self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&l));
             }
         }
     }
@@ -309,6 +327,24 @@ impl Cache {
         self.dir
             .join(format!("miss-{:016x}.json", fnv1a64(key.as_bytes())))
     }
+}
+
+/// 估算一份歌词在内存里占多少字节（字符串 + Vec 容量 + 固定开销）。
+///
+/// 只求量级正确：`String` 的 `len()` 是实际堆占用，`Vec` 按元素数 × 元素大小算，
+/// 再加上每行 64 字节的结构体开销（`LyricLine` + 分配器碎片）。
+fn approx_bytes(l: &Lyrics) -> usize {
+    let mut n = core::mem::size_of::<Lyrics>();
+    n += l.title.len() + l.artist.len() + l.album.len() + l.by.len();
+    n += l.lines.len() * (core::mem::size_of::<LyricLine>() + 64);
+    for line in &l.lines {
+        n += line.text.len();
+        n += line.words.len() * (core::mem::size_of::<LyricWord>() + 32);
+        for w in &line.words {
+            n += w.text.len();
+        }
+    }
+    n
 }
 
 /// 原子写：`.tmp` → `rename`。
@@ -438,10 +474,38 @@ mod tests {
         for i in 0..(limits::LYRIC_LRU_CAP + 3) {
             c.put(&format!("k{i}"), &l, "test");
         }
-        assert_eq!(c.map.len(), limits::LYRIC_LRU_CAP);
+        assert!(c.map.len() <= limits::LYRIC_LRU_CAP);
         // 最早的不在了，最新的在
         assert!(c.get_mem("k0").is_none());
         assert!(c.get_mem(&format!("k{}", limits::LYRIC_LRU_CAP + 2)).is_some());
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    /// 内存缓存必须按**字节**封顶（QA 要求 512 KB），不能只数条数。
+    #[test]
+    fn memory_cache_respects_byte_budget() {
+        let mut c = tmp_cache("bytes");
+        // 造一份 ~260 KB 的歌词（1200 行 × 90 字节文本 + 每行结构体开销）
+        let big = Lyrics {
+            lines: (0..1200)
+                .map(|i| LyricLine {
+                    start_ms: i * 10,
+                    end_ms: i * 10 + 10,
+                    text: "一二三四五六七八九十一二三四五六七八九十一二三四五".into(),
+                    words: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(approx_bytes(&big) > 150 * 1024, "样本太小，测不出预算");
+        for i in 0..6 {
+            c.put(&format!("big{i}"), &big, "test");
+        }
+        assert!(
+            c.mem_bytes <= MEM_BUDGET_BYTES,
+            "内存歌词 {} 字节，超过 512 KB 预算",
+            c.mem_bytes
+        );
         let _ = std::fs::remove_dir_all(&c.dir);
     }
 

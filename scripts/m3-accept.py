@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -362,22 +363,31 @@ def main():
         right_click(wl + ww // 2, wt + wh - 20)
         time.sleep(0.7)
         acc.shot("m3-06-menu.bmp", wl - 40, wt - 140, 420, wh + 180)
-        # 键盘选中第一项并确认
+        # 键盘选中第一项
         key(0x28)  # VK_DOWN
         time.sleep(0.15)
-        key(0x0D)  # VK_RETURN
-        # 采样高度时间序列（证明 200ms 缓动而不是瞬变）
+        # 采样线程先跑起来，再按回车——否则 python 发键的 60–90ms 会吃掉动画前半段
         series = []
-        t0 = time.time()
-        mid_shot_done = False
-        while time.time() - t0 < 0.40:
-            r = acc.widget_rect()
-            if r:
-                series.append((round((time.time() - t0) * 1000), r[3] - r[1]))
-                if not mid_shot_done and r[3] - r[1] < wh - 4 and r[3] - r[1] > bar_h + 2:
-                    acc.shot("m3-07-collapsing.bmp", wl - 40, wt - 10, ww + 80, wh + 20)
-                    mid_shot_done = True
-            time.sleep(0.012)
+        stop = threading.Event()
+
+        def sample_heights():
+            t0 = time.time()
+            shot_done = [False]
+            while not stop.is_set() and time.time() - t0 < 0.8:
+                r = acc.widget_rect()
+                if r:
+                    h = r[3] - r[1]
+                    series.append((round((time.time() - t0) * 1000), h))
+                    if not shot_done[0] and bar_h + 2 < h < wh - 4:
+                        acc.shot("m3-07-collapsing.bmp", wl - 40, wt - 10, ww + 80, wh + 20)
+                        shot_done[0] = True
+                time.sleep(0.008)
+
+        th = threading.Thread(target=sample_heights)
+        th.start()
+        time.sleep(0.03)
+        key(0x0D)  # VK_RETURN → 菜单关闭 → 触发收合
+        th.join()
         print("  高度时间序列（ms, px）：%s" % series)
         time.sleep(0.6)
         r = acc.widget_rect()

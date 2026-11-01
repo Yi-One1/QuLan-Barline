@@ -84,7 +84,7 @@ def main():
         edge = r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
 
     # 复用验收脚本里的辅助（起会话 / 找窗口）
-    spec = __import__("importlib.util").util.spec_from_file_location("acc", os.path.join(HERE, "m2_accept.py"))
+    spec = __import__("importlib.util").util.spec_from_file_location("acc", os.path.join(HERE, "m2-accept.py"))
     acc = __import__("importlib.util").util.module_from_spec(spec)
     sys.modules["acc"] = acc
     spec.loader.exec_module(acc)

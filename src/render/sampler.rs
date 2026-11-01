@@ -302,16 +302,13 @@ fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
     }
 
     // ---- 2. 加权相对亮度 ----
-    let theme = compute_theme(
-        &block,
-        &valid,
+    let grid = BlockGrid {
+        block: &block,
+        valid: &valid,
         bw,
         bh,
-        &req.text_rects,
-        req.scale,
-        req.accent,
-        req.mode,
-    );
+    };
+    let theme = compute_theme(&grid, req);
 
     // ---- 3. 模糊背景 ----
     let blur_buf = if req.need_blur && req.mode == BackgroundMode::Blur {
@@ -323,18 +320,30 @@ fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
     Some((theme, blur_buf))
 }
 
-/// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
-#[allow(clippy::too_many_arguments)]
-fn compute_theme(
-    block: &[u8],
-    valid: &[bool],
+/// 一次采样里「块网格 + 请求参数」的聚合体。
+///
+/// 原先 `compute_theme` 吃 8 个参数，其中 `block / valid / bw / bh` 是同一份
+/// 块网格的四个面、`text_rects / scale / accent / mode` 是同一份请求的四个字段。
+/// 聚成两个结构体后签名只剩 `(grid, req)`，语义反而更清楚。
+struct BlockGrid<'a> {
+    /// 每块的平均 BGRA（4 字节/块）
+    block: &'a [u8],
+    /// 该块是否「有效」（不是我们自己画的）
+    valid: &'a [bool],
     bw: u32,
     bh: u32,
-    text_rects: &[(RectF, f32)],
-    scale: f32,
-    accent: Rgb,
-    mode: BackgroundMode,
-) -> Theme {
+}
+
+/// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
+fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
+    let BlockGrid {
+        block,
+        valid,
+        bw,
+        bh,
+    } = *grid;
+    let text_rects = &req.text_rects;
+    let (scale, accent, mode) = (req.scale, req.accent, req.mode);
     let s = if scale > 0.0 { scale } else { 1.0 };
     let bs = limits::SAMPLE_BLOCK as f32;
     let mut sum_w = 0f64;
@@ -571,6 +580,38 @@ fn capture(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// 测试用的最小 `SampleRequest`（只关心 compute_theme 用到的四个字段）。
+    fn sample_req(text_rects: Vec<(RectF, f32)>) -> SampleRequest {
+        SampleRequest {
+            epoch: 0,
+            rect: RECT::default(),
+            scale: 1.0,
+            mode: BackgroundMode::Blur,
+            accent: Rgb::SYSTEM_ACCENT_FALLBACK,
+            coverage: None,
+            text_rects,
+            corner_radius: 0.0,
+            need_blur: false,
+        }
+    }
+
+    /// 测试里构造块网格 + 请求，直接拿主题。
+    fn theme_of(
+        block: &[u8],
+        valid: &[bool],
+        bw: u32,
+        bh: u32,
+        text_rects: Vec<(RectF, f32)>,
+    ) -> Theme {
+        let grid = BlockGrid {
+            block,
+            valid,
+            bw,
+            bh,
+        };
+        compute_theme(&grid, &sample_req(text_rects))
+    }
+
     #[test]
     fn coverage_map_counts_alpha() {
         // 8×8 全透明 → 覆盖率为 0；左上 4×4 全不透明 → 该块覆盖率 1
@@ -632,16 +673,7 @@ mod tests {
 
         let valid = [true, true, true, false];
 
-        let theme = compute_theme(
-            &block,
-            &valid,
-            bw,
-            bh,
-            &[],
-            1.0,
-            Rgb::SYSTEM_ACCENT_FALLBACK,
-            BackgroundMode::Blur,
-        );
+        let theme = theme_of(&block, &valid, bw, bh, Vec::new());
 
         // 深灰（0x20）的相对亮度 ≈ 0.0144，必须选浅色文字
         assert!(!theme.on_light, "被覆盖的白块污染了亮度判定");
@@ -658,16 +690,7 @@ mod tests {
             block[i * 4 + 3] = 0xFF;
         }
         let valid = [false, false];
-        let theme = compute_theme(
-            &block,
-            &valid,
-            bw,
-            bh,
-            &[],
-            1.0,
-            Rgb::SYSTEM_ACCENT_FALLBACK,
-            BackgroundMode::Blur,
-        );
+        let theme = theme_of(&block, &valid, bw, bh, Vec::new());
         // #808080 的亮度 ≈ 0.216
         assert!(
             (theme.backdrop_luma - 0.216).abs() < 0.02,
@@ -688,27 +711,9 @@ mod tests {
         block[7] = 0xFF;
         let valid = [true, true];
 
-        let plain = compute_theme(
-            &block,
-            &valid,
-            bw,
-            bh,
-            &[],
-            1.0,
-            Rgb::SYSTEM_ACCENT_FALLBACK,
-            BackgroundMode::Blur,
-        );
+        let plain = theme_of(&block, &valid, bw, bh, Vec::new());
         // 右半（x ∈ [4,8)）加权 ×3
-        let weighted = compute_theme(
-            &block,
-            &valid,
-            bw,
-            bh,
-            &[(RectF::new(4.0, 0.0, 4.0, 4.0), 3.0)],
-            1.0,
-            Rgb::SYSTEM_ACCENT_FALLBACK,
-            BackgroundMode::Blur,
-        );
+        let weighted = theme_of(&block, &valid, bw, bh, vec![(RectF::new(4.0, 0.0, 4.0, 4.0), 3.0)]);
         assert!(
             weighted.backdrop_luma > plain.backdrop_luma,
             "文本区加权未生效：weighted={} plain={}",

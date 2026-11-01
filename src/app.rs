@@ -206,6 +206,10 @@ pub struct App {
     lyric_anim: Option<HeightAnim>,
     /// 上一帧的歌词绘制指纹，用来跳过无变化的重绘
     last_lyric_key: Option<(Option<usize>, i32)>,
+    /// 上一帧的**像素指纹**（`frame_hash`）。相同就完全不碰 D2D / UpdateLayeredWindow
+    last_frame_hash: Option<u64>,
+    /// 被指纹去重跳过的帧数（诊断用）
+    skipped_frames: u64,
     /// 上一轮几何探测是否失败（避免日志刷屏）
     geom_failed: bool,
 }
@@ -321,6 +325,8 @@ impl App {
             lyric_h,
             lyric_anim: None,
             last_lyric_key: None,
+            last_frame_hash: None,
+            skipped_frames: 0,
             geom_failed: false,
         });
 
@@ -328,11 +334,15 @@ impl App {
 
         // 绑定 App* 到两个窗口的 GWLP_USERDATA
         crate::ui::widget_wnd::bind_app(msg_hwnd, ptr);
+        // SAFETY: ptr 由上一行的 Box::into_raw 产生，此刻还没有第二个持有者；
+        // 只读地借用其中的 widget 字段（`as_ref` 不移动、不释放）。
         if let Some(w) = unsafe { (*ptr).widget.as_ref() } {
             crate::ui::widget_wnd::bind_app(w.hwnd(), ptr);
         }
 
         // 启动媒体 / 歌词线程（MTA / 普通线程）。失败不阻塞启动。
+        // SAFETY: 同上——`ptr` 是刚 `Box::into_raw` 出来的独占指针，且本函数还没返回，
+        // 没有任何其它线程或窗口过程持有它（GWLP_USERDATA 刚写入，消息泵尚未启动）。
         unsafe {
             (*ptr).media = MediaService::spawn(sink.clone());
             (*ptr).lyric = LyricService::spawn(sink);
@@ -1160,6 +1170,16 @@ impl App {
         if self.geometry.is_none() {
             return;
         }
+        // ---- 像素指纹去重（架构 §11.1）----
+        // 同一份指纹意味着「这一帧画出来和上一帧一模一样」，直接跳过
+        // D2D 重绘 + WIC 回读 + UpdateLayeredWindow 三件套。
+        // 这是「播放中空闲 CPU」能被压住的关键：进度条每秒才动一次、
+        // 扫光在暂停时不动、悬停淡出结束后完全静止，这些情况都不该重绘。
+        let hash = self.frame_hash();
+        if self.last_frame_hash == Some(hash) {
+            self.skipped_frames = self.skipped_frames.saturating_add(1);
+            return;
+        }
         let Some(host) = self.widget.as_ref() else {
             return;
         };
@@ -1173,9 +1193,134 @@ impl App {
                     crate::log_warn!("UpdateLayeredWindow 失败：{e}");
                 }
                 self.last_coverage = coverage;
+                self.last_frame_hash = Some(hash);
             }
             Err(e) => crate::log_err!("绘制失败：{e}"),
         }
+    }
+
+    /// 本帧的「像素指纹」。
+    ///
+    /// 只喂**会影响像素**的量，而且全部先量化：
+    /// - 进度按 1 秒量化（进度条宽度一秒才动 ~1px）；
+    /// - 扫光按 1/60 行量化（13px 字号下 ~0.2px，肉眼不可辨）；
+    /// - 悬停 alpha 按 1/32 量化（120ms 淡入在 16ms 定时器下也就 7 帧）；
+    /// - 音量 HUD 按 1% 量化。
+    ///
+    /// 任何"多算了"的量都只会让去重失效（退化成每帧重绘），不会画错；
+    /// 反过来漏算就会画错——所以宁可多算。
+    fn frame_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        /// `Rgb` 没有 `Hash`，打包成 u32 再喂。
+        fn rgb_key(c: crate::media::Rgb) -> u32 {
+            ((c.r as u32) << 16) | ((c.g as u32) << 8) | (c.b as u32)
+        }
+        fn hover_key(h: HoverState) -> u8 {
+            match h {
+                HoverState::Idle => 0,
+                HoverState::Hover => 1,
+                HoverState::Seeking => 2,
+                HoverState::VolumeHud => 3,
+            }
+        }
+        fn target_key(t: HitTarget) -> u8 {
+            match t {
+                HitTarget::None => 0,
+                HitTarget::Cover => 1,
+                HitTarget::Prev => 2,
+                HitTarget::Toggle => 3,
+                HitTarget::Next => 4,
+                HitTarget::Progress => 5,
+            }
+        }
+
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let st = &self.state;
+        let lay = &st.layout;
+
+        // ---- 几何 / 布局 ----
+        let geo = [
+            self.target_rect.left,
+            self.target_rect.top,
+            self.target_rect.right,
+            self.target_rect.bottom,
+            lay.width,
+            lay.height,
+        ];
+        geo.hash(&mut h);
+        (lay.text_key as i32).hash(&mut h);
+        // 歌词区矩形（高度动画期间每帧都变）
+        let lyric_rect = [
+            lay.lyric_cur.y as i32,
+            lay.lyric_cur.h as i32,
+            lay.lyric_next.y as i32,
+        ];
+        lyric_rect.hash(&mut h);
+
+        // ---- 主题（只取影响像素的字段，忽略 luma 抖动）----
+        let theme = [
+            rgb_key(st.theme.text),
+            rgb_key(st.theme.text_dim),
+            rgb_key(st.theme.accent),
+            st.theme.hover_bg.packed(),
+            st.theme.track_bg.packed(),
+            st.theme.dim_alpha as u32,
+            st.theme.needs_outline as u32,
+            st.theme.use_blur as u32,
+        ];
+        theme.hash(&mut h);
+
+        // ---- 交互修饰态 ----
+        hover_key(st.hover).hash(&mut h);
+        ((st.hover_alpha.clamp(0.0, 1.0) * 32.0) as u32).hash(&mut h);
+        st.pressed.map(target_key).hash(&mut h);
+
+        // ---- 播放态 ----
+        st.playing.track_id.hash(&mut h);
+        (st.effective_state() as u8).hash(&mut h);
+        (st.playing.can_prev as u8).hash(&mut h);
+        (st.playing.can_next as u8).hash(&mut h);
+        (st.playing.cover.is_some() as u8).hash(&mut h);
+        let duration = st.playing.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+        ((duration > 0) as u8).hash(&mut h);
+        // 进度按 1 秒量化；拖动中按预览位置
+        let pos = if st.hover == HoverState::Seeking {
+            st.seek_preview_ms
+        } else {
+            st.playing.position_now()
+        };
+        (pos / 1000).hash(&mut h);
+        // 拖动气泡里的 mm:ss 也按秒
+        if st.hover == HoverState::Seeking {
+            (st.seek_preview_ms / 1000).hash(&mut h);
+        }
+
+        // ---- 音量 HUD ----
+        (st.hover == HoverState::VolumeHud).hash(&mut h);
+        ((st.volume_hud.clamp(0.0, 1.0) * 100.0) as u32).hash(&mut h);
+
+        // ---- 歌词 ----
+        let draw = st.lyric_draw(self.lang);
+        draw.line.hash(&mut h);
+        ((draw.sweep * 60.0) as u32).hash(&mut h);
+        draw.placeholder.hash(&mut h);
+        draw.cur.hash(&mut h);
+        draw.next.hash(&mut h);
+        // 切歌淡出：按 1/16 量化（120ms / 7.5ms ≈ 16 帧）
+        if let Some((old_cur, old_next, started)) = &st.lyric_fade {
+            let t = (started.elapsed().as_secs_f32() / LYRIC_FADE_SECS * 16.0) as u32;
+            t.hash(&mut h);
+            old_cur.hash(&mut h);
+            old_next.hash(&mut h);
+        }
+        // 模糊缓冲：内容每 250ms 换一份，必须进指纹（否则悬停背景会冻住）
+        st.blur
+            .as_ref()
+            .map(|b| Arc::as_ptr(b) as usize)
+            .hash(&mut h);
+
+        h.finish()
     }
 
     /// 可见性同步（PRD 5.2 三道门控，M2 起真的生效）。

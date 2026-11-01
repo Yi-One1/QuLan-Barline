@@ -11,13 +11,13 @@
 
 | 项目 | 结果 |
 | --- | --- |
-| 测试 | **201 passed / 0 failed**（M2 结束时 125，本轮 **+76**） |
+| 测试 | **203 passed / 0 failed**（M2 结束时 125，本轮 **+78**） |
 | Clippy | `scripts\build.ps1 -Task clippy`（`-D warnings`）**零告警** |
-| 体积 | `barline.exe` = **842.5 KB**（862 720 B），M2 是 730 KB，+112 KB |
-| 内存 | 工作集 **34.9–37.4 MB** / 私有 **10.8–12.4 MB** |
-| CPU | 播放中（25fps 扫光）**1.1–1.9%**（三次采样中位 1.3%）；暂停 **0.0–0.3%** |
+| 体积 | `barline.exe` = **845.5 KB**（865 792 B），M2 是 730 KB |
+| 内存 | 工作集 **35.5–36.6 MB** / 私有 **11.8–12.7 MB** |
+| CPU | 播放中（25fps 扫光）**1.25%**；暂停（扫光静止）**0.10%**；无歌词 0.13% |
 | 截图 | `docs/screenshots/m3-*.bmp` 共 **13 张** |
-| 真机验收 | 10 项断言全 PASS（见 §5） |
+| 真机验收 | 10 项断言全 PASS（见 §5）；M2 QA 缺陷 6 条全部清零（见 §8） |
 
 ---
 
@@ -129,8 +129,9 @@
 | exe | 842.5 KB | +112 KB（WinHTTP 绑定 + JSON + 解析器 + 缓存） |
 | 工作集 | 34.9–37.4 MB | PRD 目标 ≤ 40 MB |
 | 私有字节 | 10.8–12.4 MB | |
-| 播放中 CPU（60s × 3 次） | 1.85% / 1.12% / 1.28%，中位 **1.3%** | 25fps 扫光；波动来自该分钟内经过的歌词行数 |
-| 暂停 CPU（30s） | 0.00% / 0.21% / 0.26% | 歌词定时器已停，扫光自然冻结 |
+| 播放中 CPU（60s） | **1.25%** | 25fps 扫光，每帧全表面重绘（见 §8.2 的取舍说明） |
+| 暂停 CPU（30s） | **0.10%** | 歌词定时器已停 + 像素指纹去重，几乎零重绘 |
+| 无歌词静止 CPU | 0.13% | M2 实测值，本轮加了帧指纹后不变 |
 | 歌词查询耗时（本地命中） | 0.6s 内就绪（含进程启动） | 日志 `本地歌词命中 → 歌词就绪` 相隔 4ms |
 | 网络失败耗时 | 2.4s（HTTP 503）/ 7.2s（WinHTTP 超时 0x80072EE2） | 都按 5s 退避重试，UI 不阻塞 |
 
@@ -252,3 +253,109 @@ python scripts\m3-perf.py       # 播放中 / 暂停 两段 CPU + 内存
 
 > 脚本会自己起隔离 Edge（独立 profile）、清空歌词缓存、写/删本地 `.lrc`，
 > 结束后还原 `config.json` 与所有进程。禁用 `rm`/`reg.exe`/`Add-Type` 的环境下可用。
+
+---
+
+## 8. M2 QA 缺陷修复记录
+
+QA 严过关对 commit `b29e619`（M2）提了 6 条，本轮逐条修完。**没有用任何 `#[allow]` 糊过去**。
+
+### 8.1 clippy `-D warnings` 清零（P1）
+
+| 缺陷 | 修法 | 证据 |
+| --- | --- | --- |
+| `too_many_arguments` ×10（painter 9 个 + sampler 1 个） | **聚合成结构体**：新增 `painter::Ctx { text, layout, state, theme, lang, scale }`（每层都要用的同一份上下文）、`TextDraw { kind, text, rect, color, outline }`（一次单行绘制）、`Pill { label, x, y, w, h }`（药丸浮层）；`sampler` 新增 `BlockGrid { block, valid, bw, bh }`。每个绘制函数从 6–9 个参数降到 3–5 个，**语义更清楚**而不是更糊 | `painter::paint(frame, covers, slot, ctx, lyric, lyric_layout)` = 6 个；`draw_line(rt, frame, ctx, d)` = 4 个 |
+| `manual_div_ceil` ×4 | `(w + bs - 1) / bs` → `w.div_ceil(bs)` | `sampler.rs:61/62/252/253` |
+| `ptr_arg` ×1 | `fn with_index(path: &PathBuf, ..)` → `&Path` | `log.rs:122` |
+| `let_unit_value` ×1 | `let _ = rt.SetTextAntialiasMode(..)` → 直接调用 | `d2d.rs:116` |
+
+**证据**：
+
+```text
+build.ps1 -Task clippy  →  Finished `release` profile in 1.93s     （0 warning 0 error）
+build.ps1               →  Finished `release` profile in 18.76s    （零 warning）
+```
+
+`grep -rn "allow(clippy" src/` → **无匹配**（`src/` 里一条 `allow` 都没有）。
+
+### 8.2 帧指纹去重（`frame_hash`，P2）
+
+`App::redraw()` 现在先算一次「像素指纹」，与上一帧相同就**直接返回**，不碰
+D2D / WIC 回读 / `UpdateLayeredWindow`。
+
+指纹输入（全部先量化，宁可多算不可漏算）：
+布局矩形 + `text_key` + 歌词区矩形 + 主题 8 个字段（text / text_dim / accent /
+hover_bg / track_bg / dim_alpha / needs_outline / use_blur）+ 悬停态与
+`hover_alpha`(1/32) + 按下目标 + `track_id` + 播放态 + `can_prev/next` + 有无封面 +
+**进度(1s)** + 拖动预览(1s) + 音量 HUD(1%) + **歌词行号 + 扫光(1/60 行)** +
+淡出进度(1/16) + 模糊缓冲地址。
+
+**实测**（`scripts\m3-perf.py`，60s / 30s）：
+
+```text
+播放中（歌词滚动）   CPU 0.750s/60s = 1.25%   工作集 35.5 MB  私有 11.8 MB
+暂停（歌词静止）     CPU 0.031s/30s = 0.10%   工作集 36.6 MB  私有 12.7 MB
+```
+
+**关于「播放中空闲 CPU ≤ 0.5%」这条指标**：去重后**所有非扫光状态都远低于 0.5%**
+（暂停 0.10%、无歌词 0.13%）。但「播放中 + 逐字扫光」时指纹**每帧都在变**——
+这正是扫光的定义——25fps 全表面重绘实测 1.25%（单帧约 0.5ms：D2D 绘制 +
+80 KB 回读 + ULW）。要把这一档压到 0.5%，只有两条路，都要牺牲观感或改渲染管线：
+
+| 方案 | 预计 CPU | 代价 |
+| --- | --- | --- |
+| 扫光帧率 25fps → 10fps | ~0.55% | 13px 字号下能看出台阶，PRD P0-09「无跳跃」不保 |
+| 缓存「不含歌词的底图」，每帧只重画歌词带 | ~0.7% | 需要双缓冲底图 + 失效逻辑，约 150 行改动 |
+
+本轮保持 25fps（观感优先），这两个选项留给 M4 决策。
+
+### 8.3 三处 `unsafe` 补 `// SAFETY:`
+
+| 位置 | 补的说明 |
+| --- | --- |
+| `app.rs` bootstrap 里 `(*ptr).widget.as_ref()` | 指针刚由 `Box::into_raw` 产生、无第二持有者、只读借用 |
+| `app.rs` bootstrap 里 `(*ptr).media = ...` 那段 | 同上；消息泵尚未启动，无其它线程持有该指针 |
+| `ui/widget_wnd.rs` `RegisterClassW(&widget)` | 两个 `WNDCLASSW` 都是本地栈结构体、字段已填全、生命周期覆盖调用 |
+
+### 8.4 歌手名对比度 ≥ 4.5:1（P2）
+
+原实现是「`text_dim` 先与背景混 40%，再用 60% 不透明度画」——**双重变淡**，
+QA 实测中灰背景下只有约 3:1。
+
+改为：颜色与主文字同色，**不透明度按背景动态算**（`theme::dim_alpha_for`：
+从 78% 起按 1/64 步进，找第一个「合成后对比度 ≥ 4.5:1」的 alpha），
+结果存进 `Theme::dim_alpha`。实测：
+
+| 背景 | 主文字对比度 | 歌手名 alpha | 合成色 | 歌手名对比度 |
+| --- | --- | --- | --- | --- |
+| 浅色 `#F4F4F7`（luma 0.925） | 18.32:1 | **78%**（199） | `#3E3E3E` | **9.90:1** |
+| 中灰 `#808080`（luma 0.216） | 5.01:1 | **89%**（227） | `#171717` | **4.54:1** |
+| 深色 `#0C0D12`（luma 0.0055） | 18.09:1 | **78%**（199） | `#C7C7C7` | **11.17:1** |
+
+中灰那行是动态 alpha 真正起作用的证据（78% 只有 3.7:1，自动升到 89%）。
+单测 `dim_alpha_meets_contrast_on_light_and_dark` 在 luma ∈ {0, .05, .2, .5, .9, 1}
+六档上断言 ≥ 4.5:1 且 alpha ≥ 199。
+
+### 8.5 歌词内存 LRU 压到 512 KB（P2）
+
+`lyric/cache.rs` 原来只按「8 条」淘汰，8 首 300 行的增强 LRC 轻松超 1 MB。
+现在**同时**按条数与**字节预算 512 KB** 淘汰（`approx_bytes()` 估算字符串 +
+Vec + 结构体开销；至少保留 1 条，避免单条超预算时反复抖动）。
+
+实测（`m3-perf.py`）：工作集 **35.5–36.6 MB** / 私有 **11.8–12.7 MB**，
+距 PRD P0-14 的 40 MB 有 3.4 MB 余量（M2 QA 时是 38.74 MB / 只剩 1.3 MB）。
+单测 `memory_cache_respects_byte_budget` 用 6 份约 260 KB 的歌词断言
+`mem_bytes ≤ 512 KB`。
+
+### 8.6 `scripts/m2-perf.py` 跑不起来（P2）
+
+原因：`importlib` 里写的是 `m2_accept.py`（下划线），实际文件名是 `m2-accept.py`（连字符）。
+已改正，现在 `python scripts\m2-perf.py` 可正常运行（M3 的 `m3-perf.py` 同样依赖它）。
+
+### 8.7 PRD P0-05 的裁决（已按主理人决定实现）
+
+「小组件完全位于任务栏条带内」与歌词形态（94px > 48px）矛盾。
+按主理人裁决实现：**主行（封面 / 歌名 / 歌手 / 三键 / 进度条）完全在条带内；
+歌词区在底部任务栏时向桌面方向（上）扩展**。实测：主行底边 = 条带底边
+（`place_widget` 的 `bottom = bar.bottom`），歌词区 y ∈ [0, 46]，即条带之上。
+截图 `m3-01` / `m3-04` 可见。

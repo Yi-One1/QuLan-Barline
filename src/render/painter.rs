@@ -292,27 +292,32 @@ fn draw_texts(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Resul
     };
 
     let main = Rgba::from_rgb(theme.text, 0xFF);
-    let dim = Rgba::from_rgb(theme.text_dim, Theme::DIM_ALPHA);
+    // 歌手名：不透明度由主题按背景算过（≥ 4.5:1，下限 78%），不是写死的 60%
+    let dim = Rgba::from_rgb(theme.text_dim, theme.dim_alpha);
 
     draw_line(
         rt,
         frame,
-        text,
-        TextKind::Title,
-        title_src,
-        layout.title,
-        main,
-        theme.needs_outline,
+        ctx,
+        &TextDraw {
+            kind: TextKind::Title,
+            text: title_src,
+            rect: layout.title,
+            color: main,
+            outline: theme.needs_outline,
+        },
     )?;
     draw_line(
         rt,
         frame,
-        text,
-        TextKind::Artist,
-        artist_src,
-        layout.artist,
-        dim,
-        false,
+        ctx,
+        &TextDraw {
+            kind: TextKind::Artist,
+            text: artist_src,
+            rect: layout.artist,
+            color: dim,
+            outline: false,
+        },
     )?;
     Ok(())
 }
@@ -526,7 +531,18 @@ fn draw_progress(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Re
         let pill_h = 16.0 * s;
         let x = (layout.width as f32 - pill_w - limits::CONTENT_PAD * s).max(0.0);
         let y = (pr.y - pill_h - 1.0 * s).max(0.0);
-        draw_pill(rt, frame, text, &label, x, y, pill_w, pill_h, theme)?;
+        draw_pill(
+            rt,
+            frame,
+            ctx,
+            &Pill {
+                label: &label,
+                x,
+                y,
+                w: pill_w,
+                h: pill_h,
+            },
+        )?;
     }
 
     Ok(())
@@ -574,7 +590,6 @@ fn draw_pill(
             DWRITE_MEASURING_MODE_NATURAL,
         );
     }
-    let _ = theme;
     Ok(())
 }
 
@@ -611,24 +626,28 @@ fn draw_lyrics(
                 draw_line(
                     rt,
                     frame,
-                    text,
-                    TextKind::Lyric,
-                    old_cur,
-                    layout.lyric_cur,
-                    Rgba::from_rgb(theme.text, a),
-                    false,
+                    ctx,
+                    &TextDraw {
+                        kind: TextKind::Lyric,
+                        text: old_cur,
+                        rect: layout.lyric_cur,
+                        color: Rgba::from_rgb(theme.text, a),
+                        outline: false,
+                    },
                 )?;
             }
             if !old_next.is_empty() && !layout.lyric_next.is_empty() {
                 draw_line(
                     rt,
                     frame,
-                    text,
-                    TextKind::Lyric,
-                    old_next,
-                    layout.lyric_next,
-                    Rgba::from_rgb(theme.text_dim, ((a as f32) * 0.6) as u8),
-                    false,
+                    ctx,
+                    &TextDraw {
+                        kind: TextKind::Lyric,
+                        text: old_next,
+                        rect: layout.lyric_next,
+                        color: Rgba::from_rgb(theme.text_dim, ((a as f32) * 0.6) as u8),
+                        outline: false,
+                    },
                 )?;
             }
             return Ok(());
@@ -640,12 +659,14 @@ fn draw_lyrics(
         return draw_line(
             rt,
             frame,
-            text,
-            TextKind::Lyric,
-            lyric.cur,
-            layout.lyric_cur,
-            Rgba::from_rgb(theme.text_dim, 0xB0),
-            false,
+            ctx,
+            &TextDraw {
+                kind: TextKind::Lyric,
+                text: lyric.cur,
+                rect: layout.lyric_cur,
+                color: Rgba::from_rgb(theme.text_dim, 0xB0),
+                outline: false,
+            },
         );
     }
 
@@ -654,12 +675,14 @@ fn draw_lyrics(
         draw_line(
             rt,
             frame,
-            text,
-            TextKind::Lyric,
-            lyric.next,
-            layout.lyric_next,
-            Rgba::from_rgb(theme.text_dim, Theme::DIM_ALPHA),
-            false,
+            ctx,
+            &TextDraw {
+                kind: TextKind::Lyric,
+                text: lyric.next,
+                rect: layout.lyric_next,
+                color: Rgba::from_rgb(theme.text_dim, Theme::DIM_ALPHA),
+                outline: false,
+            },
         )?;
     }
 
@@ -672,12 +695,14 @@ fn draw_lyrics(
     draw_line(
         rt,
         frame,
-        text,
-        TextKind::Lyric,
-        lyric.cur,
-        layout.lyric_cur,
-        unsung,
-        false,
+        ctx,
+        &TextDraw {
+            kind: TextKind::Lyric,
+            text: lyric.cur,
+            rect: layout.lyric_cur,
+            color: unsung,
+            outline: false,
+        },
     )?;
 
     // ---- 当前行：已唱部分（裁剪后重画）----
@@ -686,12 +711,14 @@ fn draw_lyrics(
         return draw_line(
             rt,
             frame,
-            text,
-            TextKind::Lyric,
-            lyric.cur,
-            layout.lyric_cur,
-            Rgba::from_rgb(theme.text, 0xFF),
-            false,
+            ctx,
+            &TextDraw {
+                kind: TextKind::Lyric,
+                text: lyric.cur,
+                rect: layout.lyric_cur,
+                color: Rgba::from_rgb(theme.text, 0xFF),
+                outline: false,
+            },
         );
     };
     if lyric.sweep <= 0.01 {
@@ -716,12 +743,14 @@ fn draw_lyrics(
     let r = draw_line(
         rt,
         frame,
-        text,
-        TextKind::Lyric,
-        lyric.cur,
-        layout.lyric_cur,
-        Rgba::from_rgb(theme.text, 0xFF),
-        false,
+        ctx,
+        &TextDraw {
+            kind: TextKind::Lyric,
+            text: lyric.cur,
+            rect: layout.lyric_cur,
+            color: Rgba::from_rgb(theme.text, 0xFF),
+            outline: false,
+        },
     );
     // SAFETY: 与上面的 PushAxisAlignedClip 配对；无论 draw_line 成功与否都要 Pop。
     unsafe {
@@ -754,7 +783,18 @@ fn draw_seek_bubble(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) ->
         .min((layout.width as f32 - pill_w - 2.0 * s).max(2.0 * s));
     // 气泡贴在主行顶部（底部任务栏时主行不在客户区顶部，不能写死 0）
     let y = layout.main_row.y + 1.0 * s;
-    draw_pill(rt, frame, text, &label, x, y, pill_w, pill_h, theme)
+    draw_pill(
+        rt,
+        frame,
+        ctx,
+        &Pill {
+            label: &label,
+            x,
+            y,
+            w: pill_w,
+            h: pill_h,
+        },
+    )
 }
 
 /// `01:12 / 03:45`。**不分配 String 之外的任何东西**，且只在 Seeking 态调用。

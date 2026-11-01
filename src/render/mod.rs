@@ -168,14 +168,19 @@ impl Renderer {
         // take_next 会翻转轮换标记，所以槽位要**先**算：next_is_b == false → 本轮画 B。
         let slot: u8 = if targets.next_is_b { 0 } else { 1 };
         let frame = targets.take_next();
-        painter::paint(
+        let ctx = painter::Ctx {
             text,
+            layout: &state.layout,
+            state,
+            theme: state.theme,
+            lang,
+            scale: state.layout.effective_scale(),
+        };
+        painter::paint(
             frame,
             covers,
             slot,
-            &state.layout,
-            state,
-            lang,
+            &ctx,
             &draw,
             lyric.as_ref().map(|l| (&l.layout, l.utf16_len)),
         )?;

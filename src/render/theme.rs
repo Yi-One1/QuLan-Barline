@@ -94,6 +94,11 @@ pub struct Theme {
     pub text: Rgb,
     /// 次要文字色（歌手、占位、非当前歌词）
     pub text_dim: Rgb,
+    /// 次要文字的不透明度（**按背景算出来的**，保证合成后 ≥ 4.5:1，下限 78%）
+    ///
+    /// 为什么不用固定 60%：QA 实测中灰背景上 60% 不透明度只有 ~3:1，
+    /// 达不到 WCAG AA。这里把"淡"做成**能淡多少淡多少**，而不是写死一个值。
+    pub dim_alpha: u8,
     /// 强调色（封面主色或系统强调色或自定义）
     pub accent: Rgb,
     /// 悬停背景色（含 alpha）
@@ -141,8 +146,11 @@ impl Theme {
         let best = c_dark.max(c_light);
         let needs_outline = best < crate::config::defaults::limits::MIN_CONTRAST;
 
-        // 次要文字：主文字与背景按 40% 混合（等效于 60% 不透明度压在背景上）。
-        let text_dim = mix_rgb(text, bg_gray, 0.4);
+        // 次要文字：颜色与主文字同色，靠 `dim_alpha` 做淡化——
+        // 这样"合成后对比度"是可计算的（见 `dim_alpha_for`），不会被颜色混合
+        // 和 alpha 叠成双重变淡而算不准。
+        let text_dim = text;
+        let dim_alpha = dim_alpha_for(text, bg_gray);
 
         let accent = normalize_accent(accent);
 
@@ -165,6 +173,7 @@ impl Theme {
             on_light,
             text,
             text_dim,
+            dim_alpha,
             accent,
             hover_bg,
             track_bg,
@@ -187,12 +196,33 @@ impl Theme {
         self.on_light == other.on_light
             && self.text == other.text
             && self.text_dim == other.text_dim
+            && self.dim_alpha == other.dim_alpha
             && self.accent == other.accent
             && self.hover_bg == other.hover_bg
             && self.track_bg == other.track_bg
             && self.use_blur == other.use_blur
             && self.needs_outline == other.needs_outline
     }
+}
+
+/// 次要文字的最小不透明度。
+///
+/// 目标：**合成后**（`fg` 以 alpha 压在 `bg` 上）对背景的对比度 ≥ `MIN_CONTRAST`，
+/// 同时尽量淡。下限 78%（PRD §4.1 写的是 60% 不透明度，但那在中灰背景上
+/// 只有 ~3:1，QA 实测不达标，所以改成按背景算）。
+///
+/// 返回值是 0..=255 的 alpha；连 100% 都达不到时返回 0xFF（此时
+/// `needs_outline` 会兜底加 1px 反色描边）。
+pub fn dim_alpha_for(fg: Rgb, bg: Rgb) -> u8 {
+    const FLOOR: f32 = 0.78;
+    let mut a = FLOOR;
+    while a < 1.0 {
+        if contrast_ratio(mix_rgb(bg, fg, a), bg) >= crate::config::defaults::limits::MIN_CONTRAST {
+            return (a * 255.0).round() as u8;
+        }
+        a += 1.0 / 64.0;
+    }
+    0xFF
 }
 
 /// 背景模糊结果。由 T3（[`crate::render::sampler`]）生产，UI 线程只读。
@@ -360,6 +390,27 @@ mod tests {
         let c = Rgba::new(1, 2, 3, 0xFF).with_alpha_scale(0.5);
         assert_eq!((c.r, c.g, c.b), (1, 2, 3));
         assert_eq!(c.a, 0x80);
+    }
+
+    /// 次要文字（歌手名）在浅/深背景下都必须 ≥ 4.5:1，且不能比 78% 更淡。
+    #[test]
+    fn dim_alpha_meets_contrast_on_light_and_dark() {
+        for luma in [0.0f32, 0.05, 0.2, 0.5, 0.9, 1.0] {
+            let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Blur);
+            let bg = luma_to_srgb_gray(luma);
+            let composite = mix_rgb(bg, t.text_dim, t.dim_alpha as f32 / 255.0);
+            let c = contrast_ratio(composite, bg);
+            assert!(
+                c >= 4.5 - 0.02,
+                "luma {luma} 下歌手名对比度 {c:.2} < 4.5（alpha = {}）",
+                t.dim_alpha
+            );
+            assert!(
+                t.dim_alpha >= 199,
+                "luma {luma} 下 alpha {} 低于 78% 下限",
+                t.dim_alpha
+            );
+        }
     }
 
     /// `same_paint` 必须忽略 luma 抖动，否则 1s 心跳采样会让空闲 CPU 涨到 1%。

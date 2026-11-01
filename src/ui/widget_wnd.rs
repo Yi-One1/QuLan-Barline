@@ -98,7 +98,8 @@ pub fn register_classes(hinstance: HINSTANCE) -> Result<()> {
         ..widget
     };
 
-    // SAFETY: 两个 WNDCLASSW 都是本地栈结构体，字段已填全；
+    // SAFETY: 两个 WNDCLASSW 都是本地栈结构体，字段已填全（`lpfnWndProc` 指向本模块的
+    // `extern "system"` 函数，句柄字段为空表示用默认值）；结构体在本调用期间存活。
     // RegisterClassW 返回 0 表示失败（重复注册同类名也会返回 0，此处不视为错误）。
     unsafe {
         let a = RegisterClassW(&widget);
