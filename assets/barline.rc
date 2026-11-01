@@ -1,0 +1,7 @@
+// 曲栏 Barline —— Win32 资源脚本
+// 路径相对于「构建脚本的工作目录」，即 crate 根目录（embed-resource 不切换 cwd）。
+// 图标 ID 固定为 1，托盘与 exe 图标都取它。
+1 ICON "assets/icon.ico"
+
+// 24 = RT_MANIFEST，ID 1 = 应用清单（CREATEPROCESS_MANIFEST_RESOURCE_ID）
+1 24 "assets/app.manifest"

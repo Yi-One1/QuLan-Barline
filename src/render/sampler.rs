@@ -1,0 +1,720 @@
+//! 背景采样线程（T3）：抓屏 → alpha 掩码剔除 → 加权亮度 → 主题 + 模糊背景。
+//!
+//! 对应 `ARCHITECTURE.md` §11.2（亮度自适应）与 §11.3（悬停模糊）。
+//!
+//! ## 核心难点 H3 / 风险 R5：抓屏会抓到自己
+//!
+//! `GetDC(NULL)` + `BitBlt` 拿到的是**已合成**的桌面，包含我们自己画的文字与封面。
+//! 直接求平均亮度会被自己的内容污染，而且会形成自我强化的正反馈
+//! （文字越白 → 平均亮度越高 → 判定背景越亮 → 文字越黑 …）。
+//!
+//! **解法**：UI 线程在 `UpdateLayeredWindow` 之后把上一帧的 alpha 图按 4×4 块
+//! 统计成 [`CoverageMap`] 共享过来；采样时只统计「我们几乎没画东西」的块
+//! （coverage < 10%），文本区域覆盖的块额外加权 ×3。
+//!
+//! ## 为什么不用 `WDA_EXCLUDEFROMCAPTURE`
+//!
+//! `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` 会让我们的窗口在截图里
+//! 变成**纯黑**——那比「抓到自己的文字」更糟（整块背景被拉黑）。
+//!
+//! ## CPU 预算
+//!
+//! 窗口最大 510×135 物理像素 → 128×34 个块。块级 hole-fill + box blur + 双线性放大
+//! 合计 < 0.3 ms，且**只在收到请求时**运行；空闲时阻塞在 `recv_timeout` 上，CPU ≈ 0。
+
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SendError, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+};
+
+use crate::config::defaults::limits;
+use crate::event::AppEvent;
+use crate::media::Rgb;
+use crate::platform::wake::EventSink;
+use crate::render::blur;
+use crate::render::layout::RectF;
+use crate::render::theme::{
+    luma_to_srgb_gray, srgb8_to_linear, BackgroundMode, BlurBuffer, Rgba, Theme,
+};
+
+/// 上一帧的 alpha 覆盖率图（4×4 块粒度）。
+///
+/// `cov[i]` 是该块内 alpha > 8 的像素个数（0..=16）。
+/// 用 `u8` 而不是 `f32` 是为了让 `Arc` 共享的体积最小（510×135 → 128×34 = 4.3 KB）。
+#[derive(Debug, Clone)]
+pub struct CoverageMap {
+    pub bw: u32,
+    pub bh: u32,
+    pub cov: Vec<u8>,
+}
+
+impl CoverageMap {
+    /// 从一帧 BGRA（顶朝下）统计覆盖率。
+    pub fn from_bgra(bgra: &[u8], w: u32, h: u32) -> Self {
+        let bs = limits::SAMPLE_BLOCK;
+        let bw = (w + bs - 1) / bs;
+        let bh = (h + bs - 1) / bs;
+        let mut cov = vec![0u8; (bw * bh) as usize];
+        let stride = w as usize * 4;
+
+        for by in 0..bh {
+            for bx in 0..bw {
+                let mut n: u16 = 0;
+                let x0 = bx * bs;
+                let y0 = by * bs;
+                for dy in 0..bs {
+                    let y = y0 + dy;
+                    if y >= h {
+                        break;
+                    }
+                    for dx in 0..bs {
+                        let x = x0 + dx;
+                        if x >= w {
+                            break;
+                        }
+                        let p = y as usize * stride + x as usize * 4;
+                        if p + 3 < bgra.len() && bgra[p + 3] > 8 {
+                            n += 1;
+                        }
+                    }
+                }
+                cov[(by * bw + bx) as usize] = n.min(255) as u8;
+            }
+        }
+
+        Self { bw, bh, cov }
+    }
+
+    /// 某块的覆盖比例 0.0..=1.0。
+    pub fn ratio(&self, bx: u32, by: u32) -> f32 {
+        if bx >= self.bw || by >= self.bh {
+            return 1.0;
+        }
+        let n = self.cov[(by * self.bw + bx) as usize] as f32;
+        let total = (limits::SAMPLE_BLOCK * limits::SAMPLE_BLOCK) as f32;
+        (n / total).clamp(0.0, 1.0)
+    }
+
+    /// 整体覆盖率（诊断用）。
+    pub fn overall(&self) -> f32 {
+        if self.cov.is_empty() {
+            return 0.0;
+        }
+        let sum: u32 = self.cov.iter().map(|v| *v as u32).sum();
+        let total = self.cov.len() as u32 * limits::SAMPLE_BLOCK * limits::SAMPLE_BLOCK;
+        (sum as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// 一次采样请求。**最新覆盖槽**语义：300ms 内的多次请求只保留最后一次。
+#[derive(Debug, Clone)]
+pub struct SampleRequest {
+    /// 几何代次（与 `AppState::geometry_epoch` 对应）
+    pub epoch: u64,
+    /// 窗口在屏幕上的物理矩形
+    pub rect: RECT,
+    pub scale: f32,
+    pub mode: BackgroundMode,
+    /// 当前强调色（用于模糊结果的色调层）
+    pub accent: Rgb,
+    /// 上一帧的覆盖率图；`None` 时退化为「全块平均」
+    pub coverage: Option<Arc<CoverageMap>>,
+    /// 文本区域（客户区坐标 + 权重倍数），这些块在亮度统计里加权
+    pub text_rects: Vec<(RectF, f32)>,
+    /// 模糊背景的圆角半径（物理像素）
+    pub corner_radius: f32,
+    /// 是否需要生产模糊背景（半透明模式下只需要亮度）
+    pub need_blur: bool,
+}
+
+/// 采样线程门面。
+pub struct Sampler {
+    tx: Sender<SampleRequest>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Sampler {
+    /// 启动 T3 线程。线程创建失败返回 `None`（小组件退化为固定主题，仍可用）。
+    pub fn spawn(sink: EventSink<AppEvent>) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<SampleRequest>();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("barline-sample"))
+            .stack_size(256 * 1024)
+            .spawn(move || run(sink, rx));
+        match spawned {
+            Ok(handle) => Some(Self {
+                tx,
+                handle: Some(handle),
+            }),
+            Err(e) => {
+                crate::log_err!("采样线程创建失败：{e}（主题固定为深色）");
+                None
+            }
+        }
+    }
+
+    /// 投递一次采样请求（非阻塞）。
+    pub fn request(&self, req: SampleRequest) {
+        match self.tx.send(req) {
+            Ok(()) => {}
+            Err(SendError(_)) => crate::log_debug!("采样线程已退出，请求丢弃"),
+        }
+    }
+
+    /// 通知退出并等待结束。
+    pub fn shutdown(&mut self) {
+        // 丢弃 sender 会让 recv_timeout 返回 Disconnected，线程自然退出。
+        if let Some(handle) = self.handle.take() {
+            // 先尝试断开：把 tx 换成一个立即丢弃的 channel
+            let (dead_tx, _dead_rx) = std::sync::mpsc::channel::<SampleRequest>();
+            let old = std::mem::replace(&mut self.tx, dead_tx);
+            drop(old);
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// T3 线程主循环。
+///
+/// **节流（§11.2）**：请求进入「最新覆盖槽」，`SAMPLE_THROTTLE_MS`（300ms）内
+/// 多次请求只保留最后一次。这样「300ms 内完成黑白切换」与「不会采样风暴」
+/// 两个目标同时成立，且没有忙循环。
+fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
+    crate::log_info!("采样线程启动（T3）");
+    let throttle = Duration::from_millis(limits::SAMPLE_THROTTLE_MS);
+    let mut slot: Option<SampleRequest> = None;
+    let mut last_done = Instant::now() - throttle;
+    let mut sampled: u64 = 0;
+
+    loop {
+        // 有空槽时等到节流窗口结束；无槽时阻塞 200ms（5 次/秒的空转，CPU ≈ 0）
+        let wait = if slot.is_some() {
+            throttle.saturating_sub(last_done.elapsed())
+        } else {
+            Duration::from_millis(200)
+        };
+
+        match rx.recv_timeout(wait) {
+            Ok(req) => slot = Some(req),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        if slot.is_some() && last_done.elapsed() >= throttle {
+            if let Some(req) = slot.take() {
+                if let Some((theme, blur_buf)) = sample(&req) {
+                    sampled += 1;
+                    crate::log_debug!(
+                        "采样 #{sampled}：luma={:.3} on_light={} blur={} epoch={}",
+                        theme.backdrop_luma,
+                        theme.on_light,
+                        blur_buf.is_some(),
+                        req.epoch
+                    );
+                    sink.send(AppEvent::BackdropReady {
+                        epoch: req.epoch,
+                        theme,
+                        blur: blur_buf.map(Arc::new),
+                    });
+                }
+                last_done = Instant::now();
+            }
+        }
+    }
+
+    crate::log_info!("采样线程退出（共采样 {sampled} 次）");
+}
+
+/// 抓屏 + 统计 + 模糊。返回 `(主题, 模糊缓冲)`。
+fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
+    let w = (req.rect.right - req.rect.left).max(1) as u32;
+    let h = (req.rect.bottom - req.rect.top).max(1) as u32;
+    // 防御：异常大的矩形直接拒绝，避免一次分配几十 MB
+    if w > 4096 || h > 4096 {
+        crate::log_warn!("采样矩形异常（{w}×{h}），跳过");
+        return None;
+    }
+
+    let pixels = capture(req.rect.left, req.rect.top, w, h)?;
+    let bs = limits::SAMPLE_BLOCK;
+    let bw = (w + bs - 1) / bs;
+    let bh = (h + bs - 1) / bs;
+
+    // ---- 1. 块平均色 + 覆盖率 ----
+    let mut block = vec![0u8; (bw * bh * 4) as usize];
+    let mut valid = vec![false; (bw * bh) as usize];
+    let mut block_cov = vec![0f32; (bw * bh) as usize];
+    let stride = w as usize * 4;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut sum = [0u32; 3];
+            let mut n: u32 = 0;
+            for dy in 0..bs {
+                let y = by * bs + dy;
+                if y >= h {
+                    break;
+                }
+                for dx in 0..bs {
+                    let x = bx * bs + dx;
+                    if x >= w {
+                        break;
+                    }
+                    let p = y as usize * stride + x as usize * 4;
+                    if p + 3 >= pixels.len() {
+                        continue;
+                    }
+                    sum[0] += pixels[p + 2] as u32; // R
+                    sum[1] += pixels[p + 1] as u32; // G
+                    sum[2] += pixels[p] as u32; // B
+                    n += 1;
+                }
+            }
+            let i = (by * bw + bx) as usize;
+            if n == 0 {
+                continue;
+            }
+            block[i * 4] = (sum[2] / n) as u8;
+            block[i * 4 + 1] = (sum[1] / n) as u8;
+            block[i * 4 + 2] = (sum[0] / n) as u8;
+            block[i * 4 + 3] = 0xFF;
+
+            let cov = req
+                .coverage
+                .as_ref()
+                .map(|m| m.ratio(bx, by))
+                .unwrap_or(0.0);
+            block_cov[i] = cov;
+            valid[i] = cov < limits::SAMPLE_COVERED_RATIO;
+        }
+    }
+
+    // ---- 2. 加权相对亮度 ----
+    let theme = compute_theme(
+        &block,
+        &valid,
+        bw,
+        bh,
+        &req.text_rects,
+        req.scale,
+        req.accent,
+        req.mode,
+    );
+
+    // ---- 3. 模糊背景 ----
+    let blur_buf = if req.need_blur && req.mode == BackgroundMode::Blur {
+        Some(build_blur(req, &mut block, &valid, bw, bh, w, h))
+    } else {
+        None
+    };
+
+    Some((theme, blur_buf))
+}
+
+/// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
+fn compute_theme(
+    block: &[u8],
+    valid: &[bool],
+    bw: u32,
+    bh: u32,
+    text_rects: &[(RectF, f32)],
+    scale: f32,
+    accent: Rgb,
+    mode: BackgroundMode,
+) -> Theme {
+    let s = if scale > 0.0 { scale } else { 1.0 };
+    let bs = limits::SAMPLE_BLOCK as f32;
+    let mut sum_w = 0f64;
+    let mut sum_l = 0f64;
+    let mut valid_count = 0usize;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let i = (by * bw + bx) as usize;
+            if !valid[i] {
+                continue;
+            }
+            valid_count += 1;
+            let r = block[i * 4 + 2];
+            let g = block[i * 4 + 1];
+            let b = block[i * 4];
+
+            let luma = 0.2126 * srgb8_to_linear(r)
+                + 0.7152 * srgb8_to_linear(g)
+                + 0.0722 * srgb8_to_linear(b);
+
+            // 文本区域加权（PRD 要求「按文本区域加权」）
+            let cx = (bx as f32 * bs + bs * 0.5) / s;
+            let cy = (by as f32 * bs + bs * 0.5) / s;
+            let mut w = 1.0f64;
+            for (rect, weight) in text_rects {
+                if rect.contains(cx, cy) {
+                    w = (*weight).max(1.0) as f64;
+                    break;
+                }
+            }
+
+            sum_w += w;
+            sum_l += (luma as f64) * w;
+        }
+    }
+
+    let total = (bw * bh) as f32;
+    let valid_ratio = if total > 0.0 {
+        valid_count as f32 / total
+    } else {
+        0.0
+    };
+
+    let luma = if sum_w > 0.0 && valid_ratio >= limits::SAMPLE_MIN_VALID_RATIO {
+        (sum_l / sum_w) as f32
+    } else {
+        // 兜底（§11.2 第 4 步）：有效块太少 → 退回全块平均
+        let mut all_w = 0f64;
+        let mut all_l = 0f64;
+        for by in 0..bh {
+            for bx in 0..bw {
+                let i = (by * bw + bx) as usize;
+                let r = block[i * 4 + 2];
+                let g = block[i * 4 + 1];
+                let b = block[i * 4];
+                all_l += (0.2126 * srgb8_to_linear(r)
+                    + 0.7152 * srgb8_to_linear(g)
+                    + 0.0722 * srgb8_to_linear(b)) as f64;
+                all_w += 1.0;
+            }
+        }
+        if all_w > 0.0 {
+            (all_l / all_w) as f32
+        } else {
+            0.0
+        }
+    };
+
+    let theme = Theme::from_backdrop(luma, accent, mode);
+    if theme.needs_outline {
+        crate::log_debug!(
+            "背景亮度 {:.3} 处于中灰带，文字对比度不足，启用 1px 描边（背景代表色 {:?}）",
+            luma,
+            luma_to_srgb_gray(luma)
+        );
+    }
+    theme
+}
+
+/// 块级空洞填充 → box blur ×3 → 双线性放大 → 色调 + 圆角遮罩。
+fn build_blur(
+    req: &SampleRequest,
+    block: &mut [u8],
+    valid: &[bool],
+    bw: u32,
+    bh: u32,
+    w: u32,
+    h: u32,
+) -> BlurBuffer {
+    // 1. 用同行 / 同列最近的有效块填补「我们画过」的块，避免自己的文字被模糊成一团灰影
+    blur::fill_holes(block, bw, bh, valid);
+
+    // 2. 3 次可分离 box blur（在块空间做，块 = 4 物理像素 → 半径 3 ≈ 12 物理像素）
+    blur::box_blur(block, bw, bh, limits::BLUR_RADIUS, limits::BLUR_PASSES);
+
+    // 3. 放大回窗口尺寸
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    blur::upsample_bilinear(block, bw, bh, &mut out, w, h);
+
+    // 4. 色调层 + 圆角遮罩 + 预乘
+    let tint = Rgba::from_rgb(req.accent, limits::BLUR_TINT_ALPHA);
+    let ta = tint.a as f32 / 255.0;
+    let alpha = limits::BLUR_ALPHA;
+    let radius = req.corner_radius.max(0.0);
+
+    for y in 0..h {
+        for x in 0..w {
+            let p = (y as usize * w as usize + x as usize) * 4;
+            // 圆角遮罩：不在圆角矩形内的像素 alpha 归零
+            if !inside_rounded(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, radius) {
+                out[p] = 0;
+                out[p + 1] = 0;
+                out[p + 2] = 0;
+                out[p + 3] = 0;
+                continue;
+            }
+            let b = out[p] as f32;
+            let g = out[p + 1] as f32;
+            let r = out[p + 2] as f32;
+            // 叠色调（直通 alpha 混合）
+            let r2 = r * (1.0 - ta) + tint.r as f32 * ta;
+            let g2 = g * (1.0 - ta) + tint.g as f32 * ta;
+            let b2 = b * (1.0 - ta) + tint.b as f32 * ta;
+            // 预乘（UpdateLayeredWindow 要求 PBGRA）
+            let k = alpha as f32 / 255.0;
+            out[p] = (b2 * k).round().clamp(0.0, 255.0) as u8;
+            out[p + 1] = (g2 * k).round().clamp(0.0, 255.0) as u8;
+            out[p + 2] = (r2 * k).round().clamp(0.0, 255.0) as u8;
+            out[p + 3] = alpha;
+        }
+    }
+
+    BlurBuffer {
+        width: w,
+        height: h,
+        bgra: out,
+        geometry_epoch: req.epoch,
+    }
+}
+
+/// 点是否落在 `w × h`、圆角 `r` 的矩形内（像素中心采样）。
+pub fn inside_rounded(px: f32, py: f32, w: f32, h: f32, r: f32) -> bool {
+    let r = r.max(0.0).min(w * 0.5).min(h * 0.5);
+    if r <= 0.0 {
+        return px >= 0.0 && py >= 0.0 && px < w && py < h;
+    }
+    if px < 0.0 || py < 0.0 || px >= w || py >= h {
+        return false;
+    }
+    // 四个角做圆判定，其余直接通过
+    let cx = if px < r {
+        r
+    } else if px > w - r {
+        w - r
+    } else {
+        return true;
+    };
+    let cy = if py < r {
+        r
+    } else if py > h - r {
+        h - r
+    } else {
+        return true;
+    };
+    let dx = px - cx;
+    let dy = py - cy;
+    dx * dx + dy * dy <= r * r
+}
+
+/// 抓取屏幕上的一块矩形，返回顶朝下的 BGRA。
+fn capture(x: i32, y: i32, w: u32, h: u32) -> Option<Vec<u8>> {
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32), // 负高度 = 顶朝下
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: w * h * 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    // SAFETY: 全部是 GDI 句柄的成对创建/释放；每一条失败路径都会把已创建的句柄清掉。
+    // bits 指向 CreateDIBSection 分配的 w*h*4 字节，只要 HBITMAP 未删除就一直有效。
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        if mem.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return None;
+        }
+
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let dib = match CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(b) => b,
+            Err(_) => {
+                let _ = DeleteDC(mem);
+                let _ = ReleaseDC(None, screen);
+                return None;
+            }
+        };
+        let old = SelectObject(mem, HGDIOBJ(dib.0));
+
+        let ok = BitBlt(mem, 0, 0, w as i32, h as i32, Some(screen), x, y, SRCCOPY).is_ok();
+
+        let mut out = Vec::new();
+        if ok && !bits.is_null() {
+            let len = (w as usize) * (h as usize) * 4;
+            // SAFETY: bits 至少可读 len 字节（CreateDIBSection 按 bmi 分配）。
+            out.extend_from_slice(core::slice::from_raw_parts(bits as *const u8, len));
+        }
+
+        let _ = SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+
+        if ok {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_map_counts_alpha() {
+        // 8×8 全透明 → 覆盖率为 0；左上 4×4 全不透明 → 该块覆盖率 1
+        let (w, h) = (8u32, 8u32);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                px[(y * 8 + x) * 4 + 3] = 255;
+            }
+        }
+        let m = CoverageMap::from_bgra(&px, w, h);
+        assert_eq!((m.bw, m.bh), (2, 2));
+        assert!((m.ratio(0, 0) - 1.0).abs() < 1e-6);
+        assert!((m.ratio(1, 0) - 0.0).abs() < 1e-6);
+        assert!((m.ratio(0, 1) - 0.0).abs() < 1e-6);
+        assert!(m.overall() > 0.2 && m.overall() < 0.3);
+    }
+
+    #[test]
+    fn coverage_ratio_out_of_range_is_conservative() {
+        let m = CoverageMap {
+            bw: 1,
+            bh: 1,
+            cov: vec![0],
+        };
+        // 越界索引按「已覆盖」处理，避免误把不存在的块算进亮度
+        assert!((m.ratio(5, 5) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rounded_corner_rejects_outside_pixels() {
+        assert!(inside_rounded(10.0, 10.0, 20.0, 20.0, 6.0));
+        // 左上角顶点在圆外
+        assert!(!inside_rounded(0.5, 0.5, 20.0, 20.0, 6.0));
+        // 无圆角时整块都算内部
+        assert!(inside_rounded(0.5, 0.5, 20.0, 20.0, 0.0));
+        // 越界
+        assert!(!inside_rounded(-1.0, 5.0, 20.0, 20.0, 6.0));
+    }
+
+    /// 风险 R5 的专项单测：给定「已知 alpha 掩码 + 已知屏幕图」，
+    /// 断言只统计非覆盖块（文字色不会污染背景亮度）。
+    #[test]
+    fn brightness_ignores_covered_blocks() {
+        // 4×1 个块：前 3 块是深灰，最后 1 块是纯白（但被我们完全覆盖 → 必须被剔除）
+        let bw = 4u32;
+        let bh = 1u32;
+        let mut block = vec![0u8; (bw * bh * 4) as usize];
+        for i in 0..3 {
+            block[i * 4] = 0x20;
+            block[i * 4 + 1] = 0x20;
+            block[i * 4 + 2] = 0x20;
+            block[i * 4 + 3] = 0xFF;
+        }
+        block[3 * 4] = 0xFF;
+        block[3 * 4 + 1] = 0xFF;
+        block[3 * 4 + 2] = 0xFF;
+        block[3 * 4 + 3] = 0xFF;
+
+        let valid = [true, true, true, false];
+
+        let theme = compute_theme(
+            &block,
+            &valid,
+            bw,
+            bh,
+            &[],
+            1.0,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Blur,
+        );
+
+        // 深灰（0x20）的相对亮度 ≈ 0.0144，必须选浅色文字
+        assert!(!theme.on_light, "被覆盖的白块污染了亮度判定");
+        assert!(theme.backdrop_luma < 0.05, "luma = {}", theme.backdrop_luma);
+    }
+
+    /// 全部块都被覆盖（有效块 0%）→ 走「全块平均」兜底，不能返回 0 亮度死锁。
+    #[test]
+    fn all_covered_falls_back_to_full_average() {
+        let bw = 2u32;
+        let bh = 1u32;
+        let mut block = vec![0x80u8; (bw * bh * 4) as usize];
+        for i in 0..(bw * bh) as usize {
+            block[i * 4 + 3] = 0xFF;
+        }
+        let valid = [false, false];
+        let theme = compute_theme(
+            &block,
+            &valid,
+            bw,
+            bh,
+            &[],
+            1.0,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Blur,
+        );
+        // #808080 的亮度 ≈ 0.216
+        assert!(
+            (theme.backdrop_luma - 0.216).abs() < 0.02,
+            "luma = {}",
+            theme.backdrop_luma
+        );
+    }
+
+    #[test]
+    fn text_rects_increase_weight() {
+        // 两块：左块纯黑（权重 1），右块纯蓝（权重 3）→ 平均必须偏蓝
+        let bw = 2u32;
+        let bh = 1u32;
+        let mut block = vec![0u8; (bw * bh * 4) as usize];
+        // 块 0：BGRA = (0,0,0,255)；块 1：B=0xFF, G=0, R=0, A=0xFF
+        block[3] = 0xFF;
+        block[4] = 0xFF; // 块 1 的 B 通道
+        block[7] = 0xFF;
+        let valid = [true, true];
+
+        let plain = compute_theme(
+            &block,
+            &valid,
+            bw,
+            bh,
+            &[],
+            1.0,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Blur,
+        );
+        // 右半（x ∈ [4,8)）加权 ×3
+        let weighted = compute_theme(
+            &block,
+            &valid,
+            bw,
+            bh,
+            &[(RectF::new(4.0, 0.0, 4.0, 4.0), 3.0)],
+            1.0,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Blur,
+        );
+        assert!(
+            weighted.backdrop_luma > plain.backdrop_luma,
+            "文本区加权未生效：weighted={} plain={}",
+            weighted.backdrop_luma,
+            plain.backdrop_luma
+        );
+        // 蓝的亮度 0.0722；加权后应更接近它而不是 0
+        assert!(weighted.backdrop_luma > 0.05, "luma = {}", weighted.backdrop_luma);
+    }
+}

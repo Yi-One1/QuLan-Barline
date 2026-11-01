@@ -1,0 +1,104 @@
+[package]
+name         = "barline"
+version      = "0.0.1"
+edition      = "2021"
+rust-version = "1.82"
+description  = "曲栏 Barline — Windows 11 任务栏媒体播控小组件"
+authors      = ["Barline"]
+
+[[bin]]
+name = "barline"
+path = "src/main.rs"
+
+[dependencies]
+# windows feature 清单逐条照抄 docs/ARCHITECTURE.md §4.2。
+# 额外开了一个 Win32_Globalization：§14.6 明确要求用 GetUserDefaultUILanguage()
+# 做系统语言探测，而该方法就在 Win32_Globalization 里（架构 §4.2 的清单漏了这一条，
+# webview2-com-sys 自己也依赖它）。
+windows = { version = "0.62.2", features = [
+  # ---- 基础 ----
+  "Win32_Foundation",
+  # CreateMutexW 的签名带 SECURITY_ATTRIBUTES，被 Win32_Security 门控（单实例必需）
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemInformation",
+  # T09：AUMID 拿不到进程 id 时用 CreateToolhelp32Snapshot 按进程名反查
+  "Win32_System_Diagnostics_ToolHelp",
+
+  # ---- COM / WinRT ----
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+  "Win32_System_WinRT",
+
+  # ---- 窗口 / 任务栏 ----
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Accessibility",
+
+  # ---- 图形 ----
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_Dxgi_Common",       # 【必需】CreateWicBitmapRenderTarget 的 cfg 条件
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Imaging",
+
+  # ---- 音频 ----
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+
+  # ---- 网络 / 注册表 / 本地化 ----
+  "Win32_Networking_WinHttp",
+  "Win32_System_Registry",
+  "Win32_Globalization",
+
+  # ---- WinRT ----
+  "Foundation",
+  # D2D 的 D2D1_ELLIPSE / 渐变属性用 windows_numerics::Vector2，该模块在 Foundation_Numerics 下
+  "Foundation_Numerics",
+  "Foundation_Collections",
+  "Media",
+  "Media_Control",
+  "Storage",
+  "Storage_Streams",
+  "Graphics_Imaging",
+] }
+
+# M1 不使用 WebView2（设置页是 M3/T13 的事）。webview2-com-sys 有 4.4 万行绑定，
+# 让它在 M1 就参与 fat-LTO 链接纯属浪费时间；T13 打开设置页时再按白名单加回来。
+# webview2-com = "0.39.1"
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# D2D 的 `D2D1_ELLIPSE.point` / `D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES` 字段类型是
+# `windows_numerics::Vector2`。这个 crate **本来就在依赖树里**（`windows` 自己的
+# `DrawLine`/`DrawTextLayout` 等签名都用它），显式声明只是为了让代码能直接命名该类型，
+# 不增加任何编译产物。
+windows-numerics = "0.3"
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[profile.release]
+opt-level       = "s"      # 见 ARCHITECTURE.md §4.3：体积只比 "z" 大 3–8%，运行时更好
+lto             = "fat"
+codegen-units   = 1
+panic           = "abort"
+strip           = true
+incremental     = false
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = "s"
+
+[profile.dev]
+opt-level = 0
+debug     = 1

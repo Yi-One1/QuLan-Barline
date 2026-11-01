@@ -1,0 +1,11 @@
+# 统一按 LF 存储，避免 Windows/Linux 换行差异污染 diff
+* text=auto eol=lf
+
+# 二进制资源
+*.ico   binary
+*.bmp   binary
+*.png   binary
+*.exe   binary
+
+# PowerShell 脚本需要 UTF-8 BOM 才能被 PS 5.1 正确解析，禁止转换
+*.ps1   text eol=crlf working-tree-encoding=UTF-8-BOM

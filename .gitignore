@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# M2 验收脚本运行期产生的临时物（demo 音轨 / 封面 / 页面、隔离的 Edge profile）
+scripts/barline_demo.*
+scripts/barline_bg_*.html
+scripts/barline_edge_profile/
+scripts/_px.bmp
