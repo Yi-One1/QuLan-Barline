@@ -225,6 +225,14 @@ impl Renderer {
         self.targets.as_ref().map(|t| (t.width, t.height))
     }
 
+    /// 歌词当前行的自然宽度（跑马灯判断是否超宽用；无缓存行返回 `None`）。
+    pub fn lyric_text_width(&self) -> Option<f32> {
+        self.lyric
+            .as_ref()
+            .map(|l| crate::render::text::metrics_width(&l.layout))
+            .filter(|w| w.is_finite() && *w > 0.0)
+    }
+
     /// 封面缓存统计（诊断用）。
     pub fn cover_stats(&self) -> (u64, u64, usize) {
         (self.covers.hits, self.covers.misses, self.covers.len())

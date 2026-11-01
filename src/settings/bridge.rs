@@ -109,6 +109,12 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             cfg.lyrics.karaoke_sweep = v;
             true
         }
+        // v1.1.2：长歌词滚动（跑马灯）开关
+        "lyrics.scroll" => {
+            let Some(v) = value.as_bool() else { return false };
+            cfg.lyrics.scroll = v;
+            true
+        }
         "lyrics.online_enabled" => {
             let Some(v) = value.as_bool() else { return false };
             cfg.lyrics.online_enabled = v;
@@ -297,6 +303,11 @@ mod tests {
         let mut c = Config::default();
         assert!(apply_set(&mut c, "lyrics.enabled", &json!(false)));
         assert!(!c.lyrics.enabled);
+        // v1.1.2：长歌词滚动开关
+        assert!(apply_set(&mut c, "lyrics.scroll", &json!(false)));
+        assert!(!c.lyrics.scroll);
+        assert!(apply_set(&mut c, "lyrics.scroll", &json!(true)));
+        assert!(c.lyrics.scroll);
         assert!(apply_set(
             &mut c,
             "appearance.background_mode",

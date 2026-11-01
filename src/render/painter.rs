@@ -611,6 +611,40 @@ fn fade_band(x: f32, w: f32, fade_w: f32) -> (f32, f32) {
     (start, end)
 }
 
+// ---------------------------------------------------------------- 跑马灯（v1.1.2）
+
+/// 长歌词滚动的**纯函数状态机**（时间基准 = 累计播放中的毫秒数，暂停即冻结）。
+///
+/// 节奏：停留 1.5s → 匀速滚到尾（把被截尾部带进视口）→ 停留 1.5s → 匀速回位 → 循环。
+/// 位移方向语义：返回值是「文本相对视口的左移量」0..=excess。
+///
+/// 参数都在 [`crate::config::defaults::limits`]（MARQUEE_*），与绘制解耦，可独立单测。
+pub fn marquee_offset(excess: f32, elapsed_secs: f32) -> f32 {
+    if excess <= 0.5 {
+        return 0.0;
+    }
+    let hold = limits::MARQUEE_HOLD_SECS;
+    let scroll_secs = (excess / limits::MARQUEE_SPEED_PX).max(0.05);
+    let cycle = hold * 2.0 + scroll_secs * 2.0;
+    let t = elapsed_secs.rem_euclid(cycle);
+    if t < hold {
+        // 起点停留
+        0.0
+    } else if t < hold + scroll_secs {
+        // 向右滚动（文本左移），匀速
+        let p = (t - hold) / scroll_secs;
+        excess * p
+    } else if t < hold * 2.0 + scroll_secs {
+        // 尾部停留
+        excess
+    } else {
+        // 匀速回位
+        let p = (t - hold * 2.0 - scroll_secs) / scroll_secs;
+        excess * (1.0 - p)
+    }
+    .clamp(0.0, excess)
+}
+
 /// 画一行歌词（**右侧渐隐版**，M3 遗留 P2）。
 ///
 /// 与 [`draw_line`] 的唯一区别：文本笔刷是水平透明度渐变——行宽最后
@@ -733,7 +767,89 @@ fn draw_lyrics(
         return Ok(());
     }
 
-    // ---- 当前行：未唱部分 ----
+    // ---- 当前行 ----
+    // v1.1.2 跑马灯路径：歌词超宽且开关打开 → 视口裁剪 + 左移偏移（平色，不用渐隐）。
+    // 扫光边界在**文本坐标**里照常映射，位移只发生在绘制层，码元映射不变。
+    if state.lyric_marquee {
+        let off = state.lyric_scroll_offset.clamp(0.0, 1.0e6);
+        let rect = layout.lyric_cur;
+        // 绘制矩形随偏移左移并加宽（多留一个渐隐带宽度，保证尾部完整进布局）
+        let wide = RectF::new(
+            rect.x - off,
+            rect.y,
+            rect.w + off + LYRIC_FADE_W * ctx.scale,
+            rect.h,
+        );
+        // SAFETY: 视口裁剪矩形是栈上值；Push/Pop 严格配对（见下方先收结果再 Pop）。
+        unsafe {
+            rt.PushAxisAlignedClip(&d2d_rect(rect.x, rect.y, rect.w, rect.h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+        // 未唱部分：整行平色
+        let unsung = draw_line(
+            rt,
+            frame,
+            ctx,
+            &TextDraw {
+                kind: TextKind::Lyric,
+                text: lyric.cur,
+                rect: wide,
+                color: Rgba::from_rgb(theme.text_dim, scale_a(0x8C)),
+                outline: false,
+            },
+        );
+        // 已唱部分：扫光边界换算到屏幕坐标（文本 x − 偏移），再与视口求交
+        let sung: Result<()> = match lyric_layout {
+            Some((text_layout, utf16_len)) if lyric.sweep > 0.01 => {
+                let boundary = crate::render::text::hit_test_x(text_layout, utf16_len, lyric.sweep);
+                let vis = (boundary - off).clamp(0.0, rect.w);
+                if vis <= 0.5 {
+                    Ok(())
+                } else {
+                    // SAFETY: 内层裁剪与视口裁剪嵌套；Push/Pop 严格配对。
+                    unsafe {
+                        rt.PushAxisAlignedClip(&d2d_rect(rect.x, rect.y, vis, rect.h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    }
+                    let r = draw_line(
+                        rt,
+                        frame,
+                        ctx,
+                        &TextDraw {
+                            kind: TextKind::Lyric,
+                            text: lyric.cur,
+                            rect: wide,
+                            color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
+                            outline: false,
+                        },
+                    );
+                    // SAFETY: 与内层 Push 配对。
+                    unsafe {
+                        rt.PopAxisAlignedClip();
+                    }
+                    r
+                }
+            }
+            _ => draw_line(
+                rt,
+                frame,
+                ctx,
+                &TextDraw {
+                    kind: TextKind::Lyric,
+                    text: lyric.cur,
+                    rect: wide,
+                    color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
+                    outline: false,
+                },
+            ),
+        };
+        // SAFETY: 与最外层视口 Push 配对。
+        unsafe {
+            rt.PopAxisAlignedClip();
+        }
+        unsung?;
+        return sung;
+    }
+
+    // ---- 普通路径（未超宽 / 滚动关闭）：未唱部分 ----
     let unsung = Rgba::from_rgb(theme.text_dim, scale_a(0x8C));
     draw_lyric_line(
         rt,
@@ -904,5 +1020,39 @@ mod tests {
         assert!(s.ends_with("42%"), "s = {s}");
         let s = format_hud_volume(i18n::Lang::En, 1.0);
         assert!(s.ends_with("100%"), "s = {s}");
+    }
+
+    /// 跑马灯状态机：停留 → 匀速滚到尾 → 停留 → 匀速回位 → 循环。
+    #[test]
+    fn marquee_phases_hold_scroll_return() {
+        let excess = 60.0f32;
+        let speed = limits::MARQUEE_SPEED_PX;
+        let hold = limits::MARQUEE_HOLD_SECS;
+        let scroll = excess / speed; // 2s
+
+        // 起点停留
+        assert_eq!(marquee_offset(excess, 0.0), 0.0);
+        assert_eq!(marquee_offset(excess, hold - 0.1), 0.0);
+        // 滚动中：匀速、单调、不出界
+        let mid = marquee_offset(excess, hold + scroll * 0.5);
+        assert!((mid - excess * 0.5).abs() < 0.01, "mid = {mid}");
+        assert_eq!(marquee_offset(excess, hold + scroll), excess);
+        // 尾部停留
+        assert_eq!(marquee_offset(excess, hold + scroll + hold * 0.5), excess);
+        // 回位中：线性递减
+        let back = marquee_offset(excess, hold * 2.0 + scroll * 1.5);
+        assert!((back - excess * 0.5).abs() < 0.01, "back = {back}");
+        // 循环：一个完整周期后回到起点停留
+        let cycle = hold * 2.0 + scroll * 2.0;
+        assert_eq!(marquee_offset(excess, cycle + 0.1), 0.0);
+        // 不超宽：永远 0
+        assert_eq!(marquee_offset(0.0, 100.0), 0.0);
+        assert_eq!(marquee_offset(-5.0, 100.0), 0.0);
+        // 任意时刻都有界
+        for i in 0..200 {
+            let t = i as f32 * 0.137;
+            let o = marquee_offset(excess, t);
+            assert!((0.0..=excess).contains(&o), "t={t} o={o}");
+        }
     }
 }

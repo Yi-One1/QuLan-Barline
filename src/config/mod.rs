@@ -95,6 +95,9 @@ pub struct LyricsConfig {
     pub enabled: bool,
     pub mode: LyricModeSerde,
     pub karaoke_sweep: bool,
+    /// 长歌词滚动（跑马灯，v1.1.2 新增）：歌词超宽时停留→滚动→回位循环；
+    /// 关闭时保持右缘渐隐。旧配置缺省即 true（#[serde(default)] 兜底）。
+    pub scroll: bool,
     pub online_enabled: bool,
     /// 本地歌词搜索目录（绝对路径）。空数组表示只用默认目录。
     pub local_dirs: Vec<String>,
@@ -285,6 +288,20 @@ mod tests {
         assert!(back.window.lyrics_two_line);
         // 读取路径完全不感知该字段：歌词是否显示只由 enabled 决定
         assert!(back.lyrics.enabled);
+    }
+
+    /// v1.1.2 向后兼容：旧配置没有 `lyrics.scroll` 字段 → 反序列化不报错且默认 true。
+    #[test]
+    fn legacy_config_without_scroll_defaults_true() {
+        let mut cfg = Config::default();
+        cfg.lyrics.scroll = false; // 故意写非默认值再删掉字段，验证走 serde default
+        let mut json = serde_json::to_value(&cfg).expect("序列化不应失败");
+        json["lyrics"]
+            .as_object_mut()
+            .expect("lyrics 必须是对象")
+            .remove("scroll");
+        let back: Config = serde_json::from_value(json).expect("缺 scroll 字段不应报错");
+        assert!(back.lyrics.scroll, "旧配置缺省 scroll 必须为 true（默认开）");
     }
 
     #[test]

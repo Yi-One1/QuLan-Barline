@@ -11,6 +11,12 @@
 //! 当任务栏在左右两侧时，逻辑坐标仍是「水平布局」，由渲染层施加旋转变换
 //! （§10.4，M4/T18 实现）；本模块只负责水平语义的长边/短边。
 //!
+//! ## v1.1.2：紧凑排列 + 歌词行上移
+//!
+//! 歌名/歌手**紧凑排列**（歌手左缘 = 歌名右缘 + 固定间隔，不再从右端锚定；
+//! 只有紧凑总宽超出信息区上限才截断）。下行歌词整体上移 [`limits::LYRIC_LIFT`]。
+//! 长歌词滚动（跑马灯）的时间状态机在 `painter` 侧，布局只提供视口矩形。
+//!
 //! ## v1.1.1：单行大字歌词 + 歌手名右侧
 //!
 //! 小组件**高度恒等于任务栏条带厚度**（歌词开/关都不变）。信息区分两行：
@@ -281,10 +287,12 @@ pub fn compute_full(
     // 信息区最小宽（歌词开关动画的插值中间值），物理像素
     let lyric_w_px = (lyric_w_logical.max(0.0) * s).round();
 
-    // 信息区宽 = max(歌名 + 间隔 + 歌手自然宽, 信息区最小宽)，钳到 340*s 上限。
-    // v1.1.1：上行 = 歌名 + 歌手（同排），下行 = 单行歌词，两行共享同一信息区宽。
-    let aw_px = artist_w.max(0.0) * s;
-    let text_nat = title_w.max(0.0) * s + if aw_px > 0.5 { ta_gap + aw_px } else { 0.0 };
+    // v1.1.2 紧凑排列：歌名自然宽 + 固定间隔 + 歌手自然宽，歌手**不从右侧锚定**。
+    // 信息区宽 = max(紧凑总宽, 信息区最小宽)，钳到 340*s 上限；
+    // 只有紧凑总宽超出上限（放不下）时才截断：歌手钳到一半、歌名占其余并省略。
+    let title_nat = (title_w.max(0.0) * s).round();
+    let artist_nat = (artist_w.max(0.0) * s).round();
+    let text_nat = title_nat + if artist_nat > 0.5 { ta_gap + artist_nat } else { 0.0 };
     let info_w = text_nat
         .max(lyric_w_px)
         .round()
@@ -330,12 +338,18 @@ pub fn compute_full(
     let info_avail = (text_right - text_x).max(1.0);
     let info = info_w.min(info_avail).max(1.0);
 
-    // 歌手名：按自然宽放置，钳到信息区一半（超宽省略，歌名永远占主导）
-    let artist_w_px = if aw_px > 0.5 { aw_px.min(info * 0.5) } else { 0.0 };
-    let title_w_px = (info - artist_w_px - if artist_w_px > 0.0 { ta_gap } else { 0.0 }).max(1.0);
+    // v1.1.2 紧凑排列：放得下时歌名/歌手各取自然宽，歌手紧跟歌名右侧（无锚定空隙）；
+    // 只有放不下才截断——歌手钳到信息区一半（保证可见），歌名占其余并省略。
+    let (title_w_px, artist_w_px) = if text_nat <= info {
+        (title_nat.max(1.0), artist_nat)
+    } else {
+        let a = if artist_nat > 0.5 { artist_nat.min(info * 0.5) } else { 0.0 };
+        let t = (info - a - if a > 0.5 { ta_gap } else { 0.0 }).max(1.0);
+        (t, a)
+    };
     let title = RectF::new(text_x, row1_y, title_w_px, row_h);
     let artist = RectF::new(
-        if artist_w_px > 0.0 {
+        if artist_w_px > 0.5 {
             (text_x + title_w_px + ta_gap).min(text_right)
         } else {
             text_x
@@ -345,11 +359,14 @@ pub fn compute_full(
         row_h,
     );
 
-    // 下行单行歌词（v1.1.1：不再有下一行预览）
+    // 下行单行歌词（v1.1.1：不再有下一行预览）。
+    // v1.1.2：整体上移 LYRIC_LIFT，视觉靠近歌名行但不贴死；矩形上移后底部
+    // 仍留在条带内（bottom 只会更小）。
     let lyric_cur = if form == WidgetForm::Compact || lyric_w_px < 1.0 {
         RectF::EMPTY
     } else {
-        RectF::new(text_x, row2_y, info, row_h)
+        let y = (row2_y - limits::LYRIC_LIFT * s).max(0.0);
+        RectF::new(text_x, y, info, row_h)
     };
 
     // 命中区：按钮本身就是 28×28（≥ HIT_MIN），封面可能只有 32（也 ≥ 28），
@@ -521,12 +538,13 @@ mod tests {
                 // 进度条在主行内
                 assert!(l.progress.bottom() <= l.main_row.bottom() + 0.01);
 
-                // v1.1.1：歌词在歌名/歌手行**下方**，不出条带
+                // v1.1.1：歌词在歌名/歌手行**下方**（v1.1.2 允许上移 LYRIC_LIFT 的重叠），不出条带
                 if form == WidgetForm::Lyric {
                     assert!(l.lyric_cur.w > 0.0, "歌词行必须有宽度");
                     assert!(
-                        l.lyric_cur.y >= l.title.bottom() - 0.01,
-                        "歌词行必须在歌名歌手行下方"
+                        l.lyric_cur.y
+                            >= l.title.bottom() - limits::LYRIC_LIFT * scale - 0.01,
+                        "歌词行上移不得超过 LYRIC_LIFT"
                     );
                     assert!(
                         l.lyric_cur.bottom() <= l.main_row.bottom() + 0.01,
@@ -556,11 +574,11 @@ mod tests {
         assert!(l.cover.y >= 0.0 && l.cover.bottom() <= 48.0, "封面必须落在任务栏条带内");
         assert!(l.btn_toggle.y >= 0.0 && l.btn_toggle.bottom() <= 48.0, "按钮必须落在任务栏条带内");
         assert!(l.progress.y >= 0.0 && l.progress.bottom() <= 48.0, "进度条必须落在任务栏条带内");
-        // 上行（歌名 + 歌手）与下行（歌词）各 22px：y = 2 与 24
+        // 上行（歌名 + 歌手）与下行（歌词）：y = 2 与 24−1.5（v1.1.2 上移）
         assert!((l.title.y - 2.0).abs() < 0.001, "title.y = {}", l.title.y);
         assert!((l.artist.y - 2.0).abs() < 0.001, "artist.y = {}", l.artist.y);
-        assert!((l.lyric_cur.y - 24.0).abs() < 0.001, "lyric_cur.y = {}", l.lyric_cur.y);
-        assert!((l.lyric_cur.bottom() - 46.0).abs() < 0.001);
+        assert!((l.lyric_cur.y - 22.5).abs() < 0.001, "lyric_cur.y = {}", l.lyric_cur.y);
+        assert!((l.lyric_cur.bottom() - 44.5).abs() < 0.001);
         assert!((l.lyric_cur.w - 160.0).abs() < 0.001, "lyric_cur.w = {}", l.lyric_cur.w);
     }
 
@@ -570,8 +588,46 @@ mod tests {
         let l = compute(TaskbarEdge::Top, WidgetForm::Lyric, 1.0, 48);
         assert!(l.main_row.y.abs() < 0.001);
         assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
-        assert!((l.lyric_cur.y - 24.0).abs() < 0.001);
+        assert!((l.lyric_cur.y - 22.5).abs() < 0.001);
         assert!(l.lyric_cur.bottom() <= 48.0, "歌词行不得超出条带");
+    }
+
+    /// v1.1.2 核心修复：短歌名 + 短歌手时**紧凑排列**——歌手左缘 = 歌名右缘 +
+    /// 固定间隔，不再锚定到信息区右端（4145b89/v1.1.1 的大空隙根因）。
+    #[test]
+    fn compact_spacing_artist_follows_title() {
+        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 50.0, 40.0);
+        let gap = limits::TITLE_ARTIST_GAP;
+        assert!(
+            (l.artist.x - (l.title.x + l.title.w + gap)).abs() < 0.01,
+            "歌手左缘必须 = 歌名右缘 + {gap}px：artist.x={} title.right={} gap={gap}",
+            l.artist.x,
+            l.title.right()
+        );
+        // 各自自然宽，不被拉伸/锚定
+        assert!((l.title.w - 50.0).abs() < 0.01, "title.w = {}", l.title.w);
+        assert!((l.artist.w - 40.0).abs() < 0.01, "artist.w = {}", l.artist.w);
+        // 信息区宽 = 紧凑总宽与最小宽取大者：50+6+40=96 < 160 → 160
+        assert!((l.lyric_cur.w - 160.0).abs() < 0.001);
+    }
+
+    /// 紧凑总宽超过信息区上限 340 时才截断：歌手钳到一半，歌名占其余（歌手仍可见）。
+    #[test]
+    fn overflow_truncates_but_keeps_artist_visible() {
+        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 200.0);
+        assert!(l.artist.w > 0.0 && l.artist.w <= 170.0 + 0.01, "artist.w = {}", l.artist.w);
+        assert!(l.artist.x >= l.title.right() - 0.01);
+        assert!(l.title.w < l.artist.w * 4.0, "歌名仍占主导");
+        assert!(l.title.right() <= l.btn_prev.x + 0.01);
+    }
+
+    /// 歌词行上移量（v1.1.2）：y = 行位 − LYRIC_LIFT，底部仍在条带内。
+    #[test]
+    fn lyric_row_is_lifted_toward_title_row() {
+        let l = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
+        assert!((l.lyric_cur.y - (24.0 - limits::LYRIC_LIFT)).abs() < 0.001);
+        assert!(l.lyric_cur.bottom() <= 48.0);
+        assert!(l.lyric_cur.y >= l.title.y + l.title.h - limits::LYRIC_LIFT - 0.01);
     }
 
     /// 紧凑形态（无歌词）两种方位下主行都从 0 开始，高度 = 任务栏厚度。
@@ -628,12 +684,12 @@ mod tests {
     #[test]
     fn lyric_row_sits_below_title_and_artist_row() {
         let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 120.0, 60.0);
-        // 歌手紧跟歌名右侧
+        // 歌手紧跟歌名右侧（v1.1.2 紧凑排列）
         assert!(l.artist.x >= l.title.right(), "歌手必须在歌名右侧");
         assert!(l.artist.w > 0.0, "有歌手名时歌手区必须有宽度");
-        // 歌词行在两行文本的下方
-        assert!(l.lyric_cur.y >= l.title.bottom() - 0.01);
-        assert!(l.lyric_cur.y >= l.artist.bottom() - 0.01);
+        // 歌词行在两行文本的下方（允许 LYRIC_LIFT 上移）
+        assert!(l.lyric_cur.y >= l.title.bottom() - limits::LYRIC_LIFT - 0.01);
+        assert!(l.lyric_cur.y >= l.artist.bottom() - limits::LYRIC_LIFT - 0.01);
         assert!(!l.lyric_cur.is_empty());
     }
 

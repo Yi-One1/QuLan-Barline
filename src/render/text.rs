@@ -252,8 +252,8 @@ fn x_at(layout: &IDWriteTextLayout, text_pos: u32) -> f32 {
     x
 }
 
-/// 布局里的文本长度（UTF-16 码元数）。
-fn metrics_width(layout: &IDWriteTextLayout) -> f32 {
+/// 文本布局的自然宽度（`pub(crate)`：跑马灯需要歌词行的自然宽判断是否超宽）。
+pub(crate) fn metrics_width(layout: &IDWriteTextLayout) -> f32 {
     let mut m = DWRITE_TEXT_METRICS::default();
     // SAFETY: m 是本地栈结构体，GetMetrics 只写出它。
     // 返回 Result：失败时 m 保持全 0，下方 is_finite 判断兜底为 0.0。
