@@ -1167,6 +1167,27 @@ impl App {
             self.relocate_lyrics_dir(idx);
             return;
         }
+        // 歌词目录路径链接：openLyricsDir:<idx> → 资源管理器打开该目录
+        if let Some(idx) = action
+            .strip_prefix("openLyricsDir:")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if let Some(dir) = self.config.lyrics.local_dirs.get(idx) {
+                let w = to_wide(dir);
+                // SAFETY: w 以 NUL 结尾且在本调用期间存活。
+                unsafe {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(w.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+            }
+            return;
+        }
         match action {
             "openLogDir" => {
                 let dir = crate::platform::data_dir();
@@ -1409,13 +1430,7 @@ impl App {
             .iter()
             .map(|c| (crate::settings::bridge::action_name(c.action), c.code))
             .collect();
-        let log_dir = crate::platform::data_dir().to_string_lossy().to_string();
-        crate::settings::bridge::state_json(
-            &self.config,
-            env!("CARGO_PKG_VERSION"),
-            &conflicts,
-            &log_dir,
-        )
+        crate::settings::bridge::state_json(&self.config, env!("CARGO_PKG_VERSION"), &conflicts)
     }
 
     /// 设置窗口尺寸变化 → 同步 WebView2。

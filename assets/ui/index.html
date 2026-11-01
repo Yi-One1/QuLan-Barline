@@ -160,6 +160,9 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
 
 .link { color: var(--accent); cursor: pointer; text-decoration: none; }
 .link:hover { text-decoration: underline; }
+/* 数据目录的 desc 双类名组合特异性更高，链接色需要显式加回来 */
+.row .desc.link { color: var(--accent); cursor: pointer; }
+.row .desc.link:hover { text-decoration: underline; }
 .about-line { display: flex; gap: 8px; font-size: 13px; padding: 6px 0; }
 .about-line .k { color: var(--text-2); min-width: 88px; }
 
@@ -330,8 +333,8 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
         </div>
         <div class="row">
           <div><div class="label" data-i18n="storage.dir">数据目录</div>
-            <div class="desc" data-i18n="storage.dir.desc">歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）。</div>
-            <div class="desc" id="storage-dir" style="user-select:text">—</div></div>
+            <div class="desc" data-i18n="storage.dir.desc">歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。</div>
+            <div class="desc link" id="storage-dir" style="user-select:text">—</div></div>
           <div class="right">
             <button class="btn" id="storage-browse" data-i18n="storage.browse">更改…</button>
             <button class="btn" id="storage-reset" data-i18n="storage.reset">恢复默认</button>
@@ -346,7 +349,6 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
       <p class="sub" data-i18n="about.sub">曲栏 Barline —— Windows 11 任务栏媒体播控小组件。</p>
       <div class="card">
         <div class="about-line"><span class="k" data-i18n="about.version">版本</span><span id="about-version">—</span></div>
-        <div class="about-line"><span class="k" data-i18n="about.logdir">数据目录</span><span class="link" id="open-logdir">—</span></div>
         <div class="about-line"><span class="k" data-i18n="about.lyrics">歌词来源</span><span class="link" id="open-lrclib">lrclib.net</span></div>
         <div class="about-line"><span class="k" data-i18n="about.license">开源许可</span><span>MIT License</span></div>
         <div class="about-line"><span class="k" data-i18n="about.thanks">致谢</span><span>Windows API · Direct2D · WebView2 · lrclib</span></div>
@@ -375,10 +377,10 @@ const I18N = {
     "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件收合到任务栏高度。",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
     "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
-    "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）。",
-    "storage.browse": "更改…", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
+    "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。",
+    "storage.browse": "更改", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时向 lrclib.net 查询。",
-    "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改…", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）。", "lyrics.dirs.empty": "还没有添加目录",
+    "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
     "volume.wheel": "滚轮调节", "volume.wheel.desc": "仅指针悬停在小组件上时生效。",
     "volume.scope": "调节范围", "volume.scope.desc": "「当前播放器」需要播放器支持会话音量。",
@@ -397,7 +399,7 @@ const I18N = {
     "general.language": "界面语言", "general.lang.system": "跟随系统",
     "general.widget": "显示小组件", "general.widget.desc": "与托盘菜单里的「显示/隐藏小组件」同步。",
     "about.sub": "曲栏 Barline —— Windows 11 任务栏媒体播控小组件。",
-    "about.version": "版本", "about.logdir": "数据目录", "about.lyrics": "歌词来源",
+    "about.version": "版本", "about.lyrics": "歌词来源",
     "about.license": "开源许可", "about.thanks": "致谢",
     "toast.saved": "已应用"
   },
@@ -415,10 +417,10 @@ const I18N = {
     "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off collapses the widget to the taskbar height.",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
     "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
-    "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put).",
-    "storage.browse": "Change…", "storage.reset": "Reset", "storage.pending": "applies after restart",
+    "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put). Click the path to open it.",
+    "storage.browse": "Change", "storage.reset": "Reset", "storage.pending": "applies after restart",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Query lrclib.net when no local file exists.",
-    "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change…", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively).", "lyrics.dirs.empty": "No folders yet",
+    "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
     "volume.scope": "Scope", "volume.scope.desc": "Player-only needs session volume support.",
@@ -437,7 +439,7 @@ const I18N = {
     "general.language": "Language", "general.lang.system": "System",
     "general.widget": "Show widget", "general.widget.desc": "Synced with the tray menu item.",
     "about.sub": "Barline — a Windows 11 taskbar media widget.",
-    "about.version": "Version", "about.logdir": "Data folder", "about.lyrics": "Lyrics",
+    "about.version": "Version", "about.lyrics": "Lyrics",
     "about.license": "License", "about.thanks": "Built with",
     "toast.saved": "Applied"
   }
@@ -556,7 +558,6 @@ function render() {
 
   // 关于
   document.getElementById("about-version").textContent = state.version;
-  document.getElementById("open-logdir").textContent = state.logDir;
 }
 
 function renderDirs(dirs) {
@@ -573,18 +574,21 @@ function renderDirs(dirs) {
     const row = document.createElement("div");
     row.className = "item";
     const span = document.createElement("span");
+    span.className = "link";
     span.textContent = dir;
-    const change = document.createElement("button");
-    change.className = "btn";
-    change.textContent = t("lyrics.dirs.change");
-    change.addEventListener("click", () => post({ type: "action", payload: "browseLyricsDir:" + idx }));
+    // 点击路径 → 资源管理器打开该目录
+    span.addEventListener("click", () => post({ type: "action", payload: "openLyricsDir:" + idx }));
     const btn = document.createElement("button");
     btn.className = "btn danger";
     btn.textContent = "×";
     btn.addEventListener("click", () => set("lyrics.local_dirs_remove", dir));
+    const change = document.createElement("button");
+    change.className = "btn";
+    change.textContent = t("lyrics.dirs.change");
+    change.addEventListener("click", () => post({ type: "action", payload: "browseLyricsDir:" + idx }));
     row.appendChild(span);
-    row.appendChild(change);
     row.appendChild(btn);
+    row.appendChild(change);
     box.appendChild(row);
   });
 }
@@ -703,7 +707,7 @@ document.getElementById("widget-visible").addEventListener("change", (e) => {
 document.getElementById("dir-add").addEventListener("click", () => post({ type: "action", payload: "addLyricsDirBrowse" }));
 
 document.getElementById("hotkeys-reset").addEventListener("click", () => set("hotkeys.reset", true));
-document.getElementById("open-logdir").addEventListener("click", () => post({ type: "action", payload: "openLogDir" }));
+document.getElementById("storage-dir").addEventListener("click", () => post({ type: "action", payload: "openLogDir" }));
 document.getElementById("storage-browse").addEventListener("click", () => post({ type: "action", payload: "browseStorageDir" }));
 document.getElementById("storage-reset").addEventListener("click", () => post({ type: "action", payload: "resetStorageDir" }));
 document.getElementById("open-lrclib").addEventListener("click", () => post({ type: "action", payload: "openLrclib" }));

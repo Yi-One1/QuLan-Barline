@@ -2,7 +2,7 @@
 //!
 //! 两个方向都是 JSON：
 //! ```text
-//! Rust → JS : { "type": "state", "payload": { config, version, conflicts, logDir } }
+//! Rust → JS : { "type": "state", "payload": { config, version, conflicts, dataDir } }
 //!             { "type": "toast", "payload": { "level": "info", "text": "..." } }
 //! JS → Rust : { "type": "set",    "payload": { "path": "lyrics.enabled", "value": true } }
 //!             { "type": "action", "payload": "openLogDir" }
@@ -48,7 +48,7 @@ pub fn parse(msg: &str) -> Option<Incoming> {
 }
 
 /// 组装 `state` 消息（页面首次加载与每次配置变更都推一次全量）。
-pub fn state_json(cfg: &Config, version: &str, conflicts: &[(&str, u32)], log_dir: &str) -> String {
+pub fn state_json(cfg: &Config, version: &str, conflicts: &[(&str, u32)]) -> String {
     let conflicts: Vec<Value> = conflicts
         .iter()
         .map(|(action, code)| json!({ "action": action, "code": code }))
@@ -59,7 +59,6 @@ pub fn state_json(cfg: &Config, version: &str, conflicts: &[(&str, u32)], log_di
             "config": cfg,
             "version": version,
             "conflicts": conflicts,
-            "logDir": log_dir,
             // v1.1.5：当前生效的数据目录（storage.data_dir 为空时 = 默认根目录）
             "dataDir": crate::platform::data_dir().to_string_lossy(),
         }
@@ -400,11 +399,12 @@ mod tests {
     #[test]
     fn state_json_contains_config_and_version() {
         let c = Config::default();
-        let s = state_json(&c, "0.0.5", &[("prev", 1409)], "C:/logs");
+        let s = state_json(&c, "0.0.5", &[("prev", 1409)]);
         let v: Value = serde_json::from_str(&s).expect("state 不是合法 JSON");
         assert_eq!(v["type"], "state");
         assert_eq!(v["payload"]["version"], "0.0.5");
         assert_eq!(v["payload"]["conflicts"][0]["action"], "prev");
         assert_eq!(v["payload"]["config"]["lyrics"]["enabled"], true);
+        assert!(v["payload"]["dataDir"].as_str().map(|d| !d.is_empty()).unwrap_or(false));
     }
 }
