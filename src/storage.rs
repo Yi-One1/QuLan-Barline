@@ -1,14 +1,16 @@
-//! 数据存储位置（问题 3 / v1.1.5）。
+//! 数据存储位置（问题 3 / v1.1.5；v1.1.6 改净搬 + 支持 A→B 切换）。
 //!
 //! 职责：
 //! - 把 `config.storage.data_dir`（可为空 = 默认）解析成绝对路径；
-//! - 启动时把默认根目录（`%LOCALAPPDATA%\Barline`）下的已知缓存目录
-//!   **自动迁移**到自定义数据目录；
-//! - 迁移**永不删除**用户数据：rename 一步到位；跨卷退化 copy，成功后把
-//!   旧目录原地改名 `<name>.old` 保留（可回滚），失败则原样保留并记日志。
+//! - 启动时把**上次生效目录**（`config.storage.active_data_dir`，缺省为
+//!   `%LOCALAPPDATA%\Barline`）下的已知缓存目录**净搬**到新数据目录——
+//!   旧数据一律删除，旧目录腾空后整个删除；
+//! - 迁移失败不阻塞启动，旧数据原样保留（宁可两份，不可丢失）。
 //!
 //! 边界（用户约定）：
-//! - `config.json`（及其 `.bad` 备份）**永远留在默认根目录**，不迁移；
+//! - `config.json`（及其 `.bad` 备份）**永远留在默认根目录**，因此默认根
+//!   目录文件夹本身不会被删（腾空后它只剩 config.json）；自定义旧目录 A
+//!   腾空后连文件夹一起删除；
 //! - 日志文件由 [`crate::log::relocate`] 在关闭写句柄后自行搬迁
 //!   （打开中的文件 Windows 不允许改名，必须先关再搬）。
 
@@ -22,28 +24,46 @@ use std::path::{Path, PathBuf};
 /// - `WebView2`：设置页 WebView2 用户数据（`settings::webview`）
 pub const MIGRATE_DIRS: &[&str] = &["lyrics-cache", "lyrics", "WebView2"];
 
-/// 启动入口：按配置初始化全局数据目录，必要时执行迁移 + 日志搬迁。
+/// 启动入口：按配置初始化全局数据目录，必要时执行净搬 + 日志搬迁。
 ///
 /// 必须在 `Config::load` 之后、任何使用 [`crate::platform::data_dir`] 的模块
-/// 初始化之前调用（`App::bootstrap` 满足该顺序）。
-pub fn init_from_config(custom: &str) {
+/// 初始化之前调用（`App::bootstrap` 满足该顺序）。会把本次实际生效目录
+/// 写回 `config.storage.active_data_dir` 并落盘（下次启动从那里迁出）。
+pub fn init_from_config(config: &mut crate::config::Config) {
     let default_root = crate::platform::barline_dir();
-    let new_root = data_dir_from_config(custom, &default_root);
+    // 上次实际生效目录：active_data_dir 优先（支持自定义 A → B 切换），否则默认根
+    let old_root = resolve_custom_dir(&config.storage.active_data_dir, &default_root)
+        .unwrap_or_else(|| default_root.clone());
+    let new_root = data_dir_from_config(&config.storage.data_dir, &default_root);
     crate::platform::set_data_dir(new_root.clone());
-    if new_root == default_root {
-        return;
+    if old_root != new_root {
+        crate::log_info!(
+            "数据目录：{} → {}（启动净搬开始）",
+            old_root.display(),
+            new_root.display()
+        );
+        for line in migrate_dirs(&old_root, &new_root) {
+            crate::log_info!("迁移：{line}");
+        }
+        // 日志最后搬：迁移期间旧日志仍在写（记录迁移过程本身）
+        crate::log::relocate(&new_root);
+        crate::log_info!("日志已搬迁至 {}", new_root.join("barline.log").display());
+        // 腾空后删除旧目录文件夹本身：remove_dir 只删空目录——默认根因
+        // config.json 必然留下（约定），自定义旧目录 A 腾空后即被整个删除
+        match fs::remove_dir(&old_root) {
+            Ok(()) => crate::log_info!("原数据目录已删除：{}", old_root.display()),
+            Err(_) => crate::log_debug!("原数据目录未删除（非空，保留）：{}", old_root.display()),
+        }
     }
-    crate::log_info!(
-        "数据目录：{} → {}（启动迁移开始）",
-        default_root.display(),
-        new_root.display()
-    );
-    for line in migrate_dirs(&default_root, &new_root) {
-        crate::log_info!("迁移：{line}");
+    // 记录本次实际生效目录（下次启动从这里迁出）。落盘失败无碍：
+    // 下次启动 old_root 退化为默认根，那里已搬空，迁移自然跳过。
+    let active = new_root.to_string_lossy().to_string();
+    if config.storage.active_data_dir != active {
+        config.storage.active_data_dir = active;
+        if let Err(e) = config.save() {
+            crate::log_warn!("记录 active_data_dir 失败（不影响本次使用）：{e}");
+        }
     }
-    // 日志最后搬：迁移期间旧日志仍在写（记录迁移过程本身）
-    crate::log::relocate(&new_root);
-    crate::log_info!("日志已搬迁至 {}", new_root.join("barline.log").display());
 }
 
 /// 由配置字符串解析数据目录（`None` = 使用默认根目录）。
@@ -80,10 +100,11 @@ pub fn data_dir_from_config(raw: &str, default_root: &Path) -> PathBuf {
     resolve_custom_dir(raw, default_root).unwrap_or_else(|| default_root.to_path_buf())
 }
 
-/// 迁移 `old_root` 下所有 [`MIGRATE_DIRS`] 到 `new_root`。
+/// 迁移 `old_root` 下所有 [`MIGRATE_DIRS`] 到 `new_root`（**净搬**）。
 ///
-/// 返回人类可读的结果行（每子项一行，由调用方落日志）。同根 / 无可迁项
-/// 返回空。单项失败不阻塞其余子项。
+/// 同时清理旧根目录里 v1.1.5 遗留的 `<name>.old` 备份（其中数据已无引用，
+/// 按用户指示一并删除）。返回人类可读的结果行（每子项一行，由调用方落日志）。
+/// 同根 / 无可迁项返回空。单项失败不阻塞其余子项（旧数据原样保留）。
 pub fn migrate_dirs(old_root: &Path, new_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if old_root == new_root {
@@ -96,28 +117,35 @@ pub fn migrate_dirs(old_root: &Path, new_root: &Path) -> Vec<String> {
     for name in MIGRATE_DIRS {
         let src = old_root.join(name);
         let dst = new_root.join(name);
-        if !src.exists() {
-            continue;
+        if src.exists() {
+            if dst.exists() {
+                out.push(format!("{name}: 目标已存在，跳过（两份都保留）"));
+            } else {
+                match move_item(&src, &dst) {
+                    Ok(true) => out.push(format!("{name}: 已迁移")),
+                    Ok(false) => {}
+                    Err(e) => out.push(format!("{name}: 迁移失败（{e}），已保留原目录")),
+                }
+            }
         }
-        if dst.exists() {
-            out.push(format!("{name}: 目标已存在，跳过（两份都保留）"));
-            continue;
-        }
-        match move_item(&src, &dst) {
-            Ok(true) => out.push(format!("{name}: 已迁移")),
-            Ok(false) => {}
-            Err(e) => out.push(format!("{name}: 迁移失败（{e}），已保留原目录")),
+        // v1.1.5 遗留的 .old 备份：数据已无引用，一并删除
+        let stale = old_root.join(format!("{name}.old"));
+        if stale.is_dir() {
+            match fs::remove_dir_all(&stale) {
+                Ok(()) => out.push(format!("{name}.old: 遗留备份已删除")),
+                Err(e) => out.push(format!("{name}.old: 删除失败（{e}）")),
+            }
         }
     }
     out
 }
 
-/// 迁移单个文件 / 目录（`src` → `dst`）。
+/// 迁移单个文件 / 目录（`src` → `dst`），**净搬：成功后源不保留**。
 ///
 /// - `src` 不存在或 `dst` 已存在 → `Ok(false)`（不动）；
-/// - rename 优先（同卷瞬间完成）；失败（跨卷 / 占用）退化 copy，
-///   copy 成功后把 `src` 原地改名 `<name>.old` 保留（**不删除**）；
-/// - copy 中途失败：尽力删除半成品 `dst`，把错误抛回（`src` 未动）。
+/// - rename 优先（同卷瞬间完成，源自然消失）；失败（跨卷 / 占用）退化
+///   copy，copy 成功后**删除源**（失败则源保留，返回 Ok(true)——数据已在
+///   新处，删除失败只影响整洁性）。
 pub fn move_item(src: &Path, dst: &Path) -> std::io::Result<bool> {
     if !src.exists() || dst.exists() {
         return Ok(false);
@@ -130,16 +158,15 @@ pub fn move_item(src: &Path, dst: &Path) -> std::io::Result<bool> {
         Err(_) => {
             if src.is_dir() {
                 copy_dir(src, dst)?;
+                if let Err(_e) = fs::remove_dir_all(src) {
+                    // copy 已成功，源删不掉只影响整洁，不影响数据
+                }
             } else {
                 fs::copy(src, dst)?;
+                if let Err(_e) = fs::remove_file(src) {
+                    // 同上
+                }
             }
-            // 原地改名保留旧件（跨卷 copy 后的稳妥回滚点）
-            let name = src
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "item".to_string());
-            let backup = src.with_file_name(format!("{name}.old"));
-            let _ = fs::rename(src, &backup);
             Ok(true)
         }
     }
@@ -249,9 +276,8 @@ mod tests {
 
     #[test]
     fn move_item_open_file_result_is_consistent() {
-        // Rust std 打开文件自带 FILE_SHARE_DELETE：打开中的文件通常能直接
-        // rename（走 rename 分支）；跨卷等场景走 copy 回退（copy_dir 单测覆盖）。
-        // 这里只验证结果一致性：dst 拿到内容，src 要么搬走要么改名 .old 保留。
+        // 净搬语义：Ok(true) 后 dst 拿到内容、src 必须不存在
+        //（rename 直接搬走；copy 回退也删源——无论哪种，源都不保留）。
         let old = tmp("xv_old");
         let new = tmp("xv_new");
         let f = old.join("barline.log");
@@ -265,10 +291,8 @@ mod tests {
                     fs::read_to_string(new.join("barline.log")).unwrap(),
                     "hello"
                 );
-                assert!(
-                    !f.exists() || old.join("barline.log.old").exists(),
-                    "src 搬走或改名保留，二者必居其一"
-                );
+                assert!(!f.exists(), "净搬后源必须不存在（含 .old 也不许有）");
+                assert!(!old.join("barline.log.old").exists());
             }
             // dst 已存在 / 源不存在等不迁移情形（此处不会发生，兜底放行）
             Ok(false) | Err(_) => {}
@@ -293,5 +317,37 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn migrate_removes_emptied_old_root() {
+        // 自定义旧目录 A（无 config.json）：净搬后腾空 → 文件夹整个删除
+        let old = tmp("rm_old");
+        let new = tmp("rm_new");
+        let cache = old.join("lyrics-cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("a.json"), "{}").unwrap();
+
+        let report = migrate_dirs(&old, &new);
+        assert!(report.iter().any(|l| l.contains("已迁移")), "{report:?}");
+        assert!(new.join("lyrics-cache").join("a.json").exists());
+        assert!(fs::remove_dir(&old).is_ok(), "腾空后旧目录应可直接删除");
+        let _ = fs::remove_dir_all(&new);
+    }
+
+    #[test]
+    fn migrate_cleans_legacy_dot_old_backups() {
+        // v1.1.5 遗留的 .old 备份：一并删除
+        let old = tmp("legacy_old");
+        let new = tmp("legacy_new");
+        let stale = old.join("lyrics-cache.old");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("junk.json"), "{}").unwrap();
+
+        let report = migrate_dirs(&old, &new);
+        assert!(report.iter().any(|l| l.contains("遗留备份已删除")), "{report:?}");
+        assert!(!stale.exists());
+        let _ = fs::remove_dir_all(&old);
+        let _ = fs::remove_dir_all(&new);
     }
 }

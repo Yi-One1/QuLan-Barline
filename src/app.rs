@@ -269,10 +269,10 @@ impl App {
     /// 返回裸指针（不是 `Box`）：WndProc 需要在 `GWLP_USERDATA` 里存它，
     /// 而 `Box` 一旦移动地址就变。生命周期由 `main` 通过 [`App::shutdown`] 收尾。
     pub fn bootstrap() -> windows::core::Result<*mut App> {
-        let config = Config::load();
+        let mut config = Config::load();
         // ---- 数据目录（v1.1.5 问题 3）：必须在任何缓存 / 歌词模块使用之前。
-        // 自定义目录时把旧缓存 / 歌词目录迁过去（含日志搬迁）。
-        crate::storage::init_from_config(&config.storage.data_dir);
+        // 从上次生效目录向新目录净搬旧缓存 / 歌词目录（含日志搬迁）。
+        crate::storage::init_from_config(&mut config);
         let lang = Lang::from_serde(config.general.language);
         crate::log_info!(
             "启动：语言={:?} 歌词={}({:?}) 背景={:?}",

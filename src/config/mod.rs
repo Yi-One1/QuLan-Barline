@@ -159,14 +159,18 @@ pub struct WindowStateConfig {
     pub lyrics_two_line: bool,
 }
 
-/// 存储配置（v1.1.5 问题 3）。
+/// 存储配置（v1.1.5 问题 3；v1.1.6 净搬 + A→B 切换）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct StorageConfig {
     /// 自定义数据目录（绝对路径推荐；空 = 默认 `%LOCALAPPDATA%\Barline`）。
     /// `config.json` 本身不受影响，永远留在默认根目录；缓存/日志在
-    /// 下次启动时自动迁移过去（`storage::init_from_config`）。
+    /// 下次启动时自动净搬过去（`storage::init_from_config`）。
     pub data_dir: String,
+    /// 上次启动**实际生效**的数据目录（启动后由程序写回并落盘）。
+    /// 迁移源以它为准——支持「自定义 A 切换到 B」时把 A 的数据搬去 B。
+    /// 空 = 默认根目录。用户不必手改。
+    pub active_data_dir: String,
 }
 
 /// 全量配置。`#[serde(default)]` 保证缺字段 / 新增字段时都能正常反序列化。

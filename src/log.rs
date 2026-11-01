@@ -193,8 +193,8 @@ fn rotate_live(logger: &Logger) {
 /// 数据目录迁移：把日志（含轮转历史）搬到新目录并从那里继续写（v1.1.5）。
 ///
 /// **必须先关写句柄再搬**——Windows 不允许改名打开中的文件。搬迁用
-/// [`crate::storage::move_item`]：rename 优先，跨卷 copy 后旧文件改名
-/// `.old` 保留，绝不删除。任何失败都不阻塞启动（日志留在原地继续写旧路径）。
+/// [`crate::storage::move_item`]：rename 优先，跨卷退化 copy，净搬（源不保留）。
+/// 任何失败都不阻塞启动（日志留在原地继续写旧路径）。
 pub fn relocate(new_dir: &Path) {
     let Some(logger) = LOGGER.get() else {
         return;
