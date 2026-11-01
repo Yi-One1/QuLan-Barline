@@ -1,151 +1,115 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
-> 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各里程碑报告互补,但本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02,M4/M5 全部完成,v1.0.0 已推送 GitHub(`Yi-One1/QuLan-Barline`),团队工作流闭环。**
+> 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
+> 最后更新:**2026-11-02 03:40,第二轮(9 项问题修复)进行中:问题 1 已迭代三版(v1.1.2 待验收),问题 2~9 未开始。**
 
 ---
 
 ## 0. 项目一句话定位
 
-Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层窗口**,内嵌任务栏条带(贴托盘区左侧 8px),通过 **SMTC** 读取/控制媒体会话,支持**封面/歌名/歌手/三按钮/进度条/音量 HUD**、**壁纸亮度自适应黑白文字**、**悬停毛玻璃**、**逐字卡拉OK歌词**、**托盘菜单 / 全局快捷键 / WebView2 设置页**,以及**便携版发布 v1.0.0**。
+Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层窗口**,内嵌任务栏条带(贴托盘区左侧 8px),通过 **SMTC** 读取/控制媒体会话,支持**封面/播控三键/进度条/音量 HUD/逐字卡拉OK歌词/壁纸自适应对比度/托盘菜单/全局快捷键/WebView2 设置页**。
 
 | 项 | 值 |
 |---|---|
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
-| 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`(**禁止直接 `cargo build`**,见 §2 环境约束) |
-| 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(master,上游跟踪已建) |
-| 当前版本 | **v1.0.0**(exe 955 KB,便携包 `deliverables/曲栏_Barline_v1.0.0.zip` 341 KB,deliverables/ 不入库) |
-| 团队 | 交付总监(主理人)、寇豆码(工程师)、严过关(QA);本次全部经子代理完成,**未再遇 429** |
-| 关键语境 | 用户另有同名自研软件 `BarlineWidget`(类名 `BarlineWidget`/`BarlineBackdrop`),**不是系统控件,小组件不做任何避让/共存逻辑** |
+| 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
+| 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(master,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
+| 当前版本 | **v1.1.2**(master = a6b4552);交付包在 `deliverables/`,**只增不删** |
+| 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
+| 团队 | 交付总监(主理人)+ 寇豆码(software-engineer)+ 严过关(software-qa-engineer);团队 `software-barline-fix` 活跃,寇豆码上下文延续(可 SendMessage 继续) |
+| 推进节奏(用户定) | **一次只做一项 → 带有效测试 → 提交 → 用户验收 → 下一项**;全部完成后跑全量测试 |
+| 版本策略(用户定) | 每完成一项 bump 补丁号并出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`(**历史包永久保留,绝不删除**) |
 
 ---
 
-## 1. 已完成事项(按里程碑/提交)
+## 1. 提交序列(git log,oneline)
 
-### 提交序列(git log,共 12 个提交)
 ```
+a6b4552  feat: v1.1.2 — 歌名歌手紧凑排列,歌词行上移,长歌词滚动(可开关)
+ad2ef3d  feat: v1.1.1 — 歌词单行大字号,歌手名移至歌名右侧(布局修订)
+d65cbbc  chore: 根目录添加开发快捷启动 bat
+4145b89  feat: 歌词区移入任务栏条带(双行压缩 160px)   ← v1.1.0
+6ba2b9f  chore: 版本号 1.1.0
 836ced0  docs: QA M5 交付前终验报告(v1.0.0)
 84fe061  docs: 添加 README 与 MIT LICENSE
 5b425ac  feat: v1.0.0 — 版本资源 / 关于页版本号 / 打包准备
-8af76f6  docs: QA M3-P2 回归报告(v0.0.8)
-bbdc327  feat: v0.0.8 — M3 遗留 P2 补全 + 设置页即时回推
-2ab866f  docs: QA-M4 回归报告与截图(v0.0.7)
-a667218  fix:   v0.0.7 — M4 第二批 QA 缺陷修复(消息桥/内存/主题)
+8af76f6 / bbdc327  v0.0.8 M3 遗留 P2 补全 + QA 报告
+2ab866f / a667218  v0.0.7 M4 第二批 QA 缺陷修复 + QA 报告
 ec803b0  feat: v0.0.6 — M4 第二批(WebView2 设置页)
-be7f8d9  feat: v0.0.5 — M4 第一批(托盘 / 全局快捷键 / lrclib 修复)
-b9d204b  fix:   v0.0.4 — M2 QA 六条缺陷全部清零
-1f66500  feat: v0.0.3 — M3 歌词引擎(逐字卡拉OK)
-b29e619  feat: v0.0.2 — M1 骨架与 M2 完整小组件
+be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M1+M2)
 ```
 
-### M1~M3 与 v0.0.4(历史,详见 docs/ 各报告)
-- M1 骨架(任务栏几何/DPI/SMTC/D2D 透明窗口)、M2 完整小组件(封面/播控/毛玻璃/对比度自适应)、M3 歌词引擎(LRC/增强LRC/逐字扫光/多级缓存/WinHTTP)、v0.0.4 QA 六缺陷清零。报告:`docs/M1~M3-*-REPORT.md`、`docs/QA-M2-REPORT.md`。
+---
 
-### M4(本轮完成)
-- **第一批(v0.0.5)**:系统托盘(独立隐藏窗口承载菜单)、全局快捷键 6 组(Ctrl+Alt+Shift+ 前缀,版本迁移只迁未改过的默认)、lrclib 超时修复(12s/15s+重试+25s 总闸)、P0 退出卡死修复(25s→20ms)。
-- **第二批(v0.0.6,ec803b0)**:WebView2 设置页(~1007 行):Mica 标题栏/明暗跟随/6 分区/bridge JSON 双向协议/白名单写入/关窗彻底释放。
-- **QA 复验 + 缺陷修复(v0.0.7,a667218)**:P0 消息桥全断(`TryGetWebMessageAsString` 收不到 JSON 对象消息→改 AsString 失败回退 `WebMessageAsJson`);P1 关窗内存不回落(根因 DestroyWindow 先于 WebView2 drop,改序修复);P2 标题栏明暗改读系统 `AppsUseLightTheme`(`RegGetValueW` API 层,非 reg.exe);`runtime_version()/open_runtime_download()` 接线到 WebView2 缺失弹窗。
-- **回归闭环**:P0 四链路(落盘/语言/日志目录/录制挂起)全通;P1 口径修订(见 §2-11);P2 确认。报告 `docs/QA-M4-REPORT.md`。
+## 2. 已完成事项
 
-### M3 遗留 P2 补全(v0.0.8,bbdc327)
-- **歌词长行右侧渐隐**:`Frame::fade_brush` 水平渐变(按色+x0+x1 缓存,25fps 热路径零新建),渐隐带=行右缘 24px×scale;**不截断文本**,码元映射保真(扫光不错位);短行视觉零变化。
-- **行切换 150ms 上移动画**:淡出保持前 120ms + 上移 6px×scale 走满 150ms(ease-out cubic);四态高度 94/74/48 零变化。
-- **设置页即时回推**(QA 残留项):`Incoming::Set` 成功后 `settings.push(settings_state_json())`,语言切换当窗生效。
-- QA 回归通过(报告 `docs/QA-M3P2-REPORT.md`,240+ 帧连拍无重叠、CPU 扫光 0.32~0.61%)。
+### 第一轮(v1.0.0 之前,详见 docs/ 各报告)
+- M1 骨架、M2 完整小组件、M3 歌词引擎(逐字卡拉OK)、M4 第一批(托盘/快捷键/lrclib/退出卡死)、M4 第二批(WebView2 设置页 + QA 三缺陷修复闭环)、M3 遗留 P2(长行渐隐/行切换上移/设置页即时回推)、M5 打包(v1.0.0,README/LICENSE/版本资源/GitHub 推送)。
+- 四份 QA 独立验收报告全通过:`docs/QA-M2/QA-M4/QA-M3P2/QA-M5-REPORT.md`。
 
-### M5 打包发布(v1.0.0,5b425ac + 84fe061)
-- 版本号统一 1.0.0(Cargo/关于页经 `CARGO_PKG_VERSION`/VS_VERSIONINFO);**rc 中文乱码坑**:rc.exe 按 GBK 解读无 BOM UTF-8 → 改 **UTF-8 BOM + `#pragma code_page(65001)`**。
-- README(功能/构建/快捷键/配置/致谢)+ MIT LICENSE(`The Barline Authors` 占位,**版权人实名待用户自改**)。
-- 便携包 `deliverables/曲栏_Barline_v1.0.0.exe`(955 KB)+ 同名 zip(341 KB,含 README/LICENSE 副本)。
-- **QA 终验通过**(报告 `docs/QA-M5-REPORT.md`):exe 属性独立复核、关于页 1.0.0 真机、zip 解压直跑端到端、远端一致性。
-- **GitHub 推送完成**:全 12 提交上 `Yi-One1/QuLan-Barline`,远端 HEAD=836ced0 与本地一致。推送走本机 7890 代理(会话级 5346 代理 502 时用 `git -c http.proxy=http://127.0.0.1:7890 ...` 临时通道)。
+### 第二轮:9 项问题修复(当前进行,团队 software-barline-fix)
+用户清单(9 项,一次一项):
+1. **歌词移入小组件(进行中,已迭代三版)**
+   - v1.1.0(4145b89):歌词区移到歌名歌手右侧 160px 双行压缩,高度恒定 48px 不出任务栏,PRD P0-05 修订(作废"向桌面扩展")。
+   - v1.1.1(ad2ef3d):用户反馈字太小 → **单行歌词 11px,上行=歌名+歌手(右侧),下行=歌词**;设置页删「行数」项;右键菜单删单/双行项;WidgetForm 收敛为 {Compact, Lyric};231 测试 230 passed。
+   - v1.1.2(a6b4552):用户反馈歌手间距太远 → **紧凑排列**(歌名+6px+歌手自然宽,不再右侧锚定;总宽>340px 才截断且保证歌手可见);歌词行上移 1.5px(y=22.5..44.5,`limits::LYRIC_LIFT`);**长歌词跑马灯**(停留1.5s→30px/s滚到尾→停留→回位循环;`painter::marquee_offset` 纯函数;时间基准=播放中累计 ms,暂停冻结,行指纹归零;frame_hash 偏移按 0.5px 量化);设置页**「歌词」分区**新增「长歌词滚动」开关默认开(`lyrics.scroll`,关闭=右缘 24px 渐隐);**239 测试 238 passed / 0 failed / 1 ignored**,clippy 零,exe 955.5KB。**待用户验收**。
+2~9. 未开始(见 §4 待办)。
+
+### 交付包现状(deliverables/,只增不删)
+`曲栏_Barline_v1.0.0.exe`、`.zip`、`v1.1.0.exe`、`v1.1.1.exe`、`v1.1.2.exe`。
+> 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout master」方式(已验证可行)。
 
 ---
 
-## 2. 关键决策(拍板记录,避免推翻重来)
+## 3. 关键决策(拍板记录,避免推翻重来)
 
-1. **系统控件避让逻辑整体删除**(用户自有 BarlineWidget 不用管)。
-2. **PRD P0-05 修正**:主行必须完全在条带内,歌词区向桌面方向扩展。
-3. **CPU 指标口径(修订两次)**:原「播放中≤0.5%」→ M3 改「无扫光≤0.5% / 扫光≤2%」→ **v0.0.8 终版:扫光开 ≤2%、扫光关 ≤ 扫光开(同环境相对判定)**——壁纸轮播重采样噪声致绝对值不可测准(实测扫光开最低 0.32% < 无扫光最高 0.63%)。保持 25fps。
-4. **歌手名对比度**:同色 + 动态 alpha 下限 78%。
-5. **默认快捷键前缀** Ctrl+Alt+Shift+;`hotkeys_version` 迁移只迁从未改过默认的老配置。
-6. **首启冲突提示用托盘气泡**,不弹 MessageBox。
-7. **构建纪律**:统一 `scripts/build.ps1`,禁止裸 cargo(Git Bash link.exe 抢占);测试汇总需直跑 target/debug/deps 下测试二进制(windows_subsystem 吞 stdout)。
-8. **本机安全约束**:禁 reg.exe、Add-Type、rm 清 %LOCALAPPDATA%;截屏统一 `scripts/grab-screen.py`;启动 exe 后台起+父进程保活,结束 `Stop-Process -Name barline -Force`;**注册表读取一律 Rust API(如 RegGetValueW)**。
-9. **QA 纪律**:独立 git worktree 验收(`barline-qa-m4`,现基于 84fe061),不信任工程师自述。
-10. **进程回收陷阱**:exe 作为工具子进程会被回收,父进程必须保活。
-11. **P1 内存口径修订(v0.0.7)**:原「关窗私有回落基线 15MB 内」→ **「关窗后私有内存有界且不随开关次数增长:3 轮增量 <1MB 且峰值 <60MB」**。实测恒定 43.8MB 为 NT 堆/LFH 页保留(OS 分配器标准行为),非泄漏;原口径记 Known Issues。
-12. **deliverables/ 不入库**:产物可由 release 构建确定性复现,二进制不进 git 历史(改一行 .gitignore 即可反转)。
+### 本轮新增
+1. **布局(v1.1.1/v1.1.2 终态)**:高度**恒定 48px**(=2+22+22+2,随条带厚度自适应),任何形态不出任务栏;上行=歌名+歌手紧凑同排(歌手左缘=歌名右缘+6px),下行=单行歌词(11px SemiBold,歌名 12px/歌手 10px);信息区宽=max(紧凑总宽,160px),上限 340px;歌词开关=200ms 宽度+alpha 动画;**扫光码元映射不可错位是底线**。
+2. **设置开关分区**:「长歌词滚动」放**歌词分区**而非外观——config 路径 `lyrics.*` 与分区一一对应。
+3. **旧配置兼容**:删除的配置字段(two_line 等)**保留反序列化、布局层忽略**,不迁移不删除。
+4. **右键菜单联动**:设置页删「行数」后,右键菜单「单行/双行歌词」死项一并删除,菜单 ID 重排。
+5. **QA 无独立复验轮**:第二轮按用户节奏,工程师自测+主理人出包+**用户真人验收**即闭环;全量 QA 回归放到 9 项全部完成后。
 
----
-
-## 3. 未完成 / 后续可选项
-
-**本轮范围(M4 第二批 → M3 P2 → M5)已全部完成并推送。** 剩余均为可选项:
-
-### 存量(历史遗留,非本轮缺陷)
-- QA 无真机证据的验收项(本机限制,详见 QA-M2-REPORT,勿视为通过):播控三键真实改状态、拖动跳转误差、点击封面激活前台、滚轮音量+HUD(进程外读 SMTC/音量被安全策略阻断);多显示器/DPI/四方位/自动隐藏/Explorer 重启/运行中托盘增减/配置损坏恢复等。
-
-### 可选后续(P2/P3 级,均不阻塞)
-- **GitHub Release 发布**:QA 建议——Release v1.0.0 挂 `deliverables/曲栏_Barline_v1.0.0.zip`,Notes 引用 README 功能清单。(未做:需用户在 GitHub 操作或授权 gh。)
-- **LICENSE 版权人实名**:当前 `The Barline Authors` 占位。
-- **设置页标题栏明暗动态跟随**:当前窗口创建时读一次,运行中改系统主题需重开设置页(页面 CSS 实时);需 WM_SETTINGCHANGE 联动可开小任务。
-- **录制后热键日志冗余**:resume+rebind 重复两批,仅日志,清理会碰 reduce_settings_message effects 组装。
-- **P1 内存进一步优化**:HeapCompact/LFH 或进程外宿主(当前口径已 PASS,纯优化)。
+### 历史铁律(必须继续遵守)
+6. **构建纪律**:一律 `scripts/build.ps1`(-Task check/clippy/test/build),**禁止裸 cargo**(Git Bash link.exe 抢占 MSVC);测试汇总需直跑 target/debug/deps 下测试二进制(windows_subsystem 吞 stdout)。
+7. **本机安全约束**:禁 `reg.exe`、`Add-Type`、`cmd.exe`(WorkBuddy 工具层拦截)、`rm` 清 %LOCALAPPDATA%;注册表读取用 Rust API(RegGetValueW);截屏统一 `scripts/grab-screen.py`;启动 exe 后台起+父进程保活(或让用户用 启动曲栏.bat 自己跑),结束 `Stop-Process -Name barline -Force`;WorkBuddy PowerShell 工具里**禁用 WScript.Shell COM**(快捷方式不能代建);Bash 里调 powershell 亦被拦,构建用 PowerShell 工具跑。
+8. **QA 纪律**:独立 git worktree(`E:\APP\WorkBuddy\工作空间\barline-qa-m4`)验收,不信任工程师自述。
+9. **系统控件避让**:用户自有 BarlineWidget 不避让,逻辑已删。
+10. **CPU 口径**:扫光开 ≤2%、扫光关 ≤ 扫光开(同环境相对判定,壁纸轮播噪声使绝对值不可测)。
+11. **内存口径**:关窗后私有内存有界且不随开关增长(3 轮增量<1MB 且峰值<60MB)= PASS;NT 堆/LFH 页保留属正常。
+12. **保持 25fps** 扫光(降 fps 有可见台阶,不划算)。
 
 ---
 
-## 4. 团队状态
+## 4. 未完成的待办
 
-- 本轮(v0.0.6→v1.0.0)团队工作流已闭环:工程师寇豆码 4 次交付、QA 严过关 4 次验收,**子代理未再遇 429**。
-- `barline-qa-m4` worktree(基于 84fe061)保留,可 `git worktree remove "E:\APP\WorkBuddy\工作空间\barline-qa-m4" --force` 清理。
-- 推送通道备注:会话内 git push 若遇 5346 代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 临时切换本机代理。
+### 问题 1 遗留(用户已反馈,**记录在案,先不做**,按用户指示安排)
+- **a. 跑马灯滚动节奏与歌词进度(卡拉OK)同步**:当前按固定 30px/s+停留,唱得快的句子没滚完就切下一行,显示不全问题仍在;应改为按该行歌词时间窗口/播放进度分配滚动量(与扫光同一时间基准)。
+- **b. 歌词行再往上一点**(当前已上移 1.5px,用户仍觉得偏下)。
 
----
+### 9 项问题清单(一次一项;问题 1 待用户最终验收)
+- [~] 1. 歌词移入小组件中间(三版迭代 v1.1.0→1.1.2 待验收 + 上述两条遗留)
+- [ ] 2. 悬停背景删除模糊,只保留半透明/始终透明(旧配置 blur 模式迁移半透明)
+- [ ] 3. 所有文件/缓存可自定义存储位置(**自动迁移**旧文件;配置文件仍留原位)
+- [ ] 4. 「本地歌词目录」右侧「添加」→「浏览」(系统目录选择对话框)
+- [ ] 5. 设置页音量「调节步进」始终显示空白(bug)
+- [ ] 6. 音量范围「当前播放器」时滚轮仍改系统音量(应改会话音量 ISimpleAudioVolume)
+- [ ] 7. 单击封面激活播放器:汽水音乐/Edge(B站)失败,网易云成功(launch.rs 激活链路)
+- [ ] 8. 右键小组件菜单「显示设置」无反应(托盘菜单是好的;menu.rs 接线断点)
+- [ ] 9. 右键菜单循环/随机播放不可用(SMTC SetAutoRepeatMode/SetShuffle 写入链路;若播放器不支持需如实说明)
+- 全部完成后:严过关全量回归(独立 worktree)+ 用户终验。
 
-## 5. 新接手者下一步(按需)
-
-1. **发 GitHub Release**(可选):仓库页 Releases → Draft new release → tag `v1.0.0` → 上传 `deliverables/曲栏_Barline_v1.0.0.zip`。
-2. 跑起来:`deliverables/曲栏_Barline_v1.0.0.exe` 双击即用(需 WebView2 Runtime,缺失会弹窗引导下载)。
-3. 开发调试:读 §2 决策与 §6 文件索引;构建一律 `scripts/build.ps1 -Task check/test/clippy/build`。
-4. 后续需求:走增量流程(增量 PRD → 增量设计 → 工程师 → QA worktree 回归)。
-
----
-
-## 6. 关键文件索引
-
-| 路径 | 作用 |
-|---|---|
-| `docs/PRD.md` | 需求(30 条/P0 16 条/验收 §8.1,已按决策修正) |
-| `docs/ARCHITECTURE.md` | 架构(§4.4 内存、§10 任务栏内嵌、§11 亮度/模糊、§13 设置页) |
-| `docs/TASKS.md` | 任务分解(20 任务/5 里程碑) |
-| `docs/QA-M2/QA-M4/QA-M3P2/QA-M5-REPORT.md` | 四份 QA 独立验收报告(全部通过/闭环) |
-| `docs/M1~M4-REPORT.md`、`docs/M3-LYRIC-REPORT.md` | 里程碑报告(工程师自述,线索非结论) |
-| `src/render/` | d2d(fade_brush)/painter/layout/text/theme/sampler/blur/cover_cache |
-| `src/ui/` | widget_wnd/interaction/hit/menu/tray |
-| `src/media/` | smtc/cover/launch/player_map/wasapi |
-| `src/lyric/` | 歌词解析/查询/扫光/缓存(9 文件) |
-| `src/settings/` | 设置页 mod/webview/bridge/assets(已入库) |
-| `src/platform/` | dpi/wake/**system_app_theme_dark**(AppsUseLightTheme) |
-| `assets/barline.rc` | 版本资源+图标+manifest(UTF-8 BOM!) |
-| `deliverables/` | v1.0.0 便携包(不入库) |
-| `scripts/build.ps1` | **唯一**构建入口(-Task check/clippy/test/build) |
-| `scripts/grab-screen.py`、`scripts/m4-settings-check.py`、worktree 内 `m4-qa2-*.py` | 截屏/验收脚本 |
+### 存量与可选(不阻塞)
+- QA 无真机证据项(M2 时代,勿视为通过):播控真实改状态/拖动跳转/封面激活前台/滚轮音量 HUD(进程外读 SMTC 被安全策略阻)、多显示器/DPI/四方位/自动隐藏等。
+- GitHub Release 发布(挂 deliverables zip)、LICENSE 版权人实名(现为 The Barline Authors 占位)、设置页标题栏明暗动态跟随、热键日志冗余清理。
 
 ---
 
-## 7. 已验证硬指标(截至 836ced0,全部 QA 自跑证据)
+## 5. 接手须知(新对话从这里开始)
 
-| 指标 | 值 |
-|---|---|
-| release 构建 | 零 error、零 warning;exe **955 KB**(预算 8 MB) |
-| clippy `-D warnings` | 零告警(src/ 无 `#[allow]`) |
-| 单元测试 | **222 passed / 0 failed / 1 ignored** |
-| 内存 | 基线 WS ~36.9MB/私有 ~10.7MB;设置页开→关:私有恒定 ~43.8MB 有界不增长(口径见 §2-11) |
-| CPU | 播放+扫光 **0.32%~0.61%**(口径:扫光开 ≤2%、扫光关 ≤ 扫光开,§2-3) |
-| 退出 / 单实例 | 托盘退出内部 24~90ms;二次启动 41~43ms 退出 |
-| 设置页 | 6 分区/明暗跟随/关于页 1.0.0/语言当窗生效/改项 0.8s 落盘/关窗资源全释放 |
-| 歌词 | 长行右缘 24px 渐隐、扫光分界字间无错位;行切换 150ms 上移+120ms 淡出;四态高度 94/74/48 |
-| 快捷键 | 6 组 Ctrl+Alt+Shift+ 全通,录制挂起/恢复闭环 |
-| 便携包 | zip 解压直跑端到端 ✅(启动/小组件/设置页/退出码 0) |
-| GitHub | 远端 HEAD = 本地(836ced0),12 提交完整 |
+1. **先 `git status` / `git log --oneline -5`** 确认干净与进度(本文档头部"最后更新"为准)。
+2. 重建团队 `software-barline-fix`(TeamCreate)→ 按用户节奏派发:SendMessage 继续寇豆码(若同会话)或新 spawn `software-engineer`(prompt 必须自包含:工作目录、任务、约束 §3-6/7、版本 bump 四处、build.ps1 全链、单提交、汇报格式)。参考本文件 §4 清单与 docs/PRD.md。
+3. 每项完成:主理人抽验 → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`(**不删旧包**)→ 播报请用户验收 → **停下等回复**。
+4. 工程师不启动 exe、不动 deliverables(主理人负责);用户自测用根目录 `启动曲栏.bat`。
+5. 9 项全完成后:严过关独立 worktree 全量回归 + 终验报告。
+6. 用户在用网易云/汽水音乐/Edge B站视频测试,验收反馈常附截图,现象描述以截图为准。
