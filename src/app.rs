@@ -209,10 +209,10 @@ pub struct App {
     blur_timer_on: bool,
     /// 歌词推进定时器当前是否已挂（仅在「播放中 + 歌词就绪」时存在）
     lyric_timer_on: bool,
-    /// 歌词区当前高度（逻辑像素，**动画中间值**）
-    lyric_h: f32,
-    /// 歌词区高度过渡（PRD P0-06 的 200ms 收合）
-    lyric_anim: Option<HeightAnim>,
+    /// 歌词区当前宽度（逻辑像素，**动画中间值** 0..=160）
+    lyric_w: f32,
+    /// 歌词区宽度过渡（PRD P0-06 的 200ms 收合，v1.1 起为宽度而非高度）
+    lyric_anim: Option<WidthAnim>,
     /// 上一帧的歌词绘制指纹，用来跳过无变化的重绘
     last_lyric_key: Option<(Option<usize>, i32)>,
     /// 上一帧的**像素指纹**（`frame_hash`）。相同就完全不碰 D2D / UpdateLayeredWindow
@@ -223,16 +223,16 @@ pub struct App {
     geom_failed: bool,
 }
 
-/// 歌词区高度过渡动画。
+/// 歌词区宽度过渡动画（v1.1：歌词区移入条带后，收合动画从高度改为宽度）。
 #[derive(Debug, Clone, Copy)]
-struct HeightAnim {
+struct WidthAnim {
     from: f32,
     to: f32,
     start: Instant,
 }
 
-/// 高度过渡时长（PRD P0-06：200ms）。
-const HEIGHT_ANIM_MS: f32 = 200.0;
+/// 宽度过渡时长（PRD P0-06：200ms）。
+const LYRIC_ANIM_MS: f32 = 200.0;
 /// 切歌转场总时长（M3 遗留 P2：120ms 淡出 + 150ms 上移，窗口取并集 150ms）。
 pub const LYRIC_FADE_SECS: f32 = 0.150;
 /// 转场里旧歌词的淡出段时长（T12 第 4 条原口径，保持观感不变）。
@@ -240,10 +240,10 @@ pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
 /// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
 pub const LYRIC_SLIDE_PX: f32 = 6.0;
 
-impl HeightAnim {
-    /// 当前时刻的插值高度（ease-out cubic：收合时先快后慢，观感更自然）。
+impl WidthAnim {
+    /// 当前时刻的插值宽度（ease-out cubic：收合时先快后慢，观感更自然）。
     fn value(&self, now: Instant) -> (f32, bool) {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 / HEIGHT_ANIM_MS;
+        let t = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 / LYRIC_ANIM_MS;
         if t >= 1.0 {
             return (self.to, true);
         }
@@ -309,8 +309,8 @@ impl App {
 
         let target_rect = geometry.as_ref().map(|g| g.target).unwrap_or_default();
 
-        // 歌词区初始高度 = 配置对应的形态高度（不做入场动画）
-        let lyric_h = lyric_extra_logical(&config);
+        // 歌词区初始宽度 = 配置对应的形态宽度（不做入场动画）
+        let lyric_w = lyric_w_logical(&config);
 
         let app = Box::new(App {
             state: AppState {
@@ -339,7 +339,7 @@ impl App {
             anim_timer_on: false,
             blur_timer_on: false,
             lyric_timer_on: false,
-            lyric_h,
+            lyric_w,
             lyric_anim: None,
             last_lyric_key: None,
             last_frame_hash: None,
@@ -683,8 +683,8 @@ impl App {
 
     /// 16ms 动画定时器。
     fn on_anim_timer(&mut self) {
-        // 歌词区高度过渡（PRD P0-06 的 200ms 收合/展开）
-        let height_changed = self.advance_height_anim();
+        // 歌词区宽度过渡（v1.1：歌词开关在条带内收合/展开）
+        let width_changed = self.advance_width_anim();
         // 切歌转场：150ms 到点就清空并补一帧
         let fade_done = self.expire_lyric_fade();
 
@@ -703,8 +703,8 @@ impl App {
             }
         }
         self.sync_interaction();
-        if height_changed {
-            // 高度变了必须整条重排（窗口尺寸 + 渲染目标 + 采样区域都要跟着变）
+        if width_changed {
+            // 宽度变了必须整条重排（窗口尺寸 + 渲染目标 + 采样区域都要跟着变）
             self.relayout();
             return;
         }
@@ -731,38 +731,38 @@ impl App {
         false
     }
 
-    /// 推进歌词区高度动画。返回 `true` 表示**取整后的高度**变了，需要重排。
-    fn advance_height_anim(&mut self) -> bool {
+    /// 推进歌词区宽度动画。返回 `true` 表示**取整后的宽度**变了，需要重排。
+    fn advance_width_anim(&mut self) -> bool {
         let Some(anim) = self.lyric_anim else {
             return false;
         };
         let (value, done) = anim.value(Instant::now());
-        let before = (self.lyric_h * 1000.0) as i32;
-        self.lyric_h = value;
+        let before = (self.lyric_w * 1000.0) as i32;
+        self.lyric_w = value;
         // 按物理像素取整比较：0.5px 以内的变化重排没有意义，只会抖
-        let after = (self.lyric_h * 1000.0) as i32;
+        let after = (self.lyric_w * 1000.0) as i32;
         if done {
             self.lyric_anim = None;
-            self.lyric_h = anim.to;
+            self.lyric_w = anim.to;
         }
         before != after
     }
 
-    /// 让歌词区高度平滑过渡到配置对应的目标值。
-    fn animate_lyric_height(&mut self) {
-        let target = lyric_extra_logical(&self.config);
-        if (target - self.lyric_h).abs() < 0.01 {
+    /// 让歌词区宽度平滑过渡到配置对应的目标值（v1.1：宽度而非高度）。
+    fn animate_lyric_width(&mut self) {
+        let target = lyric_w_logical(&self.config);
+        if (target - self.lyric_w).abs() < 0.01 {
             self.lyric_anim = None;
             return;
         }
         crate::log_debug!(
-            "歌词区高度过渡：{:.0}px → {:.0}px（{}ms）",
-            self.lyric_h,
+            "歌词区宽度过渡：{:.0}px → {:.0}px（{}ms）",
+            self.lyric_w,
             target,
-            HEIGHT_ANIM_MS as u32
+            LYRIC_ANIM_MS as u32
         );
-        self.lyric_anim = Some(HeightAnim {
-            from: self.lyric_h,
+        self.lyric_anim = Some(WidthAnim {
+            from: self.lyric_w,
             to: target,
             start: Instant::now(),
         });
@@ -1025,7 +1025,7 @@ impl App {
                 crate::log_info!("配置变更（version={}）", cfg.version);
                 self.lang = Lang::from_serde(cfg.general.language);
                 self.config = *cfg;
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 self.relayout();
                 let json = self.settings_state_json();
                 self.settings.push(&json);
@@ -1074,7 +1074,7 @@ impl App {
                 // 歌词开关 / 行数变化要走高度过渡；快捷键变化要重绑
                 let hotkey_changed = path.starts_with("hotkeys.");
                 if path.starts_with("lyrics.") && (path == "lyrics.enabled" || path == "lyrics.mode") {
-                    self.animate_lyric_height();
+                    self.animate_lyric_width();
                 }
                 let mut effects = vec![
                     Effect::Relayout,
@@ -1272,7 +1272,7 @@ impl App {
             WidgetInput::VolumeHudExpired => vec![Effect::Redraw],
             WidgetInput::ToggleLyricsFromMenu => {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 self.commit_config()
             }
             WidgetInput::SetLyricMode(mode) => {
@@ -1282,7 +1282,7 @@ impl App {
                 } else {
                     LyricModeSerde::TwoLine
                 };
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 self.commit_config()
             }
             WidgetInput::SetBackgroundMode(mode) => {
@@ -1415,9 +1415,8 @@ impl App {
             self.config.lyrics.enabled,
             self.config.lyrics.mode == LyricModeSerde::OneLine,
         );
-        // 竖排任务栏（左右）在 M2 一律降级为紧凑态：M2 还没有内容旋转
-        // （`ARCHITECTURE.md` §10.4 明确「左右分支 M4 最后做，允许降级为紧凑态」）。
-        // 不降级的话窗口会为歌词区多出 46px，比任务栏还宽，直接压到桌面上。
+        // 竖排任务栏（左右）在 M4 一律降级为紧凑态：内容旋转（§10.4）尚未实现，
+        // 不降级的话 160px 歌词块会沿条带厚度方向展开，直接压到桌面上。
         let form = if geo.edge.is_vertical() {
             WidgetForm::Compact
         } else {
@@ -1444,7 +1443,7 @@ impl App {
             None => 0.0,
         };
 
-        let mut lay = layout::compute_full(geo.edge, form, scale, bar_thickness, text_w, self.lyric_h);
+        let mut lay = layout::compute_full(geo.edge, form, scale, bar_thickness, text_w, self.lyric_w);
         if let Some(r) = self.renderer.as_mut() {
             r.prepare_text(&mut lay, &title, &artist);
         }
@@ -1581,11 +1580,11 @@ impl App {
         ];
         geo.hash(&mut h);
         (lay.text_key as i32).hash(&mut h);
-        // 歌词区矩形（高度动画期间每帧都变）
+        // 歌词区矩形（宽度动画期间每帧都变；v1.1 起是横向块）
         let lyric_rect = [
-            lay.lyric_cur.y as i32,
+            lay.lyric_cur.x as i32,
+            lay.lyric_cur.w as i32,
             lay.lyric_cur.h as i32,
-            lay.lyric_next.y as i32,
         ];
         lyric_rect.hash(&mut h);
 
@@ -1882,21 +1881,21 @@ impl App {
         match cmd {
             MenuCommand::ToggleLyrics => {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
             MenuCommand::LyricOneLine => {
                 self.config.lyrics.enabled = true;
                 self.config.lyrics.mode = LyricModeSerde::OneLine;
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
             MenuCommand::LyricTwoLine => {
                 self.config.lyrics.enabled = true;
                 self.config.lyrics.mode = LyricModeSerde::TwoLine;
-                self.animate_lyric_height();
+                self.animate_lyric_width();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
@@ -2115,17 +2114,14 @@ mod tests {
     }
 }
 
-/// 配置 → 歌词区额外高度（**逻辑像素**，未乘 scale）。
+/// 配置 → 歌词区宽度（**逻辑像素**，未乘 scale；v1.1：开关只切 0 ↔ 160，
+/// 单行/双行都压在同一个 160px 条带内块里，不影响宽度）。
 ///
-/// 与 `WidgetForm::lyric_extra_h()` 必须保持一致：一个是"当前动画值"，
+/// 与 `WidgetForm::lyric_w()` 必须保持一致：一个是"当前动画值"，
 /// 一个是"形态默认值"，两者在动画结束时相等。
-fn lyric_extra_logical(config: &Config) -> f32 {
+fn lyric_w_logical(config: &Config) -> f32 {
     if !config.lyrics.enabled {
         return 0.0;
     }
-    if config.lyrics.mode == LyricModeSerde::OneLine {
-        crate::config::defaults::limits::LYRIC_ONE_LINE_H
-    } else {
-        crate::config::defaults::limits::LYRIC_TWO_LINE_H
-    }
+    crate::config::defaults::limits::LYRIC_W
 }

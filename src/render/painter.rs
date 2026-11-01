@@ -674,7 +674,8 @@ fn draw_lyrics(
     lyric_layout: Option<(&IDWriteTextLayout, u32)>,
 ) -> Result<()> {
     let (layout, state, theme) = (ctx.layout, ctx.state, &ctx.theme);
-    if layout.form == crate::render::layout::WidgetForm::Compact || lyric.is_empty() {
+    // v1.1：歌词区是条带内的横向块——关闭（Compact）或宽度动画未展开时直接跳过
+    if layout.lyric_cur.is_empty() || lyric.is_empty() {
         return Ok(());
     }
 

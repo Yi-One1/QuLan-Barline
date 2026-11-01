@@ -47,7 +47,7 @@ pub struct TextFormats {
     pub title: IDWriteTextFormat,
     /// 歌手：11px Regular @ 60% 不透明度（alpha 在 painter 里给）
     pub artist: IDWriteTextFormat,
-    /// 歌词当前行 / 下一行：13px
+    /// 歌词当前行 / 下一行：7px（v1.1 双行压缩，两行压进 48px 条带）
     pub lyric: IDWriteTextFormat,
     /// HUD / 时间气泡：12px Regular
     pub hud: IDWriteTextFormat,

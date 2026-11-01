@@ -59,9 +59,9 @@ pub const TIMER_BLUR_MS: u32 = 250;
 pub const TIMER_LYRIC: usize = 5;
 /// 歌词推进周期（40ms ≈ 25fps）。
 ///
-/// 为什么不是 16ms：13px 字号下一个汉字约 13px 宽、平均停留 250–350ms，
-/// 扫光边界每帧只移动 ~1px；25fps 已经完全看不出台阶，而 60fps 会让
-/// 「播放中空闲 CPU」逼近 PRD P0-14 的 0.5% 红线。
+/// 为什么不是 16ms：v1.1 双行压缩后歌词字号 7px，一个汉字约 7px 宽、
+/// 平均停留 250–350ms，扫光边界每帧只移动 ~1px；25fps 已经完全看不出台阶，
+/// 而 60fps 会让「播放中空闲 CPU」逼近 PRD P0-14 的 0.5% 红线。
 pub const TIMER_LYRIC_MS: u32 = 40;
 
 /// 全局的「小组件窗口句柄」与「App 指针」——`WH_MOUSE_LL` 钩子回调需要它们。

@@ -252,15 +252,15 @@ pub fn compute_target(
 
 /// **纯函数**：把「已经算好尺寸的窗口」摆到任务栏条带里。
 ///
-/// 与 [`compute_target`] 的区别：这里直接接收窗口的物理宽高，因此能正确处理
-/// **比任务栏更高的小组件**（开启歌词后总高 94px > 条带 48px）。
+/// v1.1 起 `place_widget` 的正常输入高度**恒等于任务栏条带厚度**
+/// （歌词区已移入条带内，双行压缩，小组件不再向桌面扩展），此时：
+/// - `Bottom`：右边缘贴托盘区左侧（让出 gap），上下与条带完全重合；
+/// - `Top`：同上；
+/// - `Right`：底边贴托盘区上侧，左右与条带完全重合；
+/// - `Left`：同上。
 ///
-/// 摆放规则：
-/// - `Bottom`：右边缘贴托盘区左侧（让出 gap），**底边贴任务栏底边**，
-///   于是多出来的歌词区向上扩展、压在桌面之上（这是唯一不出屏的方向）；
-/// - `Top`：右边缘同上，**顶边贴任务栏顶边**，歌词区向下扩展；
-/// - `Right`：底边贴托盘区上侧，右边贴条带右边，歌词区向左扩展；
-/// - `Left`：底边贴托盘区上侧，左边贴条带左边，歌词区向右扩展。
+/// 函数仍保留对「比条带更厚」输入的通用处理（`Bottom` 时向上扩展等），
+/// 作为防御性兜底——但正常路径不会再走到。
 ///
 /// 空间不足时先收缩长边（最小 120*scale），再不够就贴到条带起始边。
 pub fn place_widget(
@@ -434,8 +434,29 @@ mod tests {
         ));
     }
 
-    /// 开启歌词后小组件比任务栏更高（94 > 48）：
-    /// 底部任务栏时必须**向上**扩展，否则歌词区会跑出屏幕。
+    /// v1.1：小组件高度恒为条带厚度——底部任务栏时与条带完全重合，不出屏。
+    #[test]
+    fn bar_height_widget_fits_exactly_on_bottom_taskbar() {
+        let bar = rect(0, 1392, 2560, 1440);
+        let tray = rect(2194, 1392, 2560, 1440);
+        let t = place_widget(tray, bar, TaskbarEdge::Bottom, 1.0, 429, 48);
+        assert_eq!(t.top, bar.top, "顶边必须与条带重合");
+        assert_eq!(t.bottom, bar.bottom, "底边必须与条带重合");
+        assert_eq!(t.right, tray.left - 8);
+        assert_eq!(t.right - t.left, 429);
+    }
+
+    /// 顶部任务栏同样与条带完全重合。
+    #[test]
+    fn bar_height_widget_fits_exactly_on_top_taskbar() {
+        let bar = rect(0, 0, 2560, 48);
+        let tray = rect(2194, 0, 2560, 48);
+        let t = place_widget(tray, bar, TaskbarEdge::Top, 1.0, 429, 48);
+        assert_eq!(t.top, bar.top);
+        assert_eq!(t.bottom, bar.top + 48);
+    }
+
+    /// 防御性兜底：万一传入比条带更厚的窗口，底部任务栏仍向上扩展（不出屏）。
     #[test]
     fn taller_widget_grows_upward_on_bottom_taskbar() {
         let bar = rect(0, 1392, 2560, 1440);
@@ -445,16 +466,6 @@ mod tests {
         assert_eq!(t.top, bar.bottom - 94, "顶边向上扩展");
         assert_eq!(t.right, tray.left - 8);
         assert_eq!(t.right - t.left, 269);
-    }
-
-    /// 顶部任务栏时向下扩展。
-    #[test]
-    fn taller_widget_grows_downward_on_top_taskbar() {
-        let bar = rect(0, 0, 2560, 48);
-        let tray = rect(2194, 0, 2560, 48);
-        let t = place_widget(tray, bar, TaskbarEdge::Top, 1.0, 269, 94);
-        assert_eq!(t.top, bar.top);
-        assert_eq!(t.bottom, bar.top + 94);
     }
 
     /// 竖排任务栏：宽 = 条带宽度，高 = 长边，向上扩展。

@@ -11,6 +11,13 @@
 //! 当任务栏在左右两侧时，逻辑坐标仍是「水平布局」，由渲染层施加旋转变换
 //! （§10.4，M4/T18 实现）；本模块只负责水平语义的长边/短边。
 //!
+//! ## v1.1：歌词区移入条带（双行压缩）
+//!
+//! 小组件**高度恒等于任务栏条带厚度**（歌词开/关都不变）。歌词区是一个
+//! **固定 160 逻辑像素宽**的横向块，位于歌名/歌手区与上一首按钮之间；
+//! 开启歌词时小组件整体加长同样宽度。歌词开关只做**宽度**过渡（200ms），
+//! 高度四态（双行 94 / 单行 74 / 关闭 48）自 v1.1 起作废。
+//!
 //! ## 省略号缓存（M1 报告 §5.9）
 //!
 //! `title_text` / `artist_text` 是**已经截断好**的字符串，由
@@ -134,25 +141,24 @@ impl LyricMode {
     }
 }
 
-/// 小组件形态：决定总高度（PRD §4.1）。
+/// 小组件形态：决定**歌词区宽度**（v1.1 起不再决定高度——高度恒为条带厚度）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WidgetForm {
-    /// 无歌词：高度 = 任务栏高度
+    /// 无歌词：歌词区宽度 = 0（小组件不加长）
     Compact,
-    /// 单行歌词：+26 * scale
+    /// 单行歌词：只显示当前行，歌词区宽 = 160 * scale
     OneLine,
-    /// 双行歌词：+46 * scale
+    /// 双行歌词：当前行 + 下一行，歌词区宽 = 160 * scale
     #[default]
     TwoLine,
 }
 
 impl WidgetForm {
-    /// 歌词区额外高度（逻辑像素，未乘 scale）。
-    pub fn lyric_extra_h(self) -> f32 {
+    /// 歌词区宽度（逻辑像素，未乘 scale）。`Compact`（歌词关闭）为 0。
+    pub fn lyric_w(self) -> f32 {
         match self {
             WidgetForm::Compact => 0.0,
-            WidgetForm::OneLine => limits::LYRIC_ONE_LINE_H,
-            WidgetForm::TwoLine => limits::LYRIC_TWO_LINE_H,
+            WidgetForm::OneLine | WidgetForm::TwoLine => limits::LYRIC_W,
         }
     }
 
@@ -185,7 +191,8 @@ pub struct WidgetLayout {
     pub btn_next: RectF,
     /// 进度条（悬停 4px，否则 2px；这里给的是悬停态完整矩形）
     pub progress: RectF,
-    /// 歌词当前行 / 下一行（form == Compact 时二者为空矩形）
+    /// 歌词当前行 / 下一行（横向块，位于文本区与上一首按钮之间；
+    /// `form == Compact` 或宽度动画尚未展开时二者为空矩形）
     pub lyric_cur: RectF,
     pub lyric_next: RectF,
     /// 命中区（比视觉区大，保证 ≥ 28×28 * scale）
@@ -229,7 +236,7 @@ impl WidgetLayout {
         }
     }
 
-    /// 内容自然宽度（不含宽度钳位），用于日志与调试。
+    /// 内容自然宽度（不含宽度钳位，含歌词区），用于日志与调试。
     pub fn fixed_width(&self) -> f32 {
         let s = self.effective_scale();
         limits::CONTENT_PAD * s * 2.0
@@ -237,28 +244,25 @@ impl WidgetLayout {
             + limits::COVER_TEXT_GAP * s
             + limits::TEXT_BTN_GAP * s
             + (limits::BTN_HIT * 3.0 + limits::BTN_GAP * 2.0) * s
+            + self.form.lyric_w() * s
     }
 }
 
 /// 计算布局（不带文本自然宽度，等价于「文本宽 0」→ 宽度取下限）。
 ///
-/// 保留这个 4 参数签名是为了让 M1 的单测与调用点零改动；
+/// 保留这个 4 参数签名是为了让既有单测与调用点零改动；
 /// 正式路径用 [`compute_ex`]。
 pub fn compute(edge: TaskbarEdge, form: WidgetForm, scale: f32, bar_thickness: i32) -> WidgetLayout {
     compute_ex(edge, form, scale, bar_thickness, 0.0)
 }
 
-/// 计算布局（歌词区高度取形态默认值）。
+/// 计算布局（歌词区宽度取形态默认值：Off→0 / 单行、双行→160 * scale）。
 ///
 /// * `edge`          —— 任务栏方位
-/// * `form`          —— 形态（决定高度）
+/// * `form`          —— 形态（决定歌词区宽度；高度恒为条带厚度）
 /// * `scale`         —— DPI 缩放系数（96dpi → 1.0）
 /// * `bar_thickness` —— 任务栏条带厚度（物理像素）
 /// * `text_w`        —— 歌名 / 歌手中较宽者的自然宽度（物理像素，未截断）
-///
-/// **纵向排布与任务栏方位绑定**：主行（封面 / 文本 / 按钮 / 进度条）始终与任务栏
-/// 条带重合——底部任务栏时贴客户区底边，顶部任务栏时贴顶边；歌词区排在主行
-/// 朝屏幕内侧的一边。
 pub fn compute_ex(
     edge: TaskbarEdge,
     form: WidgetForm,
@@ -266,21 +270,21 @@ pub fn compute_ex(
     bar_thickness: i32,
     text_w: f32,
 ) -> WidgetLayout {
-    compute_full(edge, form, scale, bar_thickness, text_w, form.lyric_extra_h())
+    compute_full(edge, form, scale, bar_thickness, text_w, form.lyric_w())
 }
 
-/// 计算布局，并**显式指定歌词区额外高度**（逻辑像素，未乘 scale）。
+/// 计算布局，并**显式指定歌词区宽度**（逻辑像素，未乘 scale）。
 ///
-/// 存在的唯一理由是 T12 的 200ms 高度缓动：动画期间每帧的额外高度是
-/// 插值出来的中间值，不等于任何 `WidgetForm` 的默认值。
-/// `compute_ex` 就是「额外高度 = 形态默认值」的特例。
+/// 存在的唯一理由是歌词开关的 200ms 宽度缓动：动画期间每帧的歌词区宽度
+/// 是插值出来的中间值，不等于任何 `WidgetForm` 的默认值。
+/// `compute_ex` 就是「歌词区宽度 = 形态默认值」的特例。
 pub fn compute_full(
     edge: TaskbarEdge,
     form: WidgetForm,
     scale: f32,
     bar_thickness: i32,
     text_w: f32,
-    lyric_extra_logical: f32,
+    lyric_w_logical: f32,
 ) -> WidgetLayout {
     let s = if scale > 0.0 { scale } else { 1.0 };
 
@@ -292,97 +296,75 @@ pub fn compute_full(
     let bgap = limits::BTN_GAP * s;
     let btn_group = btn * 3.0 + bgap * 2.0;
 
-    // 宽度 = clamp(自然宽度, 200*s, 340*s)
+    // 歌词区宽度（动画中间值）。宽高全部取整到物理像素。
+    let lyric_w_px = (lyric_w_logical.max(0.0) * s).round();
+
+    // 基础宽度（不含歌词区）= clamp(自然宽度, 200*s, 340*s)；
+    // 开启歌词时在钳位结果上整体加长歌词区宽度。
     let fixed = pad * 2.0 + cover_side + gap_ct + gap_tb + btn_group;
     let want = (fixed + text_w.max(0.0)).round();
-    let width = want
+    let base = want
         .max((limits::WIDGET_MIN_W * s).round())
-        .min((limits::WIDGET_MAX_W * s).round()) as i32;
+        .min((limits::WIDGET_MAX_W * s).round());
+    let width = (base + lyric_w_px) as i32;
 
+    // v1.1：高度恒为任务栏条带厚度，主行与客户区完全重合（不再向桌面扩展）。
     let main_h = bar_thickness.max(1);
-    let lyric_extra = (lyric_extra_logical.max(0.0) * s).round() as i32;
-    let height = main_h + lyric_extra;
+    let height = main_h;
 
     let w = width as f32;
     let mh = main_h as f32;
 
-    // ---- 纵向排布：主行必须与任务栏条带重合 ----
-    //
-    // 底部任务栏时窗口向上扩展（见 `taskbar::geometry::place_widget`），
-    // 客户区底边才对齐任务栏底边，所以**主行要贴客户区底边**，
-    // 多出来的歌词区落在上方桌面上；顶部任务栏时正好相反。
-    // 若这里固定 `main_top = 0`，开启歌词后封面 / 歌名 / 按钮会整体浮到
-    // 任务栏上方的桌面上，而歌词反倒压在任务栏条带里（视觉上完全错位）。
-    let main_top = if edge == TaskbarEdge::Bottom {
-        lyric_extra as f32
-    } else {
-        0.0
-    };
-    // 歌词区起点：底部任务栏在上方，顶部任务栏在下方。
-    let lyric_top = if edge == TaskbarEdge::Bottom {
-        0.0
-    } else {
-        mh
-    };
-
     // 主行：整条任务栏高度，左右各留 pad
-    let main_row = RectF::new(pad, main_top, (w - pad * 2.0).max(1.0), mh);
+    let main_row = RectF::new(pad, 0.0, (w - pad * 2.0).max(1.0), mh);
 
     // 封面 32×32（×scale），在主行内垂直居中
-    let cover = RectF::new(
-        pad,
-        main_top + ((mh - cover_side) * 0.5).max(0.0),
-        cover_side,
-        cover_side,
-    );
+    let cover = RectF::new(pad, ((mh - cover_side) * 0.5).max(0.0), cover_side, cover_side);
 
     // 按钮组：右对齐
-    let btn_y = main_top + ((mh - btn) * 0.5).max(0.0);
+    let btn_y = ((mh - btn) * 0.5).max(0.0);
     let btn_next = RectF::new(w - pad - btn, btn_y, btn, btn);
     let btn_toggle = RectF::new(btn_next.x - bgap - btn, btn_y, btn, btn);
     let btn_prev = RectF::new(btn_toggle.x - bgap - btn, btn_y, btn, btn);
 
     // 进度条：主行底部，留 2*s 的内边距
     let ph = limits::PROGRESS_H_HOVER * s;
-    let progress = RectF::new(
-        pad,
-        main_top + (mh - ph - 2.0 * s).max(0.0),
-        (w - pad * 2.0).max(1.0),
-        ph,
-    );
+    let progress = RectF::new(pad, (mh - ph - 2.0 * s).max(0.0), (w - pad * 2.0).max(1.0), ph);
 
-    // 文本块：封面右侧 → 按钮组左侧；垂直范围到进度条上沿
+    // 歌词区：紧贴上一首按钮左侧的固定宽块（宽度随开关动画插值）。
+    // 右缘 = btn_prev.x - gap_tb，左缘 = 右缘 - 歌词区宽度，动画中不越出文本区。
+    let lyric_right = (btn_prev.x - gap_tb).max(0.0);
+    let lyric_x = (lyric_right - lyric_w_px).max(0.0);
+    let lyric_w = (lyric_right - lyric_x).max(0.0);
+
+    // 文本块：封面右侧 → 歌词区左侧；垂直范围到进度条上沿
     let text_x = cover.right() + gap_ct;
-    let text_right = (btn_prev.x - gap_tb).max(text_x + 1.0);
+    let text_right = (lyric_x - gap_tb).max(text_x + 1.0);
     let text_w_avail = (text_right - text_x).max(1.0);
-    let text_h = (progress.y - main_top).max(1.0);
-    let cy = main_top + text_h * 0.5;
+    let text_h = progress.y.max(1.0);
+    let cy = text_h * 0.5;
     let title_h = (limits::TITLE_PX * 1.24 * s).max(1.0);
     let artist_h = (limits::ARTIST_PX * 1.24 * s).max(1.0);
     let title = RectF::new(text_x, cy - title_h, text_w_avail, title_h);
     let artist = RectF::new(text_x, cy, text_w_avail, artist_h);
 
-    // 歌词区
-    let (lyric_cur, lyric_next) = match form {
-        WidgetForm::Compact => (RectF::EMPTY, RectF::EMPTY),
-        WidgetForm::OneLine => (
-            RectF::new(pad, lyric_top, (w - pad * 2.0).max(1.0), 26.0 * s),
-            RectF::EMPTY,
-        ),
-        WidgetForm::TwoLine => (
-            RectF::new(
-                pad,
-                lyric_top + 2.0 * s,
-                (w - pad * 2.0).max(1.0),
-                24.0 * s,
-            ),
-            RectF::new(
-                pad,
-                lyric_top + 26.0 * s,
-                (w - pad * 2.0).max(1.0),
-                20.0 * s,
-            ),
-        ),
+    // 歌词行：双行压缩进条带（48px = 2 + 22 + 22 + 2 @100% DPI）。
+    // 行高按条带实际厚度自适应收缩，保证任何厚度下两行都不出条带。
+    let (lyric_cur, lyric_next) = if form == WidgetForm::Compact || lyric_w < 1.0 {
+        (RectF::EMPTY, RectF::EMPTY)
+    } else if form == WidgetForm::OneLine {
+        let line_h = limits::LYRIC_LINE_H * s;
+        let y = ((mh - line_h) * 0.5).max(0.0);
+        (RectF::new(lyric_x, y, lyric_w, line_h), RectF::EMPTY)
+    } else {
+        let pad_y = limits::LYRIC_PAD * s;
+        let line_h = (limits::LYRIC_LINE_H * s)
+            .min(((mh - pad_y * 2.0) * 0.5).max(1.0));
+        let top = ((mh - line_h * 2.0) * 0.5).max(0.0);
+        (
+            RectF::new(lyric_x, top, lyric_w, line_h),
+            RectF::new(lyric_x, top + line_h, lyric_w, line_h),
+        )
     };
 
     // 命中区：按钮本身就是 28×28（≥ HIT_MIN），封面可能只有 32（也 ≥ 28），
@@ -390,7 +372,7 @@ pub fn compute_full(
     let hit_min = limits::HIT_MIN * s;
     let hit_cover = cover.expanded_to(hit_min);
     // 进度条命中区：整宽，从「按钮命中区下沿 + 1」到主行底部（避免抢按钮的点击）
-    let main_bottom = main_top + mh;
+    let main_bottom = mh;
     let prog_hit_top = (btn_y + btn + 1.0)
         .max(progress.y - 1.0)
         .min((main_bottom - 2.0).max(0.0));
@@ -442,12 +424,23 @@ mod tests {
     }
 
     #[test]
-    fn lyric_forms_add_height() {
+    fn height_is_constant_across_all_forms() {
+        // v1.1 裁决：高度恒定 = 任务栏条带厚度，歌词开/关不变
+        for form in [WidgetForm::Compact, WidgetForm::OneLine, WidgetForm::TwoLine] {
+            for bar in [40i32, 48, 60] {
+                let l = compute(TaskbarEdge::Bottom, form, 1.0, bar);
+                assert_eq!(l.height, bar, "{form:?}@{bar}");
+            }
+        }
+    }
+
+    #[test]
+    fn lyric_forms_widen_by_fixed_160() {
         let compact = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         let one = compute(TaskbarEdge::Bottom, WidgetForm::OneLine, 1.0, 48);
         let two = compute(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48);
-        assert_eq!(one.height - compact.height, 26);
-        assert_eq!(two.height - compact.height, 46);
+        assert_eq!(one.width - compact.width, 160);
+        assert_eq!(two.width - compact.width, 160);
     }
 
     #[test]
@@ -533,15 +526,23 @@ mod tests {
                 // 进度条在主行内
                 assert!(l.progress.bottom() <= l.main_row.bottom() + 0.01);
 
-                // 歌词区在主行之外，且方向随任务栏方位变化
+                // v1.1：歌词区在条带内（文本区与上一首按钮之间），不出主行
                 if form != WidgetForm::Compact {
-                    if l.edge == TaskbarEdge::Bottom {
-                        // 底部任务栏：歌词区在上，主行贴客户区底边
-                        assert!(l.lyric_cur.y >= -0.01);
-                        assert!(l.lyric_cur.bottom() <= l.main_row.y + 0.01);
-                    } else {
-                        assert!(l.lyric_cur.y >= l.main_row.bottom() - 0.01);
-                        assert!(l.lyric_cur.bottom() <= l.height as f32 + 0.01);
+                    assert!(l.lyric_cur.w > 0.0, "{form:?} 歌词区必须有宽度");
+                    assert!(l.title.right() <= l.lyric_cur.x + 0.01, "歌词区必须在文本区右侧");
+                    assert!(
+                        l.lyric_cur.right() <= l.btn_prev.x - limits::TEXT_BTN_GAP * scale + 0.01,
+                        "歌词区必须在上一首按钮左侧"
+                    );
+                    assert!(l.lyric_cur.y >= l.main_row.y - 0.01);
+                    assert!(
+                        l.lyric_next.bottom() <= l.main_row.bottom() + 0.01,
+                        "歌词区不得超出任务栏条带（bottom = {} > {}）",
+                        l.lyric_next.bottom(),
+                        l.main_row.bottom()
+                    );
+                    if form == WidgetForm::OneLine {
+                        assert!(l.lyric_next.is_empty(), "单行形态不应有下一行");
                     }
                 } else {
                     assert!(l.lyric_cur.is_empty());
@@ -554,27 +555,33 @@ mod tests {
         }
     }
 
-    /// 底部任务栏：主行贴客户区底边（与任务栏条带重合），歌词区在上方。
+    /// v1.1：歌词开/关主行都从 0 开始、高度 = 条带厚度，歌词区压在条带内。
     #[test]
     fn bottom_edge_keeps_main_row_on_the_taskbar_strip() {
         let l = compute(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48);
-        assert_eq!(l.height, 94);
-        assert!((l.main_row.y - 46.0).abs() < 0.001, "main_row.y = {}", l.main_row.y);
-        assert!((l.main_row.bottom() - 94.0).abs() < 0.001);
-        assert!(l.cover.y >= 46.0, "封面必须落在任务栏条带内");
-        assert!(l.btn_toggle.y >= 46.0, "按钮必须落在任务栏条带内");
-        assert!(l.progress.y >= 46.0, "进度条必须落在任务栏条带内");
-        assert!((l.lyric_cur.y - 2.0).abs() < 0.001);
-        assert!((l.lyric_next.y - 26.0).abs() < 0.001);
+        assert_eq!(l.height, 48);
+        assert!(l.main_row.y.abs() < 0.001, "main_row.y = {}", l.main_row.y);
+        assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
+        assert!(l.cover.y >= 0.0 && l.cover.bottom() <= 48.0, "封面必须落在任务栏条带内");
+        assert!(l.btn_toggle.y >= 0.0 && l.btn_toggle.bottom() <= 48.0, "按钮必须落在任务栏条带内");
+        assert!(l.progress.y >= 0.0 && l.progress.bottom() <= 48.0, "进度条必须落在任务栏条带内");
+        // 双行压缩：48px = 2 + 22 + 22 + 2
+        assert!((l.lyric_cur.y - 2.0).abs() < 0.001, "lyric_cur.y = {}", l.lyric_cur.y);
+        assert!((l.lyric_cur.h - 22.0).abs() < 0.001);
+        assert!((l.lyric_next.y - 24.0).abs() < 0.001, "lyric_next.y = {}", l.lyric_next.y);
+        assert!((l.lyric_next.bottom() - 46.0).abs() < 0.001);
+        // 歌词区固定宽 160
+        assert!((l.lyric_cur.w - 160.0).abs() < 0.001, "lyric_cur.w = {}", l.lyric_cur.w);
     }
 
-    /// 顶部任务栏：主行贴客户区顶边，歌词区在下方。
+    /// 顶部任务栏：主行同样从 0 开始（歌词不再向桌面方向扩展）。
     #[test]
     fn top_edge_keeps_main_row_on_the_taskbar_strip() {
         let l = compute(TaskbarEdge::Top, WidgetForm::TwoLine, 1.0, 48);
-        assert!((l.main_row.y).abs() < 0.001);
+        assert!(l.main_row.y.abs() < 0.001);
         assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
-        assert!((l.lyric_cur.y - 50.0).abs() < 0.001);
+        assert!((l.lyric_cur.y - 2.0).abs() < 0.001);
+        assert!(l.lyric_next.bottom() <= 48.0, "歌词区不得超出条带");
     }
 
     /// 紧凑形态（无歌词）两种方位下主行都从 0 开始，高度 = 任务栏厚度。
@@ -609,5 +616,47 @@ mod tests {
         assert_eq!(LyricMode::from_config(false, false), LyricMode::Off);
         assert_eq!(LyricMode::from_config(true, true), LyricMode::OneLine);
         assert_eq!(LyricMode::from_config(true, false), LyricMode::TwoLine);
+    }
+
+    /// 歌词开关的 200ms 宽度过渡：中间宽度下歌词区与文本区仍然互不越界，
+    /// 且高度保持条带厚度不变（宽度动画取代旧的高度动画）。
+    #[test]
+    fn width_animation_intermediate_stays_inside_strip() {
+        for w_logical in [0.0f32, 20.0, 80.0, 120.0, 160.0] {
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48, 60.0, w_logical);
+            assert_eq!(l.height, 48, "宽度动画期间高度不得变化");
+            assert!(
+                l.title.right() <= l.lyric_cur.x + 0.01 || l.lyric_cur.is_empty(),
+                "歌词区展开期间不得压住文本区（w={w_logical}）"
+            );
+            assert!(
+                l.lyric_cur.right() <= l.btn_prev.x + 0.01,
+                "歌词区展开期间不得压住按钮（w={w_logical}）"
+            );
+            assert!(l.lyric_cur.bottom() <= 48.0);
+        }
+        // 起点 / 终点：0 = 完全收合（空矩形），160 = 展开到固定宽
+        let closed = compute_full(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48, 0.0, 0.0);
+        assert!(closed.lyric_cur.is_empty());
+        let open = compute_full(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48, 0.0, 160.0);
+        assert!((open.lyric_cur.w - 160.0).abs() < 0.001);
+    }
+
+    /// 歌词区位置：歌名/歌手区右侧、上一首按钮左侧，宽 160px（v1.1 验收口径）。
+    #[test]
+    fn lyric_area_sits_between_text_and_prev_button() {
+        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::TwoLine, 1.0, 48, 120.0);
+        assert!(l.lyric_cur.x >= l.artist.right() - 0.01, "歌词区必须在歌手区右侧");
+        assert!(l.lyric_cur.right() < l.btn_prev.x, "歌词区必须在上一首按钮左侧");
+        assert!((l.lyric_cur.w - 160.0).abs() < 0.001);
+        assert!((l.lyric_next.w - 160.0).abs() < 0.001);
+    }
+
+    /// 歌词关闭时歌词区完全收合，小组件回到不加长的基础宽度。
+    #[test]
+    fn off_form_has_no_lyric_rects_and_no_extra_width() {
+        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        assert!(l.lyric_cur.is_empty() && l.lyric_next.is_empty());
+        assert_eq!(l.width, 200);
     }
 }

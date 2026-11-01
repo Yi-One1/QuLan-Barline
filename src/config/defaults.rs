@@ -22,9 +22,13 @@ pub mod limits {
     pub const WIDGET_MAX_W: f32 = 340.0;
     /// 与托盘区左边缘的间距
     pub const TRAY_GAP: f32 = 8.0;
-    /// 歌词区单行 / 双行附加高度
-    pub const LYRIC_ONE_LINE_H: f32 = 26.0;
-    pub const LYRIC_TWO_LINE_H: f32 = 46.0;
+    /// 歌词区固定宽度（逻辑像素，v1.1 裁决：歌词区移入任务栏条带内、
+    /// 歌名歌手区与上一首按钮之间，小组件整体随之加长）
+    pub const LYRIC_W: f32 = 160.0;
+    /// 歌词区单行矩形高度（逻辑像素；条带 48px = 2 + 22 + 22 + 2 双行压缩）
+    pub const LYRIC_LINE_H: f32 = 22.0;
+    /// 歌词区上下边距（逻辑像素）
+    pub const LYRIC_PAD: f32 = 2.0;
     /// 命中区最小边长
     pub const HIT_MIN: f32 = 28.0;
     /// 双击判定窗口
@@ -66,8 +70,8 @@ pub mod limits {
     pub const TITLE_PX: f32 = 14.0;
     /// 歌手字号
     pub const ARTIST_PX: f32 = 11.0;
-    /// 歌词字号
-    pub const LYRIC_PX: f32 = 13.0;
+    /// 歌词字号（v1.1 双行压缩：两行都压进 48px 条带，字号由 13px 缩到约一半）
+    pub const LYRIC_PX: f32 = 7.0;
     /// HUD / 气泡字号
     pub const HUD_PX: f32 = 12.0;
     /// 进度条静止高度
