@@ -1588,6 +1588,9 @@ impl App {
         let step = self.config.volume.step.clamp(0.01, 0.2);
         let dir = if delta > 0 { 1.0 } else { -1.0 };
 
+        // v1.1.17（用户裁决）：会话音量暂禁用——config 加载与桥接层都已把
+        // scope 归一化为 System，此分支理论上不可达；实现保留（含 v1.1.16 的
+        // GUID/匹配修复与限流诊断），待根因查明后随「当前播放器」范围一并恢复。
         let current_player = self.config.volume.scope
             == crate::config::VolumeScope::CurrentPlayer;
         let next = if current_player {

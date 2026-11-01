@@ -286,10 +286,9 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
         </div>
         <div class="row">
           <div><div class="label" data-i18n="volume.scope">调节范围</div>
-            <div class="desc" data-i18n="volume.scope.desc">「当前播放器」需要播放器支持会话音量。</div></div>
-          <div class="right"><select id="volume-scope">
+            <div class="desc" data-i18n="volume.scope.desc">「当前播放器」暂不可用（缺陷待修，后续版本恢复），当前固定为系统主音量。</div></div>
+          <div class="right"><select id="volume-scope" disabled>
             <option value="system" data-i18n="volume.scope.system">系统主音量</option>
-            <option value="current_player" data-i18n="volume.scope.session">当前播放器</option>
           </select></div>
         </div>
         <div class="row">
@@ -407,8 +406,8 @@ const I18N = {
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
     "volume.wheel": "滚轮调节", "volume.wheel.desc": "仅指针悬停在小组件上时生效。",
-    "volume.scope": "调节范围", "volume.scope.desc": "「当前播放器」需要播放器支持会话音量。",
-    "volume.scope.system": "系统主音量", "volume.scope.session": "当前播放器",
+    "volume.scope": "调节范围", "volume.scope.desc": "「当前播放器」暂不可用（缺陷待修，后续版本恢复），当前固定为系统主音量。",
+    "volume.scope.system": "系统主音量",
     "volume.step": "每次步进", "volume.hud": "提示停留",
     "hotkeys.sub": "在任意前台应用下生效；点「录制」后按下组合键即可改绑。",
     "hotkeys.enabled": "启用全局快捷键", "hotkeys.list": "按键绑定",
@@ -450,8 +449,8 @@ const I18N = {
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
-    "volume.scope": "Scope", "volume.scope.desc": "Player-only needs session volume support.",
-    "volume.scope.system": "System", "volume.scope.session": "Current player",
+    "volume.scope": "Scope", "volume.scope.desc": "Player-only scope is unavailable for now (bug pending fix); fixed to system volume.",
+    "volume.scope.system": "System",
     "volume.step": "Step", "volume.hud": "HUD duration",
     "hotkeys.sub": "Works in any foreground app. Click Record, then press the combo.",
     "hotkeys.enabled": "Enable global hotkeys", "hotkeys.list": "Bindings",

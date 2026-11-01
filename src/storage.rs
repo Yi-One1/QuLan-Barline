@@ -95,6 +95,11 @@ pub fn init_from_config(config: &mut crate::config::Config) {
             crate::log_warn!("记录存储状态失败（不影响本次使用）：{e}");
         }
     }
+    // v1.1.17 修复：无条件对齐日志路径。此前只在「发生迁移」时搬迁日志，
+    // 而 logger 启动时永远在**默认根**打开文件——于是 active_data_dir 已经
+    // 是自定义目录的后续启动中，日志一直写在默认根（「打开数据目录」看到的
+    // 自定义目录里根本没有日志）。relocate 内部对同路径文件跳过，幂等安全。
+    crate::log::relocate(&new_root);
 }
 
 /// 删除 `root` 下除配置文件外的全部内容（用户在设置页明确选择后执行）。

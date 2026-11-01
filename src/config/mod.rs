@@ -251,6 +251,14 @@ impl Config {
                     cfg.lyrics.mode,
                     cfg.appearance.ui_scale
                 );
+                // v1.1.17（用户裁决）：会话音量（「当前播放器」范围）实测在
+                // 网易云/汽水/Edge 上均无法生效（连匹配环节都失败，根因见
+                // progress.md 待办），暂时禁用——旧配置里的 current_player
+                // 一律归一化为 System，滚轮永不触碰会话音量路径。
+                if cfg.volume.scope == VolumeScope::CurrentPlayer {
+                    crate::log_warn!("音量范围「当前播放器」已暂时禁用（功能缺陷待修），回退为系统主音量");
+                    cfg.volume.scope = VolumeScope::System;
+                }
                 if cfg.hotkeys.migrate() {
                     // 迁移结果要立刻落盘，否则下次启动又会判定为「旧配置」
                     if let Err(e) = cfg.save() {

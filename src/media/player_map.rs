@@ -60,6 +60,17 @@ pub const TABLE: &[(&str, &str, PlayerInfo)] = &[
         },
     ),
     (
+        // v1.1.17（问题 7）：实测汽水音乐的 SMTC AUMID 直接是**中文名「汽水音乐」**
+        // （日志：aumid=汽水音乐，process 为空）——上面的英文键全部匹配不到，
+        // 导致「未知播放器」+ pids=[]。进程名是 SodaMusic.exe（快照可查）。
+        "汽水音乐",
+        "sodamusic.exe",
+        PlayerInfo {
+            display_name: "汽水音乐",
+            process_name: "sodamusic.exe",
+        },
+    ),
+    (
         // v1.1.16（问题 6/7）：汽水音乐的真实进程名是 SodaMusic.exe（实测
         // D:\APP\汽水音乐\Soda Music\3.1.2\SodaMusic.exe，多进程），SMTC AUMID
         // 也不含 "qishui"——旧键匹配不到，导致「未知播放器」与音量/激活全部失联。

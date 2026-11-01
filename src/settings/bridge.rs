@@ -163,11 +163,9 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             true
         }
         "volume.scope" => {
-            let Some(s) = value.as_str() else { return false };
-            cfg.volume.scope = match s {
-                "current_player" | "Session" | "CurrentPlayer" => VolumeScope::CurrentPlayer,
-                _ => VolumeScope::System,
-            };
+            // v1.1.17（用户裁决）：会话音量暂禁用——「当前播放器」不再可设，
+            // 任何值一律归一化为系统主音量（与 Config::load 同口径）。
+            cfg.volume.scope = VolumeScope::System;
             true
         }
         "volume.step" => {

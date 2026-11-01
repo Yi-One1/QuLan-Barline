@@ -155,6 +155,19 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - 全部完成后:严过关全量回归(独立 worktree)+ 用户终验。
 - 问题 1(歌词移入小组件)**✅ 已验收**(v1.1.0→v1.1.4,遗留 a/b 与验收反馈全部闭环)。
 
+### 待办登记(2026-11-02 批次⑤验收反馈,用户裁决)
+
+**A. 会话音量(问题 6)——用户裁决:暂时禁用,以后有需要再改。登记如下供将来续修:**
+- 现象:v1.1.15/v1.1.16 两版在网易云/汽水/Edge(B站)上滚轮均无效。v1.1.16 运行日志(注意:日志实际写在默认根 `%LOCALAPPDATA%\Barline`,见 C 项 bug)显示**连网易云(process="cloudmusic.exe", 正在播放)也报「没有匹配的音频会话」**——失败发生在**音频会话枚举/匹配环节**,比 GUID 解析更靠前。
+- 已排除:会话 GUID 来源(已改 GetSessionIdentifier 尾段)、循环内 `?` 提前返回(已改 continue)、汽水映射(SodaMusic.exe 已入表)。
+- 未排查嫌疑:① `IMMDevice::Activate` 拿到的 `IAudioSessionManager2` 会话枚举是否为空(GetCount/GetSession 全失败被静默吞掉,枚举环节**无日志**);② `process_image_name`(QueryFullProcessImageNameW)对会话 pid 是否失败返回空串;③ 设备归属(网易云/Edge 是否走非默认 endpoint);④ CLSCTX/COM apartment 影响。
+- 续修入口:src/media/wasapi.rs `session_simple_volume`(枚举处补逐会话 log_info 诊断);src/app.rs on_wheel 的 CurrentPlayer 分支(实现完整保留);禁用点 = Config::load 归一化 + bridge "volume.scope" 强制 System + 设置页 select disabled。
+- 禁用落地(v1.1.17):设置页「调节范围」置灰固定系统主音量;旧配置 current_player 加载时归一化。
+
+**B. 汽水激活(问题 7)——v1.1.17 已修**:汽水 SMTC AUMID 实测就是中文名「汽水音乐」(日志 aumid=汽水音乐、process 为空),player_map 补中文键 → process_name=sodamusic.exe → 快照枚举 7 个进程 → 主窗口(pid 36160,窗口标题「汽水音乐」)激活。待用户验收。
+
+**C. 日志路径 bug——v1.1.17 已修**:logger 启动时永远在默认根打开日志,而 relocate 只在「发生迁移」时执行 → active_data_dir 已是自定义目录后,日志**永远留在默认根** `%LOCALAPPDATA%\Barline\barline.log`(数据目录里看不到),排查极坑。修复:init_from_config 末尾无条件 relocate(内部同路径幂等跳过)。
+
 ### 存量与可选(不阻塞)
 - QA 无真机证据项(M2 时代,勿视为通过):播控真实改状态/拖动跳转/封面激活前台/滚轮音量 HUD(进程外读 SMTC 被安全策略阻)、多显示器/DPI/四方位/自动隐藏等。
 - GitHub Release 发布(挂 deliverables zip)、LICENSE 版权人实名(现为 The Barline Authors 占位)、设置页标题栏明暗动态跟随、热键日志冗余清理。
