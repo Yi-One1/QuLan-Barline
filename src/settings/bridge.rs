@@ -60,6 +60,8 @@ pub fn state_json(cfg: &Config, version: &str, conflicts: &[(&str, u32)], log_di
             "version": version,
             "conflicts": conflicts,
             "logDir": log_dir,
+            // v1.1.5：当前生效的数据目录（storage.data_dir 为空时 = 默认根目录）
+            "dataDir": crate::platform::data_dir().to_string_lossy(),
         }
     })
     .to_string()
@@ -182,6 +184,19 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
         "general.widget_hidden" => {
             let Some(v) = value.as_bool() else { return false };
             cfg.general.widget_hidden = v;
+            true
+        }
+        // ---------------- 存储（v1.1.5 问题 3）----------------
+        // 浏览对话框 / 恢复默认按钮送来的路径。规范化（剥引号、去尾分隔符、
+        // 相对锚定）；等于默认根目录时存空串（配置干净，语义同默认）。
+        "storage.data_dir" => {
+            let Some(s) = value.as_str() else { return false };
+            let default_root = crate::platform::barline_dir();
+            match crate::storage::resolve_custom_dir(s, &default_root) {
+                Some(p) if p == default_root => cfg.storage.data_dir = String::new(),
+                Some(p) => cfg.storage.data_dir = p.to_string_lossy().to_string(),
+                None => cfg.storage.data_dir = String::new(),
+            }
             true
         }
         // ---------------- 快捷键 ----------------

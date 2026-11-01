@@ -165,6 +165,7 @@ impl Default for Config {
             hotkeys: HotkeyConfig::default(),
             general: GeneralConfig::default(),
             window: WindowStateConfig::default(),
+            storage: crate::config::StorageConfig::default(),
         }
     }
 }

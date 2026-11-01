@@ -253,7 +253,7 @@ unsafe fn web_message_text(args: &ICoreWebView2WebMessageReceivedEventArgs) -> O
 
 /// `%LOCALAPPDATA%\Barline\WebView2`（与配置文件同目录，便携版不污染系统）。
 fn user_data_dir() -> std::path::PathBuf {
-    let dir = crate::platform::barline_dir().join("WebView2");
+    let dir = crate::platform::data_dir().join("WebView2");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

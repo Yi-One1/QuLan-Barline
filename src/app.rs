@@ -270,6 +270,9 @@ impl App {
     /// 而 `Box` 一旦移动地址就变。生命周期由 `main` 通过 [`App::shutdown`] 收尾。
     pub fn bootstrap() -> windows::core::Result<*mut App> {
         let config = Config::load();
+        // ---- 数据目录（v1.1.5 问题 3）：必须在任何缓存 / 歌词模块使用之前。
+        // 自定义目录时把旧缓存 / 歌词目录迁过去（含日志搬迁）。
+        crate::storage::init_from_config(&config.storage.data_dir);
         let lang = Lang::from_serde(config.general.language);
         crate::log_info!(
             "启动：语言={:?} 歌词={}({:?}) 背景={:?}",
@@ -1158,7 +1161,7 @@ impl App {
     fn run_settings_action(&mut self, action: &str) {
         match action {
             "openLogDir" => {
-                let dir = crate::platform::barline_dir();
+                let dir = crate::platform::data_dir();
                 let w = to_wide(&dir.to_string_lossy());
                 // SAFETY: w 以 NUL 结尾且在本调用期间存活。
                 unsafe {
@@ -1171,7 +1174,54 @@ impl App {
                         windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
                     );
                 }
-                crate::log_info!("设置页：打开日志目录 {}", dir.display());
+                crate::log_info!("设置页：打开数据目录 {}", dir.display());
+            }
+            // v1.1.5 问题 3：选数据目录 → 存配置 → 重启后自动迁移生效
+            "browseStorageDir" => {
+                let parent = self.settings.hwnd().unwrap_or(self.msg_hwnd);
+                let (title, hint) = match self.lang {
+                    Lang::Zh => ("选择数据目录", "已保存数据目录，重启曲栏后生效，旧文件将自动迁移"),
+                    Lang::En => ("Choose data folder", "Data folder saved. Restart Barline to apply; old files will migrate automatically"),
+                };
+                match crate::platform::pick_folder(parent, title) {
+                    Some(p) => {
+                        let v = serde_json::json!(p.to_string_lossy().to_string());
+                        if crate::settings::bridge::apply_set(
+                            &mut self.config,
+                            "storage.data_dir",
+                            &v,
+                        ) {
+                            if let Err(e) = self.config.save() {
+                                crate::log_err!("保存数据目录配置失败：{e}");
+                            }
+                            let toast = crate::settings::bridge::toast_json("info", hint);
+                            self.settings.push(&toast);
+                            let state = self.settings_state_json();
+                            self.settings.push(&state);
+                            crate::log_info!("数据目录已改为 {}", p.display());
+                        }
+                    }
+                    None => crate::log_debug!("设置页：取消选择数据目录"),
+                }
+            }
+            "resetStorageDir" => {
+                let hint = match self.lang {
+                    Lang::Zh => "已恢复默认数据目录，重启曲栏后生效",
+                    Lang::En => "Data folder reset to default. Restart Barline to apply",
+                };
+                if crate::settings::bridge::apply_set(
+                    &mut self.config,
+                    "storage.data_dir",
+                    &serde_json::json!(""),
+                ) {
+                    if let Err(e) = self.config.save() {
+                        crate::log_err!("保存数据目录配置失败：{e}");
+                    }
+                    let toast = crate::settings::bridge::toast_json("info", hint);
+                    self.settings.push(&toast);
+                    let state = self.settings_state_json();
+                    self.settings.push(&state);
+                }
             }
             "openLrclib" => {
                 let w = to_wide("https://lrclib.net");
@@ -1203,7 +1253,7 @@ impl App {
             .iter()
             .map(|c| (crate::settings::bridge::action_name(c.action), c.code))
             .collect();
-        let log_dir = crate::platform::barline_dir().to_string_lossy().to_string();
+        let log_dir = crate::platform::data_dir().to_string_lossy().to_string();
         crate::settings::bridge::state_json(
             &self.config,
             env!("CARGO_PKG_VERSION"),

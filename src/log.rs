@@ -50,7 +50,8 @@ struct Logger {
     file: Mutex<Option<BufWriter<File>>>,
     /// 当前文件已写字节数，用于轮转判断。
     written: AtomicU64,
-    path: PathBuf,
+    /// 当前日志路径。`Mutex`：支持启动后期数据目录迁移时换路径（v1.1.5）。
+    path: Mutex<PathBuf>,
     min_level: Level,
 }
 
@@ -91,7 +92,7 @@ fn install(path: PathBuf) {
     let _ = LOGGER.set(Logger {
         file: Mutex::new(file),
         written: AtomicU64::new(size),
-        path,
+        path: Mutex::new(path),
         min_level,
     });
 
@@ -175,16 +176,66 @@ fn rotate_live(logger: &Logger) {
             let _ = writer.flush();
         }
     }
-    rotate_if_needed(&logger.path);
+    let path = logger.path.lock().map(|p| p.clone()).unwrap_or_default();
+    rotate_if_needed(&path);
     if let Ok(f) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&logger.path)
+        .open(&path)
     {
         if let Ok(mut guard) = logger.file.lock() {
             *guard = Some(BufWriter::with_capacity(16 * 1024, f));
         }
         logger.written.store(0, Ordering::Relaxed);
+    }
+}
+
+/// 数据目录迁移：把日志（含轮转历史）搬到新目录并从那里继续写（v1.1.5）。
+///
+/// **必须先关写句柄再搬**——Windows 不允许改名打开中的文件。搬迁用
+/// [`crate::storage::move_item`]：rename 优先，跨卷 copy 后旧文件改名
+/// `.old` 保留，绝不删除。任何失败都不阻塞启动（日志留在原地继续写旧路径）。
+pub fn relocate(new_dir: &Path) {
+    let Some(logger) = LOGGER.get() else {
+        return;
+    };
+    // 1) 关写句柄
+    if let Ok(mut guard) = logger.file.lock() {
+        if let Some(mut writer) = guard.take() {
+            use std::io::Write as _;
+            let _ = writer.flush();
+        }
+    }
+    // 2) 搬当前日志 + 轮转历史
+    let old_dir = logger
+        .path
+        .lock()
+        .map(|p| p.parent().map(Path::to_path_buf).unwrap_or_default())
+        .unwrap_or_default();
+    let _ = fs::create_dir_all(new_dir);
+    for name in ["barline.log", "barline.1.log", "barline.2.log", "barline.3.log"] {
+        let src = old_dir.join(name);
+        if src == new_dir.join(name) {
+            continue;
+        }
+        match crate::storage::move_item(&src, &new_dir.join(name)) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("日志搬迁失败 {name}：{e}");
+            }
+        }
+    }
+    // 3) 换路径并重开
+    let new_path = new_dir.join("barline.log");
+    if let Ok(mut p) = logger.path.lock() {
+        *p = new_path.clone();
+    }
+    if let Ok(f) = OpenOptions::new().create(true).append(true).open(&new_path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if let Ok(mut guard) = logger.file.lock() {
+            *guard = Some(BufWriter::with_capacity(16 * 1024, f));
+        }
+        logger.written.store(len, Ordering::Relaxed);
     }
 }
 

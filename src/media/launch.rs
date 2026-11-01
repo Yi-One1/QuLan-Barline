@@ -441,7 +441,7 @@ pub fn open_url(url: &str) -> bool {
 }
 /// 打开本地日志目录（设置页 / 关于页用）。
 pub fn open_log_dir() -> bool {
-    let dir = crate::platform::barline_dir();
+    let dir = crate::platform::data_dir();
     open_url(&dir.to_string_lossy())
 }
 

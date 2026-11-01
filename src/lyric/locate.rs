@@ -100,7 +100,7 @@ pub fn search_dirs(user_dirs: &[String]) -> Vec<PathBuf> {
             out.push(p);
         }
     }
-    let app = crate::platform::barline_dir().join("lyrics");
+    let app = crate::platform::data_dir().join("lyrics");
     if app.is_dir() {
         out.push(app);
     }

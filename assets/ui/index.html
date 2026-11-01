@@ -324,6 +324,15 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
             <div class="desc" data-i18n="general.widget.desc">与托盘菜单里的「显示/隐藏小组件」同步。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="widget-visible"><span class="track"></span><span class="knob"></span></label></div>
         </div>
+        <div class="row">
+          <div><div class="label" data-i18n="storage.dir">数据目录</div>
+            <div class="desc" data-i18n="storage.dir.desc">歌词缓存与应用文件的存放位置；更改后重启曲栏生效，旧文件将自动迁移（配置文件固定不动）。</div>
+            <div class="desc" id="storage-dir" style="user-select:text">—</div></div>
+          <div class="right">
+            <button class="btn" id="storage-browse" data-i18n="storage.browse">更改…</button>
+            <button class="btn" id="storage-reset" data-i18n="storage.reset">恢复默认</button>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -333,7 +342,7 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
       <p class="sub" data-i18n="about.sub">曲栏 Barline —— Windows 11 任务栏媒体播控小组件。</p>
       <div class="card">
         <div class="about-line"><span class="k" data-i18n="about.version">版本</span><span id="about-version">—</span></div>
-        <div class="about-line"><span class="k" data-i18n="about.logdir">日志目录</span><span class="link" id="open-logdir">—</span></div>
+        <div class="about-line"><span class="k" data-i18n="about.logdir">数据目录</span><span class="link" id="open-logdir">—</span></div>
         <div class="about-line"><span class="k" data-i18n="about.lyrics">歌词来源</span><span class="link" id="open-lrclib">lrclib.net</span></div>
         <div class="about-line"><span class="k" data-i18n="about.license">开源许可</span><span>MIT License</span></div>
         <div class="about-line"><span class="k" data-i18n="about.thanks">致谢</span><span>Windows API · Direct2D · WebView2 · lrclib</span></div>
@@ -362,6 +371,8 @@ const I18N = {
     "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件收合到任务栏高度。",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
     "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
+    "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启曲栏生效，旧文件将自动迁移（配置文件固定不动）。",
+    "storage.browse": "更改…", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时向 lrclib.net 查询。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
@@ -382,7 +393,7 @@ const I18N = {
     "general.language": "界面语言", "general.lang.system": "跟随系统",
     "general.widget": "显示小组件", "general.widget.desc": "与托盘菜单里的「显示/隐藏小组件」同步。",
     "about.sub": "曲栏 Barline —— Windows 11 任务栏媒体播控小组件。",
-    "about.version": "版本", "about.logdir": "日志目录", "about.lyrics": "歌词来源",
+    "about.version": "版本", "about.logdir": "数据目录", "about.lyrics": "歌词来源",
     "about.license": "开源许可", "about.thanks": "致谢",
     "toast.saved": "已应用"
   },
@@ -400,6 +411,8 @@ const I18N = {
     "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off collapses the widget to the taskbar height.",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
     "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
+    "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Changes apply after restart and old files migrate automatically (config stays put).",
+    "storage.browse": "Change…", "storage.reset": "Reset", "storage.pending": "applies after restart",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Query lrclib.net when no local file exists.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
@@ -420,7 +433,7 @@ const I18N = {
     "general.language": "Language", "general.lang.system": "System",
     "general.widget": "Show widget", "general.widget.desc": "Synced with the tray menu item.",
     "about.sub": "Barline — a Windows 11 taskbar media widget.",
-    "about.version": "Version", "about.logdir": "Log folder", "about.lyrics": "Lyrics",
+    "about.version": "Version", "about.logdir": "Data folder", "about.lyrics": "Lyrics",
     "about.license": "License", "about.thanks": "Built with",
     "toast.saved": "Applied"
   }
@@ -528,6 +541,14 @@ function render() {
   document.getElementById("autostart").checked = c.general.autostart;
   document.getElementById("language").value = c.general.language;
   document.getElementById("widget-visible").checked = !c.general.widget_hidden;
+
+  // 存储（v1.1.5）：显示当前生效目录 + 已配置的自定义目录
+  const configured = (c.storage && c.storage.data_dir) ? c.storage.data_dir : "";
+  const effective = state.dataDir || configured;
+  const el = document.getElementById("storage-dir");
+  el.textContent = configured && configured !== effective
+    ? `${effective}（${t("storage.pending")}：${configured}）`
+    : effective;
 
   // 关于
   document.getElementById("about-version").textContent = state.version;
@@ -680,6 +701,8 @@ document.getElementById("dir-add").addEventListener("click", () => {
 
 document.getElementById("hotkeys-reset").addEventListener("click", () => set("hotkeys.reset", true));
 document.getElementById("open-logdir").addEventListener("click", () => post({ type: "action", payload: "openLogDir" }));
+document.getElementById("storage-browse").addEventListener("click", () => post({ type: "action", payload: "browseStorageDir" }));
+document.getElementById("storage-reset").addEventListener("click", () => post({ type: "action", payload: "resetStorageDir" }));
 document.getElementById("open-lrclib").addEventListener("click", () => post({ type: "action", payload: "openLrclib" }));
 
 /* ---------------- 消息接收 ---------------- */

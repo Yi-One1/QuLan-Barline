@@ -34,6 +34,7 @@ mod media;
 mod platform;
 mod render;
 mod settings;
+mod storage;
 mod taskbar;
 mod ui;
 

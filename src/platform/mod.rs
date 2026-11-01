@@ -42,9 +42,56 @@ pub fn local_app_data_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// `%LOCALAPPDATA%\Barline`。日志、配置、歌词缓存都在这里。
+/// `%LOCALAPPDATA%\Barline`。**默认根目录**：config.json 永远在这里（用户约定：
+/// 配置文件不随数据目录迁移），迁移源也以它为准。
 pub fn barline_dir() -> PathBuf {
     local_app_data_dir().join("Barline")
+}
+
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// 设置生效的数据目录（v1.1.5 问题 3）。**只在启动早期调用一次**
+/// （`App::bootstrap` 里 `Config::load` 之后、任何缓存/歌词模块使用之前）。
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+/// 当前生效的数据目录：日志、歌词缓存、应用歌词目录、WebView2 数据的根。
+/// 未初始化（测试 / 极早启动日志）时退化为 [`barline_dir`]。
+pub fn data_dir() -> PathBuf {
+    DATA_DIR.get().cloned().unwrap_or_else(barline_dir)
+}
+
+/// 目录选择对话框（v1.1.5 问题 3；IFileOpenDialog，FOS_PICKFOLDERS）。
+///
+/// 用户取消 / COM 失败一律 `None`（调用方静默忽略即可）。成功返回绝对路径。
+pub fn pick_folder(parent: windows::Win32::Foundation::HWND, title: &str) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, IFileOpenDialog, SIGDN_FILESYSPATH,
+    };
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let _ = dialog.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        if !title.is_empty() {
+            let _ = dialog.SetTitle(&windows::core::HSTRING::from(title));
+        }
+        // Show 返回 Err = 用户取消（HRESULT_FROM_WIN32(ERROR_CANCELLED)）或失败
+        if dialog.Show(Some(parent)).is_err() {
+            return None;
+        }
+        let item = dialog.GetResult().ok()?;
+        let pwstr = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = pwstr_to_string(pwstr);
+        CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
+        let p = PathBuf::from(s);
+        if p.as_os_str().is_empty() {
+            None
+        } else {
+            Some(p)
+        }
+    }
 }
 
 /// 系统的「应用模式」明暗设置（HKCU\...\Themes\Personalize\AppsUseLightTheme）。

@@ -103,7 +103,7 @@ fn closed_sender() -> std::sync::mpsc::Sender<LyricRequest> {
 /// 线程主循环。
 fn run(sink: EventSink<AppEvent>, rx: Receiver<LyricRequest>) {
     crate::log_info!("歌词线程启动");
-    let mut cache = Cache::new(crate::platform::barline_dir().join("lyrics-cache"));
+    let mut cache = Cache::new(crate::platform::data_dir().join("lyrics-cache"));
     let mut pending: Option<Retry> = None;
 
     loop {

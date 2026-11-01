@@ -1,6 +1,7 @@
 //! 配置持久化（`ARCHITECTURE.md` §7.5 / §14.1）。
 //!
-//! - 路径：`%LOCALAPPDATA%\Barline\config.json`（`SHGetKnownFolderPath`，不用环境变量）
+//! - 路径：`%LOCALAPPDATA%\Barline\config.json`（`SHGetKnownFolderPath`，不用环境变量；
+//!   **v1.1.5 起无论数据目录迁移到哪里，config.json 都固定在这里**）
 //! - 格式：单行压缩 JSON（约 2 KB）
 //! - 读：不存在 → 默认值并写盘；解析失败 → 备份为 `config.bad.<ts>.json`，用默认值并写盘
 //! - 写：先写 `config.json.tmp`，再 `rename` 覆盖（Windows 上 Rust 的 `fs::rename`
@@ -158,6 +159,16 @@ pub struct WindowStateConfig {
     pub lyrics_two_line: bool,
 }
 
+/// 存储配置（v1.1.5 问题 3）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// 自定义数据目录（绝对路径推荐；空 = 默认 `%LOCALAPPDATA%\Barline`）。
+    /// `config.json` 本身不受影响，永远留在默认根目录；缓存/日志在
+    /// 下次启动时自动迁移过去（`storage::init_from_config`）。
+    pub data_dir: String,
+}
+
 /// 全量配置。`#[serde(default)]` 保证缺字段 / 新增字段时都能正常反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -170,6 +181,8 @@ pub struct Config {
     pub hotkeys: HotkeyConfig,
     pub general: GeneralConfig,
     pub window: WindowStateConfig,
+    /// v1.1.5：存储位置
+    pub storage: StorageConfig,
 }
 
 /// `%LOCALAPPDATA%\Barline\config.json`
