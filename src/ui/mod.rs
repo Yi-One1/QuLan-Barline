@@ -3,6 +3,7 @@
 pub mod hit;
 pub mod interaction;
 pub mod menu;
+pub mod tray;
 pub mod widget_wnd;
 
 use windows::core::Result;

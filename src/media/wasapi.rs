@@ -70,6 +70,19 @@ pub fn set_system_mute(mute: bool) -> bool {
     unsafe { vol.SetMute(mute, core::ptr::null()) }.is_ok()
 }
 
+/// 切换系统静音，返回切换后的状态（拿不到设备时返回 `false`）。
+pub fn toggle_system_mute() -> bool {
+    let cur = system_muted().unwrap_or(false);
+    let next = !cur;
+    if set_system_mute(next) {
+        crate::log_info!("系统静音 → {}", if next { "开" } else { "关" });
+        next
+    } else {
+        crate::log_warn!("切换静音失败（可能没有默认渲染设备）");
+        cur
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// 音量钳位逻辑（不触碰真实设备，保证单测在无音频设备的环境也能跑）。

@@ -112,8 +112,9 @@ pub struct VolumeConfig {
     pub hud_ms: u32,
 }
 
-/// 热键（6 组）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 热键（6 组）。全部字段都是 `Copy`，整体也 `Copy`——注册时要同时借用
+/// `config.hotkeys` 与 `&mut app.hotkeys`，值语义最省事。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,

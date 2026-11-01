@@ -73,13 +73,17 @@ impl LyricService {
         }
     }
 
-    /// 通知退出并等待（最多由 join 决定）。
+    /// 通知退出。
+    ///
+    /// **刻意不 `join`**：歌词线程可能正卡在一次最长 25 秒的网络请求里
+    /// （`net::TOTAL_BUDGET_MS`），等它会把「点退出 → 进程消失」拖成 25 秒。
+    /// 断开命令通道后线程会在下一次 `recv_timeout` 返回 Disconnected 时自行退出；
+    /// 即使它晚几毫秒才醒，进程也已经在退出了，OS 会回收——detach 是安全的
+    /// （`EventSink::send` 在接收端销毁后只是静默失败，不会 panic）。
     pub fn shutdown(&mut self) {
-        // 用 channel 断开让线程自然退出：drop 发送端即可
-        if let Some(handle) = self.handle.take() {
-            drop(std::mem::replace(&mut self.tx, closed_sender()));
-            let _ = handle.join();
-        }
+        self.tx = closed_sender();
+        // drop JoinHandle = detach
+        let _ = self.handle.take();
     }
 }
 

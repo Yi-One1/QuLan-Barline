@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><title>M4 lrclib 验收</title></head>
+<body style="background:#101014;color:#ddd;font-family:Segoe UI">
+<h2>lrclib 在线歌词验收（请勿关闭）</h2>
+<audio id="a" src="barline_demo.wav" autoplay loop controls></audio>
+<script>
+const a = document.getElementById('a');
+if ('mediaSession' in navigator) {
+  navigator.mediaSession.metadata = new MediaMetadata({title: "Yellow", artist: "Coldplay", album: 'Parachutes'});
+}
+a.play().catch(e => document.title = 'blocked: ' + e);
+</script></body></html>

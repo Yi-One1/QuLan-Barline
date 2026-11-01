@@ -54,15 +54,37 @@ impl LyricProvider for LrclibProvider {
 
         let url = build_url(t);
         crate::log_info!("请求 lrclib：{url}");
-        let resp = net::get(&url, USER_AGENT).map_err(|e| match e {
+        match self.fetch_once(&url) {
+            // 超时 / 5xx：**立刻**重试一次（总预算 12s × 2 = 24s ≤ 25s）。
+            // 为什么不用 service 的退避（5s/15s/60s）：那个是给"整首查不到"用的，
+            // 而这里只是"这一次慢了"，等 5s 再试等于白白多等 5s。
+            Err(ProviderError::Network(e)) => {
+                crate::log_warn!("lrclib 首次失败（{e}），立刻重试一次");
+                self.fetch_once(&url)
+            }
+            other => other,
+        }
+    }
+}
+
+impl LrclibProvider {
+    /// 发一次请求并计时（日志里带 HTTP 状态码、字节数、耗时，便于验收）。
+    fn fetch_once(&self, url: &str) -> Result<Lyrics, ProviderError> {
+        let t0 = std::time::Instant::now();
+        let resp = net::get(url, USER_AGENT).map_err(|e| match e {
             NetError::Transport(s) => ProviderError::Network(s),
             NetError::BadRequest(s) => ProviderError::Parse(s),
         })?;
-
+        crate::log_info!(
+            "lrclib 响应：HTTP {} / {} 字节 / {:.1}s",
+            resp.status,
+            resp.bytes,
+            t0.elapsed().as_secs_f32()
+        );
         match resp.status {
             200 => parse_body(&resp.body),
             404 => Err(ProviderError::NotFound),
-            // 5xx 与其它 4xx 一律按网络失败重试（可能是限流 / 临时故障）
+            // 5xx 与其它 4xx 一律按网络失败处理（可能是限流 / 临时故障）
             s => Err(ProviderError::Network(format!("HTTP {s}"))),
         }
     }

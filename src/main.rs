@@ -26,6 +26,7 @@
 mod app;
 mod config;
 mod event;
+mod hotkey;
 mod i18n;
 mod log;
 mod lyric;

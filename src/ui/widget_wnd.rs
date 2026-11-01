@@ -370,6 +370,14 @@ unsafe extern "system" fn msg_proc(
             }
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY => {
+            let app = app_ptr(hwnd);
+            if !app.is_null() {
+                // SAFETY: 同 WM_TIMER；热键消息由 RegisterHotKey 投递到本窗口所在线程。
+                unsafe { (*app).on_hotkey(wparam.0) };
+            }
+            LRESULT(0)
+        }
         windows::Win32::UI::WindowsAndMessaging::WM_DESTROY => {
             // SAFETY: 标准的退出消息泵写法。
             unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };

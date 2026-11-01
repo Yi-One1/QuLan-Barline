@@ -17,13 +17,45 @@ use windows::Win32::Networking::WinHttp::{
 
 use crate::platform::wide::to_wide;
 
-/// 连接 / 发送 / 接收超时（毫秒）。`TASKS.md` T11 要求 3000/3000/3000/5000。
-const TIMEOUT_RESOLVE: i32 = 3_000;
-const TIMEOUT_CONNECT: i32 = 3_000;
-const TIMEOUT_SEND: i32 = 3_000;
-const TIMEOUT_RECV: i32 = 5_000;
+/// 一次 GET 的四段超时（毫秒）。
+///
+/// **必须分开设**：`WinHttpSetTimeouts` 的 resolve / connect / send / receive 是四个
+/// 独立的预算，用一个值卡死会出现「域名解析慢一点就整条链路失败」。
+///
+/// 实测 lrclib.net 从本机访问：TCP 连上很快，但**响应体要 6.6 秒才回来**
+/// （`GET /api/get` 实测 6.64s，`/api/search` 12.0s）。原来 receive 只给 5s，
+/// 等于每次都自己掐断，表现成"网络失败"——这是本轮修的 P1 缺陷。
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub resolve: i32,
+    pub connect: i32,
+    pub send: i32,
+    pub receive: i32,
+}
+
+/// `/api/get`（单曲精确查询）：实测 6.6s，给到 12s。
+pub const TIMEOUT_GET: Timeouts = Timeouts {
+    resolve: 5_000,
+    connect: 5_000,
+    send: 5_000,
+    receive: 12_000,
+};
+
+/// `/api/search`（模糊搜索）：实测 12s，给到 15s。
+pub const TIMEOUT_SEARCH: Timeouts = Timeouts {
+    resolve: 5_000,
+    connect: 5_000,
+    send: 5_000,
+    receive: 15_000,
+};
 /// 单次响应体上限：歌词 JSON 最大也就几十 KB，1 MB 是安全阀。
 const MAX_BODY: usize = 1024 * 1024;
+/// 一次请求的**总**预算（毫秒）。
+///
+/// `WinHttpSetTimeouts` 的 receive 是「单次接收操作」的超时，不是总时长：
+/// 实测 lrclib 一个 404 也能拖 22.4s（数据一点点滴出来，每次都小于 12s）。
+/// 所以这里再加一道总闸，超过就主动放弃——否则歌词线程会被一个请求卡住半分钟。
+const TOTAL_BUDGET_MS: u128 = 25_000;
 
 /// 网络错误分类。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +79,8 @@ impl NetError {
 pub struct Response {
     pub status: u32,
     pub body: String,
+    /// 响应体字节数（诊断 / 日志用）
+    pub bytes: usize,
 }
 
 /// WinHTTP 句柄的 RAII 包装。
@@ -64,8 +98,13 @@ impl Drop for Handle {
     }
 }
 
-/// 发一个 GET 请求。`url` 必须是 `https://host/path?query` 形式。
+/// 发一个 GET 请求（用 `/api/get` 的超时）。
 pub fn get(url: &str, user_agent: &str) -> Result<Response, NetError> {
+    get_with(url, user_agent, TIMEOUT_GET)
+}
+
+/// 发一个 GET 请求。`url` 必须是 `https://host/path?query` 形式。
+pub fn get_with(url: &str, user_agent: &str, t: Timeouts) -> Result<Response, NetError> {
     let (host, port, path, secure) = split_url(url)?;
 
     let agent = to_wide(user_agent);
@@ -83,15 +122,9 @@ pub fn get(url: &str, user_agent: &str) -> Result<Response, NetError> {
     if session.0.is_null() {
         return Err(NetError::Transport("WinHttpOpen 失败".into()));
     }
-    // SAFETY: session 是刚创建的有效会话句柄。
+    // SAFETY: session 是刚创建的有效会话句柄；四个超时值都是正的有限毫秒数。
     unsafe {
-        let _ = WinHttpSetTimeouts(
-            session.0,
-            TIMEOUT_RESOLVE,
-            TIMEOUT_CONNECT,
-            TIMEOUT_SEND,
-            TIMEOUT_RECV,
-        );
+        let _ = WinHttpSetTimeouts(session.0, t.resolve, t.connect, t.send, t.receive);
     }
 
     let host_w = to_wide(&host);
@@ -131,7 +164,8 @@ pub fn get(url: &str, user_agent: &str) -> Result<Response, NetError> {
 
     let status = query_status(request.0).unwrap_or(0);
     let body = read_body(request.0)?;
-    Ok(Response { status, body })
+    let bytes = body.len();
+    Ok(Response { status, body, bytes })
 }
 
 /// 读 HTTP 状态码。
@@ -154,9 +188,17 @@ fn query_status(request: *mut core::ffi::c_void) -> Option<u32> {
 
 /// 循环读响应体直到没有数据。
 fn read_body(request: *mut core::ffi::c_void) -> Result<String, NetError> {
+    let started = std::time::Instant::now();
     let mut out: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = vec![0u8; 8192];
     loop {
+        if started.elapsed().as_millis() > TOTAL_BUDGET_MS {
+            return Err(NetError::Transport(format!(
+                "总耗时超过 {}s 预算（已收 {} 字节）",
+                TOTAL_BUDGET_MS / 1000,
+                out.len()
+            )));
+        }
         let mut avail: u32 = 0;
         // SAFETY: avail 是本地变量；request 有效。
         unsafe {
@@ -333,6 +375,29 @@ mod tests {
             .expect("请求失败");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("syncedLyrics"), "body = {}", r.body);
+    }
+
+    /// **需要联网**：验证真实 lrclib 的端到端耗时。
+    ///
+    /// 手动跑：`cargo test lrclib_live -- --ignored --nocapture`
+    /// （默认 `#[ignore]`，不让 CI / 常规 `cargo test` 依赖外网）
+    #[test]
+    #[ignore = "需要联网：手动跑 cargo test lrclib_live -- --ignored --nocapture"]
+    fn lrclib_live_get_returns_synced_lyrics() {
+        let t0 = std::time::Instant::now();
+        let r = get(
+            "https://lrclib.net/api/get?artist_name=Coldplay&track_name=Yellow",
+            "Barline/0.0.1 (https://github.com/Yi-One1/QuLan-Barline-Next)",
+        )
+        .expect("请求失败");
+        eprintln!(
+            "lrclib /api/get → HTTP {} / {} 字节 / {:.1}s",
+            r.status,
+            r.bytes,
+            t0.elapsed().as_secs_f32()
+        );
+        assert_eq!(r.status, 200, "body = {}", &r.body[..r.body.len().min(200)]);
+        assert!(r.body.contains("syncedLyrics"));
     }
 
     #[test]

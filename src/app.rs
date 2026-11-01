@@ -31,7 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{Config, LyricModeSerde};
-use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, WidgetInput};
+use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, TrayCommand, WidgetInput};
 use crate::i18n::{self, Lang};
 use crate::lyric::service::LyricService;
 use crate::lyric::{LyricDraw, LyricStatus, LyricView};
@@ -184,6 +184,10 @@ pub struct App {
     rx: Receiver<AppEvent>,
     msg_hwnd: HWND,
     widget: Option<TaskbarHost>,
+    /// 托盘图标（T14）。`None` 表示创建失败（不影响小组件）
+    tray: Option<crate::ui::tray::Tray>,
+    /// 全局快捷键（T15）
+    hotkeys: crate::hotkey::Hotkeys,
     renderer: Option<Renderer>,
     media: Option<MediaService>,
     lyric: Option<LyricService>,
@@ -310,6 +314,8 @@ impl App {
             rx,
             msg_hwnd,
             widget,
+            tray: None,
+            hotkeys: crate::hotkey::Hotkeys::default(),
             renderer,
             media: None,
             lyric: None,
@@ -332,12 +338,25 @@ impl App {
 
         let ptr = Box::into_raw(app);
 
-        // 绑定 App* 到两个窗口的 GWLP_USERDATA
+        // 托盘图标（T14）：失败只记日志，不影响小组件
+        unsafe {
+            match crate::ui::tray::Tray::install(hinstance, 0) {
+                Ok(t) => {
+                    (*ptr).tray = Some(t);
+                }
+                Err(e) => crate::log_err!("托盘窗口创建失败：{e}"),
+            }
+        }
+
+        // 绑定 App* 到三个窗口的 GWLP_USERDATA
         crate::ui::widget_wnd::bind_app(msg_hwnd, ptr);
         // SAFETY: ptr 由上一行的 Box::into_raw 产生，此刻还没有第二个持有者；
         // 只读地借用其中的 widget 字段（`as_ref` 不移动、不释放）。
         if let Some(w) = unsafe { (*ptr).widget.as_ref() } {
             crate::ui::widget_wnd::bind_app(w.hwnd(), ptr);
+        }
+        if let Some(t) = unsafe { (*ptr).tray.as_ref() } {
+            crate::ui::widget_wnd::bind_app(t.hwnd(), ptr);
         }
 
         // 启动媒体 / 歌词线程（MTA / 普通线程）。失败不阻塞启动。
@@ -346,6 +365,11 @@ impl App {
         unsafe {
             (*ptr).media = MediaService::spawn(sink.clone());
             (*ptr).lyric = LyricService::spawn(sink);
+            if let Some(t) = (*ptr).tray.as_mut() {
+                t.add((*ptr).lang);
+            }
+            let cfg = (*ptr).config.hotkeys;
+            (*ptr).hotkeys.register_all((*ptr).msg_hwnd, &cfg);
             (*ptr).relayout();
         }
 
@@ -371,6 +395,7 @@ impl App {
         if let Some(lyric) = app.lyric.as_mut() {
             lyric.shutdown();
         }
+        app.hotkeys.unregister_all(app.msg_hwnd);
         if let Some(sampler) = app.sampler.as_mut() {
             sampler.shutdown();
         }
@@ -467,6 +492,10 @@ impl App {
                 self.geometry = Some(g);
             }
         }
+        // 托盘图标在 Explorer 重启后会消失，必须重新 NIM_ADD（T14 第 4 条）
+        if let Some(t) = self.tray.as_mut() {
+            t.add(self.lang);
+        }
         self.relayout();
         self.ensure_on_top();
     }
@@ -477,6 +506,41 @@ impl App {
         self.geometry = None;
         self.last_coverage = None;
         self.relayout();
+    }
+
+    /// `WM_HOTKEY`：全局快捷键按下。
+    pub fn on_hotkey(&mut self, wparam: usize) {
+        let Some(action) = crate::hotkey::action_of_wparam(wparam) else {
+            return;
+        };
+        crate::log_info!("热键触发：{action:?}");
+        let effects = self.reduce(AppEvent::Hotkey(action));
+        self.apply(effects);
+    }
+
+    /// 托盘图标的回调消息（`WM_BARLINE_TRAY`）。
+    ///
+    /// 右键抬起 → 弹菜单；左键双击 → 打开设置（PRD P0-12）。
+    pub fn on_tray_message(&mut self, lparam: LPARAM) -> Option<LRESULT> {
+        if crate::ui::tray::mouse_event_of(lparam) == 0 {
+            return Some(LRESULT(0));
+        }
+        if crate::ui::tray::is_right_up(lparam) {
+            crate::log_info!("托盘回调：右键抬起，弹菜单");
+            let cmd = self
+                .tray
+                .as_ref()
+                .and_then(|t| t.show_menu(self.lang, self.config.general.widget_hidden));
+            if let Some(cmd) = cmd {
+                let effects = self.reduce(AppEvent::TrayCommand(cmd));
+                self.apply(effects);
+            }
+        } else if crate::ui::tray::is_double_click(lparam) {
+            crate::log_info!("托盘图标双击 → 打开设置");
+            let effects = self.reduce(AppEvent::TrayCommand(TrayCommand::OpenSettings));
+            self.apply(effects);
+        }
+        Some(LRESULT(0))
     }
 
     /// 第二个实例请求唤起（M3 起打开设置页）。
@@ -824,6 +888,30 @@ impl App {
                 Vec::new()
             }
             AppEvent::WidgetInput(input) => self.reduce_input(input),
+            AppEvent::Hotkey(action) => self.reduce_hotkey(action),
+            AppEvent::TrayCommand(cmd) => match cmd {
+                TrayCommand::OpenSettings => {
+                    self.on_second_instance();
+                    Vec::new()
+                }
+                TrayCommand::ToggleWidget => {
+                    self.config.general.widget_hidden = !self.config.general.widget_hidden;
+                    crate::log_info!(
+                        "托盘：小组件{}",
+                        if self.config.general.widget_hidden {
+                            "隐藏"
+                        } else {
+                            "显示"
+                        }
+                    );
+                    self.sync_visibility();
+                    vec![Effect::SaveConfig(Box::new(self.config.clone()))]
+                }
+                TrayCommand::Quit => {
+                    crate::log_info!("托盘：退出");
+                    vec![Effect::Quit]
+                }
+            },
             // ---------------- 歌词（T2 → T0） ----------------
             AppEvent::LyricLoading { track_id } => {
                 // 代次不符 = 用户已经切走了，丢弃（避免旧歌词覆盖新歌）
@@ -898,7 +986,7 @@ impl App {
                 self.config = *cfg;
                 self.animate_lyric_height();
                 self.relayout();
-                Vec::new()
+                vec![Effect::RefreshTrayMenu]
             }
             AppEvent::Tick => {
                 self.tick_optimistic();
@@ -909,6 +997,28 @@ impl App {
             // ---- M3–M5 的接口预留：记录后忽略，绝不 panic ----
             other => {
                 crate::log_debug!("reduce: 暂未处理的 AppEvent（M2 范围外）：{other:?}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 全局快捷键 → 与小组件按钮完全相同的语义（复用 `reduce_input`，避免两套逻辑）。
+    fn reduce_hotkey(&mut self, action: crate::event::HotkeyAction) -> Vec<Effect> {
+        use crate::event::HotkeyAction as A;
+        match action {
+            A::PlayPause => self.reduce_input(WidgetInput::ClickPlayPause),
+            A::Prev => self.reduce_input(WidgetInput::ClickPrev),
+            A::Next => self.reduce_input(WidgetInput::ClickNext),
+            A::ToggleLyrics => self.reduce_input(WidgetInput::ToggleLyricsFromMenu),
+            A::ToggleWidget => {
+                self.config.general.widget_hidden = !self.config.general.widget_hidden;
+                self.sync_visibility();
+                vec![Effect::SaveConfig(Box::new(self.config.clone()))]
+            }
+            A::Mute => {
+                // 静音走 WASAPI：SMTC 的 Mute 只有部分播放器实现
+                let muted = crate::media::wasapi::toggle_system_mute();
+                crate::log_info!("热键：静音切换 → {muted}");
                 Vec::new()
             }
         }
@@ -1029,6 +1139,15 @@ impl App {
                     Some(m) => m.send(cmd),
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
+                Effect::RebindHotkeys => {
+                    let cfg = self.config.hotkeys;
+                    self.hotkeys.register_all(self.msg_hwnd, &cfg);
+                }
+                Effect::RefreshTrayMenu => {
+                    if let Some(t) = self.tray.as_mut() {
+                        t.refresh(self.lang);
+                    }
+                }
                 Effect::Lyric(req) => match self.lyric.as_ref() {
                     Some(l) => l.send(req),
                     None => crate::log_warn!("歌词线程未启动，请求被丢弃"),
