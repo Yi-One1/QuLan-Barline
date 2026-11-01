@@ -10,3 +10,6 @@ scripts/barline_edge_profile/
 scripts/_px.bmp
 scripts/_band*.bmp
 scripts/_fade*.bmp
+
+# M5 便携版交付物（可由 release 构建复现，不入库）
+/deliverables/

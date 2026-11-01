@@ -1,3 +1,4 @@
+﻿#pragma code_page(65001)
 // 曲栏 Barline —— Win32 资源脚本
 // 路径相对于「构建脚本的工作目录」，即 crate 根目录（embed-resource 不切换 cwd）。
 // 图标 ID 固定为 1，托盘与 exe 图标都取它。
@@ -5,3 +6,35 @@
 
 // 24 = RT_MANIFEST，ID 1 = 应用清单（CREATEPROCESS_MANIFEST_RESOURCE_ID）
 1 24 "assets/app.manifest"
+
+// VS_VERSION_INFO（ID 1）：exe「属性 → 详细信息」面板。
+// 全部用 RC 关键字（VERSIONINFO / FILEVERSION / BEGIN / END），不 include
+// 任何头文件——rc.exe 的默认包含路径不保证可用，零 include 最稳。
+// FILEVERSION / PRODUCTVERSION 是逗号分隔的 4 个 16 位数，与 Cargo 版本同步改。
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          0x40004L   // VOS_NT_WINDOWS32
+FILETYPE        0x1L       // VFT_APP
+FILESUBTYPE     0x0L       // VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    // 0x0804 = 简体中文，0x04B0 (1200) = Unicode
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "CompanyName",      "The Barline Authors"
+      VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
+      VALUE "FileVersion",      "1.0.0"
+      VALUE "InternalName",     "barline"
+      VALUE "LegalCopyright",   "MIT License. The Barline Authors."
+      VALUE "OriginalFilename", "barline.exe"
+      VALUE "ProductName",      "曲栏 Barline"
+      VALUE "ProductVersion",   "1.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END
