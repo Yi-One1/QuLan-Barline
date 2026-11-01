@@ -1575,7 +1575,9 @@ impl App {
         if !self.config.volume.wheel_enabled {
             return Vec::new();
         }
-        let step = self.config.volume.step.clamp(0.01, 0.05);
+        // 桥接层写入口径 clamp(0.01, 0.2)：这里必须同口径，否则设置页选的
+        // 10% 会被静默钳成 5%（v1.1.10 修复；此前 0.01..=0.05 是笔误）。
+        let step = self.config.volume.step.clamp(0.01, 0.2);
         let dir = if delta > 0 { 1.0 } else { -1.0 };
         let base = media::wasapi::system_volume().unwrap_or(self.state.volume_hud);
         let next = (base + dir * step).clamp(0.0, 1.0);

@@ -111,10 +111,26 @@ pub struct LyricsConfig {
 pub struct VolumeConfig {
     pub wheel_enabled: bool,
     pub scope: VolumeScope,
-    /// 每格步进：0.01 / 0.02 / 0.05
+    /// 每格步进：0.01 / 0.02 / 0.05 / 0.1（v1.1.10 问题 5）。
+    ///
+    /// **序列化按 0.01 粒度取整**——serde_json 序列化 f32 会先拓宽成 f64
+    /// （`0.05f32` → `0.05000000074505806`），设置页 JS 用 `String(value)`
+    /// 匹配下拉选项 `"0.05"` 永不相等 → 「每次步进」一直显示空白。
+    /// 取整后设置页与 config.json 里都存干净值；内存里的 f32 不动。
+    #[serde(serialize_with = "serialize_step_percent")]
     pub step: f32,
-    /// HUD 停留时长（毫秒）：800 / 1200 / 2000
+    /// HUD 停留时长（毫秒）：600 / 1200 / 2000
     pub hud_ms: u32,
+}
+
+/// `volume.step` 序列化钩子：按 0.01 粒度取整（v1.1.10 问题 5）。
+///
+/// `(0.05f32 as f64 * 100.0).round() / 100.0` = `0.05f64`，ryu 最短表示
+/// 正好是 `0.05`；0.01 / 0.02 / 0.1 同理。步进值只来自设置页下拉
+/// （0.01/0.02/0.05/0.1）或桥接层 clamp(0.01, 0.2)，取整到两位百分数
+/// 不会丢失合法输入。
+fn serialize_step_percent<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(((*v as f64) * 100.0).round() / 100.0)
 }
 
 /// 热键（6 组）。全部字段都是 `Copy`，整体也 `Copy`——注册时要同时借用
@@ -338,6 +354,27 @@ mod tests {
         assert!(cfg.lyrics.enabled);
         assert_eq!(cfg.volume.step, 0.02);
         assert!(cfg.hotkeys.play_pause.is_bound());
+    }
+
+    /// v1.1.10 问题 5：`volume.step` 序列化必须按 0.01 粒度取整。
+    ///
+    /// serde_json 对 f32 先拓宽 f64（0.05f32 → 0.05000000074505806），
+    /// 设置页 JS `String(value)` 与选项 "0.05" 永不相等 → 「每次步进」
+    /// 一直空白。回归断言：序列化后的 JSON 数值必须严格等于干净值。
+    #[test]
+    fn volume_step_serializes_as_clean_percent() {
+        // 期望值用 f64 字面量：json!(0.01f32 as f64) 会复现 f32→f64 拓宽，
+        // 反而是被修掉的脏值
+        for step in [0.01f64, 0.02, 0.05, 0.1] {
+            let mut cfg = Config::default();
+            cfg.volume.step = step as f32;
+            let v = serde_json::to_value(&cfg).expect("序列化不应失败");
+            assert_eq!(
+                v["volume"]["step"],
+                serde_json::json!(step),
+                "step={step} 必须序列化为干净百分数"
+            );
+        }
     }
 
     #[test]
