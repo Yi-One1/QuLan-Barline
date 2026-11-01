@@ -5,7 +5,7 @@
 //! 1. BeginDraw
 //! 2. Clear(全透明)                 ← 不 clear 会残留上一帧（风险 R3）
 //! 3. 命中区占位 alpha = 1           ← 视觉不可见但整块可点（§10.7）
-//! 4. 悬停背景（模糊位图 / 半透明纯色，alpha = hover_alpha）
+//! 4. 悬停背景（idle→hover 两态插值，v1.1.12 起常规态也可半透明）
 //! 5. 封面（真实位图 or 渐变占位 + 音符）
 //! 6. 歌名 / 歌手（读 WidgetLayout 里缓存的截断结果）
 //! 7. 三个按钮（含 disabled / pressed 态）
@@ -145,10 +145,11 @@ pub fn paint(
 
 // ------------------------------------------------------------------ 背景
 
-/// 悬停背景：半透明纯色（`hover_bg`）。
+/// 悬停背景：`idle_bg → hover_bg` 按 `t`（悬停淡入进度）线性插值。
 ///
-/// v1.1.11（问题 2）：模糊背景已删除——「始终透明」模式 `hover_bg` alpha 为 0，
-/// 直接跳过绘制。
+/// v1.1.12（背景体系扩展）：常规态也可以是半透明（`idle_bg`），悬停淡入
+/// 就是两色之间的过渡；任一端 alpha = 0（透明档）时该端画不出来，
+/// 全程 alpha = 0 则整帧跳过背景绘制。
 fn draw_background(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
@@ -159,13 +160,12 @@ fn draw_background(
     let w = frame.width as f32;
     let h = frame.height as f32;
 
-    // 始终透明（或淡出结束）：什么都不画
-    if theme.hover_bg.a == 0 || alpha <= 0.0 {
+    let bg = crate::render::theme::mix_rgba(theme.idle_bg, theme.hover_bg, alpha);
+    if bg.a == 0 {
         return Ok(());
     }
 
     let radius = (8.0 * s).min(h * 0.5);
-    let bg = theme.hover_bg.with_alpha_scale(alpha);
     let brush = frame.brush(bg)?;
     // SAFETY: 栈上圆角矩形；brush 由本帧持有。
     unsafe {

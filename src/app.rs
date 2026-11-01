@@ -1113,12 +1113,19 @@ impl App {
                 if path == "lyrics.enabled" {
                     self.animate_lyric_width();
                 }
+                // 外观（背景模式/透明度）变了 → 立即重采样拿新主题 + 重绘，
+                // 不能等 1s 心跳（v1.1.12：idle_mode/hover_alpha/idle_alpha 同样走这里）
+                let appearance_changed = path.starts_with("appearance.");
                 let mut effects = vec![
                     Effect::Relayout,
                     Effect::SaveConfig(Box::new(self.config.clone())),
                 ];
                 if hotkey_changed {
                     effects.push(Effect::RebindHotkeys);
+                }
+                if appearance_changed {
+                    self.request_backdrop();
+                    effects.push(Effect::Redraw);
                 }
                 // 改项成功后立刻把全量 state 回推给页面（M4 QA 回归缺陷）：
                 // 语言切换等改动要当窗生效，不能等重开。push 同时更新 last_state，
@@ -1844,6 +1851,7 @@ impl App {
             rgb_key(st.theme.text_dim),
             rgb_key(st.theme.accent),
             st.theme.hover_bg.packed(),
+            st.theme.idle_bg.packed(),
             st.theme.track_bg.packed(),
             st.theme.dim_alpha as u32,
             st.theme.needs_outline as u32,
@@ -1932,6 +1940,9 @@ impl App {
             rect: self.target_rect,
             scale,
             mode: self.config.appearance.background_mode,
+            idle_mode: self.config.appearance.idle_mode,
+            hover_alpha: self.config.appearance.hover_alpha,
+            idle_alpha: self.config.appearance.idle_alpha,
             accent: self.state.theme.accent,
             coverage: self.last_coverage.clone(),
             text_rects: vec![

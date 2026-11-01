@@ -4,7 +4,7 @@
 //! ```text
 //! ✓ 显示歌词            ← ToggleLyrics
 //! ─────────────────
-//!   ● 背景：半透明 / ○ 背景：始终透明  ← BgTranslucent / BgTransparent
+//!   ● 背景：半透明 / ○ 背景：透明  ← BgTranslucent / BgTransparent
 //! ✓ 随机播放（不支持时置灰）      ← ToggleShuffle
 //!   循环播放（不支持时置灰）        ← CycleRepeat
 //! ─────────────────

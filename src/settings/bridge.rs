@@ -86,6 +86,25 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             };
             true
         }
+        // v1.1.12：常规背景模式 + 两态不透明度（百分比 1..=100）
+        "appearance.idle_mode" => {
+            let Some(s) = value.as_str() else { return false };
+            cfg.appearance.idle_mode = match s {
+                "translucent" | "Translucent" => BackgroundMode::Translucent,
+                _ => BackgroundMode::Transparent,
+            };
+            true
+        }
+        "appearance.hover_alpha" => {
+            let Some(v) = value.as_f64() else { return false };
+            cfg.appearance.hover_alpha = (v as f32).round().clamp(1.0, 100.0) as u8;
+            true
+        }
+        "appearance.idle_alpha" => {
+            let Some(v) = value.as_f64() else { return false };
+            cfg.appearance.idle_alpha = (v as f32).round().clamp(1.0, 100.0) as u8;
+            true
+        }
         "appearance.ui_scale" => {
             let Some(v) = value.as_f64() else { return false };
             // 只接受 1.0 / 1.25 / 1.5 / 2.0 四档（PRD P0-15）

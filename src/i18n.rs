@@ -92,7 +92,7 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "menu.toggle_lyrics") => "Show lyrics",
         (Lang::Zh, "menu.bg_translucent") => "背景：半透明",
         (Lang::En, "menu.bg_translucent") => "Background: Translucent",
-        (Lang::Zh, "menu.bg_transparent") => "背景：始终透明",
+        (Lang::Zh, "menu.bg_transparent") => "背景：透明",
         (Lang::En, "menu.bg_transparent") => "Background: Transparent",
         (Lang::Zh, "menu.shuffle") => "随机播放",
         (Lang::En, "menu.shuffle") => "Shuffle",

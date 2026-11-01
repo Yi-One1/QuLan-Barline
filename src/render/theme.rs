@@ -106,8 +106,10 @@ pub struct Theme {
     pub dim_alpha: u8,
     /// 强调色（封面主色或系统强调色或自定义）
     pub accent: Rgb,
-    /// 悬停背景色（含 alpha）
+    /// 悬停背景色（含 alpha；模式为透明时 alpha = 0）
     pub hover_bg: Rgba,
+    /// 常规（不悬停）背景色（含 alpha；v1.1.12 新增，模式为透明时 alpha = 0）
+    pub idle_bg: Rgba,
     /// 进度条轨道色
     pub track_bg: Rgba,
     /// 对比度推到极端仍不达标（背景正好是中灰）→ 文字需要 1px 反色描边
@@ -117,7 +119,14 @@ pub struct Theme {
 impl Default for Theme {
     /// 兜底主题：深色壁纸假设（首帧还没有采样结果时用）。
     fn default() -> Self {
-        Self::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent)
+        Self::from_backdrop(
+            0.0,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        )
     }
 }
 
@@ -129,10 +138,19 @@ impl Theme {
     /// 次要文字的 alpha（PRD §4.1：60% 不透明度）
     pub const DIM_ALPHA: u8 = 0x99;
 
-    /// 由背景亮度 + 强调色 + 背景模式算出完整主题。
+    /// 由背景亮度 + 强调色 + 背景配置算出完整主题。
     ///
     /// `luma` 是 0..=1 的**相对亮度**（已做 sRGB → 线性）。
-    pub fn from_backdrop(luma: f32, accent: Rgb, mode: BackgroundMode) -> Self {
+    /// `mode` / `idle_mode`：悬停 / 常规背景模式；`hover_alpha` / `idle_alpha`：
+    /// 两态半透明的不透明度百分比（1..=100）。
+    pub fn from_backdrop(
+        luma: f32,
+        accent: Rgb,
+        mode: BackgroundMode,
+        idle_mode: BackgroundMode,
+        hover_alpha: u8,
+        idle_alpha: u8,
+    ) -> Self {
         let luma = luma.clamp(0.0, 1.0);
 
         // 用「与该亮度等效的中性灰」作为背景代表色，做对比度择优。
@@ -157,14 +175,25 @@ impl Theme {
 
         let accent = normalize_accent(accent);
 
-        // 半透明背景色：浅背景用白、深背景用近黑，alpha = 70%（PRD §4.2）。
-        // 「始终透明」模式 alpha 归零——悬停也不画背景（绘制层见 alpha==0 跳过）。
+        // 背景色：浅背景用白、深背景用近黑（PRD §4.2）。
+        // v1.1.12：悬停 / 常规两态独立，模式为「透明」时 alpha 归零
+        // （绘制层见 alpha==0 跳过）；半透明档 alpha 由设置页百分比换算。
+        let base = if on_light {
+            (0xF2, 0xF2, 0xF4)
+        } else {
+            (0x1A, 0x1A, 0x1E)
+        };
         let hover_bg = if mode == BackgroundMode::Transparent {
             Rgba::new(0, 0, 0, 0)
-        } else if on_light {
-            Rgba::new(0xF2, 0xF2, 0xF4, 0xB3)
         } else {
-            Rgba::new(0x1A, 0x1A, 0x1E, 0xB3)
+            let a = alpha_pct(hover_alpha);
+            Rgba::new(base.0, base.1, base.2, a)
+        };
+        let idle_bg = if idle_mode == BackgroundMode::Transparent {
+            Rgba::new(0, 0, 0, 0)
+        } else {
+            let a = alpha_pct(idle_alpha);
+            Rgba::new(base.0, base.1, base.2, a)
         };
 
         // 进度条轨道：与文字同侧的低对比色，保证在任何背景上都看得见
@@ -182,6 +211,7 @@ impl Theme {
             dim_alpha,
             accent,
             hover_bg,
+            idle_bg,
             track_bg,
             needs_outline,
         }
@@ -204,9 +234,28 @@ impl Theme {
             && self.dim_alpha == other.dim_alpha
             && self.accent == other.accent
             && self.hover_bg == other.hover_bg
+            && self.idle_bg == other.idle_bg
             && self.track_bg == other.track_bg
             && self.needs_outline == other.needs_outline
     }
+}
+
+/// 不透明度百分比（1..=100）→ 0..=255 alpha。
+///
+/// 四舍五入：70% → 0xB3（179），与 v1.1.11 前的固定值完全一致；
+/// 50% → 0x80（128），100% → 255。
+fn alpha_pct(pct: u8) -> u8 {
+    ((pct.clamp(1, 100) as u32 * 255 + 50) / 100) as u8
+}
+
+/// 两份 RGBA 线性插值（`t` = 0 取 `a`，1 取 `b`）。
+///
+/// 悬停淡入淡出用：`idle_bg → hover_bg` 之间的过渡帧。两态 RGB 基底相同
+/// （都来自同一 on_light 基色），只有 alpha 不同，中间态无色偏。
+pub fn mix_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8 };
+    Rgba::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
 }
 
 /// 次要文字的最小不透明度。
@@ -317,7 +366,7 @@ mod tests {
 
     #[test]
     fn dark_backdrop_gets_light_text() {
-        let t = Theme::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let t = Theme::from_backdrop(0.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         assert!(!t.on_light);
         assert_eq!(t.text, Theme::LIGHT_TEXT);
         assert!(t.text_contrast() >= 4.5);
@@ -325,7 +374,7 @@ mod tests {
 
     #[test]
     fn light_backdrop_gets_dark_text() {
-        let t = Theme::from_backdrop(1.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let t = Theme::from_backdrop(1.0, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         assert!(t.on_light);
         assert_eq!(t.text, Theme::DARK_TEXT);
         assert!(t.text_contrast() >= 4.5);
@@ -335,7 +384,7 @@ mod tests {
     #[test]
     fn mid_gray_picks_the_readable_side() {
         let luma = relative_luminance(Rgb::new(0x80, 0x80, 0x80));
-        let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         assert!(t.on_light, "中灰必须选深色文字");
         assert!(
             t.text_contrast() >= 4.5,
@@ -362,11 +411,62 @@ mod tests {
     /// v1.1.11：半透明模式悬停背景 70% 不透明度；透明模式 alpha = 0。
     #[test]
     fn background_mode_controls_hover_bg_alpha() {
-        let t = Theme::from_backdrop(0.2, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        // 悬停=半透明(70%) / 常规=透明
+        let t = Theme::from_backdrop(
+            0.2,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
         assert_eq!(t.hover_bg.a, 0xB3, "半透明模式悬停背景 70% 不透明度");
-        let t2 = Theme::from_backdrop(0.2, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Transparent);
-        assert_eq!(t2.hover_bg.a, 0, "始终透明模式悬停背景全透明");
+        assert_eq!(t.idle_bg.a, 0, "常规透明模式背景全透明");
+        // 悬停=透明 / 常规=半透明(50%)
+        let t2 = Theme::from_backdrop(
+            0.2,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Transparent,
+            BackgroundMode::Translucent,
+            70,
+            50,
+        );
+        assert_eq!(t2.hover_bg.a, 0, "透明模式悬停背景全透明");
+        assert_eq!(t2.idle_bg.a, 0x80, "常规半透明 50% → 0x80");
         assert_ne!(t.hover_bg, t2.hover_bg, "模式切换必须改变 same_paint 判定");
+        // alpha 可调：悬停 30% → 77
+        let t3 = Theme::from_backdrop(
+            0.2,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Translucent,
+            30,
+            100,
+        );
+        assert_eq!(t3.hover_bg.a, 77, "30% → 77");
+        assert_eq!(t3.idle_bg.a, 255, "100% → 255");
+    }
+
+    /// v1.1.12：悬停淡入淡出 = idle_bg → hover_bg 线性插值，端点与中点正确。
+    #[test]
+    fn mix_rgba_interpolates_between_idle_and_hover() {
+        let t = Theme::from_backdrop(
+            0.2,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Translucent,
+            70,
+            50,
+        );
+        assert_eq!(mix_rgba(t.idle_bg, t.hover_bg, 0.0), t.idle_bg);
+        assert_eq!(mix_rgba(t.idle_bg, t.hover_bg, 1.0), t.hover_bg);
+        let mid = mix_rgba(t.idle_bg, t.hover_bg, 0.5);
+        let avg = (t.idle_bg.a as i32 + t.hover_bg.a as i32) / 2;
+        assert!(
+            (mid.a as i32 - avg).abs() <= 1,
+            "中点 alpha 应≈均值：{} vs {avg}",
+            mid.a
+        );
     }
 
     /// v1.1.11：旧配置里的 `"blur"` 反序列化为半透明（serde alias 迁移）。
@@ -406,7 +506,7 @@ mod tests {
     #[test]
     fn dim_alpha_meets_contrast_on_light_and_dark() {
         for luma in [0.0f32, 0.05, 0.2, 0.5, 0.9, 1.0] {
-            let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+            let t = Theme::from_backdrop(luma, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
             let bg = luma_to_srgb_gray(luma);
             let composite = mix_rgb(bg, t.text_dim, t.dim_alpha as f32 / 255.0);
             let c = contrast_ratio(composite, bg);
@@ -426,7 +526,7 @@ mod tests {
     /// `same_paint` 必须忽略 luma 抖动，否则 1s 心跳采样会让空闲 CPU 涨到 1%。
     #[test]
     fn same_paint_ignores_luma_jitter() {
-        let a = Theme::from_backdrop(0.20, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let a = Theme::from_backdrop(0.20, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         let mut b = a;
         b.backdrop_luma = 0.200_4;
         assert_ne!(a, b, "整体 PartialEq 会认为不同");
@@ -436,8 +536,8 @@ mod tests {
     /// 文字颜色真的变了就必须判定为不同（否则黑字会留在深色背景上）。
     #[test]
     fn same_paint_detects_text_flip() {
-        let dark = Theme::from_backdrop(0.02, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
-        let light = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent);
+        let dark = Theme::from_backdrop(0.02, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
+        let light = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         assert!(!dark.same_paint(&light));
     }
 }

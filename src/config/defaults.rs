@@ -166,6 +166,9 @@ impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             background_mode: BackgroundMode::Translucent,
+            idle_mode: BackgroundMode::Transparent,
+            hover_alpha: 70,
+            idle_alpha: 50,
             accent_source: AccentSource::Cover,
             accent_custom: String::from("#0078D4"),
             ui_scale: 1.0,

@@ -78,7 +78,14 @@ impl HotkeyBinding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceConfig {
+    /// 悬停背景模式（v1.1.12：默认档；`background_mode` 字段名沿用旧配置）
     pub background_mode: BackgroundMode,
+    /// 常规（不悬停）背景模式：默认透明 = 沿用 v1.1.11 前的行为
+    pub idle_mode: BackgroundMode,
+    /// 悬停半透明的不透明度百分比（1..=100，默认 70 = 原 0xB3）
+    pub hover_alpha: u8,
+    /// 常规半透明的不透明度百分比（1..=100，默认 50）
+    pub idle_alpha: u8,
     /// 强调色来源：封面 / 系统 / 自定义
     pub accent_source: AccentSource,
     /// 自定义强调色，形如 "#0078D4"

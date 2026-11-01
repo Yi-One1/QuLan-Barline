@@ -120,6 +120,12 @@ pub struct SampleRequest {
     pub rect: RECT,
     pub scale: f32,
     pub mode: BackgroundMode,
+    /// 常规（不悬停）背景模式（v1.1.12）
+    pub idle_mode: BackgroundMode,
+    /// 悬停半透明不透明度百分比 1..=100（v1.1.12）
+    pub hover_alpha: u8,
+    /// 常规半透明不透明度百分比 1..=100（v1.1.12）
+    pub idle_alpha: u8,
     /// 当前强调色（主题推导用）
     pub accent: Rgb,
     /// 上一帧的覆盖率图；`None` 时退化为「全块平均」
@@ -329,7 +335,9 @@ fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
         bh,
     } = *grid;
     let text_rects = &req.text_rects;
-    let (scale, accent, mode) = (req.scale, req.accent, req.mode);
+    let (scale, accent) = (req.scale, req.accent);
+    let (mode, idle_mode) = (req.mode, req.idle_mode);
+    let (hover_alpha, idle_alpha) = (req.hover_alpha, req.idle_alpha);
     let s = if scale > 0.0 { scale } else { 1.0 };
     let bs = limits::SAMPLE_BLOCK as f32;
     let mut sum_w = 0f64;
@@ -399,7 +407,7 @@ fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
         }
     };
 
-    let theme = Theme::from_backdrop(luma, accent, mode);
+    let theme = Theme::from_backdrop(luma, accent, mode, idle_mode, hover_alpha, idle_alpha);
     if theme.needs_outline {
         crate::log_debug!(
             "背景亮度 {:.3} 处于中灰带，文字对比度不足，启用 1px 描边（背景代表色 {:?}）",
@@ -512,6 +520,9 @@ mod tests {
             rect: RECT::default(),
             scale: 1.0,
             mode: BackgroundMode::Translucent,
+            idle_mode: BackgroundMode::Transparent,
+            hover_alpha: 70,
+            idle_alpha: 50,
             accent: Rgb::SYSTEM_ACCENT_FALLBACK,
             coverage: None,
             text_rects,

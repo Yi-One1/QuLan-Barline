@@ -110,6 +110,9 @@ select, input[type="text"] {
 }
 select:focus, input[type="text"]:focus { border-color: var(--accent); }
 
+/* v1.1.12：不透明度滑条（Fluent 观感，强调色填充） */
+input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex: 0 0 auto; }
+
 /* ToggleSwitch：44×20，滑块 12px，开态用强调色（PRD §7 要求 Fluent 观感） */
 .switch { position: relative; width: 44px; height: 20px; flex: 0 0 auto; }
 .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
@@ -194,12 +197,30 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
       <p class="sub" data-i18n="appearance.sub">小组件的背景、缩放与显示位置。</p>
       <div class="card">
         <div class="row">
-          <div><div class="label" data-i18n="appearance.bg">悬停背景</div>
-            <div class="desc" data-i18n="appearance.bg.desc">半透明：悬停时显示 70% 不透明度的底色；始终透明：不显示任何背景。</div></div>
-          <div class="right"><select id="bg-mode">
-            <option value="translucent" data-i18n="appearance.bg.trans">半透明</option>
-            <option value="transparent" data-i18n="appearance.bg.transparent">始终透明</option>
+          <div><div class="label" data-i18n="appearance.bg.idle">常规背景</div>
+            <div class="desc" data-i18n="appearance.bg.idle.desc">不悬停时的底色；选「半透明」时用下方滑条调节深浅。</div></div>
+          <div class="right"><select id="bg-idle-mode">
+            <option value="transparent" data-i18n="appearance.bg.transparent">透明</option>
+            <option value="translucent" data-i18n="appearance.bg.translucent">半透明</option>
           </select></div>
+        </div>
+        <div class="row">
+          <div><div class="label" data-i18n="appearance.bg.idle.alpha">常规不透明度</div>
+            <div class="desc"><span id="idle-alpha-val">50</span>%</div></div>
+          <div class="right"><input type="range" id="bg-idle-alpha" class="slider" min="1" max="100" step="1"></div>
+        </div>
+        <div class="row">
+          <div><div class="label" data-i18n="appearance.bg.hover">悬停背景</div>
+            <div class="desc" data-i18n="appearance.bg.hover.desc">鼠标悬停时的底色；选「半透明」时用下方滑条调节深浅。</div></div>
+          <div class="right"><select id="bg-mode">
+            <option value="translucent" data-i18n="appearance.bg.translucent">半透明</option>
+            <option value="transparent" data-i18n="appearance.bg.transparent">透明</option>
+          </select></div>
+        </div>
+        <div class="row">
+          <div><div class="label" data-i18n="appearance.bg.hover.alpha">悬停不透明度</div>
+            <div class="desc"><span id="hover-alpha-val">70</span>%</div></div>
+          <div class="right"><input type="range" id="bg-hover-alpha" class="slider" min="1" max="100" step="1"></div>
         </div>
         <div class="row">
           <div><div class="label" data-i18n="appearance.scale">界面缩放</div>
@@ -368,8 +389,11 @@ const I18N = {
     "nav.appearance": "外观", "nav.lyrics": "歌词", "nav.volume": "音量",
     "nav.hotkeys": "快捷键", "nav.general": "通用", "nav.about": "关于",
     "appearance.sub": "小组件的背景、缩放与显示位置。",
-    "appearance.bg": "悬停背景", "appearance.bg.desc": "半透明：悬停时显示 70% 不透明度的底色；始终透明：不显示任何背景。",
-    "appearance.bg.trans": "半透明", "appearance.bg.transparent": "始终透明",
+    "appearance.bg.hover": "悬停背景", "appearance.bg.hover.desc": "鼠标悬停时的底色；选「半透明」时用下方滑条调节深浅。",
+    "appearance.bg.hover.alpha": "悬停不透明度",
+    "appearance.bg.idle": "常规背景", "appearance.bg.idle.desc": "不悬停时的底色；选「半透明」时用下方滑条调节深浅。",
+    "appearance.bg.idle.alpha": "常规不透明度",
+    "appearance.bg.translucent": "半透明", "appearance.bg.transparent": "透明",
     "appearance.scale": "界面缩放", "appearance.scale.desc": "默认跟随显示器 DPI。",
     "appearance.monitor": "显示显示器", "appearance.monitor.desc": "多显示器时小组件贴在哪块屏的任务栏上。",
     "appearance.monitor.primary": "主显示器",
@@ -408,8 +432,11 @@ const I18N = {
     "nav.appearance": "Appearance", "nav.lyrics": "Lyrics", "nav.volume": "Volume",
     "nav.hotkeys": "Hotkeys", "nav.general": "General", "nav.about": "About",
     "appearance.sub": "Background, scaling and where the widget shows up.",
-    "appearance.bg": "Hover background", "appearance.bg.desc": "Translucent: 70% opaque panel on hover. Transparent: no background at all.",
-    "appearance.bg.trans": "Translucent", "appearance.bg.transparent": "Transparent",
+    "appearance.bg.hover": "Hover background", "appearance.bg.hover.desc": "Background while hovering; pick Translucent and adjust with the slider below.",
+    "appearance.bg.hover.alpha": "Hover opacity",
+    "appearance.bg.idle": "Idle background", "appearance.bg.idle.desc": "Background when not hovering; pick Translucent and adjust with the slider below.",
+    "appearance.bg.idle.alpha": "Idle opacity",
+    "appearance.bg.translucent": "Translucent", "appearance.bg.transparent": "Transparent",
     "appearance.scale": "UI scale", "appearance.scale.desc": "Follows monitor DPI by default.",
     "appearance.monitor": "Monitor", "appearance.monitor.desc": "Which taskbar the widget attaches to.",
     "appearance.monitor.primary": "Primary",
@@ -523,6 +550,11 @@ function render() {
 
   // 外观
   document.getElementById("bg-mode").value = c.appearance.background_mode;
+  document.getElementById("bg-idle-mode").value = c.appearance.idle_mode;
+  document.getElementById("bg-hover-alpha").value = c.appearance.hover_alpha;
+  document.getElementById("bg-idle-alpha").value = c.appearance.idle_alpha;
+  document.getElementById("hover-alpha-val").textContent = c.appearance.hover_alpha;
+  document.getElementById("idle-alpha-val").textContent = c.appearance.idle_alpha;
   document.getElementById("ui-scale").value = String(c.appearance.ui_scale);
   document.getElementById("monitor").value = String(c.appearance.monitor_index);
 
@@ -685,6 +717,16 @@ function bind(id, path, kind) {
 }
 
 bind("bg-mode", "appearance.background_mode", "str");
+bind("bg-idle-mode", "appearance.idle_mode", "str");
+bind("bg-hover-alpha", "appearance.hover_alpha", "int");
+bind("bg-idle-alpha", "appearance.idle_alpha", "int");
+// 滑条拖动时实时刷新百分比标签（change 事件松手才发 set）
+document.getElementById("bg-hover-alpha").addEventListener("input", (e) => {
+  document.getElementById("hover-alpha-val").textContent = e.target.value;
+});
+document.getElementById("bg-idle-alpha").addEventListener("input", (e) => {
+  document.getElementById("idle-alpha-val").textContent = e.target.value;
+});
 bind("ui-scale", "appearance.ui_scale", "num");
 bind("monitor", "appearance.monitor_index", "int");
 bind("lyrics-enabled", "lyrics.enabled", "bool");
