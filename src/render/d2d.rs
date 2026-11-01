@@ -113,7 +113,7 @@ impl D2d {
         // SAFETY: 两个枚举值都合法，且是对刚创建的 rt 调用。
         unsafe {
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-            let _ = rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         }
 
         Ok(Frame {
@@ -333,6 +333,8 @@ pub struct HdcBuf {
     width: u32,
     height: u32,
     coverage: Option<Arc<CoverageMap>>,
+    /// 已经 upload 过的帧数（用于给覆盖率图降频，见 `upload`）
+    frames: u32,
 }
 
 // SAFETY: HdcBuf 只在 UI 线程（T0）创建与使用；内部持有的是 GDI 句柄与一块
@@ -386,6 +388,7 @@ impl HdcBuf {
                 width: w,
                 height: h,
                 coverage: None,
+                frames: 0,
             })
         }
     }
@@ -433,8 +436,15 @@ impl HdcBuf {
             }
         }
 
-        // 覆盖率：直接读 DIB（顶朝下，行紧密）
-        if !self.bits.is_null() {
+        // 覆盖率：直接读 DIB（顶朝下，行紧密）。
+        //
+        // **降频到每 8 帧一次**：覆盖率只给采样线程做「自遮挡剔除」用，而采样
+        // 最快也是 300ms 一次；逐字扫光时是 25fps，每帧都统计 2.5 万像素纯属浪费
+        // （实测占单帧成本的 ~25%）。布局在两次采样之间不会变，8 帧 ≈ 320ms，
+        // 完全够用。
+        self.frames = self.frames.wrapping_add(1);
+        let need_coverage = self.frames % 8 == 1;
+        if need_coverage && !self.bits.is_null() {
             let len = (self.width as usize) * (self.height as usize) * 4;
             // SAFETY: bits 指向 CreateDIBSection 分配的 len 字节，刚写完。
             let px = unsafe { core::slice::from_raw_parts(self.bits as *const u8, len) };

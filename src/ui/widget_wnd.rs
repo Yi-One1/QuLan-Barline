@@ -55,6 +55,14 @@ pub const TIMER_CLICK: usize = 3;
 pub const TIMER_BLUR: usize = 4;
 /// 悬停期间模糊背景刷新周期（§11.3：悬停持续时每 250ms 重新抓屏）。
 pub const TIMER_BLUR_MS: u32 = 250;
+/// 歌词推进定时器（T12：逐字扫光需要连续重绘）。
+pub const TIMER_LYRIC: usize = 5;
+/// 歌词推进周期（40ms ≈ 25fps）。
+///
+/// 为什么不是 16ms：13px 字号下一个汉字约 13px 宽、平均停留 250–350ms，
+/// 扫光边界每帧只移动 ~1px；25fps 已经完全看不出台阶，而 60fps 会让
+/// 「播放中空闲 CPU」逼近 PRD P0-14 的 0.5% 红线。
+pub const TIMER_LYRIC_MS: u32 = 40;
 
 /// 全局的「小组件窗口句柄」与「App 指针」——`WH_MOUSE_LL` 钩子回调需要它们。
 ///

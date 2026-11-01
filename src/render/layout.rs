@@ -248,7 +248,7 @@ pub fn compute(edge: TaskbarEdge, form: WidgetForm, scale: f32, bar_thickness: i
     compute_ex(edge, form, scale, bar_thickness, 0.0)
 }
 
-/// 计算布局。
+/// 计算布局（歌词区高度取形态默认值）。
 ///
 /// * `edge`          —— 任务栏方位
 /// * `form`          —— 形态（决定高度）
@@ -265,6 +265,22 @@ pub fn compute_ex(
     scale: f32,
     bar_thickness: i32,
     text_w: f32,
+) -> WidgetLayout {
+    compute_full(edge, form, scale, bar_thickness, text_w, form.lyric_extra_h())
+}
+
+/// 计算布局，并**显式指定歌词区额外高度**（逻辑像素，未乘 scale）。
+///
+/// 存在的唯一理由是 T12 的 200ms 高度缓动：动画期间每帧的额外高度是
+/// 插值出来的中间值，不等于任何 `WidgetForm` 的默认值。
+/// `compute_ex` 就是「额外高度 = 形态默认值」的特例。
+pub fn compute_full(
+    edge: TaskbarEdge,
+    form: WidgetForm,
+    scale: f32,
+    bar_thickness: i32,
+    text_w: f32,
+    lyric_extra_logical: f32,
 ) -> WidgetLayout {
     let s = if scale > 0.0 { scale } else { 1.0 };
 
@@ -284,7 +300,7 @@ pub fn compute_ex(
         .min((limits::WIDGET_MAX_W * s).round()) as i32;
 
     let main_h = bar_thickness.max(1);
-    let lyric_extra = (form.lyric_extra_h() * s).round() as i32;
+    let lyric_extra = (lyric_extra_logical.max(0.0) * s).round() as i32;
     let height = main_h + lyric_extra;
 
     let w = width as f32;

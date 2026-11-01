@@ -18,9 +18,11 @@ pub mod theme;
 use std::sync::Arc;
 
 use windows::core::Result;
+use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 use windows::Win32::Graphics::Gdi::HDC;
 
 use crate::app::AppState;
+use crate::lyric::LyricDraw;
 use cover_cache::CoverCache;
 use d2d::{D2d, HdcBuf, Targets};
 use layout::WidgetLayout;
@@ -37,6 +39,18 @@ pub struct Renderer {
     targets: Option<Targets>,
     buf: Option<HdcBuf>,
     covers: CoverCache,
+    /// 歌词当前行的 `IDWriteTextLayout` 缓存（扫光要用它把码元位置换成 x）
+    lyric: Option<LyricLayout>,
+}
+
+/// 歌词行的布局缓存。键里带 `track_id` + 行号 + 文本长度 + 宽度，
+/// 只要换行 / 换歌 / 改宽度就会重建。
+struct LyricLayout {
+    /// `(track_id, line_idx, 文本字节长度, 可用宽度 bits)`
+    key: (u64, usize, usize, u32),
+    layout: IDWriteTextLayout,
+    /// 这行文本的 UTF-16 码元数（`hit_test_x` 需要上界）
+    utf16_len: u32,
 }
 
 impl Renderer {
@@ -51,6 +65,7 @@ impl Renderer {
             targets: None,
             buf: None,
             covers: CoverCache::new(),
+            lyric: None,
         })
     }
 
@@ -124,11 +139,16 @@ impl Renderer {
         state: &AppState,
         lang: crate::i18n::Lang,
     ) -> Result<(HDC, i32, i32, Option<Arc<CoverageMap>>)> {
+        // 歌词当前行的布局：只在「换行 / 换歌 / 改宽度」时重建（T12 性能要求）
+        let draw = state.lyric_draw(lang);
+        self.ensure_lyric_layout(&draw, state);
+
         let Self {
             text,
             targets,
             buf,
             covers,
+            lyric,
             ..
         } = self;
 
@@ -148,10 +168,51 @@ impl Renderer {
         // take_next 会翻转轮换标记，所以槽位要**先**算：next_is_b == false → 本轮画 B。
         let slot: u8 = if targets.next_is_b { 0 } else { 1 };
         let frame = targets.take_next();
-        painter::paint(text, frame, covers, slot, &state.layout, state, lang)?;
+        painter::paint(
+            text,
+            frame,
+            covers,
+            slot,
+            &state.layout,
+            state,
+            lang,
+            &draw,
+            lyric.as_ref().map(|l| (&l.layout, l.utf16_len)),
+        )?;
         buf.upload(frame)?;
 
         Ok((buf.hdc(), buf.width() as i32, buf.height() as i32, buf.coverage()))
+    }
+
+    /// 保证歌词当前行的 `IDWriteTextLayout` 与内容匹配。
+    fn ensure_lyric_layout(&mut self, draw: &LyricDraw<'_>, state: &AppState) {
+        // 占位文案 / 空行不需要扫光布局
+        if draw.placeholder || draw.cur.is_empty() {
+            self.lyric = None;
+            return;
+        }
+        let max_w = state.layout.lyric_cur.w.max(1.0);
+        let key = (
+            state.playing.track_id,
+            draw.line.unwrap_or(usize::MAX),
+            draw.cur.len(),
+            max_w.to_bits(),
+        );
+        if self.lyric.as_ref().map(|l| l.key) == Some(key) {
+            return;
+        }
+        let Some(layout) = self
+            .text
+            .layout(&self.d2d.dwrite, TextKind::Lyric, draw.cur, max_w)
+        else {
+            self.lyric = None;
+            return;
+        };
+        self.lyric = Some(LyricLayout {
+            key,
+            layout,
+            utf16_len: draw.cur.encode_utf16().count() as u32,
+        });
     }
 
     /// 当前渲染目标尺寸（诊断用）。

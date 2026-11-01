@@ -58,8 +58,8 @@ impl CoverageMap {
     /// 从一帧 BGRA（顶朝下）统计覆盖率。
     pub fn from_bgra(bgra: &[u8], w: u32, h: u32) -> Self {
         let bs = limits::SAMPLE_BLOCK;
-        let bw = (w + bs - 1) / bs;
-        let bh = (h + bs - 1) / bs;
+        let bw = w.div_ceil(bs);
+        let bh = h.div_ceil(bs);
         let mut cov = vec![0u8; (bw * bh) as usize];
         let stride = w as usize * 4;
 
@@ -249,8 +249,8 @@ fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
 
     let pixels = capture(req.rect.left, req.rect.top, w, h)?;
     let bs = limits::SAMPLE_BLOCK;
-    let bw = (w + bs - 1) / bs;
-    let bh = (h + bs - 1) / bs;
+    let bw = w.div_ceil(bs);
+    let bh = h.div_ceil(bs);
 
     // ---- 1. 块平均色 + 覆盖率 ----
     let mut block = vec![0u8; (bw * bh * 4) as usize];
@@ -324,6 +324,7 @@ fn sample(req: &SampleRequest) -> Option<(Theme, Option<BlurBuffer>)> {
 }
 
 /// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
+#[allow(clippy::too_many_arguments)]
 fn compute_theme(
     block: &[u8],
     valid: &[bool],

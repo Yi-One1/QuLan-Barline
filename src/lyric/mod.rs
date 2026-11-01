@@ -1,11 +1,32 @@
-//! 歌词模型（`ARCHITECTURE.md` §7.2）。
+//! 歌词引擎（`ARCHITECTURE.md` §7.2 数据契约 + §12 实现）。
 //!
-//! **M1 只落数据契约，不落引擎**：解析器 / 插值 / 网络 / 缓存分别是 T10–T12（M3）的内容。
-//! 这里提前把类型定义好，是因为 `AppState`（§7.7）必须持有 `LyricView`，
-//! 而 `AppEvent`（§8.1）必须能携带 `Lyrics` / `LyricMissReason`。
+//! 分层：
+//! ```text
+//! parser.rs    文本 → Lyrics（LRC / 增强 LRC 状态机）
+//! interp.rs    一行文本 → 扫光单元（CJK 逐字 / 拉丁按词）+ 时间插值
+//! locate.rs    本地 .lrc 查找（文件名匹配）
+//! provider.rs  LyricProvider trait + 有序链（本地 → 在线）
+//! lrclib.rs    lrclib.net 实现
+//! net.rs       WinHTTP GET（零依赖）
+//! cache.rs     内存 LRU + 磁盘正缓存 + 负缓存
+//! service.rs   T2 线程：请求 → 查询 → AppEvent
+//! ```
+//!
+//! 本文件只放**数据模型**（`Lyrics` / `LyricLine` / `LyricWord` / `LyricView`，逐字段
+//! 照抄 §7.2）与**绘制态推导**（`LyricView::draw`，纯函数，无句柄）。
+
+pub mod cache;
+pub mod interp;
+pub mod locate;
+pub mod lrclib;
+pub mod net;
+pub mod parser;
+pub mod provider;
+pub mod service;
 
 use std::sync::Arc;
 
+use crate::i18n::{self, Lang};
 use crate::media::{Ms, TrackId};
 
 /// 歌词类型。
@@ -55,7 +76,7 @@ pub struct Lyrics {
 }
 
 impl Lyrics {
-    /// 二分查找当前行下标。`t` 已含 offset。
+    /// 二分查找当前行下标。`t` 是播放位置（时间戳里已经扣过 offset，这里直接比）。
     /// 返回 `None` 表示还没到第一行。
     pub fn line_at(&self, t: Ms) -> Option<usize> {
         if self.lines.is_empty() {
@@ -87,6 +108,35 @@ impl Lyrics {
         let total = line.words.len() as f32;
         ((cur as f32 + frac) / total, cur)
     }
+}
+
+/// 扫光边界在一行内的位置（**UTF-16 码元**，连续值）。
+///
+/// 为什么是 UTF-16 而不是 char 下标：DirectWrite 的
+/// `IDWriteTextLayout::HitTestTextPosition` 收的就是 UTF-16 位置，
+/// 直接用可以省掉一次 char → u16 的映射表。
+///
+/// 返回值 `0.0..=行长度`：整数部分是"第几个码元之前"，小数部分是"当前字扫了多少"。
+pub fn sweep_offset(line: &LyricLine, t: Ms) -> f32 {
+    if line.words.is_empty() {
+        // 没有切分单元（空行 / 间奏）：整行按时间线性扫
+        let span = (line.end_ms - line.start_ms).max(1) as f32;
+        let p = ((t - line.start_ms) as f32 / span).clamp(0.0, 1.0);
+        return p * line.text.encode_utf16().count() as f32;
+    }
+    let idx = line
+        .words
+        .partition_point(|w| w.start_ms <= t)
+        .saturating_sub(1);
+    let mut before = 0usize;
+    for w in &line.words[..idx] {
+        before += w.text.encode_utf16().count();
+    }
+    let w = &line.words[idx];
+    let span = (w.end_ms - w.start_ms).max(1) as f32;
+    let local = ((t - w.start_ms) as f32 / span).clamp(0.0, 1.0);
+    let wlen = w.text.encode_utf16().count() as f32;
+    before as f32 + local * wlen
 }
 
 /// 歌词加载状态。
@@ -136,6 +186,75 @@ impl Default for LyricView {
     }
 }
 
+/// 一帧要画的歌词内容。**纯数据**，由 [`LyricView::draw`] 推导。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LyricDraw<'a> {
+    /// 当前行文本（占位态时是占位文案）
+    pub cur: &'a str,
+    /// 下一行文本（单行模式忽略）
+    pub next: &'a str,
+    /// 扫光边界（当前行内的 UTF-16 位置，连续值）
+    pub sweep: f32,
+    /// 当前行下标（占位 / 首行之前为 `None`）
+    pub line: Option<usize>,
+    /// `true` 表示 `cur` 是占位文案：不做扫光、用低对比色
+    pub placeholder: bool,
+}
+
+impl<'a> LyricDraw<'a> {
+    fn placeholder_of(text: &'a str) -> Self {
+        Self {
+            cur: text,
+            next: "",
+            sweep: 0.0,
+            line: None,
+            placeholder: true,
+        }
+    }
+
+    /// 是否什么都不用画（歌词关闭且无占位）。
+    pub fn is_empty(&self) -> bool {
+        self.cur.is_empty() && self.next.is_empty()
+    }
+}
+
+impl LyricView {
+    /// 由当前状态 + 播放位置推出「这一帧画什么」。
+    ///
+    /// **高度与它无关**：四种降级态都返回同样结构的数据，布局只看 `LyricMode`
+    /// （PRD P0-16 无抖动的实现方式）。
+    pub fn draw(&self, t: Ms, lang: Lang) -> LyricDraw<'_> {
+        match (self.status, self.lyrics.as_deref()) {
+            (LyricStatus::Ready, Some(l)) if !l.lines.is_empty() => match l.line_at(t) {
+                Some(i) => {
+                    let line = &l.lines[i];
+                    let next = l.lines.get(i + 1).map(|x| x.text.as_str()).unwrap_or("");
+                    LyricDraw {
+                        cur: line.text.as_str(),
+                        next,
+                        sweep: sweep_offset(line, t),
+                        line: Some(i),
+                        placeholder: false,
+                    }
+                }
+                // 还没唱到第一行：当前行留白，下一行预告第一句
+                None => LyricDraw {
+                    cur: "",
+                    next: l.lines.first().map(|x| x.text.as_str()).unwrap_or(""),
+                    sweep: 0.0,
+                    line: None,
+                    placeholder: false,
+                },
+            },
+            (LyricStatus::Loading, _) => LyricDraw::placeholder_of(i18n::t(lang, "lyric.loading")),
+            (LyricStatus::NotFound, _) | (LyricStatus::NetworkError, _) => {
+                LyricDraw::placeholder_of(i18n::t(lang, "lyric.missing"))
+            }
+            _ => LyricDraw::placeholder_of(""),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +265,14 @@ mod tests {
             end_ms: end,
             text: String::from(text),
             words: Vec::new(),
+        }
+    }
+
+    fn word(text: &str, s: Ms, e: Ms) -> LyricWord {
+        LyricWord {
+            text: text.into(),
+            start_ms: s,
+            end_ms: e,
         }
     }
 
@@ -178,5 +305,121 @@ mod tests {
         let (p, idx) = l.word_progress(0, 1500);
         assert!((p - 0.5).abs() < 1e-6);
         assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn sweep_offset_is_monotonic_and_bounded() {
+        let l = Lyrics {
+            lines: vec![LyricLine {
+                start_ms: 0,
+                end_ms: 3000,
+                text: "你好世界".into(),
+                words: vec![
+                    word("你", 0, 750),
+                    word("好", 750, 1500),
+                    word("世", 1500, 2250),
+                    word("界", 2250, 3000),
+                ],
+            }],
+            ..Default::default()
+        };
+        let line = &l.lines[0];
+        let mut prev = 0.0f32;
+        for t in [-500, 0, 400, 750, 1000, 1500, 2999, 5000] {
+            let s = sweep_offset(line, t);
+            assert!(s >= prev - 1e-6, "扫光回退了：t={t} s={s} prev={prev}");
+            assert!((0.0..=4.0).contains(&s), "越界：t={t} s={s}");
+            prev = s;
+        }
+        // 整行唱完 = 4 个码元
+        assert!((sweep_offset(line, 3000) - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sweep_offset_handles_latin_words_by_utf16_len() {
+        let l = Lyrics {
+            lines: vec![LyricLine {
+                start_ms: 0,
+                end_ms: 2000,
+                text: "hello world".into(),
+                words: vec![word("hello ", 0, 1000), word("world", 1000, 2000)],
+            }],
+            ..Default::default()
+        };
+        let line = &l.lines[0];
+        // 第一个词 6 个码元（含空格）
+        assert!((sweep_offset(line, 1000) - 6.0).abs() < 1e-6);
+        assert!((sweep_offset(line, 1500) - 8.5).abs() < 1e-6);
+        assert!((sweep_offset(line, 2000) - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn draw_returns_placeholders_for_each_status() {
+        let mut v = LyricView::default();
+        assert!(v.draw(0, Lang::Zh).is_empty());
+
+        v.status = LyricStatus::Loading;
+        let d = v.draw(0, Lang::Zh);
+        assert!(d.placeholder);
+        assert!(d.cur.contains("加载"));
+
+        v.status = LyricStatus::NotFound;
+        let d = v.draw(0, Lang::Zh);
+        assert!(d.placeholder);
+        assert!(d.cur.contains("暂无"));
+
+        v.status = LyricStatus::NetworkError;
+        let d = v.draw(0, Lang::En);
+        assert!(d.placeholder);
+        assert!(d.cur.contains("No lyrics"));
+    }
+
+    #[test]
+    fn draw_picks_current_and_next_line() {
+        let l = Arc::new(Lyrics {
+            lines: vec![line(0, 1000, "第一"), line(1000, 2000, "第二"), line(2000, 3000, "第三")],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(l),
+            ..Default::default()
+        };
+        let d = v.draw(1500, Lang::Zh);
+        assert_eq!(d.cur, "第二");
+        assert_eq!(d.next, "第三");
+        assert!(!d.placeholder);
+    }
+
+    #[test]
+    fn draw_before_first_line_shows_next_as_first() {
+        let l = Arc::new(Lyrics {
+            lines: vec![line(5000, 6000, "第一")],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(l),
+            ..Default::default()
+        };
+        let d = v.draw(0, Lang::Zh);
+        assert_eq!(d.cur, "");
+        assert_eq!(d.next, "第一");
+    }
+
+    #[test]
+    fn draw_after_last_line_keeps_last_line() {
+        let l = Arc::new(Lyrics {
+            lines: vec![line(0, 1000, "只有一句")],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(l),
+            ..Default::default()
+        };
+        let d = v.draw(99_999, Lang::Zh);
+        assert_eq!(d.cur, "只有一句");
+        assert_eq!(d.next, "");
     }
 }

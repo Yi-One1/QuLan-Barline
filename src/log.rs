@@ -13,7 +13,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -119,7 +119,7 @@ fn rotate_if_needed(path: &PathBuf) {
     let _ = fs::rename(path, with_index(path, 1));
 }
 
-fn with_index(path: &PathBuf, index: u32) -> PathBuf {
+fn with_index(path: &Path, index: u32) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())

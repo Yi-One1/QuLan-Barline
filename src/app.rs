@@ -31,9 +31,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{Config, LyricModeSerde};
-use crate::event::{AppEvent, Effect, MediaCommand, WidgetInput};
+use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, WidgetInput};
 use crate::i18n::{self, Lang};
-use crate::lyric::LyricView;
+use crate::lyric::service::LyricService;
+use crate::lyric::{LyricDraw, LyricStatus, LyricView};
 use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState, RepeatMode};
 use crate::platform::dpi::scale_for;
 use crate::platform::wake::{EventSink, WakeHwnd};
@@ -48,7 +49,7 @@ use crate::taskbar::host::TaskbarHost;
 use crate::ui::hit::HitTarget;
 use crate::ui::interaction::Interaction;
 use crate::ui::menu::{self, MenuCommand};
-use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_BLUR, TIMER_CLICK};
+use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_BLUR, TIMER_CLICK, TIMER_LYRIC};
 
 /// 交互修饰态（PRD 机器 C）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,6 +109,11 @@ pub struct AppState {
     pub geometry_epoch: u64,
     /// 模糊背景（仅 Hover 且 mode=Blur 时非 None）
     pub blur: Option<Arc<BlurBuffer>>,
+    /// 切歌瞬间的旧歌词淡出：`(当前行, 下一行, 开始时刻)`，120ms 后清空。
+    ///
+    /// 存的是**字符串副本**而不是引用：切歌时 `lyrics` 会被换成 Loading，
+    /// 旧那首的 `Arc<Lyrics>` 随时可能被释放。
+    pub lyric_fade: Option<(String, String, Instant)>,
 }
 
 impl AppState {
@@ -150,6 +156,23 @@ impl AppState {
         };
         (pos as f32 / dur as f32).clamp(0.0, 1.0)
     }
+
+    /// 歌词应该用的时间轴（PRD P0-09 / T12 第 6 条）。
+    ///
+    /// 拖动进度条时用预览位置——否则用户拖到 3:00 而歌词还停在 1:20，
+    /// 松手瞬间才跳变。暂停时 `position_now()` 返回采样值，扫光自然停住。
+    pub fn lyric_time(&self) -> Ms {
+        if self.hover == HoverState::Seeking {
+            self.seek_preview_ms
+        } else {
+            self.playing.position_now()
+        }
+    }
+
+    /// 这一帧要画的歌词。渲染层与 UI 层共用同一份推导，避免两边算法漂移。
+    pub fn lyric_draw(&self, lang: Lang) -> LyricDraw<'_> {
+        self.lyrics.draw(self.lyric_time(), lang)
+    }
 }
 
 /// 应用主体。持有句柄与副作用执行器。
@@ -163,6 +186,7 @@ pub struct App {
     widget: Option<TaskbarHost>,
     renderer: Option<Renderer>,
     media: Option<MediaService>,
+    lyric: Option<LyricService>,
     sampler: Option<Sampler>,
     geometry: Option<TaskbarGeometry>,
     /// 小组件当前的屏幕矩形（由 `relayout` 算好，`redraw` 直接用）
@@ -174,9 +198,42 @@ pub struct App {
     /// 动画 / 模糊定时器当前是否已挂
     anim_timer_on: bool,
     blur_timer_on: bool,
-    /// 系统控件提示是否已弹过（本次进程内）
+    /// 歌词推进定时器当前是否已挂（仅在「播放中 + 歌词就绪」时存在）
+    lyric_timer_on: bool,
+    /// 歌词区当前高度（逻辑像素，**动画中间值**）
+    lyric_h: f32,
+    /// 歌词区高度过渡（PRD P0-06 的 200ms 收合）
+    lyric_anim: Option<HeightAnim>,
+    /// 上一帧的歌词绘制指纹，用来跳过无变化的重绘
+    last_lyric_key: Option<(Option<usize>, i32)>,
     /// 上一轮几何探测是否失败（避免日志刷屏）
     geom_failed: bool,
+}
+
+/// 歌词区高度过渡动画。
+#[derive(Debug, Clone, Copy)]
+struct HeightAnim {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+/// 高度过渡时长（PRD P0-06：200ms）。
+const HEIGHT_ANIM_MS: f32 = 200.0;
+/// 切歌时旧歌词的淡出时长（T12 第 4 条：120ms）。
+pub const LYRIC_FADE_SECS: f32 = 0.120;
+
+impl HeightAnim {
+    /// 当前时刻的插值高度（ease-out cubic：收合时先快后慢，观感更自然）。
+    fn value(&self, now: Instant) -> (f32, bool) {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 / HEIGHT_ANIM_MS;
+        if t >= 1.0 {
+            return (self.to, true);
+        }
+        let t = t.clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - t).powi(3);
+        (self.from + (self.to - self.from) * e, false)
+    }
 }
 
 impl App {
@@ -235,6 +292,9 @@ impl App {
 
         let target_rect = geometry.as_ref().map(|g| g.target).unwrap_or_default();
 
+        // 歌词区初始高度 = 配置对应的形态高度（不做入场动画）
+        let lyric_h = lyric_extra_logical(&config);
+
         let app = Box::new(App {
             state: AppState {
                 theme: Theme::default(),
@@ -248,6 +308,7 @@ impl App {
             widget,
             renderer,
             media: None,
+            lyric: None,
             sampler,
             geometry,
             target_rect,
@@ -256,6 +317,10 @@ impl App {
             last_coverage: None,
             anim_timer_on: false,
             blur_timer_on: false,
+            lyric_timer_on: false,
+            lyric_h,
+            lyric_anim: None,
+            last_lyric_key: None,
             geom_failed: false,
         });
 
@@ -267,9 +332,10 @@ impl App {
             crate::ui::widget_wnd::bind_app(w.hwnd(), ptr);
         }
 
-        // 启动媒体线程（MTA）。失败不阻塞启动。
+        // 启动媒体 / 歌词线程（MTA / 普通线程）。失败不阻塞启动。
         unsafe {
-            (*ptr).media = MediaService::spawn(sink);
+            (*ptr).media = MediaService::spawn(sink.clone());
+            (*ptr).lyric = LyricService::spawn(sink);
             (*ptr).relayout();
         }
 
@@ -291,6 +357,9 @@ impl App {
         widget_wnd::uninstall_wheel_hook();
         if let Some(media) = app.media.as_mut() {
             media.shutdown();
+        }
+        if let Some(lyric) = app.lyric.as_mut() {
+            lyric.shutdown();
         }
         if let Some(sampler) = app.sampler.as_mut() {
             sampler.shutdown();
@@ -316,6 +385,7 @@ impl App {
             let effects = self.reduce(evt);
             self.apply(effects);
         }
+        self.sync_lyric_timer();
     }
 
     /// 1 秒定时器：几何兜底探测 + 乐观更新对账。
@@ -498,6 +568,8 @@ impl App {
                     self.kill_widget_timer(TIMER_CLICK);
                     let inputs = self.interact.on_click_timer();
                     self.dispatch(inputs);
+                } else if id == TIMER_LYRIC {
+                    self.on_lyric_tick();
                 } else if id == TIMER_BLUR {
                     if self.is_hovering() {
                         self.request_backdrop(true);
@@ -513,6 +585,11 @@ impl App {
 
     /// 16ms 动画定时器。
     fn on_anim_timer(&mut self) {
+        // 歌词区高度过渡（PRD P0-06 的 200ms 收合/展开）
+        let height_changed = self.advance_height_anim();
+        // 切歌淡出：120ms 到点就清空并补一帧
+        let fade_done = self.expire_lyric_fade();
+
         let inputs = self
             .interact
             .on_anim_tick(crate::config::defaults::limits::ANIM_TIMER_MS);
@@ -528,8 +605,125 @@ impl App {
             }
         }
         self.sync_interaction();
-        if redraw || self.interact.animating() {
+        if height_changed {
+            // 高度变了必须整条重排（窗口尺寸 + 渲染目标 + 采样区域都要跟着变）
+            self.relayout();
+            return;
+        }
+        if redraw || fade_done || self.interact.animating() || self.lyric_fade_active() {
             self.redraw();
+        }
+    }
+
+    /// 切歌淡出是否还在进行（120ms 内）。
+    fn lyric_fade_active(&self) -> bool {
+        self.state
+            .lyric_fade
+            .as_ref()
+            .map(|(_, _, t)| t.elapsed().as_secs_f32() < LYRIC_FADE_SECS)
+            .unwrap_or(false)
+    }
+
+    /// 淡出到点就清空。返回 `true` 表示刚清空（需要补一帧）。
+    fn expire_lyric_fade(&mut self) -> bool {
+        if self.state.lyric_fade.is_some() && !self.lyric_fade_active() {
+            self.state.lyric_fade = None;
+            return true;
+        }
+        false
+    }
+
+    /// 推进歌词区高度动画。返回 `true` 表示**取整后的高度**变了，需要重排。
+    fn advance_height_anim(&mut self) -> bool {
+        let Some(anim) = self.lyric_anim else {
+            return false;
+        };
+        let (value, done) = anim.value(Instant::now());
+        let before = (self.lyric_h * 1000.0) as i32;
+        self.lyric_h = value;
+        // 按物理像素取整比较：0.5px 以内的变化重排没有意义，只会抖
+        let after = (self.lyric_h * 1000.0) as i32;
+        if done {
+            self.lyric_anim = None;
+            self.lyric_h = anim.to;
+        }
+        before != after
+    }
+
+    /// 让歌词区高度平滑过渡到配置对应的目标值。
+    fn animate_lyric_height(&mut self) {
+        let target = lyric_extra_logical(&self.config);
+        if (target - self.lyric_h).abs() < 0.01 {
+            self.lyric_anim = None;
+            return;
+        }
+        crate::log_debug!(
+            "歌词区高度过渡：{:.0}px → {:.0}px（{}ms）",
+            self.lyric_h,
+            target,
+            HEIGHT_ANIM_MS as u32
+        );
+        self.lyric_anim = Some(HeightAnim {
+            from: self.lyric_h,
+            to: target,
+            start: Instant::now(),
+        });
+        if !self.anim_timer_on {
+            self.start_widget_timer(TIMER_ANIM, crate::config::defaults::limits::ANIM_TIMER_MS);
+        }
+    }
+
+    /// 歌词推进定时器（40ms ≈ 25fps）的开关判定。
+    ///
+    /// 只在「小组件可见 + 歌词就绪 + 正在播放」时存在。暂停时立刻停掉：
+    /// 扫光本来就该停住（PRD P0-09），继续 25fps 重绘纯属浪费 CPU。
+    fn sync_lyric_timer(&mut self) {
+        let want = self.state.visible
+            && self.config.lyrics.enabled
+            && self.state.lyrics.status == LyricStatus::Ready
+            && self.state.effective_state() == PlaybackState::Playing;
+        if want {
+            if !self.lyric_timer_on {
+                self.start_widget_timer(TIMER_LYRIC, widget_wnd::TIMER_LYRIC_MS);
+            }
+        } else if self.lyric_timer_on {
+            self.kill_widget_timer(TIMER_LYRIC);
+            self.last_lyric_key = None;
+        }
+    }
+
+    /// 25fps 歌词推进：只有「行号或扫光位置真的变了」才重绘。
+    ///
+    /// 扫光位置量化到 1/4 码元（约 3px @13px 字号）再比较——比这更细的变化
+    /// 人眼看不出来，却会让每一帧都重绘。
+    fn on_lyric_tick(&mut self) {
+        // 先把要比较的量拷出来，结束对 `self.state` 的不可变借用
+        let (key, preview) = {
+            let draw = self.state.lyric_draw(self.lang);
+            let key = (draw.line, (draw.sweep * 4.0) as i32);
+            let cut = draw.cur.char_indices().nth(24).map(|(i, _)| i).unwrap_or(draw.cur.len());
+            (key, draw.cur[..cut].to_string())
+        };
+        if self.last_lyric_key == Some(key) {
+            return;
+        }
+        let line_changed = self.last_lyric_key.map(|k| k.0) != Some(key.0);
+        self.last_lyric_key = Some(key);
+        self.state.lyrics.line_idx = key.0;
+        if line_changed {
+            crate::log_debug!("歌词行切换 → {:?}：{preview}", key.0);
+        }
+        self.redraw();
+    }
+
+    /// 组装一次歌词请求。
+    fn lyric_request(&self, retry: bool) -> LyricRequest {
+        LyricRequest {
+            track_id: self.state.playing.track_id,
+            track: self.state.playing.track.clone().unwrap_or_default(),
+            local_dirs: self.config.lyrics.local_dirs.clone(),
+            online_enabled: self.config.lyrics.online_enabled,
+            retry,
         }
     }
 
@@ -540,6 +734,14 @@ impl App {
         match evt {
             AppEvent::NowPlaying(np) => {
                 let track_changed = self.state.playing.track_id != np.track_id;
+                if track_changed && self.state.lyrics.status == LyricStatus::Ready {
+                    // 旧歌词淡出 120ms（T12 第 4 条），避免"啪"一下消失
+                    let draw = self.state.lyric_draw(self.lang);
+                    if !draw.cur.is_empty() || !draw.next.is_empty() {
+                        self.state.lyric_fade =
+                            Some((draw.cur.to_string(), draw.next.to_string(), Instant::now()));
+                    }
+                }
                 self.state.playing = *np;
                 self.state.optimistic = None;
                 if track_changed {
@@ -547,12 +749,18 @@ impl App {
                     self.interact.reset();
                     self.sync_interaction();
                 }
-                vec![Effect::Relayout]
+                let mut effects = vec![Effect::Relayout];
+                if track_changed {
+                    // 换歌 → 立刻发歌词请求（旧歌词由 `LyricLoading` 覆盖，不残留）
+                    effects.push(Effect::Lyric(self.lyric_request(false)));
+                }
+                effects
             }
             AppEvent::SessionCleared => {
                 crate::log_info!("会话已清空，小组件隐藏");
                 self.state.playing = NowPlaying::default();
                 self.state.blur = None;
+                self.state.lyrics = LyricView::default();
                 self.interact.reset();
                 self.sync_interaction();
                 vec![Effect::Relayout]
@@ -606,6 +814,58 @@ impl App {
                 Vec::new()
             }
             AppEvent::WidgetInput(input) => self.reduce_input(input),
+            // ---------------- 歌词（T2 → T0） ----------------
+            AppEvent::LyricLoading { track_id } => {
+                // 代次不符 = 用户已经切走了，丢弃（避免旧歌词覆盖新歌）
+                if track_id != self.state.playing.track_id {
+                    crate::log_debug!("丢弃过期 LyricLoading（track {track_id}）");
+                    return Vec::new();
+                }
+                self.state.lyrics.status = LyricStatus::Loading;
+                self.state.lyrics.track_id = track_id;
+                self.state.lyrics.lyrics = None;
+                self.state.lyrics.line_idx = None;
+                vec![Effect::Redraw]
+            }
+            AppEvent::LyricReady { track_id, lyrics } => {
+                if track_id != self.state.playing.track_id {
+                    crate::log_debug!("丢弃过期 LyricReady（track {track_id}）");
+                    return Vec::new();
+                }
+                crate::log_info!(
+                    "歌词就绪：{} 行，kind={:?}",
+                    lyrics.lines.len(),
+                    lyrics.kind
+                );
+                self.state.lyrics.status = LyricStatus::Ready;
+                self.state.lyrics.track_id = track_id;
+                self.state.lyrics.lyrics = Some(lyrics);
+                self.state.lyrics.retry = 0;
+                self.state.lyrics.line_idx = None;
+                self.sync_lyric_timer();
+                vec![Effect::Redraw]
+            }
+            AppEvent::LyricMissing { track_id, reason } => {
+                if track_id != self.state.playing.track_id {
+                    return Vec::new();
+                }
+                crate::log_info!("歌词缺失：{reason:?}");
+                self.state.lyrics.status = match reason {
+                    crate::lyric::LyricMissReason::NetworkError => LyricStatus::NetworkError,
+                    _ => LyricStatus::NotFound,
+                };
+                self.state.lyrics.track_id = track_id;
+                self.state.lyrics.lyrics = None;
+                self.state.lyrics.line_idx = None;
+                self.sync_lyric_timer();
+                vec![Effect::Redraw]
+            }
+            AppEvent::LyricRetryDue { track_id } => {
+                if track_id != self.state.playing.track_id {
+                    return Vec::new();
+                }
+                vec![Effect::Lyric(self.lyric_request(true))]
+            }
             AppEvent::TaskbarGeometry(g) => {
                 self.geometry = Some(g);
                 vec![Effect::Relayout]
@@ -626,6 +886,7 @@ impl App {
                 crate::log_info!("配置变更（version={}）", cfg.version);
                 self.lang = Lang::from_serde(cfg.general.language);
                 self.config = *cfg;
+                self.animate_lyric_height();
                 self.relayout();
                 Vec::new()
             }
@@ -699,6 +960,7 @@ impl App {
             WidgetInput::VolumeHudExpired => vec![Effect::Redraw],
             WidgetInput::ToggleLyricsFromMenu => {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
+                self.animate_lyric_height();
                 self.commit_config()
             }
             WidgetInput::SetLyricMode(mode) => {
@@ -708,6 +970,7 @@ impl App {
                 } else {
                     LyricModeSerde::TwoLine
                 };
+                self.animate_lyric_height();
                 self.commit_config()
             }
             WidgetInput::SetBackgroundMode(mode) => {
@@ -755,6 +1018,10 @@ impl App {
                 Effect::Media(cmd) => match self.media.as_ref() {
                     Some(m) => m.send(cmd),
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
+                },
+                Effect::Lyric(req) => match self.lyric.as_ref() {
+                    Some(l) => l.send(req),
+                    None => crate::log_warn!("歌词线程未启动，请求被丢弃"),
                 },
                 Effect::SaveConfig(cfg) => {
                     if let Err(e) = cfg.save() {
@@ -836,7 +1103,7 @@ impl App {
             None => 0.0,
         };
 
-        let mut lay = layout::compute_ex(geo.edge, form, scale, bar_thickness, text_w);
+        let mut lay = layout::compute_full(geo.edge, form, scale, bar_thickness, text_w, self.lyric_h);
         if let Some(r) = self.renderer.as_mut() {
             r.prepare_text(&mut lay, &title, &artist);
         }
@@ -884,6 +1151,7 @@ impl App {
 
         self.redraw();
         self.sync_visibility();
+        self.sync_lyric_timer();
         self.request_backdrop(self.is_hovering());
     }
 
@@ -927,6 +1195,8 @@ impl App {
             self.kill_widget_timer(TIMER_BLUR);
             widget_wnd::uninstall_wheel_hook();
             self.interact.wheel_hooked = false;
+            self.kill_widget_timer(TIMER_LYRIC);
+            self.last_lyric_key = None;
         }
     }
 
@@ -976,8 +1246,8 @@ impl App {
         self.state.pressed = self.interact.pressed;
         self.state.volume_hud_left_ms = self.interact.hud_left_ms;
 
-        // 16ms 动画定时器：只在真的需要推进时存在
-        if self.interact.animating() {
+        // 16ms 动画定时器：只在真的需要推进时存在（悬停淡入淡出 / 歌词高度过渡）
+        if self.interact.animating() || self.lyric_anim.is_some() || self.lyric_fade_active() {
             if !self.anim_timer_on {
                 self.start_widget_timer(TIMER_ANIM, crate::config::defaults::limits::ANIM_TIMER_MS);
             }
@@ -1021,6 +1291,7 @@ impl App {
         match id {
             TIMER_ANIM => self.anim_timer_on = true,
             TIMER_BLUR => self.blur_timer_on = true,
+            TIMER_LYRIC => self.lyric_timer_on = true,
             _ => {}
         }
     }
@@ -1035,6 +1306,7 @@ impl App {
         match id {
             TIMER_ANIM => self.anim_timer_on = false,
             TIMER_BLUR => self.blur_timer_on = false,
+            TIMER_LYRIC => self.lyric_timer_on = false,
             _ => {}
         }
     }
@@ -1134,18 +1406,21 @@ impl App {
         match cmd {
             MenuCommand::ToggleLyrics => {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
+                self.animate_lyric_height();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
             MenuCommand::LyricOneLine => {
                 self.config.lyrics.enabled = true;
                 self.config.lyrics.mode = LyricModeSerde::OneLine;
+                self.animate_lyric_height();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
             MenuCommand::LyricTwoLine => {
                 self.config.lyrics.enabled = true;
                 self.config.lyrics.mode = LyricModeSerde::TwoLine;
+                self.animate_lyric_height();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
@@ -1361,5 +1636,20 @@ mod tests {
     fn progress_fraction_is_zero_without_duration() {
         let s = AppState::default();
         assert_eq!(s.progress_fraction(), 0.0);
+    }
+}
+
+/// 配置 → 歌词区额外高度（**逻辑像素**，未乘 scale）。
+///
+/// 与 `WidgetForm::lyric_extra_h()` 必须保持一致：一个是"当前动画值"，
+/// 一个是"形态默认值"，两者在动画结束时相等。
+fn lyric_extra_logical(config: &Config) -> f32 {
+    if !config.lyrics.enabled {
+        return 0.0;
+    }
+    if config.lyrics.mode == LyricModeSerde::OneLine {
+        crate::config::defaults::limits::LYRIC_ONE_LINE_H
+    } else {
+        crate::config::defaults::limits::LYRIC_TWO_LINE_H
     }
 }

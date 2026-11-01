@@ -15,8 +15,8 @@ use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_HIT_TEST_METRICS, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 
 use crate::config::defaults::limits;
@@ -188,8 +188,71 @@ impl TextFormats {
             format!("{}{}", text[..bounds[lo]].trim_end(), ELLIPSIS)
         }
     }
+
+    /// 建一个**可复用**的 `IDWriteTextLayout`。
+    ///
+    /// 只给歌词当前行用：扫光需要把「第 N 个码元」映射到 x 坐标
+    /// （[`hit_test_x`]），而只有 `IDWriteTextLayout` 知道每个字形的实际位置。
+    ///
+    /// **只在行文本 / 宽度变化时调用**（结果缓存在 `Renderer` 里），
+    /// 绝不能在渲染热路径上每帧新建——那是 PRD P0-14「空闲 CPU ≤ 0.5%」的头号杀手。
+    pub fn layout(
+        &self,
+        dwrite: &IDWriteFactory,
+        kind: TextKind,
+        text: &str,
+        max_w: f32,
+    ) -> Option<IDWriteTextLayout> {
+        if text.is_empty() || max_w <= 0.0 {
+            return None;
+        }
+        let utf16 = to_utf16(text);
+        let format = self.get(kind);
+        // SAFETY: utf16 生命周期覆盖调用（CreateTextLayout 会复制内容）；
+        // format 由 self 持有；宽高都是正的有限值。
+        unsafe { dwrite.CreateTextLayout(&utf16, format, max_w, 4096.0).ok() }
+    }
 }
 
+/// 把「行内 UTF-16 位置」映射成「相对行首的 x 偏移」。
+///
+/// `text_len` 是这一行文本的 UTF-16 码元数（调用方知道，不用去问 layout）。
+/// `pos` 是**连续值**（例如 `3.4` = 第 4 个码元扫了 40%），所以要在
+/// 两个整数位置之间线性插值——这样扫光才会平滑移动，而不是一个字一个字地跳。
+///
+/// 越界与命中失败都返回 `0.0`（宁可少扫一点，也不要画到行外）。
+pub fn hit_test_x(layout: &IDWriteTextLayout, text_len: u32, pos: f32) -> f32 {
+    if text_len == 0 {
+        return 0.0;
+    }
+    let clamped = pos.clamp(0.0, text_len as f32);
+    let i0 = clamped.floor() as u32;
+    let i1 = (i0 + 1).min(text_len);
+    let frac = clamped - i0 as f32;
+    let x0 = x_at(layout, i0);
+    if frac <= 0.001 || i1 == i0 {
+        return x0;
+    }
+    let x1 = x_at(layout, i1);
+    x0 + (x1 - x0) * frac
+}
+
+/// 单个码元位置的 x 坐标。
+fn x_at(layout: &IDWriteTextLayout, text_pos: u32) -> f32 {
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+    // SAFETY: 三个出参都是本地栈变量；text_pos 由调用方钳在 [0, len] 内。
+    let ok = unsafe {
+        layout.HitTestTextPosition(text_pos, false, &mut x, &mut y, &mut metrics)
+    };
+    if ok.is_err() || !x.is_finite() {
+        return 0.0;
+    }
+    x
+}
+
+/// 布局里的文本长度（UTF-16 码元数）。
 fn metrics_width(layout: &IDWriteTextLayout) -> f32 {
     let mut m = DWRITE_TEXT_METRICS::default();
     // SAFETY: m 是本地栈结构体，GetMetrics 只写出它。

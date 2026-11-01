@@ -29,14 +29,17 @@
 
 use windows::core::Result;
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP,
 };
-use windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL;
+use windows::Win32::Graphics::DirectWrite::{
+    IDWriteTextLayout, DWRITE_MEASURING_MODE_NATURAL,
+};
 
 use crate::app::{AppState, HoverState};
 use crate::config::defaults::limits;
 use crate::i18n;
+use crate::lyric::LyricDraw;
 use crate::media::PlaybackState;
 use crate::platform::wide::to_utf16;
 use crate::render::cover_cache::CoverCache;
@@ -46,24 +49,58 @@ use crate::render::text::{TextFormats, TextKind};
 use crate::render::theme::{Rgba, Theme};
 use crate::ui::hit::HitTarget;
 
+/// 一帧的绘制上下文。
+///
+/// 为什么要有它：`paint` 一族函数原先各自吃 6–9 个参数，其中
+/// `text / layout / state / theme / lang / scale` 是**每一层都要用**的同一份东西。
+/// 聚合之后每个绘制函数只剩「本层特有的参数」（矩形、颜色、文本），
+/// 签名反而更好读（也自然满足 clippy 的 `too_many_arguments`）。
+pub struct Ctx<'a> {
+    pub text: &'a TextFormats,
+    pub layout: &'a WidgetLayout,
+    pub state: &'a AppState,
+    /// 主题按值存（`Theme` 是 `Copy` 的小结构体，比多传一层引用清爽）
+    pub theme: Theme,
+    pub lang: i18n::Lang,
+    pub scale: f32,
+}
+
+/// 一次单行文本绘制的参数（`draw_line` 的入参）。
+struct TextDraw<'a> {
+    kind: TextKind,
+    text: &'a str,
+    rect: crate::render::layout::RectF,
+    color: Rgba,
+    outline: bool,
+}
+
+/// 一个药丸浮层（音量 HUD / 拖动时间气泡）的参数。
+struct Pill<'a> {
+    label: &'a str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 /// 把一帧画出来。调用方负责 `upload` + `UpdateLayeredWindow`。
 ///
 /// `slot` 是当前帧的缓冲槽位（0 = A / 1 = B），封面位图按槽位分桶缓存
 /// （见 [`crate::render::cover_cache`]）。
+///
+/// `lyric` 是本帧的歌词内容（纯数据），`lyric_layout` 是当前行的
+/// `IDWriteTextLayout` + 码元数——扫光需要它把「第 N 个码元」换成 x 坐标。
 pub fn paint(
-    text: &TextFormats,
     frame: &mut Frame,
     covers: &mut CoverCache,
     slot: u8,
-    layout: &WidgetLayout,
-    state: &AppState,
-    lang: i18n::Lang,
+    ctx: &Ctx<'_>,
+    lyric: &LyricDraw<'_>,
+    lyric_layout: Option<(&IDWriteTextLayout, u32)>,
 ) -> Result<()> {
     let w = frame.width as f32;
     let h = frame.height as f32;
-    let s = layout.effective_scale();
-    let theme = state.theme;
-    let hover_a = state.hover_alpha.clamp(0.0, 1.0);
+    let hover_a = ctx.state.hover_alpha.clamp(0.0, 1.0);
 
     let rt = frame.rt.clone();
 
@@ -79,26 +116,26 @@ pub fn paint(
 
         // ---- 2. 悬停背景 ----
         if hover_a > 0.004 {
-            draw_background(&rt, frame, state, &theme, hover_a, s)?;
+            draw_background(&rt, frame, ctx, hover_a)?;
         }
 
         // ---- 3. 封面 ----
-        draw_cover(&rt, frame, covers, slot, layout, state, &theme, s)?;
+        draw_cover(&rt, frame, covers, slot, ctx)?;
 
         // ---- 4. 文字 ----
-        draw_texts(&rt, frame, text, layout, state, &theme, lang, s)?;
+        draw_texts(&rt, frame, ctx)?;
 
         // ---- 5. 按钮 ----
-        draw_buttons(&rt, frame, layout, state, &theme, s)?;
+        draw_buttons(&rt, frame, ctx)?;
 
         // ---- 6. 进度条 / 音量 HUD ----
-        draw_progress(&rt, frame, text, layout, state, &theme, lang, s)?;
+        draw_progress(&rt, frame, ctx)?;
 
-        // ---- 7. 歌词占位（M3/T12 换成真歌词与扫光）----
-        draw_lyric_placeholder(&rt, frame, text, layout, &theme, lang, s)?;
+        // ---- 7. 歌词（逐字扫光）----
+        draw_lyrics(&rt, frame, ctx, lyric, lyric_layout)?;
 
         // ---- 8. Seeking 时间气泡 ----
-        draw_seek_bubble(&rt, frame, text, layout, state, &theme, s)?;
+        draw_seek_bubble(&rt, frame, ctx)?;
 
         rt.EndDraw(None, None)?;
     }
@@ -112,11 +149,10 @@ pub fn paint(
 fn draw_background(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
-    state: &AppState,
-    theme: &Theme,
+    ctx: &Ctx<'_>,
     alpha: f32,
-    s: f32,
 ) -> Result<()> {
+    let (state, theme, s) = (ctx.state, &ctx.theme, ctx.scale);
     let w = frame.width as f32;
     let h = frame.height as f32;
     let radius = (8.0 * s).min(h * 0.5);
@@ -179,11 +215,9 @@ fn draw_cover(
     frame: &mut Frame,
     covers: &mut CoverCache,
     slot: u8,
-    layout: &WidgetLayout,
-    state: &AppState,
-    theme: &Theme,
-    s: f32,
+    ctx: &Ctx<'_>,
 ) -> Result<()> {
+    let (layout, state, theme, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.scale);
     let c = layout.cover;
     if c.is_empty() {
         return Ok(());
@@ -241,16 +275,8 @@ fn draw_cover(
 
 // ------------------------------------------------------------------ 文字
 
-fn draw_texts(
-    rt: &ID2D1RenderTarget,
-    frame: &mut Frame,
-    text: &TextFormats,
-    layout: &WidgetLayout,
-    state: &AppState,
-    theme: &Theme,
-    lang: i18n::Lang,
-    _s: f32,
-) -> Result<()> {
+fn draw_texts(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
+    let (layout, state, theme, lang) = (ctx.layout, ctx.state, &ctx.theme, ctx.lang);
     // 歌名：优先用布局里缓存的截断结果（M1 报告 §5.9 的技术债解法）
     let title_src: &str = if layout.text_key != 0 {
         layout.title_text.as_str()
@@ -295,13 +321,11 @@ fn draw_texts(
 fn draw_line(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
-    text: &TextFormats,
-    kind: TextKind,
-    s: &str,
-    rect: crate::render::layout::RectF,
-    color: Rgba,
-    outline: bool,
+    ctx: &Ctx<'_>,
+    d: &TextDraw<'_>,
 ) -> Result<()> {
+    let text = ctx.text;
+    let (kind, s, rect, color, outline) = (d.kind, d.text, d.rect, d.color, d.outline);
     if s.is_empty() || rect.is_empty() {
         return Ok(());
     }
@@ -352,14 +376,8 @@ fn draw_line(
 
 // ------------------------------------------------------------------ 按钮
 
-fn draw_buttons(
-    rt: &ID2D1RenderTarget,
-    frame: &mut Frame,
-    layout: &WidgetLayout,
-    state: &AppState,
-    theme: &Theme,
-    s: f32,
-) -> Result<()> {
+fn draw_buttons(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
+    let (layout, state, theme, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.scale);
     let playing = state.effective_state() == PlaybackState::Playing;
     let fallback = state.effective_state() == PlaybackState::Fallback;
 
@@ -446,17 +464,8 @@ fn fill_triangle(
 
 // ------------------------------------------------------------------ 进度条 / HUD
 
-#[allow(clippy::too_many_arguments)]
-fn draw_progress(
-    rt: &ID2D1RenderTarget,
-    frame: &mut Frame,
-    text: &TextFormats,
-    layout: &WidgetLayout,
-    state: &AppState,
-    theme: &Theme,
-    lang: i18n::Lang,
-    s: f32,
-) -> Result<()> {
+fn draw_progress(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
+    let (layout, state, theme, lang, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.lang, ctx.scale);
     let duration = state.playing.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
     let hud = state.hover == HoverState::VolumeHud;
     let seeking = state.hover == HoverState::Seeking;
@@ -538,14 +547,11 @@ fn format_hud_volume(lang: i18n::Lang, v: f32) -> String {
 fn draw_pill(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
-    text: &TextFormats,
-    label: &str,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    theme: &Theme,
+    ctx: &Ctx<'_>,
+    p: &Pill<'_>,
 ) -> Result<()> {
+    let text = ctx.text;
+    let (label, x, y, w, h) = (p.label, p.x, p.y, p.w, p.h);
     let bg = frame.brush(Rgba::new(0x14, 0x14, 0x18, 0xE6))?;
     // SAFETY: 栈上圆角矩形。
     unsafe {
@@ -572,45 +578,162 @@ fn draw_pill(
     Ok(())
 }
 
-// ------------------------------------------------------------------ 歌词占位
+// ------------------------------------------------------------------ 歌词
 
-fn draw_lyric_placeholder(
+/// 画歌词区（T12）：当前行**逐字扫光**，下一行 30% 不透明度。
+///
+/// 扫光用「两遍绘制 + 裁剪」实现，而不是逐字画不同颜色：
+/// 1. 整行先按**未唱**颜色画一遍；
+/// 2. `PushAxisAlignedClip` 裁到 `[行首, 扫光边界]`，再用**已唱**颜色画同一行；
+/// 3. `PopAxisAlignedClip`。
+///
+/// 为什么不用 `IDWriteTextLayout::SetDrawingEffect` 分段上色：那需要
+/// `IDWriteTextLayout1` + `IDWriteTextRenderer` 自定义渲染器（几百行 COM），
+/// 而且每帧都要重设 effect。裁剪法只要一次 `HitTestTextPosition`，成本低一个量级。
+fn draw_lyrics(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
-    text: &TextFormats,
-    layout: &WidgetLayout,
-    theme: &Theme,
-    lang: i18n::Lang,
-    _s: f32,
+    ctx: &Ctx<'_>,
+    lyric: &LyricDraw<'_>,
+    lyric_layout: Option<(&IDWriteTextLayout, u32)>,
 ) -> Result<()> {
-    if layout.form == crate::render::layout::WidgetForm::Compact || layout.lyric_cur.is_empty() {
+    let (layout, state, theme) = (ctx.layout, ctx.state, &ctx.theme);
+    if layout.form == crate::render::layout::WidgetForm::Compact || lyric.is_empty() {
         return Ok(());
     }
-    // M3/T12 会把这里换成真歌词 + 扫光；M2 只保证「高度按形态变化」这条验收成立。
-    let label = i18n::t(lang, "lyric.missing");
+
+    // ---- 切歌瞬间：旧歌词淡出（120ms），这期间不画新内容 ----
+    if let Some((old_cur, old_next, started)) = &state.lyric_fade {
+        let t = started.elapsed().as_secs_f32() / crate::app::LYRIC_FADE_SECS;
+        if t < 1.0 {
+            let a = ((1.0 - t) * 255.0).clamp(0.0, 255.0) as u8;
+            if !old_cur.is_empty() {
+                draw_line(
+                    rt,
+                    frame,
+                    text,
+                    TextKind::Lyric,
+                    old_cur,
+                    layout.lyric_cur,
+                    Rgba::from_rgb(theme.text, a),
+                    false,
+                )?;
+            }
+            if !old_next.is_empty() && !layout.lyric_next.is_empty() {
+                draw_line(
+                    rt,
+                    frame,
+                    text,
+                    TextKind::Lyric,
+                    old_next,
+                    layout.lyric_next,
+                    Rgba::from_rgb(theme.text_dim, ((a as f32) * 0.6) as u8),
+                    false,
+                )?;
+            }
+            return Ok(());
+        }
+    }
+
+    // ---- 占位文案（加载中 / 暂无歌词）：淡色、无扫光 ----
+    if lyric.placeholder {
+        return draw_line(
+            rt,
+            frame,
+            text,
+            TextKind::Lyric,
+            lyric.cur,
+            layout.lyric_cur,
+            Rgba::from_rgb(theme.text_dim, 0xB0),
+            false,
+        );
+    }
+
+    // ---- 下一行（先画，压在下面也无所谓，两行不重叠）----
+    if !lyric.next.is_empty() && !layout.lyric_next.is_empty() {
+        draw_line(
+            rt,
+            frame,
+            text,
+            TextKind::Lyric,
+            lyric.next,
+            layout.lyric_next,
+            Rgba::from_rgb(theme.text_dim, Theme::DIM_ALPHA),
+            false,
+        )?;
+    }
+
+    if lyric.cur.is_empty() || layout.lyric_cur.is_empty() {
+        return Ok(());
+    }
+
+    // ---- 当前行：未唱部分 ----
+    let unsung = Rgba::from_rgb(theme.text_dim, 0x8C);
     draw_line(
         rt,
         frame,
         text,
         TextKind::Lyric,
-        label,
+        lyric.cur,
         layout.lyric_cur,
-        Rgba::from_rgb(theme.text_dim, 0xB0),
+        unsung,
         false,
-    )
+    )?;
+
+    // ---- 当前行：已唱部分（裁剪后重画）----
+    let Some((text_layout, utf16_len)) = lyric_layout else {
+        // 没有布局（理论上不会发生）→ 整行按已唱色画，至少不会看着像"没歌词"
+        return draw_line(
+            rt,
+            frame,
+            text,
+            TextKind::Lyric,
+            lyric.cur,
+            layout.lyric_cur,
+            Rgba::from_rgb(theme.text, 0xFF),
+            false,
+        );
+    };
+    if lyric.sweep <= 0.01 {
+        return Ok(());
+    }
+    let boundary = crate::render::text::hit_test_x(text_layout, utf16_len, lyric.sweep);
+    if boundary <= 0.5 {
+        return Ok(());
+    }
+    let clip = d2d_rect(
+        layout.lyric_cur.x,
+        layout.lyric_cur.y,
+        boundary.min(layout.lyric_cur.w),
+        layout.lyric_cur.h,
+    );
+    // SAFETY: clip 是栈上矩形；Push/Pop 严格配对（中间只有一次 DrawText，
+    // 且 `?` 提前返回前已保证没有未配对的 Push——这里 draw_line 失败会跳过 Pop，
+    // 所以先用 let 接住结果再 Pop）。
+    unsafe {
+        rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    }
+    let r = draw_line(
+        rt,
+        frame,
+        text,
+        TextKind::Lyric,
+        lyric.cur,
+        layout.lyric_cur,
+        Rgba::from_rgb(theme.text, 0xFF),
+        false,
+    );
+    // SAFETY: 与上面的 PushAxisAlignedClip 配对；无论 draw_line 成功与否都要 Pop。
+    unsafe {
+        rt.PopAxisAlignedClip();
+    }
+    r
 }
 
 // ------------------------------------------------------------------ Seeking 气泡
 
-fn draw_seek_bubble(
-    rt: &ID2D1RenderTarget,
-    frame: &mut Frame,
-    text: &TextFormats,
-    layout: &WidgetLayout,
-    state: &AppState,
-    theme: &Theme,
-    s: f32,
-) -> Result<()> {
+fn draw_seek_bubble(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
+    let (layout, state, s) = (ctx.layout, ctx.state, ctx.scale);
     if state.hover != HoverState::Seeking {
         return Ok(());
     }
