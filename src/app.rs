@@ -109,7 +109,8 @@ pub struct AppState {
     pub geometry_epoch: u64,
     /// 模糊背景（仅 Hover 且 mode=Blur 时非 None）
     pub blur: Option<Arc<BlurBuffer>>,
-    /// 切歌瞬间的旧歌词淡出：`(当前行, 下一行, 开始时刻)`，120ms 后清空。
+    /// 切歌瞬间的旧歌词转场：`(当前行, 下一行, 开始时刻)`，150ms 后清空。
+    /// 转场 = 120ms 淡出 + 150ms 上移（M3 遗留 P2）。
     ///
     /// 存的是**字符串副本**而不是引用：切歌时 `lyrics` 会被换成 Loading，
     /// 旧那首的 `Arc<Lyrics>` 随时可能被释放。
@@ -232,8 +233,12 @@ struct HeightAnim {
 
 /// 高度过渡时长（PRD P0-06：200ms）。
 const HEIGHT_ANIM_MS: f32 = 200.0;
-/// 切歌时旧歌词的淡出时长（T12 第 4 条：120ms）。
-pub const LYRIC_FADE_SECS: f32 = 0.120;
+/// 切歌转场总时长（M3 遗留 P2：120ms 淡出 + 150ms 上移，窗口取并集 150ms）。
+pub const LYRIC_FADE_SECS: f32 = 0.150;
+/// 转场里旧歌词的淡出段时长（T12 第 4 条原口径，保持观感不变）。
+pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
+/// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
+pub const LYRIC_SLIDE_PX: f32 = 6.0;
 
 impl HeightAnim {
     /// 当前时刻的插值高度（ease-out cubic：收合时先快后慢，观感更自然）。
@@ -680,7 +685,7 @@ impl App {
     fn on_anim_timer(&mut self) {
         // 歌词区高度过渡（PRD P0-06 的 200ms 收合/展开）
         let height_changed = self.advance_height_anim();
-        // 切歌淡出：120ms 到点就清空并补一帧
+        // 切歌转场：150ms 到点就清空并补一帧
         let fade_done = self.expire_lyric_fade();
 
         let inputs = self
@@ -708,7 +713,7 @@ impl App {
         }
     }
 
-    /// 切歌淡出是否还在进行（120ms 内）。
+    /// 切歌转场是否还在进行（150ms 内）。
     fn lyric_fade_active(&self) -> bool {
         self.state
             .lyric_fade
@@ -828,7 +833,7 @@ impl App {
             AppEvent::NowPlaying(np) => {
                 let track_changed = self.state.playing.track_id != np.track_id;
                 if track_changed && self.state.lyrics.status == LyricStatus::Ready {
-                    // 旧歌词淡出 120ms（T12 第 4 条），避免"啪"一下消失
+                    // 旧歌词转场 150ms（120ms 淡出 + 上移，M3 遗留 P2），避免"啪"一下消失
                     let draw = self.state.lyric_draw(self.lang);
                     if !draw.cur.is_empty() || !draw.next.is_empty() {
                         self.state.lyric_fade =
@@ -1078,6 +1083,11 @@ impl App {
                 if hotkey_changed {
                     effects.push(Effect::RebindHotkeys);
                 }
+                // 改项成功后立刻把全量 state 回推给页面（M4 QA 回归缺陷）：
+                // 语言切换等改动要当窗生效，不能等重开。push 同时更新 last_state，
+                // 窗口重建后 on_webview_ready 也能补推到最新值。
+                let json = self.settings_state_json();
+                self.settings.push(&json);
                 effects
             }
         }
@@ -1628,7 +1638,7 @@ impl App {
         draw.placeholder.hash(&mut h);
         draw.cur.hash(&mut h);
         draw.next.hash(&mut h);
-        // 切歌淡出：按 1/16 量化（120ms / 7.5ms ≈ 16 帧）
+        // 切歌转场：按 1/16 量化（150ms / 16 ≈ 9.4ms，仍在 25fps 步长内）
         if let Some((old_cur, old_next, started)) = &st.lyric_fade {
             let t = (started.elapsed().as_secs_f32() / LYRIC_FADE_SECS * 16.0) as u32;
             t.hash(&mut h);

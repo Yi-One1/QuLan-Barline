@@ -44,7 +44,7 @@ use crate::media::PlaybackState;
 use crate::platform::wide::to_utf16;
 use crate::render::cover_cache::CoverCache;
 use crate::render::d2d::{d2d_rect, ellipse, rounded, Frame, TRANSPARENT};
-use crate::render::layout::WidgetLayout;
+use crate::render::layout::{RectF, WidgetLayout};
 use crate::render::text::{TextFormats, TextKind};
 use crate::render::theme::{Rgba, Theme};
 use crate::ui::hit::HitTarget;
@@ -595,6 +595,64 @@ fn draw_pill(
 
 // ------------------------------------------------------------------ 歌词
 
+/// 歌词右侧渐隐带宽度（逻辑像素；随 DPI 缩放）。
+///
+/// 文本超宽时，可用宽度最后这一段从实色渐到全透明（M3 遗留 P2），
+/// 取代旧的「右缘硬裁」。不超宽时该带落在文本之外，视觉零差异。
+const LYRIC_FADE_W: f32 = 24.0;
+
+/// 计算一行歌词的渐隐带（渲染目标坐标）。
+///
+/// 返回 `(fade_start, fade_end)`：`fade_end` = 行右缘；可用宽度不足
+/// `LYRIC_FADE_W` 时起点钳到行首（整行都在渐变里，不会出现负起点）。
+fn fade_band(x: f32, w: f32, fade_w: f32) -> (f32, f32) {
+    let end = x + w;
+    let start = (end - fade_w).max(x);
+    (start, end)
+}
+
+/// 画一行歌词（**右侧渐隐版**，M3 遗留 P2）。
+///
+/// 与 [`draw_line`] 的唯一区别：文本笔刷是水平透明度渐变——行宽最后
+/// `LYRIC_FADE_W` 像素从实色渐到全透明。文本不超宽时整行落在渐变起点
+/// 之前（CLAMP 延展 = stop0 实色），视觉与实色笔刷一致，因此**无需先测量
+/// 是否超宽**，无差别使用即可（省一次测量，保住空闲 CPU 指标）。
+///
+/// 扫光的码元 → x 映射不受影响：文本仍然整行进 `IDWriteTextLayout`，
+/// 裁剪宽度仍由 `hit_test_x` 给出，渐隐只是绘制层面的透明度调制。
+fn draw_lyric_line(
+    rt: &ID2D1RenderTarget,
+    frame: &mut Frame,
+    text: &TextFormats,
+    s: f32,
+    d: &TextDraw<'_>,
+) -> Result<()> {
+    let rect = d.rect;
+    if d.text.is_empty() || rect.is_empty() {
+        return Ok(());
+    }
+    let utf16 = to_utf16(d.text);
+    if utf16.is_empty() {
+        return Ok(());
+    }
+    let (fade_start, fade_end) = fade_band(rect.x, rect.w, LYRIC_FADE_W * s);
+    let brush = frame.fade_brush(d.color, fade_start, fade_end)?;
+    let rect_d = d2d_rect(rect.x, rect.y, rect.w, rect.h);
+    let format = text.get(d.kind);
+    // SAFETY: utf16 生命周期覆盖调用；brush / format 由 frame / text 持有；rect 是栈上值。
+    unsafe {
+        rt.DrawText(
+            &utf16,
+            format,
+            &rect_d,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
+    Ok(())
+}
+
 /// 画歌词区（T12）：当前行**逐字扫光**，下一行 30% 不透明度。
 ///
 /// 扫光用「两遍绘制 + 裁剪」实现，而不是逐字画不同颜色：
@@ -605,6 +663,9 @@ fn draw_pill(
 /// 为什么不用 `IDWriteTextLayout::SetDrawingEffect` 分段上色：那需要
 /// `IDWriteTextLayout1` + `IDWriteTextRenderer` 自定义渲染器（几百行 COM），
 /// 而且每帧都要重设 effect。裁剪法只要一次 `HitTestTextPosition`，成本低一个量级。
+///
+/// 长行不再硬裁：两遍绘制都走 [`draw_lyric_line`]（右侧渐隐），文本整行
+/// 进布局，扫光码元映射保持正确。
 fn draw_lyrics(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
@@ -617,11 +678,19 @@ fn draw_lyrics(
         return Ok(());
     }
 
-    // ---- 切歌瞬间：旧歌词淡出（120ms），这期间不画新内容 ----
+    // ---- 切歌瞬间：旧歌词淡出 + 上移（M3 遗留 P2）----
+    // 淡出在前 120ms 内完成（保持原 PRD 观感），上移走满 150ms（ease-out cubic，
+    // 与高度过渡同一族曲线）。这期间不画新内容。
     if let Some((old_cur, old_next, started)) = &state.lyric_fade {
-        let t = started.elapsed().as_secs_f32() / crate::app::LYRIC_FADE_SECS;
-        if t < 1.0 {
-            let a = ((1.0 - t) * 255.0).clamp(0.0, 255.0) as u8;
+        let t = started.elapsed().as_secs_f32();
+        if t < crate::app::LYRIC_FADE_SECS {
+            let a = ((1.0 - t / crate::app::LYRIC_FADE_OUT_SECS) * 255.0).clamp(0.0, 255.0) as u8;
+            let p = (t / crate::app::LYRIC_FADE_SECS).clamp(0.0, 1.0);
+            let eased = 1.0 - (1.0 - p).powi(3);
+            let dy = -eased * crate::app::LYRIC_SLIDE_PX * ctx.scale;
+            let shift = |r: &crate::render::layout::RectF| {
+                RectF::new(r.x, r.y + dy, r.w, r.h)
+            };
             if !old_cur.is_empty() {
                 draw_line(
                     rt,
@@ -630,7 +699,7 @@ fn draw_lyrics(
                     &TextDraw {
                         kind: TextKind::Lyric,
                         text: old_cur,
-                        rect: layout.lyric_cur,
+                        rect: shift(&layout.lyric_cur),
                         color: Rgba::from_rgb(theme.text, a),
                         outline: false,
                     },
@@ -644,7 +713,7 @@ fn draw_lyrics(
                     &TextDraw {
                         kind: TextKind::Lyric,
                         text: old_next,
-                        rect: layout.lyric_next,
+                        rect: shift(&layout.lyric_next),
                         color: Rgba::from_rgb(theme.text_dim, ((a as f32) * 0.6) as u8),
                         outline: false,
                     },
@@ -672,10 +741,11 @@ fn draw_lyrics(
 
     // ---- 下一行（先画，压在下面也无所谓，两行不重叠）----
     if !lyric.next.is_empty() && !layout.lyric_next.is_empty() {
-        draw_line(
+        draw_lyric_line(
             rt,
             frame,
-            ctx,
+            ctx.text,
+            ctx.scale,
             &TextDraw {
                 kind: TextKind::Lyric,
                 text: lyric.next,
@@ -692,10 +762,11 @@ fn draw_lyrics(
 
     // ---- 当前行：未唱部分 ----
     let unsung = Rgba::from_rgb(theme.text_dim, 0x8C);
-    draw_line(
+    draw_lyric_line(
         rt,
         frame,
-        ctx,
+        ctx.text,
+        ctx.scale,
         &TextDraw {
             kind: TextKind::Lyric,
             text: lyric.cur,
@@ -735,15 +806,16 @@ fn draw_lyrics(
         layout.lyric_cur.h,
     );
     // SAFETY: clip 是栈上矩形；Push/Pop 严格配对（中间只有一次 DrawText，
-    // 且 `?` 提前返回前已保证没有未配对的 Push——这里 draw_line 失败会跳过 Pop，
-    // 所以先用 let 接住结果再 Pop）。
+    // 且 `?` 提前返回前已保证没有未配对的 Push——这里 draw_lyric_line 失败会
+    // 跳过 Pop，所以先用 let 接住结果再 Pop）。
     unsafe {
         rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     }
-    let r = draw_line(
+    let r = draw_lyric_line(
         rt,
         frame,
-        ctx,
+        ctx.text,
+        ctx.scale,
         &TextDraw {
             kind: TextKind::Lyric,
             text: lyric.cur,
@@ -828,6 +900,22 @@ fn push_mmss(out: &mut String, ms: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fade_band_stays_inside_rect_and_clamps() {
+        // 正常情况：渐隐带 = 右缘前 24px
+        let (s, e) = fade_band(100.0, 200.0, 24.0);
+        assert_eq!(s, 276.0);
+        assert_eq!(e, 300.0);
+        // 可用宽度比渐隐带还窄：起点钳到行首，整行都在渐变里
+        let (s, e) = fade_band(100.0, 10.0, 24.0);
+        assert_eq!(s, 100.0);
+        assert_eq!(e, 110.0);
+        // 零宽：起终点重合（DrawText 侧有 rect.is_empty 兜底，不会真画）
+        let (s, e) = fade_band(50.0, 0.0, 24.0);
+        assert_eq!(s, 50.0);
+        assert_eq!(e, 50.0);
+    }
 
     #[test]
     fn time_pair_formats_with_leading_zeros() {

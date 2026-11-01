@@ -124,6 +124,7 @@ impl D2d {
             wic: self.wic.clone(),
             brushes: BrushCache::new(),
             grad: None,
+            fade: None,
             blur: None,
         })
     }
@@ -141,6 +142,9 @@ pub struct Frame {
     pub brushes: BrushCache,
     /// 封面渐变占位笔刷缓存：`(accent 打包值, 笔刷)`
     pub grad: Option<(u32, ID2D1LinearGradientBrush)>,
+    /// 歌词右侧渐隐笔刷缓存：`(颜色, 渐变起点 x, 渐变终点 x, 笔刷)`。
+    /// x 用 `to_bits()` 做键（同帧内歌词矩形不变，命中率高）。
+    pub fade: Option<((u32, u32, u32), ID2D1LinearGradientBrush)>,
     /// 悬停模糊背景位图缓存：`(几何代次, 缓冲地址, 位图)`
     ///
     /// 键里带「缓冲地址」是因为同一个 `geometry_epoch` 下模糊缓冲会每 250ms 换一份
@@ -248,6 +252,54 @@ impl Frame {
     pub fn gradient_base(&mut self, accent: Rgba) -> Result<ID2D1Brush> {
         let g = self.gradient(accent)?;
         g.cast::<ID2D1Brush>()
+    }
+
+    /// 取（或创建）**歌词右侧渐隐笔刷**（M3 遗留 P2：长行右侧渐隐）。
+    ///
+    /// 水平透明度渐变，坐标在**渲染目标空间**（笔刷默认 transform = identity）：
+    /// `fade_start` 之前 CLAMP 到 stop0（`c` 原色），`fade_start..fade_end`
+    /// 线性降到全透明，之后保持全透明。文本不超宽时整行都落在 stop0 区，
+    /// 视觉与实色笔刷完全一致——所以调用方无需先测量是否超宽，直接用。
+    ///
+    /// 按键缓存：换行 / 换色 / 窗口改宽才会重建（扫光 25fps 热路径零新建）。
+    pub fn fade_brush(
+        &mut self,
+        c: Rgba,
+        fade_start: f32,
+        fade_end: f32,
+    ) -> Result<ID2D1LinearGradientBrush> {
+        let key = (c.packed(), fade_start.to_bits(), fade_end.to_bits());
+        if let Some((k, b)) = self.fade.as_ref() {
+            if *k == key {
+                return Ok(b.clone());
+            }
+        }
+        let stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: color_f(c.r, c.g, c.b, c.a),
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: color_f(c.r, c.g, c.b, 0),
+            },
+        ];
+        let rt = self.rt.clone();
+        // SAFETY: stops 是栈上数组，生命周期覆盖调用；gamma / extend 都是合法枚举。
+        let collection: ID2D1GradientStopCollection =
+            unsafe { rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)? };
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: Vector2 {
+                X: fade_start,
+                Y: 0.0,
+            },
+            endPoint: Vector2 { X: fade_end, Y: 0.0 },
+        };
+        // SAFETY: props 栈上；collection 是本函数刚创建的合法对象。
+        let brush: ID2D1LinearGradientBrush =
+            unsafe { rt.CreateLinearGradientBrush(&props, None, &collection)? };
+        self.fade = Some((key, brush.clone()));
+        Ok(brush)
     }
 
     /// 把一张外部 BGRA（预乘）缓冲变成 D2D 位图。用于悬停模糊背景。
