@@ -98,11 +98,6 @@ pub struct AppState {
     pub lyric_marquee: bool,
     /// 跑马灯当前偏移（文本左移量 0..=excess；`sync_lyric_scroll` 写入，painter 只读）
     pub lyric_scroll_offset: f32,
-    /// 跑马灯累计推进时间（毫秒）。只在播放中的 25fps tick 上累加——暂停即冻结，
-    /// 与扫光行为一致；换行 / 换歌时归零。
-    pub lyric_scroll_ms: u32,
-    /// 跑马灯行指纹 `(track_id, line, 字节长, 是否占位)`，变化即归零累计时间
-    pub lyric_scroll_key: (u64, Option<usize>, usize, bool),
     /// 当前按下的按钮（M2 新增：画按下态）
     pub pressed: Option<HitTarget>,
     /// 用户是否隐藏（PRD 机器 B 门控 1）
@@ -775,34 +770,33 @@ impl App {
             .clamp(0.0, 1.0);
     }
 
-    /// 推导本帧的跑马灯状态（v1.1.2）：激活标记 + 滚动偏移。
+    /// 推导本帧的跑马灯状态（v1.1.3：行时间窗口驱动）。
     ///
-    /// 在每次 `redraw()` 开头调用——frame_hash 会把偏移量化进去，所以停留阶段
-    /// （偏移不变）自动被去重跳过，滚动阶段每 tick 重绘一帧。
+    /// 在每次 `redraw()` 开头调用——frame_hash 会把偏移量化进去，偏移不变
+    /// （暂停 / 长窗口慢滚不足 0.5px）自动被去重跳过。
+    ///
+    /// 时间基准与扫光完全一致（`lyric_time()` 播放位置外推）：暂停冻结、
+    /// 拖动跳转跟随、行切换天然从头开始——无需 v1.1.2 的行指纹归零机制。
     fn sync_lyric_scroll(&mut self) {
-        // 行指纹：换行 / 换歌 / 占位切换 → 累计时间归零（重新从起点停留开始）
-        let (track_id, line, cur_len, placeholder, cur_empty) = {
-            let d = self.state.lyric_draw(self.lang);
-            (self.state.playing.track_id, d.line, d.cur.len(), d.placeholder, d.cur.is_empty())
-        };
-        let key = (track_id, line, cur_len, placeholder);
-        if self.state.lyric_scroll_key != key {
-            self.state.lyric_scroll_key = key;
-            self.state.lyric_scroll_ms = 0;
-        }
+        let t = self.state.lyric_time();
+        let d = self.state.lyrics.draw(t, self.lang);
         let viewport_w = self.state.layout.lyric_cur.w;
         let lyric_on = self.state.layout.form == WidgetForm::Lyric;
         // 歌词行自然宽来自渲染器缓存（上一帧建的 TextLayout——宽度只在换行时变，够用）
         let text_w = self.renderer.as_ref().and_then(|r| r.lyric_text_width());
-        let (marquee, offset) = marquee_frame(
-            self.state.lyric_scroll_enabled,
-            placeholder,
-            cur_empty,
+        // 行内已播时长（行开始前钳 0）与行窗口（负窗口视为 0 → 不滚）
+        let elapsed_ms = (t - d.line_start_ms).max(0) as u32;
+        let window_ms = (d.line_end_ms - d.line_start_ms).max(0) as u32;
+        let (marquee, offset) = marquee_frame(MarqueeInput {
+            enabled: self.state.lyric_scroll_enabled,
+            placeholder: d.placeholder,
+            cur_empty: d.cur.is_empty(),
             lyric_on,
             text_w,
             viewport_w,
-            self.state.lyric_scroll_ms,
-        );
+            elapsed_ms,
+            window_ms,
+        });
         self.state.lyric_marquee = marquee;
         self.state.lyric_scroll_offset = offset;
     }
@@ -854,15 +848,12 @@ impl App {
     /// 扫光位置量化到 1/4 码元（约 3px @13px 字号）再比较——比这更细的变化
     /// 人眼看不出来，却会让每一帧都重绘。
     fn on_lyric_tick(&mut self) {
-        // v1.1.2：跑马灯时间推进。只在播放中的 25fps tick 进来（暂停时定时器已停，
-        // 累计时间自然冻结，与扫光一致）；换行 / 换歌由 sync_lyric_scroll 归零。
-        self.state.lyric_scroll_ms = self
-            .state
-            .lyric_scroll_ms
-            .saturating_add(widget_wnd::TIMER_LYRIC_MS);
+        // v1.1.3：跑马灯偏移直接由播放位置推导（sync_lyric_scroll），tick 只负责
+        // 25fps 重绘节拍；暂停时定时器已停，偏移自然冻结，与扫光一致。
         let prev_offset = self.state.lyric_scroll_offset;
         self.sync_lyric_scroll();
-        // 偏移按 0.5px 量化比较：跑马灯 30px/s @25fps 每帧走 1.2px，量化后每帧都算"动了"
+        // 偏移按 0.5px 量化比较：窗口驱动下长窗口每帧位移不足 0.5px 时自动去重，
+        // 不产生无谓重绘
         let offset_moved = (self.state.lyric_scroll_offset * 2.0) as i32
             != (prev_offset * 2.0) as i32;
         // 先把要比较的量拷出来，结束对 `self.state` 的不可变借用
@@ -2175,29 +2166,45 @@ fn lyric_w_logical(config: &Config) -> f32 {
     crate::config::defaults::limits::LYRIC_W
 }
 
-/// 跑马灯本帧判定的**纯函数**（v1.1.2，便于单测）：返回 `(是否激活, 偏移)`。
-///
-/// 激活条件：开关开 + 歌词形态 + 非占位 + 非空行 + 歌词行自然宽超出视口 > 0.5px。
-/// 激活时偏移由 [`crate::render::painter::marquee_offset`] 按累计播放时间给出。
-fn marquee_frame(
+/// 跑马灯本帧输入（v1.1.3）。字段语义见 [`marquee_frame`] 文档。
+#[derive(Debug, Clone, Copy)]
+struct MarqueeInput {
+    /// 长歌词滚动开关（`config.lyrics.scroll`）
     enabled: bool,
+    /// 当前行是占位文案
     placeholder: bool,
+    /// 当前行文本为空
     cur_empty: bool,
+    /// 当前形态是歌词形态
     lyric_on: bool,
+    /// 歌词行自然宽（渲染器缓存；`None` 表示尚无布局）
     text_w: Option<f32>,
+    /// 歌词行视口宽
     viewport_w: f32,
+    /// 行内已播时长（毫秒）
     elapsed_ms: u32,
-) -> (bool, f32) {
-    let usable = enabled && lyric_on && !placeholder && !cur_empty;
+    /// 行时间窗口（毫秒）
+    window_ms: u32,
+}
+
+/// 跑马灯本帧判定的**纯函数**（v1.1.3，便于单测）：返回 `(是否激活, 偏移)`。
+///
+/// 激活条件：开关开 + 歌词形态 + 非占位 + 非空行 + 歌词行自然宽超出视口 > 0.5px，
+/// 且行时间窗口不小于 [`limits::MARQUEE_MIN_WINDOW_SECS`]（短窗口滚完一圈快到看不清，直接回落渐隐）。
+/// 激活时偏移由 [`crate::render::painter::marquee_offset`] 按**行内进度**给出
+/// （行时间窗口驱动：唱完该句时刚好滚到尾）。
+fn marquee_frame(i: MarqueeInput) -> (bool, f32) {
+    let usable = i.enabled && i.lyric_on && !i.placeholder && !i.cur_empty;
     let excess = if usable {
-        text_w.map_or(0.0, |tw| (tw - viewport_w).max(0.0))
+        i.text_w.map_or(0.0, |tw| (tw - i.viewport_w).max(0.0))
     } else {
         0.0
     };
-    if excess > 0.5 {
+    let window = i.window_ms as f32 / 1000.0;
+    if excess > 0.5 && window >= crate::config::defaults::limits::MARQUEE_MIN_WINDOW_SECS {
         (
             true,
-            crate::render::painter::marquee_offset(excess, elapsed_ms as f32 / 1000.0),
+            crate::render::painter::marquee_offset(excess, i.elapsed_ms as f32 / 1000.0, window),
         )
     } else {
         (false, 0.0)
@@ -2208,15 +2215,37 @@ fn marquee_frame(
 mod marquee_tests {
     use super::*;
 
+    /// 构造输入的便捷函数：默认超宽 400px / 视口 160px / 长窗口 10s。
+    fn input(
+        enabled: bool,
+        placeholder: bool,
+        cur_empty: bool,
+        lyric_on: bool,
+        text_w: Option<f32>,
+        elapsed_ms: u32,
+        window_ms: u32,
+    ) -> MarqueeInput {
+        MarqueeInput {
+            enabled,
+            placeholder,
+            cur_empty,
+            lyric_on,
+            text_w,
+            viewport_w: 160.0,
+            elapsed_ms,
+            window_ms,
+        }
+    }
+
     #[test]
     fn marquee_disabled_means_no_scroll() {
         // 开关关：无论文本多宽都不滚
-        let (m, o) = marquee_frame(false, false, false, true, Some(500.0), 160.0, 99_999);
+        let (m, o) = marquee_frame(input(false, false, false, true, Some(500.0), 99_999, 10_000));
         assert!(!m);
         assert_eq!(o, 0.0);
         // 占位 / 空行 / 歌词关：同样不滚
         for (ph, empty, on) in [(true, false, true), (false, true, true), (false, false, false)] {
-            let (m, o) = marquee_frame(true, ph, empty, on, Some(500.0), 160.0, 50_000);
+            let (m, o) = marquee_frame(input(true, ph, empty, on, Some(500.0), 50_000, 10_000));
             assert!(!m && o == 0.0, "ph={ph} empty={empty} on={on}");
         }
     }
@@ -2224,27 +2253,52 @@ mod marquee_tests {
     #[test]
     fn marquee_active_only_when_overflowing() {
         // 恰好放得下：不滚
-        let (m, o) = marquee_frame(true, false, false, true, Some(160.0), 160.0, 5_000);
+        let (m, o) = marquee_frame(input(true, false, false, true, Some(160.0), 5_000, 10_000));
         assert!(!m && o == 0.0);
         // 超出 0.5px 以内：不滚（去抖）
-        let (m, _) = marquee_frame(true, false, false, true, Some(160.4), 160.0, 5_000);
+        let (m, _) = marquee_frame(input(true, false, false, true, Some(160.4), 5_000, 10_000));
         assert!(!m);
-        // 超宽：激活，偏移在状态机节奏内
-        let (m, o) = marquee_frame(true, false, false, true, Some(400.0), 160.0, 100);
+        // 超宽：激活，行首（进度 0）偏移为 0
+        let (m, o) = marquee_frame(input(true, false, false, true, Some(400.0), 0, 10_000));
         assert!(m);
-        assert_eq!(o, 0.0, "起点停留期偏移为 0");
-        let speed = crate::config::defaults::limits::MARQUEE_SPEED_PX;
-        let hold = crate::config::defaults::limits::MARQUEE_HOLD_SECS;
+        assert_eq!(o, 0.0);
+    }
+
+    #[test]
+    fn marquee_offset_tracks_window_progress() {
         let excess = 400.0 - 160.0;
-        let (_, o) = marquee_frame(true, false, false, true, Some(400.0), 160.0, ((hold + (excess / speed) * 0.5) * 1000.0) as u32);
-        assert!((o - excess * 0.5).abs() < 1.0, "o = {o}");
+        // 行窗口 10s，行内播到一半 → 滚一半
+        let (_, o) = marquee_frame(input(true, false, false, true, Some(400.0), 5_000, 10_000));
+        assert!((o - excess * 0.5).abs() < 0.5, "o = {o}");
+        // 行唱完（窗口尽头）→ 刚好滚到尾（快歌慢歌都不再截断）
+        let (_, o) = marquee_frame(input(true, false, false, true, Some(400.0), 10_000, 10_000));
+        assert!((o - excess).abs() < 0.01, "o = {o}");
+        // 唱完之后（最后一行常驻屏幕）→ 钳在尾部
+        let (_, o) = marquee_frame(input(true, false, false, true, Some(400.0), 30_000, 10_000));
+        assert!((o - excess).abs() < 0.01, "o = {o}");
+    }
+
+    #[test]
+    fn marquee_short_window_falls_back_to_fade() {
+        // 行窗口 < MARQUEE_MIN_WINDOW_SECS：不激活（回落右侧渐隐），偏移 0
+        let min = crate::config::defaults::limits::MARQUEE_MIN_WINDOW_SECS;
+        let (m, o) = marquee_frame(input(
+            true,
+            false,
+            false,
+            true,
+            Some(400.0),
+            1_000,
+            ((min - 0.1) * 1000.0) as u32,
+        ));
+        assert!(!m && o == 0.0);
     }
 
     #[test]
     fn marquee_freezes_without_ticks() {
-        // 累计时间不推进（暂停）→ 偏移不变：同一入参必然同一输出
-        let a = marquee_frame(true, false, false, true, Some(400.0), 160.0, 7_777);
-        let b = marquee_frame(true, false, false, true, Some(400.0), 160.0, 7_777);
+        // 同一播放位置必然同一偏移（暂停冻结）：同一入参必然同一输出
+        let a = marquee_frame(input(true, false, false, true, Some(400.0), 7_777, 10_000));
+        let b = marquee_frame(input(true, false, false, true, Some(400.0), 7_777, 10_000));
         assert_eq!(a, b);
     }
 }

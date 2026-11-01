@@ -611,38 +611,25 @@ fn fade_band(x: f32, w: f32, fade_w: f32) -> (f32, f32) {
     (start, end)
 }
 
-// ---------------------------------------------------------------- 跑马灯（v1.1.2）
+// ---------------------------------------------------------------- 跑马灯（v1.1.3）
 
-/// 长歌词滚动的**纯函数状态机**（时间基准 = 累计播放中的毫秒数，暂停即冻结）。
+/// 长歌词滚动的**纯函数**（v1.1.3：行时间窗口驱动，取代 v1.1.2 固定速度跑马灯）。
 ///
-/// 节奏：停留 1.5s → 匀速滚到尾（把被截尾部带进视口）→ 停留 1.5s → 匀速回位 → 循环。
-/// 位移方向语义：返回值是「文本相对视口的左移量」0..=excess。
+/// 滚动行程按当前歌词行的时间窗口线性分配：窗口内匀速滚完全程，唱完该句时
+/// 刚好滚到尾——快歌慢歌都不会出现「句子切走了还没滚完」。时间基准与扫光
+/// 一致（播放位置外推），暂停自然冻结、拖动跳转天然跟随，无需行指纹归零。
 ///
-/// 参数都在 [`crate::config::defaults::limits`]（MARQUEE_*），与绘制解耦，可独立单测。
-pub fn marquee_offset(excess: f32, elapsed_secs: f32) -> f32 {
-    if excess <= 0.5 {
+/// 窗口短于 [`limits::MARQUEE_MIN_WINDOW_SECS`] 的行返回 0，由调用方判定
+/// 不激活、回落右侧渐隐带（窗口太短滚完全程会快到看不清）。
+///
+/// 返回值是「文本相对视口的左移量」`0.0..=excess`。
+pub fn marquee_offset(excess: f32, elapsed_secs: f32, window_secs: f32) -> f32 {
+    if excess <= 0.5 || window_secs < limits::MARQUEE_MIN_WINDOW_SECS {
         return 0.0;
     }
-    let hold = limits::MARQUEE_HOLD_SECS;
-    let scroll_secs = (excess / limits::MARQUEE_SPEED_PX).max(0.05);
-    let cycle = hold * 2.0 + scroll_secs * 2.0;
-    let t = elapsed_secs.rem_euclid(cycle);
-    if t < hold {
-        // 起点停留
-        0.0
-    } else if t < hold + scroll_secs {
-        // 向右滚动（文本左移），匀速
-        let p = (t - hold) / scroll_secs;
-        excess * p
-    } else if t < hold * 2.0 + scroll_secs {
-        // 尾部停留
-        excess
-    } else {
-        // 匀速回位
-        let p = (t - hold * 2.0 - scroll_secs) / scroll_secs;
-        excess * (1.0 - p)
-    }
-    .clamp(0.0, excess)
+    // 行内进度 0..=1（行开始前 / 唱完后——如最后一行常驻屏幕——都钳在两端）
+    let p = (elapsed_secs / window_secs).clamp(0.0, 1.0);
+    excess * p
 }
 
 /// 画一行歌词（**右侧渐隐版**，M3 遗留 P2）。
@@ -1022,37 +1009,36 @@ mod tests {
         assert!(s.ends_with("100%"), "s = {s}");
     }
 
-    /// 跑马灯状态机：停留 → 匀速滚到尾 → 停留 → 匀速回位 → 循环。
+    /// 跑马灯窗口驱动：行内进度线性映射滚动量，两端钳位，短行回落渐隐。
     #[test]
-    fn marquee_phases_hold_scroll_return() {
+    fn marquee_offset_tracks_window_linearly() {
         let excess = 60.0f32;
-        let speed = limits::MARQUEE_SPEED_PX;
-        let hold = limits::MARQUEE_HOLD_SECS;
-        let scroll = excess / speed; // 2s
+        let window = 10.0f32;
 
-        // 起点停留
-        assert_eq!(marquee_offset(excess, 0.0), 0.0);
-        assert_eq!(marquee_offset(excess, hold - 0.1), 0.0);
-        // 滚动中：匀速、单调、不出界
-        let mid = marquee_offset(excess, hold + scroll * 0.5);
+        // 行首：偏移 0
+        assert_eq!(marquee_offset(excess, 0.0, window), 0.0);
+        // 行内线性：播到一半滚一半
+        let mid = marquee_offset(excess, window * 0.5, window);
         assert!((mid - excess * 0.5).abs() < 0.01, "mid = {mid}");
-        assert_eq!(marquee_offset(excess, hold + scroll), excess);
-        // 尾部停留
-        assert_eq!(marquee_offset(excess, hold + scroll + hold * 0.5), excess);
-        // 回位中：线性递减
-        let back = marquee_offset(excess, hold * 2.0 + scroll * 1.5);
-        assert!((back - excess * 0.5).abs() < 0.01, "back = {back}");
-        // 循环：一个完整周期后回到起点停留
-        let cycle = hold * 2.0 + scroll * 2.0;
-        assert_eq!(marquee_offset(excess, cycle + 0.1), 0.0);
+        // 窗口尽头：刚好滚到尾
+        assert!((marquee_offset(excess, window, window) - excess).abs() < 1e-4);
+        // 唱完之后（最后一行常驻屏幕）：钳在尾部
+        assert_eq!(marquee_offset(excess, window + 99.0, window), excess);
+        // 行开始之前（理论上不出现）：钳 0
+        assert_eq!(marquee_offset(excess, -1.0, window), 0.0);
         // 不超宽：永远 0
-        assert_eq!(marquee_offset(0.0, 100.0), 0.0);
-        assert_eq!(marquee_offset(-5.0, 100.0), 0.0);
-        // 任意时刻都有界
-        for i in 0..200 {
-            let t = i as f32 * 0.137;
-            let o = marquee_offset(excess, t);
-            assert!((0.0..=excess).contains(&o), "t={t} o={o}");
+        assert_eq!(marquee_offset(0.0, 100.0, window), 0.0);
+        assert_eq!(marquee_offset(-5.0, 100.0, window), 0.0);
+        // 短窗口（< MARQUEE_MIN_WINDOW_SECS）：不滚，回落渐隐
+        assert_eq!(marquee_offset(excess, 0.5, limits::MARQUEE_MIN_WINDOW_SECS - 0.1), 0.0);
+        // 窗口内单调不减且有界
+        let mut prev = 0.0f32;
+        for i in 0..=200 {
+            let t = window * i as f32 / 200.0;
+            let o = marquee_offset(excess, t, window);
+            assert!(o >= prev - 1e-6, "回退：t={t} o={o} prev={prev}");
+            assert!((0.0..=excess).contains(&o), "越界：t={t} o={o}");
+            prev = o;
         }
     }
 }

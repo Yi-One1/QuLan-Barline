@@ -199,6 +199,10 @@ pub struct LyricDraw<'a> {
     pub line: Option<usize>,
     /// `true` 表示 `cur` 是占位文案：不做扫光、用低对比色
     pub placeholder: bool,
+    /// 当前行时间窗口（v1.1.3）：跑马灯按窗口分配滚动量。
+    /// 占位 / 首行之前为 `(0, 0)`——窗口为 0 时跑马灯自然不激活。
+    pub line_start_ms: Ms,
+    pub line_end_ms: Ms,
 }
 
 impl<'a> LyricDraw<'a> {
@@ -208,6 +212,8 @@ impl<'a> LyricDraw<'a> {
             sweep: 0.0,
             line: None,
             placeholder: true,
+            line_start_ms: 0,
+            line_end_ms: 0,
         }
     }
 
@@ -232,6 +238,8 @@ impl LyricView {
                         sweep: sweep_offset(line, t),
                         line: Some(i),
                         placeholder: false,
+                        line_start_ms: line.start_ms,
+                        line_end_ms: line.end_ms,
                     }
                 }
                 // 还没唱到第一行：留白（v1.1.1 起没有下一行预告）
@@ -240,6 +248,8 @@ impl LyricView {
                     sweep: 0.0,
                     line: None,
                     placeholder: false,
+                    line_start_ms: 0,
+                    line_end_ms: 0,
                 },
             },
             (LyricStatus::Loading, _) => LyricDraw::placeholder_of(i18n::t(lang, "lyric.loading")),

@@ -31,12 +31,11 @@ pub mod limits {
     pub const LYRIC_PAD: f32 = 2.0;
     /// 上行内歌名与歌手名的横向间隔（逻辑像素）
     pub const TITLE_ARTIST_GAP: f32 = 6.0;
-    /// 下行歌词相对行矩形中心的整体上移量（逻辑像素，v1.1.2：靠近歌名行但不贴死）
-    pub const LYRIC_LIFT: f32 = 1.5;
-    /// 长歌词滚动（跑马灯）：两端停留时长（秒）
-    pub const MARQUEE_HOLD_SECS: f32 = 1.5;
-    /// 长歌词滚动：匀速滚动速度（逻辑像素/秒）
-    pub const MARQUEE_SPEED_PX: f32 = 30.0;
+    /// 下行歌词相对行矩形中心的整体上移量（逻辑像素，v1.1.3：再上移 2px，累计 3.5px）
+    pub const LYRIC_LIFT: f32 = 3.5;
+    /// 长歌词滚动（跑马灯）：行时间窗口低于该值（秒）不滚，回落右侧渐隐（v1.1.3）。
+    /// 窗口太短的行在窗口内匀速滚完全程会快到看不清，宁可只显示行首。
+    pub const MARQUEE_MIN_WINDOW_SECS: f32 = 2.0;
     /// 命中区最小边长
     pub const HIT_MIN: f32 = 28.0;
     /// 双击判定窗口

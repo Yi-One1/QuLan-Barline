@@ -574,11 +574,11 @@ mod tests {
         assert!(l.cover.y >= 0.0 && l.cover.bottom() <= 48.0, "封面必须落在任务栏条带内");
         assert!(l.btn_toggle.y >= 0.0 && l.btn_toggle.bottom() <= 48.0, "按钮必须落在任务栏条带内");
         assert!(l.progress.y >= 0.0 && l.progress.bottom() <= 48.0, "进度条必须落在任务栏条带内");
-        // 上行（歌名 + 歌手）与下行（歌词）：y = 2 与 24−1.5（v1.1.2 上移）
+        // 上行（歌名 + 歌手）与下行（歌词）：y = 2 与 24−LYRIC_LIFT（v1.1.3 累计上移 3.5px）
         assert!((l.title.y - 2.0).abs() < 0.001, "title.y = {}", l.title.y);
         assert!((l.artist.y - 2.0).abs() < 0.001, "artist.y = {}", l.artist.y);
-        assert!((l.lyric_cur.y - 22.5).abs() < 0.001, "lyric_cur.y = {}", l.lyric_cur.y);
-        assert!((l.lyric_cur.bottom() - 44.5).abs() < 0.001);
+        assert!((l.lyric_cur.y - (24.0 - limits::LYRIC_LIFT)).abs() < 0.001, "lyric_cur.y = {}", l.lyric_cur.y);
+        assert!((l.lyric_cur.bottom() - (46.0 - limits::LYRIC_LIFT)).abs() < 0.001);
         assert!((l.lyric_cur.w - 160.0).abs() < 0.001, "lyric_cur.w = {}", l.lyric_cur.w);
     }
 
@@ -588,7 +588,7 @@ mod tests {
         let l = compute(TaskbarEdge::Top, WidgetForm::Lyric, 1.0, 48);
         assert!(l.main_row.y.abs() < 0.001);
         assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
-        assert!((l.lyric_cur.y - 22.5).abs() < 0.001);
+        assert!((l.lyric_cur.y - (24.0 - limits::LYRIC_LIFT)).abs() < 0.001);
         assert!(l.lyric_cur.bottom() <= 48.0, "歌词行不得超出条带");
     }
 
