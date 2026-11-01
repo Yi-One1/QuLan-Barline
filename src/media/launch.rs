@@ -83,26 +83,34 @@ impl Activation {
 
 /// 点击封面：把当前播放器拉到前台。永不 panic、永不返回错误。
 pub fn activate_player(session: &MediaSessionInfo) -> Activation {
-    let pid = resolve_pid(session);
+    let pids = resolve_pids(session);
     crate::log_info!(
-        "激活播放器：app={} aumid={} process={} pid={}",
+        "激活播放器：app={} aumid={} process={} pids={:?}",
         session.app_name,
         session.aumid,
         session.process_name,
-        pid
+        pids
     );
 
-    // ---- a. 按 PID 找主窗口 ----
-    if pid != 0 {
-        if let Some(hwnd) = find_main_window(pid) {
+    // ---- a. 按候选 PID 逐个找主窗口 ----
+    // v1.1.15（问题 7）：多进程应用（Edge / 网易云 / 汽水）的 SMTC 会话常挂在
+    // **子进程**上，主窗口在另一个同名进程里——单 PID 找不到窗口就放弃的
+    // 旧逻辑对它们必然失败。现在收集全部候选进程，逐个尝试。
+    let mut window_seen = false;
+    for pid in &pids {
+        if let Some(hwnd) = find_main_window(*pid) {
             if force_foreground(hwnd) {
-                crate::log_info!("已激活播放器窗口 hwnd=0x{:X}", hwnd.0 as usize);
+                crate::log_info!("已激活播放器窗口 hwnd=0x{:X} pid={pid}", hwnd.0 as usize);
                 return Activation::Window;
             }
-            crate::log_warn!("找到窗口但 SetForegroundWindow 失败，继续尝试 AUMID");
-        } else {
-            crate::log_debug!("PID {pid} 没有可见的顶层主窗口");
+            window_seen = true;
+            crate::log_debug!("pid={pid} 找到窗口但置前失败，继续下一个候选");
         }
+    }
+    if window_seen {
+        crate::log_debug!("候选进程窗口全部置前失败，继续尝试 AUMID");
+    } else {
+        crate::log_debug!("候选进程都没有可见的顶层主窗口");
     }
 
     // ---- b. AUMID 激活 ----
@@ -131,29 +139,38 @@ pub fn activate_player(session: &MediaSessionInfo) -> Activation {
 
 // ---------------------------------------------------------------- PID 解析
 
-/// 解析播放器进程 id。三级：会话自带 → 音频会话枚举 → Toolhelp 进程快照。
-fn resolve_pid(session: &MediaSessionInfo) -> u32 {
-    if session.process_id != 0 {
-        return session.process_id;
-    }
-    let by_audio = pid_from_audio_sessions(&session.process_name, &session.aumid);
-    if by_audio != 0 {
-        return by_audio;
+/// 解析播放器候选进程 id 列表（v1.1.15 问题 7：多进程应用友好）。
+///
+/// 三级来源按序合并去重：会话自带 → 音频会话枚举 → Toolhelp 进程快照。
+/// 顺序即优先级：SMTC 自带的 PID 最可信，音频会话次之，快照兜底。
+fn resolve_pids(session: &MediaSessionInfo) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let push = |pid: u32, out: &mut Vec<u32>| {
+        if pid != 0 && pid != std::process::id() && !out.contains(&pid) {
+            out.push(pid);
+        }
+    };
+    push(session.process_id, &mut out);
+    for pid in pids_from_audio_sessions(&session.process_name, &session.aumid) {
+        push(pid, &mut out);
     }
     if !session.process_name.is_empty() {
-        return pid_from_snapshot(&session.process_name);
+        for pid in pids_from_snapshot(&session.process_name) {
+            push(pid, &mut out);
+        }
     }
-    0
+    out
 }
 
-/// 枚举音频会话，按进程名 / AUMID 关键字匹配出 PID。
+/// 枚举音频会话，返回与进程名 / AUMID 匹配的**全部** PID。
 ///
 /// 这是 T09 指定的主路径：`IAudioSessionControl2::GetProcessId`。
-fn pid_from_audio_sessions(want_process: &str, want_aumid: &str) -> u32 {
-    let want_process = want_process.to_ascii_lowercase();
-    let want_aumid = want_aumid.to_ascii_lowercase();
-    if want_process.is_empty() && want_aumid.is_empty() {
-        return 0;
+/// v1.1.15：改用 [`crate::media::session_matches`]（含 player_map 反查），
+/// 并收集全部命中——浏览器/多进程播放器的音频会话不止一个。
+fn pids_from_audio_sessions(want_process: &str, want_aumid: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    if want_process.trim().is_empty() && want_aumid.trim().is_empty() {
+        return out;
     }
 
     // SAFETY: 所有 COM 对象都在本函数作用域内释放；CLSID 是系统注册的进程内组件。
@@ -163,28 +180,28 @@ fn pid_from_audio_sessions(want_process: &str, want_aumid: &str) -> u32 {
                 Ok(e) => e,
                 Err(e) => {
                     crate::log_debug!("IMMDeviceEnumerator 创建失败：{e}");
-                    return 0;
+                    return out;
                 }
             };
         let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
             Ok(d) => d,
             Err(e) => {
                 crate::log_debug!("默认渲染设备不可用：{e}");
-                return 0;
+                return out;
             }
         };
         let mgr: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
             Ok(m) => m,
             Err(e) => {
                 crate::log_debug!("IAudioSessionManager2 激活失败：{e}");
-                return 0;
+                return out;
             }
         };
         let sessions = match mgr.GetSessionEnumerator() {
             Ok(s) => s,
             Err(e) => {
                 crate::log_debug!("会话枚举器获取失败：{e}");
-                return 0;
+                return out;
             }
         };
         let count = sessions.GetCount().unwrap_or(0);
@@ -202,20 +219,18 @@ fn pid_from_audio_sessions(want_process: &str, want_aumid: &str) -> u32 {
             if pid == 0 || pid == std::process::id() {
                 continue;
             }
-            let name = process_image_name(pid).to_ascii_lowercase();
-            let matched = (!want_process.is_empty() && name.contains(&want_process))
-                || (!want_aumid.is_empty() && name.contains(&want_aumid));
-            if matched {
+            let name = process_image_name(pid);
+            if crate::media::session_matches(&name, want_process, want_aumid) {
                 crate::log_debug!("音频会话命中：pid={pid} name={name}");
-                return pid;
+                out.push(pid);
             }
         }
     }
-    0
+    out
 }
 
-/// 取进程可执行文件名（小写）。
-fn process_image_name(pid: u32) -> String {
+/// 取进程可执行文件名（小写）。v1.1.15 起 `wasapi` 的会话音量路径共用。
+pub(crate) fn process_image_name(pid: u32) -> String {
     // SAFETY: OpenProcess 失败返回 Err；句柄在作用域结束前关闭。
     unsafe {
         let handle: HANDLE = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
@@ -243,23 +258,23 @@ fn process_image_name(pid: u32) -> String {
     }
 }
 
-/// Toolhelp 快照按进程名反查 PID（最后一道兜底）。
-fn pid_from_snapshot(name: &str) -> u32 {
+/// Toolhelp 快照按进程名反查**全部** PID（最后一道兜底；v1.1.15 多进程应用友好）。
+fn pids_from_snapshot(name: &str) -> Vec<u32> {
     let want = name.to_ascii_lowercase();
+    let mut out = Vec::new();
     // SAFETY: 快照句柄在函数末尾关闭；PROCESSENTRY32W.dwSize 必须先填。
     unsafe {
         let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(h) => h,
             Err(e) => {
                 crate::log_debug!("CreateToolhelp32Snapshot 失败：{e}");
-                return 0;
+                return out;
             }
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut found = 0u32;
         if Process32FirstW(snap, &mut entry).is_ok() {
             loop {
                 let exe = String::from_utf16_lossy(
@@ -270,8 +285,7 @@ fn pid_from_snapshot(name: &str) -> u32 {
                         .unwrap_or(entry.szExeFile.len())],
                 );
                 if exe.to_ascii_lowercase() == want {
-                    found = entry.th32ProcessID;
-                    break;
+                    out.push(entry.th32ProcessID);
                 }
                 if Process32NextW(snap, &mut entry).is_err() {
                     break;
@@ -279,8 +293,8 @@ fn pid_from_snapshot(name: &str) -> u32 {
             }
         }
         let _ = CloseHandle(snap);
-        found
     }
+    out
 }
 
 // ---------------------------------------------------------------- 窗口查找

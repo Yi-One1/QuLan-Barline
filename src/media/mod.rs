@@ -221,6 +221,72 @@ impl NowPlaying {
     }
 }
 
+/// 「SMTC 会话 ↔ 音频会话」匹配判定（v1.1.15 问题 6/7 共用）。
+///
+/// `image_name` 是音频会话所在进程的可执行文件名（小写）；`want_process` /
+/// `want_aumid` 来自 SMTC 会话。匹配键：
+/// 1. 原始进程名 / AUMID 本身（双向 contains）；
+/// 2. [`player_map`] 反查出的**权威进程名**（如 AUMID `...MSEDGE!...` →
+///    `msedge.exe`）——UWP 打包应用的 AUMID 与进程名差异大，靠查表对上。
+pub fn session_matches(image_name: &str, want_process: &str, want_aumid: &str) -> bool {
+    let name = image_name.to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let mut keys: Vec<String> = Vec::new();
+    for k in [want_process, want_aumid] {
+        let k = k.trim().to_ascii_lowercase();
+        if !k.is_empty() {
+            keys.push(k);
+        }
+    }
+    for r in [
+        player_map::resolve_by_process(want_process),
+        player_map::resolve(want_aumid),
+    ] {
+        let p = r.process_name.trim().to_ascii_lowercase();
+        if !p.is_empty() {
+            keys.push(p);
+        }
+    }
+    keys.iter()
+        .any(|k| name.contains(k.as_str()) || k.contains(&name))
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::*;
+
+    /// v1.1.15（问题 6/7）：SMTC 会话 ↔ 音频会话匹配。
+    #[test]
+    fn session_matches_process_and_aumid() {
+        // 直查进程名
+        assert!(session_matches("cloudmusic.exe", "cloudmusic.exe", ""));
+        assert!(session_matches("CloudMusic.exe", "CLOUDMUSIC.EXE", ""), "大小写不敏感");
+        // player_map 反查：AUMID 是 UWP 形态也能翻出权威进程名
+        assert!(
+            session_matches(
+                "msedge.exe",
+                "",
+                "Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!MSEDGE"
+            ),
+            "Edge AUMID → msedge.exe"
+        );
+        assert!(session_matches("qishui.exe", "", "com.sesame.qishui.desktop"), "汽水");
+        assert!(session_matches("cloudmusic.exe", "", "NeteaseCloudMusic!App"), "网易云");
+        // 未知播放器：进程名直查兜底
+        assert!(session_matches("foobar2000.exe", "foobar2000.exe", ""));
+        // 不相关进程不能命中
+        assert!(!session_matches(
+            "chrome.exe",
+            "",
+            "Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!MSEDGE"
+        ));
+        assert!(!session_matches("chrome.exe", "", ""));
+        assert!(!session_matches("", "cloudmusic.exe", ""), "空进程名不匹配");
+    }
+}
+
 /// WASAPI 兜底会话信息（`ARCHITECTURE.md` §8.1）。
 ///
 /// 放在 media 层而不是 event 层，是因为它是「采集层的事实」，

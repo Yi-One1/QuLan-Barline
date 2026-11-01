@@ -480,7 +480,20 @@ fn execute(
 
     match result {
         Ok(accepted) => {
-            crate::log_info!("命令 {cmd:?} 已下发，播放器接受={accepted}");
+            if accepted {
+                crate::log_info!("命令 {cmd:?} 已下发，播放器接受");
+            } else {
+                // v1.1.15（问题 9）：Shuffle/Repeat 的「接受=false」是播放器侧
+                // 决定——SMTC 远程变更（TryChangeShuffleActive/AutoRepeatMode）
+                // 只是**请求**，网易云/汽水等大量播放器声明了能力却不响应。
+                // Windows 无通用强制手段；UI 侧乐观状态已按 CommandResult 回滚。
+                let hint = if matches!(cmd, MediaCommand::Shuffle(_) | MediaCommand::Repeat(_)) {
+                    "（该播放器不支持远程循环/随机，属平台限制）"
+                } else {
+                    ""
+                };
+                crate::log_warn!("命令 {cmd:?} 被播放器拒绝 {hint}");
+            }
             sink.send(AppEvent::CommandResult {
                 kind,
                 ok: accepted,

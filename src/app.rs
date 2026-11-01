@@ -1576,6 +1576,9 @@ impl App {
     }
 
     /// 滚轮：音量 ±1 格 + HUD。
+    ///
+    /// v1.1.15（问题 6）：范围「当前播放器」走 `ISimpleAudioVolume` 会话音量，
+    /// **不再碰系统主音量**；找不到匹配会话（播放器没出声 / 不认识）时不动作。
     fn on_wheel(&mut self, delta: i32) -> Vec<Effect> {
         if !self.config.volume.wheel_enabled {
             return Vec::new();
@@ -1584,14 +1587,48 @@ impl App {
         // 10% 会被静默钳成 5%（v1.1.10 修复；此前 0.01..=0.05 是笔误）。
         let step = self.config.volume.step.clamp(0.01, 0.2);
         let dir = if delta > 0 { 1.0 } else { -1.0 };
-        let base = media::wasapi::system_volume().unwrap_or(self.state.volume_hud);
-        let next = (base + dir * step).clamp(0.0, 1.0);
-        let ok = media::wasapi::set_system_volume(next);
-        self.state.volume_hud = next;
-        crate::log_debug!(
-            "滚轮 delta={delta} → 音量 {:.0}%（设备写入={ok}）",
-            next * 100.0
-        );
+
+        let current_player = self.config.volume.scope
+            == crate::config::VolumeScope::CurrentPlayer;
+        let next = if current_player {
+            let s = self.state.playing.session.clone();
+            match crate::media::wasapi::session_volume(&s.process_name, &s.aumid) {
+                Some(v) => {
+                    let next = (v + dir * step).clamp(0.0, 1.0);
+                    if !crate::media::wasapi::set_session_volume(
+                        &s.process_name,
+                        &s.aumid,
+                        next,
+                    ) {
+                        return Vec::new();
+                    }
+                    Some(next)
+                }
+                None => {
+                    crate::log_debug!(
+                        "滚轮：会话音量不可用（播放器未出声或不认识该进程），本次不调整"
+                    );
+                    return Vec::new();
+                }
+            }
+        } else {
+            let base = media::wasapi::system_volume().unwrap_or(self.state.volume_hud);
+            let next = (base + dir * step).clamp(0.0, 1.0);
+            let ok = media::wasapi::set_system_volume(next);
+            if !ok {
+                return Vec::new();
+            }
+            Some(next)
+        };
+
+        if let Some(next) = next {
+            self.state.volume_hud = next;
+            crate::log_debug!(
+                "滚轮 delta={delta} → {}音量 {:.0}%",
+                if current_player { "会话" } else { "系统" },
+                next * 100.0
+            );
+        }
         vec![Effect::Redraw]
     }
 
