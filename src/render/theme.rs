@@ -175,27 +175,6 @@ impl Theme {
 
         let accent = normalize_accent(accent);
 
-        // 背景色：浅背景用白、深背景用近黑（PRD §4.2）。
-        // v1.1.12：悬停 / 常规两态独立，模式为「透明」时 alpha 归零
-        // （绘制层见 alpha==0 跳过）；半透明档 alpha 由设置页百分比换算。
-        let base = if on_light {
-            (0xF2, 0xF2, 0xF4)
-        } else {
-            (0x1A, 0x1A, 0x1E)
-        };
-        let hover_bg = if mode == BackgroundMode::Transparent {
-            Rgba::new(0, 0, 0, 0)
-        } else {
-            let a = alpha_pct(hover_alpha);
-            Rgba::new(base.0, base.1, base.2, a)
-        };
-        let idle_bg = if idle_mode == BackgroundMode::Transparent {
-            Rgba::new(0, 0, 0, 0)
-        } else {
-            let a = alpha_pct(idle_alpha);
-            Rgba::new(base.0, base.1, base.2, a)
-        };
-
         // 进度条轨道：与文字同侧的低对比色，保证在任何背景上都看得见
         let track_bg = if on_light {
             Rgba::new(0x00, 0x00, 0x00, 0x2E)
@@ -203,18 +182,50 @@ impl Theme {
             Rgba::new(0xFF, 0xFF, 0xFF, 0x38)
         };
 
-        Self {
+        let mut theme = Self {
             backdrop_luma: luma,
             on_light,
             text,
             text_dim,
             dim_alpha,
             accent,
-            hover_bg,
-            idle_bg,
+            hover_bg: Rgba::new(0, 0, 0, 0),
+            idle_bg: Rgba::new(0, 0, 0, 0),
             track_bg,
             needs_outline,
-        }
+        };
+        theme.apply_bg_config(mode, idle_mode, hover_alpha, idle_alpha);
+        theme
+    }
+
+    /// 按背景配置**就地**更新两态背景色（v1.1.12）。
+    ///
+    /// 基色取「浅背景用白、深背景用近黑」（PRD §4.2），模式为「透明」时
+    /// alpha 归零（绘制层见 alpha==0 跳过），半透明档由百分比换算。
+    /// [`Theme::from_backdrop`] 组装时调用；设置页改模式 / 透明度时也用它
+    /// **就地同步**当前主题——滑条拖动即时可见，不必等下一次采样回来。
+    pub fn apply_bg_config(
+        &mut self,
+        mode: BackgroundMode,
+        idle_mode: BackgroundMode,
+        hover_alpha: u8,
+        idle_alpha: u8,
+    ) {
+        let (r, g, b) = if self.on_light {
+            (0xF2, 0xF2, 0xF4)
+        } else {
+            (0x1A, 0x1A, 0x1E)
+        };
+        self.hover_bg = if mode == BackgroundMode::Transparent {
+            Rgba::new(0, 0, 0, 0)
+        } else {
+            Rgba::new(r, g, b, alpha_pct(hover_alpha))
+        };
+        self.idle_bg = if idle_mode == BackgroundMode::Transparent {
+            Rgba::new(0, 0, 0, 0)
+        } else {
+            Rgba::new(r, g, b, alpha_pct(idle_alpha))
+        };
     }
 
     /// 主文字在该背景亮度下的对比度（验收日志用）。

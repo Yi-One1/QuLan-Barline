@@ -1124,6 +1124,15 @@ impl App {
                     effects.push(Effect::RebindHotkeys);
                 }
                 if appearance_changed {
+                    // 就地同步两态背景色：滑条 / 模式改动即时可见；
+                    // 随后采样回来的主题按同一配置重算，same_paint 相等不闪
+                    let a = &self.config.appearance;
+                    self.state.theme.apply_bg_config(
+                        a.background_mode,
+                        a.idle_mode,
+                        a.hover_alpha,
+                        a.idle_alpha,
+                    );
                     self.request_backdrop();
                     effects.push(Effect::Redraw);
                 }
@@ -1539,8 +1548,13 @@ impl App {
             }
             WidgetInput::SetBackgroundMode(mode) => {
                 self.config.appearance.background_mode = mode;
-                // 立即重采样：hover_bg 随模式变化（透明档 alpha=0），
-                // 新主题经 BackdropReady 回来后重绘
+                // 就地同步主题（悬停底色即时切换）+ 立即重采样拿新亮度主题
+                self.state.theme.apply_bg_config(
+                    mode,
+                    self.config.appearance.idle_mode,
+                    self.config.appearance.hover_alpha,
+                    self.config.appearance.idle_alpha,
+                );
                 self.request_backdrop();
                 let mut effects = self.commit_config();
                 effects.push(Effect::Redraw);
@@ -2120,12 +2134,24 @@ impl App {
             }
             MenuCommand::BgTranslucent => {
                 self.config.appearance.background_mode = BackgroundMode::Translucent;
+                self.state.theme.apply_bg_config(
+                    self.config.appearance.background_mode,
+                    self.config.appearance.idle_mode,
+                    self.config.appearance.hover_alpha,
+                    self.config.appearance.idle_alpha,
+                );
                 self.request_backdrop();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
             MenuCommand::BgTransparent => {
                 self.config.appearance.background_mode = BackgroundMode::Transparent;
+                self.state.theme.apply_bg_config(
+                    self.config.appearance.background_mode,
+                    self.config.appearance.idle_mode,
+                    self.config.appearance.hover_alpha,
+                    self.config.appearance.idle_alpha,
+                );
                 self.request_backdrop();
                 let effects = self.commit_config();
                 self.apply(effects);

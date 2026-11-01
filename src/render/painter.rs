@@ -114,8 +114,10 @@ pub fn paint(
         let hit_brush = frame.brush(Rgba::new(0, 0, 0, 1))?;
         rt.FillRectangle(&d2d_rect(0.0, 0.0, w, h), &hit_brush);
 
-        // ---- 2. 悬停背景 ----
-        if hover_a > 0.004 {
+        // ---- 2. 背景（常规 idle_bg / 悬停 hover_bg 插值）----
+        // v1.1.12：常规态也可能半透明——只有「不悬停 且 常规透明」才整块跳过
+        // （此前守卫只看 hover_a，把常规半透明整帧吞掉 = 问题 1/2 的根因）
+        if hover_a > 0.004 || ctx.theme.idle_bg.a > 0 {
             draw_background(&rt, frame, ctx, hover_a)?;
         }
 
