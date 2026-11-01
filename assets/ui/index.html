@@ -149,9 +149,13 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
 .list { display: flex; flex-direction: column; gap: 6px; }
 .list .item {
   display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
   padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px;
   font-size: 12px; font-family: Consolas, monospace;
 }
+/* 路径文本吃满剩余宽度，操作按钮成组靠右相邻（v1.1.8 修复更改按钮偏左） */
+.list .item > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.list .item .btn { flex: none; margin-left: 6px; }
 .list .empty { color: var(--text-2); font-size: 12px; }
 
 .link { color: var(--accent); cursor: pointer; text-decoration: none; }
