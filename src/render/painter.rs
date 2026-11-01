@@ -595,22 +595,6 @@ fn draw_pill(
 
 // ------------------------------------------------------------------ 歌词
 
-/// 歌词右侧渐隐带宽度（逻辑像素；随 DPI 缩放）。
-///
-/// 文本超宽时，可用宽度最后这一段从实色渐到全透明（M3 遗留 P2），
-/// 取代旧的「右缘硬裁」。不超宽时该带落在文本之外，视觉零差异。
-const LYRIC_FADE_W: f32 = 24.0;
-
-/// 计算一行歌词的渐隐带（渲染目标坐标）。
-///
-/// 返回 `(fade_start, fade_end)`：`fade_end` = 行右缘；可用宽度不足
-/// `LYRIC_FADE_W` 时起点钳到行首（整行都在渐变里，不会出现负起点）。
-fn fade_band(x: f32, w: f32, fade_w: f32) -> (f32, f32) {
-    let end = x + w;
-    let start = (end - fade_w).max(x);
-    (start, end)
-}
-
 // ---------------------------------------------------------------- 跑马灯（v1.1.3）
 
 /// 长歌词滚动的**纯函数**（v1.1.3：行时间窗口驱动，取代 v1.1.2 固定速度跑马灯）。
@@ -620,7 +604,7 @@ fn fade_band(x: f32, w: f32, fade_w: f32) -> (f32, f32) {
 /// 一致（播放位置外推），暂停自然冻结、拖动跳转天然跟随，无需行指纹归零。
 ///
 /// 窗口短于 [`limits::MARQUEE_MIN_WINDOW_SECS`] 的行返回 0，由调用方判定
-/// 不激活、回落右侧渐隐带（窗口太短滚完全程会快到看不清）。
+/// 不激活（窗口太短滚完全程会快到看不清，只显示行首）。
 ///
 /// 返回值是「文本相对视口的左移量」`0.0..=excess`。
 pub fn marquee_offset(excess: f32, elapsed_secs: f32, window_secs: f32) -> f32 {
@@ -632,49 +616,7 @@ pub fn marquee_offset(excess: f32, elapsed_secs: f32, window_secs: f32) -> f32 {
     excess * p
 }
 
-/// 画一行歌词（**右侧渐隐版**，M3 遗留 P2）。
-///
-/// 与 [`draw_line`] 的唯一区别：文本笔刷是水平透明度渐变——行宽最后
-/// `LYRIC_FADE_W` 像素从实色渐到全透明。文本不超宽时整行落在渐变起点
-/// 之前（CLAMP 延展 = stop0 实色），视觉与实色笔刷一致，因此**无需先测量
-/// 是否超宽**，无差别使用即可（省一次测量，保住空闲 CPU 指标）。
-///
-/// 扫光的码元 → x 映射不受影响：文本仍然整行进 `IDWriteTextLayout`，
-/// 裁剪宽度仍由 `hit_test_x` 给出，渐隐只是绘制层面的透明度调制。
-fn draw_lyric_line(
-    rt: &ID2D1RenderTarget,
-    frame: &mut Frame,
-    text: &TextFormats,
-    s: f32,
-    d: &TextDraw<'_>,
-) -> Result<()> {
-    let rect = d.rect;
-    if d.text.is_empty() || rect.is_empty() {
-        return Ok(());
-    }
-    let utf16 = to_utf16(d.text);
-    if utf16.is_empty() {
-        return Ok(());
-    }
-    let (fade_start, fade_end) = fade_band(rect.x, rect.w, LYRIC_FADE_W * s);
-    let brush = frame.fade_brush(d.color, fade_start, fade_end)?;
-    let rect_d = d2d_rect(rect.x, rect.y, rect.w, rect.h);
-    let format = text.get(d.kind);
-    // SAFETY: utf16 生命周期覆盖调用；brush / format 由 frame / text 持有；rect 是栈上值。
-    unsafe {
-        rt.DrawText(
-            &utf16,
-            format,
-            &rect_d,
-            &brush,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            DWRITE_MEASURING_MODE_NATURAL,
-        );
-    }
-    Ok(())
-}
-
-/// 画歌词区（T12）：当前行**逐字扫光**，下一行 30% 不透明度。
+/// 画歌词区（T12）：当前行**逐字扫光**。
 ///
 /// 扫光用「两遍绘制 + 裁剪」实现，而不是逐字画不同颜色：
 /// 1. 整行先按**未唱**颜色画一遍；
@@ -685,8 +627,9 @@ fn draw_lyric_line(
 /// `IDWriteTextLayout1` + `IDWriteTextRenderer` 自定义渲染器（几百行 COM），
 /// 而且每帧都要重设 effect。裁剪法只要一次 `HitTestTextPosition`，成本低一个量级。
 ///
-/// 长行不再硬裁：两遍绘制都走 [`draw_lyric_line`]（右侧渐隐），文本整行
-/// 进布局，扫光码元映射保持正确。
+/// 长行处理：v1.1.2 起超宽行走跑马灯（视口裁剪 + 左移偏移）；v1.1.4 删除
+/// 右缘渐隐带——普通路径实色硬裁（放不下的部分不显示），不再有渐变吃淡
+/// 最后一个字的问题。文本仍整行进布局，扫光码元映射保持正确。
 fn draw_lyrics(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
@@ -760,11 +703,11 @@ fn draw_lyrics(
     if state.lyric_marquee {
         let off = state.lyric_scroll_offset.clamp(0.0, 1.0e6);
         let rect = layout.lyric_cur;
-        // 绘制矩形随偏移左移并加宽（多留一个渐隐带宽度，保证尾部完整进布局）
+        // 绘制矩形随偏移左移并加宽（多留 2px 余量抵消测量舍入，保证尾部完整进布局）
         let wide = RectF::new(
             rect.x - off,
             rect.y,
-            rect.w + off + LYRIC_FADE_W * ctx.scale,
+            rect.w + off + 2.0 * ctx.scale,
             rect.h,
         );
         // SAFETY: 视口裁剪矩形是栈上值；Push/Pop 严格配对（见下方先收结果再 Pop）。
@@ -837,12 +780,12 @@ fn draw_lyrics(
     }
 
     // ---- 普通路径（未超宽 / 滚动关闭）：未唱部分 ----
+    // v1.1.4：右缘渐隐带已删——实色绘制，放不下的部分被视口硬裁。
     let unsung = Rgba::from_rgb(theme.text_dim, scale_a(0x8C));
-    draw_lyric_line(
+    draw_line(
         rt,
         frame,
-        ctx.text,
-        ctx.scale,
+        ctx,
         &TextDraw {
             kind: TextKind::Lyric,
             text: lyric.cur,
@@ -882,16 +825,15 @@ fn draw_lyrics(
         layout.lyric_cur.h,
     );
     // SAFETY: clip 是栈上矩形；Push/Pop 严格配对（中间只有一次 DrawText，
-    // 且 `?` 提前返回前已保证没有未配对的 Push——这里 draw_lyric_line 失败会
+    // 且 `?` 提前返回前已保证没有未配对的 Push——这里 draw_line 失败会
     // 跳过 Pop，所以先用 let 接住结果再 Pop）。
     unsafe {
         rt.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     }
-    let r = draw_lyric_line(
+    let r = draw_line(
         rt,
         frame,
-        ctx.text,
-        ctx.scale,
+        ctx,
         &TextDraw {
             kind: TextKind::Lyric,
             text: lyric.cur,
@@ -978,22 +920,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fade_band_stays_inside_rect_and_clamps() {
-        // 正常情况：渐隐带 = 右缘前 24px
-        let (s, e) = fade_band(100.0, 200.0, 24.0);
-        assert_eq!(s, 276.0);
-        assert_eq!(e, 300.0);
-        // 可用宽度比渐隐带还窄：起点钳到行首，整行都在渐变里
-        let (s, e) = fade_band(100.0, 10.0, 24.0);
-        assert_eq!(s, 100.0);
-        assert_eq!(e, 110.0);
-        // 零宽：起终点重合（DrawText 侧有 rect.is_empty 兜底，不会真画）
-        let (s, e) = fade_band(50.0, 0.0, 24.0);
-        assert_eq!(s, 50.0);
-        assert_eq!(e, 50.0);
-    }
-
-    #[test]
     fn time_pair_formats_with_leading_zeros() {
         assert_eq!(format_time_pair(72_000, 225_000), "01:12 / 03:45");
         assert_eq!(format_time_pair(0, 0), "00:00 / 00:00");
@@ -1009,7 +935,7 @@ mod tests {
         assert!(s.ends_with("100%"), "s = {s}");
     }
 
-    /// 跑马灯窗口驱动：行内进度线性映射滚动量，两端钳位，短行回落渐隐。
+    /// 跑马灯窗口驱动：行内进度线性映射滚动量，两端钳位，短行只显示行首。
     #[test]
     fn marquee_offset_tracks_window_linearly() {
         let excess = 60.0f32;
@@ -1029,7 +955,7 @@ mod tests {
         // 不超宽：永远 0
         assert_eq!(marquee_offset(0.0, 100.0, window), 0.0);
         assert_eq!(marquee_offset(-5.0, 100.0, window), 0.0);
-        // 短窗口（< MARQUEE_MIN_WINDOW_SECS）：不滚，回落渐隐
+        // 短窗口（< MARQUEE_MIN_WINDOW_SECS）：不滚，只显示行首
         assert_eq!(marquee_offset(excess, 0.5, limits::MARQUEE_MIN_WINDOW_SECS - 0.1), 0.0);
         // 窗口内单调不减且有界
         let mut prev = 0.0f32;

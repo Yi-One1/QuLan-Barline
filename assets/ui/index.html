@@ -227,7 +227,7 @@ select:focus, input[type="text"]:focus { border-color: var(--accent); }
         </div>
         <div class="row">
           <div><div class="label" data-i18n="lyrics.scroll">长歌词滚动</div>
-            <div class="desc" data-i18n="lyrics.scroll.desc">歌词超宽时停留后向右滚动展示完整内容；关闭后右侧渐隐截断。</div></div>
+            <div class="desc" data-i18n="lyrics.scroll.desc">歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-scroll"><span class="track"></span><span class="knob"></span></label></div>
         </div>
         <div class="row">
@@ -361,7 +361,7 @@ const I18N = {
     "lyrics.sub": "本地 .lrc 优先，其次 lrclib.net 在线歌词。",
     "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件收合到任务栏高度。",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
-    "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时停留后向右滚动展示完整内容；关闭后右侧渐隐截断。",
+    "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时向 lrclib.net 查询。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
@@ -399,7 +399,7 @@ const I18N = {
     "lyrics.sub": "Local .lrc first, then lrclib.net.",
     "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off collapses the widget to the taskbar height.",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
-    "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics into view after a pause. Off = fade at the right edge.",
+    "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Query lrclib.net when no local file exists.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",

@@ -770,7 +770,7 @@ impl App {
             .clamp(0.0, 1.0);
     }
 
-    /// 推导本帧的跑马灯状态（v1.1.3：行时间窗口驱动）。
+    /// 推导本帧的跑马灯状态（v1.1.4：行时间窗口驱动 + 演唱结束前提前滚完）。
     ///
     /// 在每次 `redraw()` 开头调用——frame_hash 会把偏移量化进去，偏移不变
     /// （暂停 / 长窗口慢滚不足 0.5px）自动被去重跳过。
@@ -784,9 +784,10 @@ impl App {
         let lyric_on = self.state.layout.form == WidgetForm::Lyric;
         // 歌词行自然宽来自渲染器缓存（上一帧建的 TextLayout——宽度只在换行时变，够用）
         let text_w = self.renderer.as_ref().and_then(|r| r.lyric_text_width());
-        // 行内已播时长（行开始前钳 0）与行窗口（负窗口视为 0 → 不滚）
+        // 行内已播时长（行开始前钳 0）与滚动窗口（= 演唱窗口 − 提前量，见下）
         let elapsed_ms = (t - d.line_start_ms).max(0) as u32;
-        let window_ms = (d.line_end_ms - d.line_start_ms).max(0) as u32;
+        let sing_window_ms = (d.line_sing_end_ms - d.line_start_ms).max(0);
+        let window_ms = marquee_scroll_window_ms(sing_window_ms);
         let (marquee, offset) = marquee_frame(MarqueeInput {
             enabled: self.state.lyric_scroll_enabled,
             placeholder: d.placeholder,
@@ -2166,7 +2167,20 @@ fn lyric_w_logical(config: &Config) -> f32 {
     crate::config::defaults::limits::LYRIC_W
 }
 
-/// 跑马灯本帧输入（v1.1.3）。字段语义见 [`marquee_frame`] 文档。
+/// 演唱窗口（毫秒）→ 滚动窗口（毫秒）的**纯函数**（v1.1.4）。
+///
+/// 滚动在「最后一个字唱完」之前 [`limits::MARQUEE_LEAD_MS`] 提前完成，
+/// 提前量同时钳到演唱窗口的 1/4——行尾 + 行间间歇留给用户读最后一个字，
+/// 短句也不会因为提前太多而滚得过快。
+fn marquee_scroll_window_ms(sing_window_ms: i64) -> u32 {
+    if sing_window_ms <= 0 {
+        return 0;
+    }
+    let lead = crate::config::defaults::limits::MARQUEE_LEAD_MS.min(sing_window_ms / 4);
+    (sing_window_ms - lead) as u32
+}
+
+/// 跑马灯本帧输入（v1.1.3，便于单测）。字段语义见 [`marquee_frame`] 文档。
 #[derive(Debug, Clone, Copy)]
 struct MarqueeInput {
     /// 长歌词滚动开关（`config.lyrics.scroll`）
@@ -2190,7 +2204,7 @@ struct MarqueeInput {
 /// 跑马灯本帧判定的**纯函数**（v1.1.3，便于单测）：返回 `(是否激活, 偏移)`。
 ///
 /// 激活条件：开关开 + 歌词形态 + 非占位 + 非空行 + 歌词行自然宽超出视口 > 0.5px，
-/// 且行时间窗口不小于 [`limits::MARQUEE_MIN_WINDOW_SECS`]（短窗口滚完一圈快到看不清，直接回落渐隐）。
+/// 且行时间窗口不小于 [`limits::MARQUEE_MIN_WINDOW_SECS`]（短窗口滚完一圈快到看不清，只显示行首）。
 /// 激活时偏移由 [`crate::render::painter::marquee_offset`] 按**行内进度**给出
 /// （行时间窗口驱动：唱完该句时刚好滚到尾）。
 fn marquee_frame(i: MarqueeInput) -> (bool, f32) {
@@ -2280,7 +2294,7 @@ mod marquee_tests {
 
     #[test]
     fn marquee_short_window_falls_back_to_fade() {
-        // 行窗口 < MARQUEE_MIN_WINDOW_SECS：不激活（回落右侧渐隐），偏移 0
+        // 行窗口 < MARQUEE_MIN_WINDOW_SECS：不激活（只显示行首），偏移 0
         let min = crate::config::defaults::limits::MARQUEE_MIN_WINDOW_SECS;
         let (m, o) = marquee_frame(input(
             true,
@@ -2292,6 +2306,18 @@ mod marquee_tests {
             ((min - 0.1) * 1000.0) as u32,
         ));
         assert!(!m && o == 0.0);
+    }
+
+    #[test]
+    fn marquee_scroll_window_subtracts_lead() {
+        // 长句（10s）：提前 1.2s 滚完，行尾留给读最后一个字
+        assert_eq!(marquee_scroll_window_ms(10_000), 8_800);
+        // 短句（2s）：提前量钳到窗口 1/4（0.5s），滚动窗口 1.5s
+        assert_eq!(marquee_scroll_window_ms(2_000), 1_500);
+        // 更短（0.4s）：提前 0.1s；零 / 负窗口：0（不滚）
+        assert_eq!(marquee_scroll_window_ms(400), 300);
+        assert_eq!(marquee_scroll_window_ms(0), 0);
+        assert_eq!(marquee_scroll_window_ms(-5), 0);
     }
 
     #[test]

@@ -203,6 +203,9 @@ pub struct LyricDraw<'a> {
     /// 占位 / 首行之前为 `(0, 0)`——窗口为 0 时跑马灯自然不激活。
     pub line_start_ms: Ms,
     pub line_end_ms: Ms,
+    /// 当前行**演唱**结束时刻（v1.1.4：最后一个字的 end_ms；无字级时间戳
+    /// 则退化为 `line_end_ms`）。跑马灯比它提前完成滚动，留出读尾时间。
+    pub line_sing_end_ms: Ms,
 }
 
 impl<'a> LyricDraw<'a> {
@@ -214,6 +217,7 @@ impl<'a> LyricDraw<'a> {
             placeholder: true,
             line_start_ms: 0,
             line_end_ms: 0,
+            line_sing_end_ms: 0,
         }
     }
 
@@ -233,6 +237,14 @@ impl LyricView {
             (LyricStatus::Ready, Some(l)) if !l.lines.is_empty() => match l.line_at(t) {
                 Some(i) => {
                     let line = &l.lines[i];
+                    // 演唱结束 = 最后一个字的 end_ms（可能早于行窗口结束，
+                    // 中间的差值就是行间间歇——留给读尾）；异常时间戳钳到行尾。
+                    let sing_end = line
+                        .words
+                        .last()
+                        .map(|w| w.end_ms.min(line.end_ms))
+                        .unwrap_or(line.end_ms)
+                        .max(line.start_ms);
                     LyricDraw {
                         cur: line.text.as_str(),
                         sweep: sweep_offset(line, t),
@@ -240,6 +252,7 @@ impl LyricView {
                         placeholder: false,
                         line_start_ms: line.start_ms,
                         line_end_ms: line.end_ms,
+                        line_sing_end_ms: sing_end,
                     }
                 }
                 // 还没唱到第一行：留白（v1.1.1 起没有下一行预告）
@@ -250,6 +263,7 @@ impl LyricView {
                     placeholder: false,
                     line_start_ms: 0,
                     line_end_ms: 0,
+                    line_sing_end_ms: 0,
                 },
             },
             (LyricStatus::Loading, _) => LyricDraw::placeholder_of(i18n::t(lang, "lyric.loading")),
@@ -411,6 +425,57 @@ mod tests {
         let d = v.draw(0, Lang::Zh);
         assert_eq!(d.cur, "");
         assert!(d.is_empty());
+    }
+
+    /// v1.1.4：演唱结束 = 最后一个字的 end_ms（无字级时间戳退化为行尾）。
+    #[test]
+    fn draw_reports_sing_end() {
+        let with_words = Arc::new(Lyrics {
+            lines: vec![LyricLine {
+                start_ms: 0,
+                end_ms: 5000,
+                text: "你好".into(),
+                words: vec![word("你", 0, 1000), word("好", 1000, 1800)],
+            }],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(with_words),
+            ..Default::default()
+        };
+        let d = v.draw(500, Lang::Zh);
+        assert_eq!(d.line_sing_end_ms, 1800, "唱完 = 最后一个字的 end_ms");
+
+        let without_words = Arc::new(Lyrics {
+            lines: vec![line(1000, 4000, "无字级时间戳")],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(without_words),
+            ..Default::default()
+        };
+        let d = v.draw(2000, Lang::Zh);
+        assert_eq!(d.line_sing_end_ms, 4000, "无词退化为行尾");
+
+        // 异常时间戳（词尾晚于行尾）钳到行尾
+        let bad = Arc::new(Lyrics {
+            lines: vec![LyricLine {
+                start_ms: 0,
+                end_ms: 3000,
+                text: "坏".into(),
+                words: vec![word("坏", 0, 9000)],
+            }],
+            ..Default::default()
+        });
+        let v = LyricView {
+            status: LyricStatus::Ready,
+            lyrics: Some(bad),
+            ..Default::default()
+        };
+        let d = v.draw(100, Lang::Zh);
+        assert_eq!(d.line_sing_end_ms, 3000);
     }
 
     #[test]

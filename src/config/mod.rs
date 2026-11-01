@@ -95,8 +95,9 @@ pub struct LyricsConfig {
     pub enabled: bool,
     pub mode: LyricModeSerde,
     pub karaoke_sweep: bool,
-    /// 长歌词滚动（跑马灯，v1.1.2 新增）：歌词超宽时停留→滚动→回位循环；
-    /// 关闭时保持右缘渐隐。旧配置缺省即 true（#[serde(default)] 兜底）。
+    /// 长歌词滚动（跑马灯，v1.1.2 新增；v1.1.4 改行时间窗口驱动 + 提前滚完）：
+    /// 歌词超宽时按行时间窗口线性滚动，比该行唱完提前滚到尾；
+    /// 关闭时行首截断（超宽部分不显示）。旧配置缺省即 true（#[serde(default)] 兜底）。
     pub scroll: bool,
     pub online_enabled: bool,
     /// 本地歌词搜索目录（绝对路径）。空数组表示只用默认目录。
