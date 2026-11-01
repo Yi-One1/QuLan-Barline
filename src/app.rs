@@ -188,6 +188,10 @@ pub struct App {
     tray: Option<crate::ui::tray::Tray>,
     /// 全局快捷键（T15）
     hotkeys: crate::hotkey::Hotkeys,
+    /// 设置页（T13）
+    settings: crate::settings::SettingsService,
+    /// 模块句柄（建设置窗口 / 加载图标用）
+    hinstance: HINSTANCE,
     renderer: Option<Renderer>,
     media: Option<MediaService>,
     lyric: Option<LyricService>,
@@ -316,6 +320,8 @@ impl App {
             widget,
             tray: None,
             hotkeys: crate::hotkey::Hotkeys::default(),
+            settings: crate::settings::SettingsService::new(),
+            hinstance,
             renderer,
             media: None,
             lyric: None,
@@ -370,6 +376,17 @@ impl App {
             }
             let cfg = (*ptr).config.hotkeys;
             (*ptr).hotkeys.register_all((*ptr).msg_hwnd, &cfg);
+            // 首启发现快捷键冲突 → 托盘气泡提示一次（不打断用户）
+            if !(*ptr).hotkeys.conflicts.is_empty() && !(*ptr).config.hotkeys.conflict_notified {
+                if let Some(t) = (*ptr).tray.as_ref() {
+                    let title = i18n::t((*ptr).lang, "tray.conflict_title");
+                    let text = i18n::t((*ptr).lang, "tray.conflict_text");
+                    t.show_balloon((*ptr).lang, title, text, true);
+                }
+                (*ptr).config.hotkeys.conflict_notified = true;
+                let cfg = (*ptr).config.clone();
+                (*ptr).apply(vec![Effect::SaveConfig(Box::new(cfg))]);
+            }
             (*ptr).relayout();
         }
 
@@ -543,10 +560,12 @@ impl App {
         Some(LRESULT(0))
     }
 
-    /// 第二个实例请求唤起（M3 起打开设置页）。
+    /// 第二个实例请求唤起：打开（或前置）设置页。
     pub fn on_second_instance(&mut self) {
-        crate::log_info!("第二个实例请求唤起：设置页在 M3/T13 落地，当前仅重绘小组件");
+        crate::log_info!("第二个实例请求唤起 → 打开设置页");
         self.relayout();
+        let effects = self.reduce(AppEvent::SettingsOpenRequest);
+        self.apply(effects);
     }
 
     // ---------------------------------------------------------------- 小组件输入
@@ -888,6 +907,23 @@ impl App {
                 Vec::new()
             }
             AppEvent::WidgetInput(input) => self.reduce_input(input),
+            AppEvent::SettingsOpenRequest => {
+                vec![Effect::OpenSettings]
+            }
+            AppEvent::SettingsClosed => {
+                crate::log_info!("设置页已关闭");
+                Vec::new()
+            }
+            AppEvent::SettingsWebViewReady => {
+                self.settings.on_webview_ready();
+                Vec::new()
+            }
+            AppEvent::SettingsWebViewFailed(reason) => {
+                crate::log_err!("设置页不可用：{reason}");
+                self.show_webview_missing();
+                Vec::new()
+            }
+            AppEvent::SettingsMessage(msg) => self.reduce_settings_message(&msg),
             AppEvent::Hotkey(action) => self.reduce_hotkey(action),
             AppEvent::TrayCommand(cmd) => match cmd {
                 TrayCommand::OpenSettings => {
@@ -986,6 +1022,8 @@ impl App {
                 self.config = *cfg;
                 self.animate_lyric_height();
                 self.relayout();
+                let json = self.settings_state_json();
+                self.settings.push(&json);
                 vec![Effect::RefreshTrayMenu]
             }
             AppEvent::Tick => {
@@ -999,6 +1037,139 @@ impl App {
                 crate::log_debug!("reduce: 暂未处理的 AppEvent（M2 范围外）：{other:?}");
                 Vec::new()
             }
+        }
+    }
+
+    /// 设置页 JS 消息。
+    fn reduce_settings_message(&mut self, msg: &str) -> Vec<Effect> {
+        use crate::settings::bridge::{self, Incoming};
+        let Some(inc) = bridge::parse(msg) else {
+            crate::log_debug!("设置页消息无法解析：{}", &msg[..msg.len().min(80)]);
+            return Vec::new();
+        };
+        match inc {
+            Incoming::Record(start) => {
+                // 录制期间挂起全局热键（PRD P1-02），否则按旧键会直接触发动作
+                let cfg = self.config.hotkeys;
+                if start {
+                    self.hotkeys.suspend(self.msg_hwnd);
+                } else {
+                    self.hotkeys.resume(self.msg_hwnd, &cfg);
+                }
+                Vec::new()
+            }
+            Incoming::Action(a) => {
+                self.run_settings_action(&a);
+                Vec::new()
+            }
+            Incoming::Set { path, value } => {
+                if !bridge::apply_set(&mut self.config, &path, &value) {
+                    return Vec::new();
+                }
+                // 歌词开关 / 行数变化要走高度过渡；快捷键变化要重绑
+                let hotkey_changed = path.starts_with("hotkeys.");
+                if path.starts_with("lyrics.") && (path == "lyrics.enabled" || path == "lyrics.mode") {
+                    self.animate_lyric_height();
+                }
+                let mut effects = vec![
+                    Effect::Relayout,
+                    Effect::SaveConfig(Box::new(self.config.clone())),
+                ];
+                if hotkey_changed {
+                    effects.push(Effect::RebindHotkeys);
+                }
+                effects
+            }
+        }
+    }
+
+    /// 设置页里的「动作」按钮。
+    fn run_settings_action(&mut self, action: &str) {
+        match action {
+            "openLogDir" => {
+                let dir = crate::platform::barline_dir();
+                let w = to_wide(&dir.to_string_lossy());
+                // SAFETY: w 以 NUL 结尾且在本调用期间存活。
+                unsafe {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(w.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+                crate::log_info!("设置页：打开日志目录 {}", dir.display());
+            }
+            "openLrclib" => {
+                let w = to_wide("https://lrclib.net");
+                // SAFETY: 同上。
+                unsafe {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(w.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+            }
+            "ready" => {
+                // 页面加载完了：补推一次全量状态
+                self.settings.on_webview_ready();
+            }
+            other => crate::log_debug!("设置页未知动作：{other}"),
+        }
+    }
+
+    /// 组装给设置页的全量状态 JSON。
+    fn settings_state_json(&self) -> String {
+        let conflicts: Vec<(&str, u32)> = self
+            .hotkeys
+            .conflicts
+            .iter()
+            .map(|c| (crate::settings::bridge::action_name(c.action), c.code))
+            .collect();
+        let log_dir = crate::platform::barline_dir().to_string_lossy().to_string();
+        crate::settings::bridge::state_json(
+            &self.config,
+            env!("CARGO_PKG_VERSION"),
+            &conflicts,
+            &log_dir,
+        )
+    }
+
+    /// 设置窗口尺寸变化 → 同步 WebView2。
+    pub fn on_settings_resize(&mut self, hwnd: HWND) {
+        self.settings.resize(hwnd);
+    }
+
+    /// 设置窗口收到 WM_CLOSE：销毁窗口（释放 WebView2），进程继续跑。
+    pub fn on_settings_close_request(&mut self) {
+        self.settings.close();
+    }
+
+    /// 设置窗口 WM_DESTROY：兜底释放。
+    pub fn on_settings_destroyed(&mut self) {
+        self.settings.close();
+        let effects = self.reduce(AppEvent::SettingsClosed);
+        self.apply(effects);
+    }
+
+    /// WebView2 不可用时的原生兜底提示（不静默失败）。
+    fn show_webview_missing(&self) {
+        let title = to_wide(i18n::t(self.lang, "settings.webview_missing_title"));
+        let body = to_wide(i18n::t(self.lang, "settings.webview_missing_body"));
+        // SAFETY: 两个缓冲都是 NUL 结尾且在本调用期间存活。
+        unsafe {
+            MessageBoxW(
+                None,
+                windows::core::PCWSTR(body.as_ptr()),
+                windows::core::PCWSTR(title.as_ptr()),
+                MB_ICONINFORMATION | MB_SETFOREGROUND,
+            );
         }
     }
 
@@ -1139,6 +1310,23 @@ impl App {
                     Some(m) => m.send(cmd),
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
+                Effect::OpenSettings => {
+                    let json = self.settings_state_json();
+                    let dark = !self.state.theme.on_light;
+                    self.settings.open(
+                        self.hinstance,
+                        self.sink.clone(),
+                        json,
+                        dark,
+                    );
+                    // 设置窗口刚建好，把 App* 绑上去（WndProc 要用）
+                    if let Some(h) = self.settings.hwnd() {
+                        crate::settings::bind_app(h, self as *mut App);
+                    }
+                }
+                Effect::CloseSettings => {
+                    self.settings.close();
+                }
                 Effect::RebindHotkeys => {
                     let cfg = self.config.hotkeys;
                     self.hotkeys.register_all(self.msg_hwnd, &cfg);

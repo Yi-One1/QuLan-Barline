@@ -118,6 +118,12 @@ pub struct VolumeConfig {
 #[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,
+    /// 默认值版本（0 = 旧 `Ctrl+Alt+*`）。见 `defaults::HOTKEYS_VERSION`
+    #[serde(default)]
+    pub hotkeys_version: u32,
+    /// 「快捷键被占用」气泡是否已经提示过（只提示一次）
+    #[serde(default)]
+    pub conflict_notified: bool,
     pub play_pause: HotkeyBinding,
     pub prev: HotkeyBinding,
     pub next: HotkeyBinding,
@@ -188,13 +194,19 @@ impl Config {
         };
 
         match serde_json::from_slice::<Config>(&raw) {
-            Ok(cfg) => {
+            Ok(mut cfg) => {
                 crate::log_info!(
                     "配置已加载：version={} lyrics.mode={:?} ui_scale={}",
                     cfg.version,
                     cfg.lyrics.mode,
                     cfg.appearance.ui_scale
                 );
+                if cfg.hotkeys.migrate() {
+                    // 迁移结果要立刻落盘，否则下次启动又会判定为「旧配置」
+                    if let Err(e) = cfg.save() {
+                        crate::log_warn!("迁移后的配置保存失败：{e}");
+                    }
+                }
                 cfg
             }
             Err(e) => {

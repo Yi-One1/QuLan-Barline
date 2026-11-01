@@ -16,8 +16,8 @@
 use windows::core::{w, PCWSTR, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
@@ -161,6 +161,27 @@ impl Tray {
         crate::log_debug!("托盘图标已移除");
     }
 
+    /// 弹一次气泡提示（`NIF_INFO`）。
+    ///
+    /// 用途：首启发现快捷键被占用时提示用户改绑（不弹 MessageBox 打断操作）。
+    /// `warning == true` 用黄色感叹号图标。
+    pub fn show_balloon(&self, lang: Lang, title: &str, text: &str, warning: bool) {
+        if !self.added {
+            return;
+        }
+        let mut d = self.data(lang);
+        d.uFlags = NIF_INFO;
+        d.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };
+        copy_into(&mut d.szInfoTitle, title);
+        copy_into(&mut d.szInfo, text);
+        // SAFETY: d 是本地结构体且 cbSize 已填；NIM_MODIFY + NIF_INFO 是文档规定的气泡用法。
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) }.as_bool() {
+            crate::log_info!("托盘气泡已弹出：{title} / {text}");
+        } else {
+            crate::log_warn!("托盘气泡弹出失败");
+        }
+    }
+
     /// 弹出右键菜单并返回选中的命令。
     pub fn show_menu(&self, lang: Lang, hidden: bool) -> Option<TrayCommand> {
         // SAFETY: 菜单句柄由本函数创建并在末尾销毁；所有字符串缓冲在调用期间存活。
@@ -174,6 +195,8 @@ impl Tray {
 
             // MSDN：弹出前必须把宿主窗口设为前台，否则点别处菜单不消失。
             // 宿主是隐藏窗口时 SetForegroundWindow 可能失败，这里显式记日志便于诊断。
+            // 先抢前台（用户正在操作别的程序时 SetForegroundWindow 会被拒）
+            crate::platform::force_foreground(self.hwnd);
             let fg_ok = SetForegroundWindow(self.hwnd).as_bool();
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -216,9 +239,7 @@ impl Tray {
             hIcon: windows::Win32::UI::WindowsAndMessaging::HICON(self.icon as *mut core::ffi::c_void),
             ..Default::default()
         };
-        let tip = to_wide(i18n::t(lang, "tray.tip"));
-        let n = tip.len().min(d.szTip.len());
-        d.szTip[..n].copy_from_slice(&tip[..n]);
+        copy_into(&mut d.szTip, i18n::t(lang, "tray.tip"));
         d
     }
 }
@@ -233,6 +254,13 @@ impl Drop for Tray {
             }
         }
     }
+}
+
+/// 把 `&str` 拷进定长 UTF-16 缓冲（截断而不是 panic）。
+fn copy_into(dst: &mut [u16], src: &str) {
+    let wide = to_wide(src);
+    let n = wide.len().min(dst.len());
+    dst[..n].copy_from_slice(&wide[..n]);
 }
 
 /// 追加一个菜单项（`checked` 为真时带勾）。

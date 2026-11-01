@@ -33,6 +33,7 @@ mod lyric;
 mod media;
 mod platform;
 mod render;
+mod settings;
 mod taskbar;
 mod ui;
 

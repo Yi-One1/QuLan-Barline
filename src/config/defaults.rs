@@ -116,6 +116,14 @@ pub mod mods {
     pub const NOREPEAT: u32 = 0x4000;
 }
 
+/// 快捷键默认值的版本号。
+///
+/// 0 = M2/M3 时代的 `Ctrl+Alt+*`；1 = 现在的 `Ctrl+Alt+Shift+*`。
+/// 为什么要版本号：旧配置里存的是**旧默认值**，但那也可能是用户**手动选过的**
+/// 同款组合。只有"6 组全都等于旧默认值"才能判定为"用户没改过"→ 可以迁移；
+/// 改过任何一组就原样保留（见 `HotkeyConfig::migrate`）。
+pub const HOTKEYS_VERSION: u32 = 1;
+
 /// 常用虚拟键码（`RegisterHotKey` 用）。
 pub mod vk {
     pub const P: u32 = 0x50;
@@ -181,11 +189,17 @@ impl Default for VolumeConfig {
     }
 }
 
-impl Default for HotkeyConfig {
-    fn default() -> Self {
+impl HotkeyConfig {
+    /// **旧**默认值（`Ctrl+Alt+*`）。只用于迁移判定，不要拿来注册。
+    ///
+    /// 实测这台机器上 `Ctrl+Alt+P / ← / → / L / M` 全被其它软件占用（1409），
+    /// 所以默认值整体换成 `Ctrl+Alt+Shift+*`。
+    pub fn legacy_defaults() -> Self {
         let ctrl_alt = mods::CONTROL | mods::ALT;
         Self {
             enabled: true,
+            hotkeys_version: 0,
+            conflict_notified: false,
             play_pause: HotkeyBinding {
                 modifiers: ctrl_alt,
                 vk: vk::P,
@@ -208,6 +222,72 @@ impl Default for HotkeyConfig {
             },
             toggle_widget: HotkeyBinding {
                 modifiers: ctrl_alt,
+                vk: vk::H,
+            },
+        }
+    }
+
+    /// 6 组绑定是否完全一致（不含 `enabled` 与元数据字段）。
+    pub fn same_bindings(&self, other: &Self) -> bool {
+        self.play_pause == other.play_pause
+            && self.prev == other.prev
+            && self.next == other.next
+            && self.toggle_lyrics == other.toggle_lyrics
+            && self.mute == other.mute
+            && self.toggle_widget == other.toggle_widget
+    }
+
+    /// 旧配置迁移：只有「版本 0 + 6 组全是旧默认值」才换成新默认值。
+    /// 返回 `true` 表示配置被改动，调用方应落盘。
+    pub fn migrate(&mut self) -> bool {
+        if self.hotkeys_version >= HOTKEYS_VERSION {
+            return false;
+        }
+        let legacy = Self::legacy_defaults();
+        if self.same_bindings(&legacy) {
+            let enabled = self.enabled;
+            let notified = self.conflict_notified;
+            *self = Self::default();
+            self.enabled = enabled;
+            self.conflict_notified = notified;
+            crate::log_info!("快捷键默认值已从 Ctrl+Alt+* 迁移到 Ctrl+Alt+Shift+*");
+        } else {
+            crate::log_info!("快捷键默认值保持用户自定义值（不迁移）");
+        }
+        self.hotkeys_version = HOTKEYS_VERSION;
+        true
+    }
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        let ctrl_alt_shift = mods::CONTROL | mods::ALT | mods::SHIFT;
+        Self {
+            enabled: true,
+            hotkeys_version: HOTKEYS_VERSION,
+            conflict_notified: false,
+            play_pause: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
+                vk: vk::P,
+            },
+            prev: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
+                vk: vk::LEFT,
+            },
+            next: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
+                vk: vk::RIGHT,
+            },
+            toggle_lyrics: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
+                vk: vk::L,
+            },
+            mute: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
+                vk: vk::M,
+            },
+            toggle_widget: HotkeyBinding {
+                modifiers: ctrl_alt_shift,
                 vk: vk::H,
             },
         }

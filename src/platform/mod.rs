@@ -47,6 +47,50 @@ pub fn barline_dir() -> PathBuf {
     local_app_data_dir().join("Barline")
 }
 
+/// 把窗口强行提到前台。
+///
+/// `SetForegroundWindow` 在「用户正在操作别的程序」时会被系统拒绝（返回 false）。
+/// 标准绕过办法是先把本线程 attach 到当前前台窗口的输入队列上，改完再 detach——
+/// 这样前台权限被判给「同一个输入队列」，不会抢走用户的输入焦点语义。
+///
+/// 托盘菜单尤其需要它：`TrackPopupMenuEx` 的宿主不是前台窗口时，菜单会收不到
+/// 键盘/鼠标、点外面也不消失，表现为「菜单卡住」。
+pub fn force_foreground(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, SetForegroundWindow, SetWindowPos, HWND_TOPMOST,
+        SWP_NOMOVE, SWP_NOACTIVATE, SWP_NOSIZE,
+    };
+
+    // SAFETY: 全是无副作用的窗口/线程查询与置顶调用；句柄都来自本进程或系统。
+    unsafe {
+        let fg = GetForegroundWindow();
+        let tid_cur = GetCurrentThreadId();
+        let tid_fg = if fg.is_invalid() {
+            0
+        } else {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None)
+        };
+        let attached = tid_fg != 0 && tid_fg != tid_cur && AttachThreadInput(tid_cur, tid_fg, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        if !SetForegroundWindow(hwnd).as_bool() {
+            crate::log_debug!("SetForegroundWindow 仍被拒绝（前台窗口可能正被用户操作）");
+        }
+        if attached {
+            let _ = AttachThreadInput(tid_cur, tid_fg, false);
+        }
+    }
+}
+
 /// 把 PWSTR 读成 String（读到 NUL 为止），不持有所有权。
 fn pwstr_to_string(p: PWSTR) -> String {
     if p.is_null() {

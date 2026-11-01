@@ -71,9 +71,9 @@ windows = { version = "0.62.2", features = [
   "Graphics_Imaging",
 ] }
 
-# M1 不使用 WebView2（设置页是 M3/T13 的事）。webview2-com-sys 有 4.4 万行绑定，
-# 让它在 M1 就参与 fat-LTO 链接纯属浪费时间；T13 打开设置页时再按白名单加回来。
-# webview2-com = "0.39.1"
+# 设置页（T13）：WebView2。webview2-com-sys 有 4.4 万行绑定，会让 release 构建
+# 明显变慢（fat LTO 下多 20–40s），这是预期内的，不是卡死。
+webview2-com = "0.39.1"
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

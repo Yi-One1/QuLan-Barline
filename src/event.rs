@@ -77,6 +77,12 @@ pub enum AppEvent {
     /// 设置页请求打开 / 关闭
     SettingsOpenRequest,
     SettingsClosed,
+    /// WebView2 就绪（controller 已拿到）
+    SettingsWebViewReady,
+    /// WebView2 创建失败（未安装运行时等）
+    SettingsWebViewFailed(String),
+    /// 设置页 JS 发来的一条 JSON
+    SettingsMessage(String),
 
     // ---------------- 生命周期 ----------------
     /// 第二个实例启动，要求唤起设置页
