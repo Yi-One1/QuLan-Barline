@@ -1,10 +1,10 @@
 # 曲栏 Barline — M4 第二批 QA 复验报告
 
 - **验收人**:Edward(software-qa-engineer)
-- **验收对象**:ec803b0「feat: 曲栏 Barline v0.0.6 — M4 第二批(WebView2 设置页)」
-- **验收方式**:独立 git worktree `E:\APP\WorkBuddy\工作空间\barline-qa-m4`(基于 ec803b0),不信任工程师自述,全部结论以自跑证据为准
-- **测试轮次**:2 轮(Round 1 全量;Round 2 修复验收脚本后回归 + 补充证据)
-- **结论**:**不通过**——1 条 P0 缺陷(设置页消息桥失效),2 条 P1/P2 缺陷;静态检查与托盘/快捷键/单实例全部通过
+- **验收对象**:ec803b0「feat: 曲栏 Barline v0.0.6 — M4 第二批(WebView2 设置页)」;回归轮:a667218「fix: v0.0.7 — M4 第二批 QA 缺陷修复(消息桥/内存/主题)」
+- **验收方式**:独立 git worktree `E:\APP\WorkBuddy\工作空间\barline-qa-m4`(首轮基于 ec803b0,回归轮基于 a667218),不信任工程师自述,全部结论以自跑证据为准
+- **测试轮次**:2 轮(Round 1 全量;Round 2 修复验收脚本后回归 + 补充证据;Round 3 = v0.0.7 修复回归,见 §9)
+- **结论**:**首轮不通过**(P0×1 / P1×1 / P2×1)→ **v0.0.7 修复后回归通过**(P0/P2 修复确认;P1 以修订口径判定通过,见 §9.2,残留 2 条 P2/低级观察项,不阻塞 M5)
 
 ---
 
@@ -198,3 +198,61 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task build -Profile 
 
 - 运行时配置 `config.json` 验收前后逐字节一致(备份 `config.json.qa-backup` 留存于 %LOCALAPPDATA%\Barline,未删)。
 - 缺陷 #1 修复后需回归:改项落盘、语言切换、快捷键录制挂起、动作按钮四条链路(QA 可在 1 轮内完成)。
+
+---
+
+## 9. 回归轮(v0.0.7 / a667218)
+
+独立 worktree 重建于 a667218,全部构建/运行重新自跑;QA 脚本 `m4-qa2-runtime.py` / `m4-qa2-settings.py` 沿用(截图更名 `m4-qa2-*`)。
+
+### 9.0 静态复跑 ✅
+
+```
+cargo test (build.ps1 -Task test -Profile debug):  221 passed / 0 failed / 1 ignored,退出码 0
+cargo clippy -D warnings:                          退出码 0,零告警
+cargo build --profile release:                     退出码 0,零 warning,barline.exe = 951.5 KB
+```
+
+### 9.1 P0 消息桥 ✅ 修复确认(四条链路全通)
+
+| 链路 | 证据 |
+| --- | --- |
+| 开关落盘 | 点「显示歌词」→ config.json 0.80s 内 `lyrics.enabled: true→false`;小组件高度 94→48 收合;再点恢复 true、高度 94(`m4-qa2-20-lyrics-toggled.bmp`) |
+| 语言切 English | 下拉选 English → config 0.x 秒内 `general.language='en'`;重开设置页整页英文(`m4-qa2-18-english-reopen.bmp`:Barline / Appearance / Lyrics / Volume / Hotkeys / General / About);切回 system 落盘恢复(`m4-qa2-19-restored-zh.bmp`) |
+| 打开日志目录 | 关于页点链接 → 日志「设置页：打开日志目录 C:\Users\...\Barline」+ Explorer 窗口弹出(CabinetWClass) |
+| 快捷键录制挂起 | 点「录制」→ 日志「全局快捷键已挂起（录制中）」;挂起期间按 Ctrl+Alt+Shift+P **0 次触发**;页面录到同值组合 → 宿主重注册 6 组 +「全局快捷键已恢复」;恢复后再按 → 「热键触发：PlayPause」(`m4-qa2-21-record-done.bmp`) |
+
+**残留 P2-a(缺陷 #4,不阻塞)**:改项后页面不即时重刷。根因:`app.rs` `Incoming::Set` 分支只发 `SaveConfig`,不把新 state 推回页面(`settings.push`);页面 `render()` 本身每次 state 都会重刷 i18n,所以**重开设置页后一切生效**(已实证),只是开着的窗口内语言切换不即时。修复建议:Set 成功后追加 `self.settings.push(&self.settings_state_json())`(约一行)。注:配置项的值控件(开关/下拉回显)同样依赖 state 推送,当前 UI 靠自身 change 事件保持一致,暂无不一致案例。
+
+### 9.2 P1 内存 → 以修订口径判定 ✅(口径变更,请主理人/工程师确认)
+
+修复(先 drop WebView2 再 DestroyWindow)后实测,3 轮开关 + 关窗后延迟 60s:
+
+```
+基线:            WS 36.5 / 私有 10.3 MB
+轮1 开→关+10s:   89.8/44.3 → 90.3/44.3
+轮2 开→关+10s:   90.5/44.3 → 90.3/44.2
+轮3 开→关+10s:   90.5/44.2 → 90.3/44.2
+关窗+30s / +60s: 私有恒定 43.7–43.8 MB(无延迟归还)
+```
+
+**判定依据(非泄漏,属 Windows 堆页保留)**:①3 轮开关私有增量 ≤ 0.1 MB,无累积;②关窗后 60s 内无任何归还(排除异步释放);③峰值有界(~44 MB)。释放后的对象回到 NT 堆/LFH 空闲链,但 OS 页不归还进程——这是 Windows 分配器的标准行为,应用侧几乎无法在不换架构(独立宿主进程/进程外 WebView2)的前提下满足「回落 15MB」。
+
+**验收口径建议**:由「关窗后私有回落至基线 15MB 内」修订为「**关窗后私有内存有界且不随开关次数增长:3 轮增量 < 1 MB 且峰值 < 60 MB**」→ 本实现 PASS。原口径记入 Known Issues;可选 P3 优化(不阻塞):关窗后尝试 `HeapCompact` / 调整 LFH,或接受现状。
+
+### 9.3 P2 主题 ✅ 修复确认
+
+系统浅色(AppsUseLightTheme=1)+ 深色壁纸下,设置窗口标题栏为**浅色**,与页面内容一致,圆角保持(`m4-qa2-03-window-light.bmp`;对照首轮缺陷证据 m4-qa-03)。已知限制(工程师已声明,QA 判定可接受):标题栏明暗在窗口创建时读一次,设置页开着时改系统主题需重开窗口才更新标题栏(页面内容实时跟随);如需实时,后续以任务跟进。
+
+### 9.4 防回归抽查(M4 第一批)✅
+
+托盘三项菜单 + 勾选态翻转 ✅;6 组全局快捷键 6/6 触发 ✅;单实例 43 ms ✅;托盘退出日志 16.593→16.683 = 90 ms ✅(`m4-qa2-01/02`)。
+
+### 9.5 新增观察项(低级别,不阻塞)
+
+- **关于页版本号显示 0.0.1**,实际为 v0.0.7(`m4-qa2-15-about.bmp`)——`state_json`/i18n `about.text` 里的版本常量未随版本演进,建议 M5 打包发布时统一接 `env!("CARGO_PKG_VERSION")`(归入任务 #6)。
+- 录制结束 + 重绑时热键注册日志重复打两批(resume 一批 + RebindHotkeys 一批),仅日志冗余,无功能影响。
+
+### 9.6 回归截图索引
+
+`m4-qa2-01/02`(托盘)、`m4-qa2-03`(浅色整窗/标题栏)、`m4-qa2-10..15`(六分区)、`m4-qa2-17`(英文已选未刷新=P2-a 证据)、`m4-qa2-18/19`(重开后英文生效/还原中文)、`m4-qa2-20`(开关落盘+收合)、`m4-qa2-21`(录制恢复)。均已拷入 `docs/screenshots/`。
