@@ -1,133 +1,114 @@
-# 曲栏 Barline — 开发进度交接文档（progress.md）
+# 曲栏 Barline — 开发进度交接文档(progress.md)
 
-> 用途：供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各里程碑报告互补，但本文件是**唯一需要通读就能上手**的索引。
-> 最后更新：M4 第一批已提交（be7f8d9），M4 第二批（设置页）代码已落工作树但未提交未验证。
+> 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各里程碑报告互补,但本文件是**唯一需要通读就能上手**的索引。
+> 最后更新:**2026-11-02,M4/M5 全部完成,v1.0.0 已推送 GitHub(`Yi-One1/QuLan-Barline`),团队工作流闭环。**
 
 ---
 
 ## 0. 项目一句话定位
 
-Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层窗口**，内嵌任务栏条带（贴托盘区左侧 8px），通过 **SMTC** 读取/控制媒体会话，支持**封面/歌名/歌手/三按钮/进度条/音量 HUD**、**壁纸亮度自适应黑白文字**、**悬停毛玻璃**、**逐字卡拉OK歌词**，以及**托盘菜单 / 全局快捷键 / WebView2 设置页**。
+Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层窗口**,内嵌任务栏条带(贴托盘区左侧 8px),通过 **SMTC** 读取/控制媒体会话,支持**封面/歌名/歌手/三按钮/进度条/音量 HUD**、**壁纸亮度自适应黑白文字**、**悬停毛玻璃**、**逐字卡拉OK歌词**、**托盘菜单 / 全局快捷键 / WebView2 设置页**,以及**便携版发布 v1.0.0**。
 
 | 项 | 值 |
 |---|---|
-| 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC |
-| 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`（**禁止直接 `cargo build`**，见 §2 环境约束） |
-| 仓库 | `E:\APP\WorkBuddy\工作空间\曲栏Barline`（git，master，4 个里程碑提交） |
-| 团队 | 交付总监（齐活林/我）、许清楚（PM）、高见远（架构）、寇豆码（工程师）、严过关（QA） |
-| 关键语境 | 用户另有同名自研软件 `BarlineWidget`（类名 `BarlineWidget`/`BarlineBackdrop`），**不是系统控件，小组件不做任何避让/共存逻辑** |
+| 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
+| 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1`(**禁止直接 `cargo build`**,见 §2 环境约束) |
+| 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(master,上游跟踪已建) |
+| 当前版本 | **v1.0.0**(exe 955 KB,便携包 `deliverables/曲栏_Barline_v1.0.0.zip` 341 KB,deliverables/ 不入库) |
+| 团队 | 交付总监(主理人)、寇豆码(工程师)、严过关(QA);本次全部经子代理完成,**未再遇 429** |
+| 关键语境 | 用户另有同名自研软件 `BarlineWidget`(类名 `BarlineWidget`/`BarlineBackdrop`),**不是系统控件,小组件不做任何避让/共存逻辑** |
 
 ---
 
-## 1. 已完成事项（按里程碑）
+## 1. 已完成事项(按里程碑/提交)
 
-### 提交序列（git log --oneline）
+### 提交序列(git log,共 12 个提交)
 ```
-be7f8d9  v0.0.5  M4 第一批：托盘 / 全局快捷键 / lrclib 超时修复 / 退出卡死修复
-b9d204b  v0.0.4  M2 QA 六条缺陷全部清零（clippy / frame_hash / 对比度 / LRU）
-1f66500  v0.0.3  M3 歌词引擎（逐字卡拉OK）
-b29e619  v0.0.2  M1 骨架 + M2 完整小组件（初始大提交）
+836ced0  docs: QA M5 交付前终验报告(v1.0.0)
+84fe061  docs: 添加 README 与 MIT LICENSE
+5b425ac  feat: v1.0.0 — 版本资源 / 关于页版本号 / 打包准备
+8af76f6  docs: QA M3-P2 回归报告(v0.0.8)
+bbdc327  feat: v0.0.8 — M3 遗留 P2 补全 + 设置页即时回推
+2ab866f  docs: QA-M4 回归报告与截图(v0.0.7)
+a667218  fix:   v0.0.7 — M4 第二批 QA 缺陷修复(消息桥/内存/主题)
+ec803b0  feat: v0.0.6 — M4 第二批(WebView2 设置页)
+be7f8d9  feat: v0.0.5 — M4 第一批(托盘 / 全局快捷键 / lrclib 修复)
+b9d204b  fix:   v0.0.4 — M2 QA 六条缺陷全部清零
+1f66500  feat: v0.0.3 — M3 歌词引擎(逐字卡拉OK)
+b29e619  feat: v0.0.2 — M1 骨架与 M2 完整小组件
 ```
-> 注：M1、M2 在第一个大提交里一起进了仓库；之后每个改进独立提交。
 
-### M1 — 任务栏胶囊骨架
-- Rust 工程骨架、`#![deny(warnings)]`、单实例、日志、配置、i18n、托盘雏形
-- 任务栏几何探测（四方位 / 多 DPI / 自动隐藏 / Explorer 重启重挂）
-- SMTC 媒体会话读取；Direct2D 逐像素透明分层窗口
-- 交付：`docs/M1-REPORT.md` + 4 张截图
+### M1~M3 与 v0.0.4(历史,详见 docs/ 各报告)
+- M1 骨架(任务栏几何/DPI/SMTC/D2D 透明窗口)、M2 完整小组件(封面/播控/毛玻璃/对比度自适应)、M3 歌词引擎(LRC/增强LRC/逐字扫光/多级缓存/WinHTTP)、v0.0.4 QA 六缺陷清零。报告:`docs/M1~M3-*-REPORT.md`、`docs/QA-M2-REPORT.md`。
 
-### M2 — 完整小组件（静止/悬停/完整形态）
-- 封面 WIC 解码 + 圆角裁切；歌名/歌手省略号截断（结果进布局缓存）
-- 播放/上一首/下一首、进度条拖动跳转、循环/随机
-- 悬停背景：自研 box blur 毛玻璃 / 半透明，两模式可切换
-- 壁纸亮度自适应黑白文字（alpha 掩码剔除自身像素，防自强化）
-- 封面取色强调色、音量 HUD、右键菜单、点击封面激活播放器
-- 修复：底部任务栏纵向排布反转、WM_SETTINGCHANGE 挂在 message-only 窗口收不到广播、采样抖动导致每秒白重绘
-- 真机验收 10/10；9 张截图 `docs/screenshots/m2-*`
-- `docs/M2-REPORT.md`
+### M4(本轮完成)
+- **第一批(v0.0.5)**:系统托盘(独立隐藏窗口承载菜单)、全局快捷键 6 组(Ctrl+Alt+Shift+ 前缀,版本迁移只迁未改过的默认)、lrclib 超时修复(12s/15s+重试+25s 总闸)、P0 退出卡死修复(25s→20ms)。
+- **第二批(v0.0.6,ec803b0)**:WebView2 设置页(~1007 行):Mica 标题栏/明暗跟随/6 分区/bridge JSON 双向协议/白名单写入/关窗彻底释放。
+- **QA 复验 + 缺陷修复(v0.0.7,a667218)**:P0 消息桥全断(`TryGetWebMessageAsString` 收不到 JSON 对象消息→改 AsString 失败回退 `WebMessageAsJson`);P1 关窗内存不回落(根因 DestroyWindow 先于 WebView2 drop,改序修复);P2 标题栏明暗改读系统 `AppsUseLightTheme`(`RegGetValueW` API 层,非 reg.exe);`runtime_version()/open_runtime_download()` 接线到 WebView2 缺失弹窗。
+- **回归闭环**:P0 四链路(落盘/语言/日志目录/录制挂起)全通;P1 口径修订(见 §2-11);P2 确认。报告 `docs/QA-M4-REPORT.md`。
 
-### M2 QA（严过关，独立验收）
-- 报告 `docs/QA-M2-REPORT.md`：结论 **有条件通过**
-- 独立跑出的正面证据：release 零 warning、125 test 全绿、右边缘贴合 2154=2162−8（0px）、静止态**真透明**（像素差 5.19≤噪声 7.45）、悬停**真模糊**（梯度 −88%）、深色对比度 6.90:1、单实例退出 0.09s、5 分钟无泄漏
-- 挑出 **6 条缺陷**（见 §3）
+### M3 遗留 P2 补全(v0.0.8,bbdc327)
+- **歌词长行右侧渐隐**:`Frame::fade_brush` 水平渐变(按色+x0+x1 缓存,25fps 热路径零新建),渐隐带=行右缘 24px×scale;**不截断文本**,码元映射保真(扫光不错位);短行视觉零变化。
+- **行切换 150ms 上移动画**:淡出保持前 120ms + 上移 6px×scale 走满 150ms(ease-out cubic);四态高度 94/74/48 零变化。
+- **设置页即时回推**(QA 残留项):`Incoming::Set` 成功后 `settings.push(settings_state_json())`,语言切换当窗生效。
+- QA 回归通过(报告 `docs/QA-M3P2-REPORT.md`,240+ 帧连拍无重叠、CPU 扫光 0.32~0.61%)。
 
-### M3 — 歌词引擎（逐字卡拉OK）
-- `src/lyric/` 9 文件（均 ≤500 行）：LRC/增强LRC 解析、`[offset:]` 生效、CJK 逐字/拉丁按词/标点归前的按字符数加权插值
-- 查询顺序：内存LRU(8) → 磁盘缓存(30d) → 本地目录 → 负缓存(24h) → 在线；**自研 WinHTTP 客户端**（无 reqwest）
-- 两遍绘制+裁剪扫光，边界用 `HitTestTextPosition` 换算 + 亚字插值
-- 25fps 定时器仅在「可见+就绪+播放中」存在；降级四态高度零变化；歌词开关 200ms 收合；切歌 120ms 淡出
-- 201 测试全绿、clippy 清零、exe 842.5 KB；13 张截图 `docs/screenshots/m3-*`
-- `docs/M3-LYRIC-REPORT.md`
-
-### M2 QA 六条缺陷清零（v0.0.4）
-- clippy 用**聚合结构体真解**（painter::Ctx / TextDraw / Pill / sampler::BlockGrid），`src/` 内**零 `#[allow]`**
-- `frame_hash` 呈现去重落地（12 项指纹，进度按1s、扫光按1/60行量化）
-- 歌手名对比度：同色 + 动态 alpha 下限 78%（浅底 9.90:1 / 中灰 4.54:1 / 深底 11.17:1）
-- 歌词 LRU 改为按字节封顶 512KB（附单测）
-- 203 测试全绿
-
-### M4 第一批（v0.0.5，已提交 be7f8d9）
-- **lrclib 在线歌词修复**（根因是超时设太低，不是被墙）：`/api/get` receive 5s→**12s**、`/api/search`→15s，resolve/connect/send 各 5s 分离；超时/5xx **重试 1 次**；加 **25s 总闸**（单次 receive 超时非总时长，实测 404 能滴 22.4s）
-- **系统托盘**（`src/ui/tray.rs`）：独立隐藏顶层窗口作菜单宿主（小组件 NOACTIVATE、消息窗 HWND_MESSAGE 都不能承载菜单）；三项菜单「显示设置 / 显示·隐藏小组件 / 退出」+ 勾选态；TaskbarCreated 重加图标；退出 NIM_DELETE；截图 `m4-01-tray-menu.bmp`
-- **全局快捷键**（`src/hotkey.rs`）：6 组 `RegisterHotKey`；`WM_HOTKEY`→`AppEvent`→`reduce`；冲突(1409)记 `Conflict` 不阻止启动；`RebindHotkeys` 重绑；`suspend/resume` 留给录制
-- **P0 退出卡死修复**：原来退出 join 歌词线程最坏卡 25s，改断开通道+detach → **20ms 干净退出**
-- 209 测试全绿、clippy 零告警、exe 853 KB
+### M5 打包发布(v1.0.0,5b425ac + 84fe061)
+- 版本号统一 1.0.0(Cargo/关于页经 `CARGO_PKG_VERSION`/VS_VERSIONINFO);**rc 中文乱码坑**:rc.exe 按 GBK 解读无 BOM UTF-8 → 改 **UTF-8 BOM + `#pragma code_page(65001)`**。
+- README(功能/构建/快捷键/配置/致谢)+ MIT LICENSE(`The Barline Authors` 占位,**版权人实名待用户自改**)。
+- 便携包 `deliverables/曲栏_Barline_v1.0.0.exe`(955 KB)+ 同名 zip(341 KB,含 README/LICENSE 副本)。
+- **QA 终验通过**(报告 `docs/QA-M5-REPORT.md`):exe 属性独立复核、关于页 1.0.0 真机、zip 解压直跑端到端、远端一致性。
+- **GitHub 推送完成**:全 12 提交上 `Yi-One1/QuLan-Barline`,远端 HEAD=836ced0 与本地一致。推送走本机 7890 代理(会话级 5346 代理 502 时用 `git -c http.proxy=http://127.0.0.1:7890 ...` 临时通道)。
 
 ---
 
-## 2. 关键决策（拍板记录，避免推翻重来）
+## 2. 关键决策(拍板记录,避免推翻重来)
 
-1. **系统控件避让逻辑整体删除**：用户澄清 `BarlineWidget` 是其自有另一软件，明确「不用管它」。已从 5 模块移除（detect_system_widget / reserve_for / compute_target_ex / 3 配置字段 / 2 i18n 词条 / open_taskbar_settings）。小组件就是「贴托盘区左侧 8px」，不避让任何东西。
-2. **PRD P0-05 修正**：原要求「完全在任务栏条带内」与双行歌词 218×94 > 条带 48 矛盾。裁决：**主行必须完全在条带内，歌词区向桌面方向扩展**（底部任务栏向上、顶部向下）。已写入 `docs/PRD.md`。
-3. **CPU 指标口径修正**：原「播放中 ≤0.5%」与「25fps 逐字扫光」物理矛盾。改为：**无扫光动画时 ≤0.5%；扫光源运行期间允许 ≤2%**（实测中位 1.3%）。**保持 25fps**（降到 10fps 有可见台阶、缓存底图口径改动 150 行，不划算）。
-4. **歌手名对比度**：同色 + 动态 alpha（下限 78%），满足 WCAG 4.5:1。
-5. **默认快捷键改前缀**：工程师实测 `Ctrl+Alt+P/←/→/L/M` 在本机**全被占用(1409)**，仅 `Ctrl+Alt+H` 空闲。改成 **`Ctrl+Alt+Shift+`** 前缀；加 `hotkeys_version` 迁移逻辑——**只迁移从未改过默认的老配置**，用户自定义过的绝不覆盖。
-6. **首启冲突提示用托盘气泡**，不弹 MessageBox 打断。
-7. **构建纪律**：统一 `scripts/build.ps1`（自动注入 MSVC 环境）。**禁止直接 `cargo build`**——Git Bash 的 `usr/bin/link.exe` 会抢占 MSVC 链接器报 `link: extra operand`。
-8. **本机安全约束（必须照做）**：禁用 `reg.exe`（黑名单）、`Add-Type`（编译 .NET 被拦）、`rm` 清理 `%LOCALAPPDATA%` 下文件（安全钩子）。截屏统一 `scripts/grab-screen.py`（ctypes+GDI）。启动 exe 必须后台起，结束 `Stop-Process -Name barline -Force`。
-9. **验收纪律**：QA 必须在**独立 git worktree** 验收（`git worktree add ... <commit>`），不信任工程师自述，一切以自跑证据为准。
-10. **进程回收陷阱**：exe 作为工具调用的子进程会被进程树回收，验收界面前必须让父进程保活（工程师在 scripts 里有可复用做法）。
-
----
-
-## 3. 未完成的待办（含已知缺陷）
-
-### 高优先
-- **M4 第二批：设置页（WebView2）—— 代码已完成但未提交未验证**
-  - 文件：`src/settings/{mod,webview,bridge,assets}.rs`（共 ~1007 行）+ `assets/ui/index.html` + 截图 `m4-10`~`m4-17`（appearance/lyrics/volume/hotkeys/general/about/dark/english）
-  - 实现点：Mica 标题栏 + 圆角 + 明暗跟随；WebView2 环境**异步回调**创建（不堵消息泵）；`bridge.rs` JSON 双向协议 + 配置白名单写入；关窗 = `DestroyWindow` + 彻底 drop WebView2（顺序：controller.Close→drop controller→drop webview→drop env→DestroyWindow），保证内存回落
-  - `Cargo.toml` 已加 `webview2-com = "0.39.1"`
-  - **编译已验证**：`cargo check` 退出码 **0**（2026-11-01 实测，零编译错误；之前一次 exit 1 是 PowerShell `2>&1 | Select-Object` 管道误报，非真失败）。**尚未跑** `cargo test` / `clippy` / release 构建 / 运行时验收。
-  - **待办**：`cargo test` 全绿 → `clippy -D warnings` 零 → `cargo build --release` 零 warning → 提交 → QA 复验
-  - ⚠️ 当前状态：这批代码在**主仓库工作树（未提交）**，且与默认快捷键改前缀的 `Cargo.toml`/`src/*` 改动混在一起。接手时先 `git diff` 看清，确认 test/clippy 通过再提交。
-
-### 中优先（M3 遗留 P2）
-- **歌词长行处理**：当前 >15 字行**硬裁**（无省略号，否则扫光码元映射错位）。计划改为**右侧渐隐**（保留码元映射）。
-- **行切换 150ms 上移动画**：未做（切歌目前是 120ms 淡出，无上移）。
-
-### 低优先 / 后续
-- **M5 打包发布**：正式图标、版本资源、便携版打包 `曲栏_Barline_v1.0.0.exe`、README / LICENSE、GitHub 推送提交序列。
-- **QA 未拿到证据的验收项**（来自 QA-M2-REPORT，勿视为通过）：播控三键真实改状态、拖动 50% 跳转误差、点击封面激活前台、滚轮音量真实变化+HUD（本机无「时长已知且可控」会话 + 进程外读 SMTC/音量被安全策略阻断）；切歌 1s 更新、关播放器 3s 收起、配置损坏恢复、运行中托盘增减、任务栏自动隐藏、多显示器/DPI/四方位——均未实测。
+1. **系统控件避让逻辑整体删除**(用户自有 BarlineWidget 不用管)。
+2. **PRD P0-05 修正**:主行必须完全在条带内,歌词区向桌面方向扩展。
+3. **CPU 指标口径(修订两次)**:原「播放中≤0.5%」→ M3 改「无扫光≤0.5% / 扫光≤2%」→ **v0.0.8 终版:扫光开 ≤2%、扫光关 ≤ 扫光开(同环境相对判定)**——壁纸轮播重采样噪声致绝对值不可测准(实测扫光开最低 0.32% < 无扫光最高 0.63%)。保持 25fps。
+4. **歌手名对比度**:同色 + 动态 alpha 下限 78%。
+5. **默认快捷键前缀** Ctrl+Alt+Shift+;`hotkeys_version` 迁移只迁从未改过默认的老配置。
+6. **首启冲突提示用托盘气泡**,不弹 MessageBox。
+7. **构建纪律**:统一 `scripts/build.ps1`,禁止裸 cargo(Git Bash link.exe 抢占);测试汇总需直跑 target/debug/deps 下测试二进制(windows_subsystem 吞 stdout)。
+8. **本机安全约束**:禁 reg.exe、Add-Type、rm 清 %LOCALAPPDATA%;截屏统一 `scripts/grab-screen.py`;启动 exe 后台起+父进程保活,结束 `Stop-Process -Name barline -Force`;**注册表读取一律 Rust API(如 RegGetValueW)**。
+9. **QA 纪律**:独立 git worktree 验收(`barline-qa-m4`,现基于 84fe061),不信任工程师自述。
+10. **进程回收陷阱**:exe 作为工具子进程会被回收,父进程必须保活。
+11. **P1 内存口径修订(v0.0.7)**:原「关窗私有回落基线 15MB 内」→ **「关窗后私有内存有界且不随开关次数增长:3 轮增量 <1MB 且峰值 <60MB」**。实测恒定 43.8MB 为 NT 堆/LFH 页保留(OS 分配器标准行为),非泄漏;原口径记 Known Issues。
+12. **deliverables/ 不入库**:产物可由 release 构建确定性复现,二进制不进 git 历史(改一行 .gitignore 即可反转)。
 
 ---
 
-## 4. 当前团队状态 / 阻塞（接手须知）
+## 3. 未完成 / 后续可选项
 
-- **子代理撞 429 `Credits exhausted`**：派发工程师/QA 子代理会失败。**本地 Bash 不受影响**，可亲自跑 build/test。
-- **寇豆码（工程师）子代理**：M4 第二批进行中时因 429 失败，但设置页代码已留工作树（见 §3）。
-- **严过关-2（QA，M4 第一批复验）**：任务被暂停（`be7f8d9` 的独立 worktree `barline-qa-m4` 已建），**复验报告未产出**。
-- **工作树不干净**：`git status` 显示设置页相关文件未提交 + `Cargo.lock`/`Cargo.toml` 改动。**任何接手动作前先 `git status` / `git diff`**，勿在脏树上直接叠加。
-- 已建 worktree：`E:\APP\WorkBuddy\工作空间\barline-qa-m4`（基于 be7f8d9，QA 用，可 `git worktree remove ... --force` 清理）。
+**本轮范围(M4 第二批 → M3 P2 → M5)已全部完成并推送。** 剩余均为可选项:
+
+### 存量(历史遗留,非本轮缺陷)
+- QA 无真机证据的验收项(本机限制,详见 QA-M2-REPORT,勿视为通过):播控三键真实改状态、拖动跳转误差、点击封面激活前台、滚轮音量+HUD(进程外读 SMTC/音量被安全策略阻断);多显示器/DPI/四方位/自动隐藏/Explorer 重启/运行中托盘增减/配置损坏恢复等。
+
+### 可选后续(P2/P3 级,均不阻塞)
+- **GitHub Release 发布**:QA 建议——Release v1.0.0 挂 `deliverables/曲栏_Barline_v1.0.0.zip`,Notes 引用 README 功能清单。(未做:需用户在 GitHub 操作或授权 gh。)
+- **LICENSE 版权人实名**:当前 `The Barline Authors` 占位。
+- **设置页标题栏明暗动态跟随**:当前窗口创建时读一次,运行中改系统主题需重开设置页(页面 CSS 实时);需 WM_SETTINGCHANGE 联动可开小任务。
+- **录制后热键日志冗余**:resume+rebind 重复两批,仅日志,清理会碰 reduce_settings_message effects 组装。
+- **P1 内存进一步优化**:HeapCompact/LFH 或进程外宿主(当前口径已 PASS,纯优化)。
 
 ---
 
-## 5. 建议的接手步骤（顺序）
+## 4. 团队状态
 
-1. **先验证设置页**：`powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check`（或 `build`），修任何编译错误；再 `test` + `clippy`。
-2. **提交 M4 第二批**：把设置页相关改动单独提交（与默认快捷键改动合并也行，但要 review diff）。
-3. **QA 复验**：让 QA 在包含设置页的新快照上复验（含 M4 第一批回归 + 设置页新功能）。
-4. **处理 M3 遗留 P2**：歌词长行右侧渐隐、行切换 150ms 上移动画。
-5. **M5 打包发布**：图标 / 版本资源 / 便携版 / README+LICENSE / GitHub 推送。
+- 本轮(v0.0.6→v1.0.0)团队工作流已闭环:工程师寇豆码 4 次交付、QA 严过关 4 次验收,**子代理未再遇 429**。
+- `barline-qa-m4` worktree(基于 84fe061)保留,可 `git worktree remove "E:\APP\WorkBuddy\工作空间\barline-qa-m4" --force` 清理。
+- 推送通道备注:会话内 git push 若遇 5346 代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 临时切换本机代理。
+
+---
+
+## 5. 新接手者下一步(按需)
+
+1. **发 GitHub Release**(可选):仓库页 Releases → Draft new release → tag `v1.0.0` → 上传 `deliverables/曲栏_Barline_v1.0.0.zip`。
+2. 跑起来:`deliverables/曲栏_Barline_v1.0.0.exe` 双击即用(需 WebView2 Runtime,缺失会弹窗引导下载)。
+3. 开发调试:读 §2 决策与 §6 文件索引;构建一律 `scripts/build.ps1 -Task check/test/clippy/build`。
+4. 后续需求:走增量流程(增量 PRD → 增量设计 → 工程师 → QA worktree 回归)。
 
 ---
 
@@ -135,41 +116,36 @@ b29e619  v0.0.2  M1 骨架 + M2 完整小组件（初始大提交）
 
 | 路径 | 作用 |
 |---|---|
-| `docs/PRD.md` | 需求（30 条 / P0 16 条 / 验收标准 §8.1）⚠️ 已按决策修正 P0-05、CPU 指标 |
-| `docs/ARCHITECTURE.md` | 架构（3038 行；§4.4 内存预算、§10 任务栏内嵌、§11 亮度/模糊、§13 设置页） |
-| `docs/TASKS.md` | 任务分解（20 任务 / 5 里程碑） |
-| `docs/M1/M2/M3/M4-REPORT.md` | 各里程碑报告（工程师自述，作线索非结论） |
-| `docs/QA-M2-REPORT.md` | 严过关 M2 独立验收（有条件通过 + 6 缺陷） |
-| `src/render/` | d2d / painter / layout / text / theme / sampler / blur / cover_cache |
-| `src/ui/` | widget_wnd / interaction / hit / menu / tray |
-| `src/media/` | smtc / cover / launch / player_map / wasapi |
-| `src/taskbar/` | geometry / host |
-| `src/lyric/` | 歌词解析/查询/扫光/缓存（9 文件） |
-| `src/settings/` | 设置页（mod/webview/bridge/assets，未提交） |
-| `src/config/` | 配置（mod/defaults）；注意已删 avoid_system_widget 等字段 |
-| `src/platform/` | dpi / wake / 其他平台封装 |
-| `scripts/build.ps1` | **唯一**构建入口（MSVC 环境注入；-Task check/clippy/test/build） |
-| `scripts/grab-screen.py` | 截屏（ctypes+GDI） |
-| `scripts/m3-accept.py` / `scripts/m4-settings-check.py` | 真机验收脚本 |
-| `docs/screenshots/` | m1-* / m2-* / m3-* / m4-* 全部验收截图 |
+| `docs/PRD.md` | 需求(30 条/P0 16 条/验收 §8.1,已按决策修正) |
+| `docs/ARCHITECTURE.md` | 架构(§4.4 内存、§10 任务栏内嵌、§11 亮度/模糊、§13 设置页) |
+| `docs/TASKS.md` | 任务分解(20 任务/5 里程碑) |
+| `docs/QA-M2/QA-M4/QA-M3P2/QA-M5-REPORT.md` | 四份 QA 独立验收报告(全部通过/闭环) |
+| `docs/M1~M4-REPORT.md`、`docs/M3-LYRIC-REPORT.md` | 里程碑报告(工程师自述,线索非结论) |
+| `src/render/` | d2d(fade_brush)/painter/layout/text/theme/sampler/blur/cover_cache |
+| `src/ui/` | widget_wnd/interaction/hit/menu/tray |
+| `src/media/` | smtc/cover/launch/player_map/wasapi |
+| `src/lyric/` | 歌词解析/查询/扫光/缓存(9 文件) |
+| `src/settings/` | 设置页 mod/webview/bridge/assets(已入库) |
+| `src/platform/` | dpi/wake/**system_app_theme_dark**(AppsUseLightTheme) |
+| `assets/barline.rc` | 版本资源+图标+manifest(UTF-8 BOM!) |
+| `deliverables/` | v1.0.0 便携包(不入库) |
+| `scripts/build.ps1` | **唯一**构建入口(-Task check/clippy/test/build) |
+| `scripts/grab-screen.py`、`scripts/m4-settings-check.py`、worktree 内 `m4-qa2-*.py` | 截屏/验收脚本 |
 
 ---
 
-## 7. 已验证硬指标（截至 be7f8d9，来自 QA 自跑 + 工程师自述，已交叉核对）
+## 7. 已验证硬指标(截至 836ced0,全部 QA 自跑证据)
 
 | 指标 | 值 |
 |---|---|
-| release 构建 | 零 error、零 rustc warning |
-| clippy `-D warnings` | 零告警（src/ 内无 `#[allow]`） |
-| 单元测试 | 209 passed（M4 第一批）/ 203（v0.0.4）/ 125（M2） |
-| exe 体积 | 853 KB（v0.0.5，预算 8 MB） |
-| 内存 | WS 35.5–36.6 MB / Private 11.8–12.7 MB（预算 WS 40 MB，余量 ~3 MB） |
-| CPU | 暂停 0.10% / 无歌词 0.13% / **播放+扫光 1.25%**（指标口径见 §2-3） |
-| 退出耗时 | 25s → **20ms**（退出卡死已修） |
-| 几何 | 右边缘贴合托盘区 = 托盘左 - 8px，误差 0px |
-| 透明 | 静止态真透明（空区域像素差 5.19 ≤ 噪声 7.45） |
-| 悬停 | 真模糊（边缘梯度 −88%） |
-| 对比度 | 深色背景文字 6.90:1、歌手名浅/中/深 9.90/4.54/11.17:1 |
-| 歌词 | 高度四态零变化（双行94/单行74/关闭48）；200ms 收合实测 6 中间帧；25fps 扫光 |
-| 单实例 | 二次启动 0.09s 退出，退出码 0 |
-| 长稳 | 5 分钟无泄漏无抖动（CPU 0.245%） |
+| release 构建 | 零 error、零 warning;exe **955 KB**(预算 8 MB) |
+| clippy `-D warnings` | 零告警(src/ 无 `#[allow]`) |
+| 单元测试 | **222 passed / 0 failed / 1 ignored** |
+| 内存 | 基线 WS ~36.9MB/私有 ~10.7MB;设置页开→关:私有恒定 ~43.8MB 有界不增长(口径见 §2-11) |
+| CPU | 播放+扫光 **0.32%~0.61%**(口径:扫光开 ≤2%、扫光关 ≤ 扫光开,§2-3) |
+| 退出 / 单实例 | 托盘退出内部 24~90ms;二次启动 41~43ms 退出 |
+| 设置页 | 6 分区/明暗跟随/关于页 1.0.0/语言当窗生效/改项 0.8s 落盘/关窗资源全释放 |
+| 歌词 | 长行右缘 24px 渐隐、扫光分界字间无错位;行切换 150ms 上移+120ms 淡出;四态高度 94/74/48 |
+| 快捷键 | 6 组 Ctrl+Alt+Shift+ 全通,录制挂起/恢复闭环 |
+| 便携包 | zip 解压直跑端到端 ✅(启动/小组件/设置页/退出码 0) |
+| GitHub | 远端 HEAD = 本地(836ced0),12 提交完整 |
