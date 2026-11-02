@@ -22,9 +22,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW, GetWindowRect,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
     SendMessageTimeoutW, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SMTO_ABORTIFHUNG,
-    GWL_EXSTYLE, GWL_STYLE, GUITHREADINFO, SW_HIDE, SW_RESTORE, WM_NULL, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    GWL_EXSTYLE, GWL_STYLE, GUITHREADINFO, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WM_NULL,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
+use windows::Win32::System::Com::CLSCTX_ALL;
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "enum".into());
@@ -40,6 +41,9 @@ fn main() {
         }
         "click" => click_test(),
         "fix" => fix_test(),
+        "aumid" => aumid_test(),
+        "shell" => shell_test(),
+        "tray" => tray_test(),
         other => eprintln!("未知模式：{other}（enum / activate / fg）"),
     }
 }
@@ -201,6 +205,251 @@ fn enum_all() {
     match best {
         Some((w, s)) => println!(">> launch.rs 会选：hwnd=0x{:X}（score={s}）", w.hwnd.0 as usize),
         None => println!(">> 无候选窗口"),
+    }
+}
+
+// ---------------------------------------------------------------- 正规激活通道
+
+/// 汽水主窗口 hwnd（Chrome_WidgetWin_1 且有标题）
+fn find_soda() -> Option<HWND> {
+    let pids = soda_pids();
+    let wins = enum_windows_of(&pids);
+    wins.iter()
+        .find(|w| w.class == "Chrome_WidgetWin_1" && !w.title.is_empty())
+        .map(|w| w.hwnd)
+}
+
+/// 托盘化 + 等待，然后打印窗口/前台状态快照
+fn tray_then_report(tag: &str) {
+    let hwnd = match find_soda() {
+        Some(h) => h,
+        None => {
+            println!("找不到汽水主窗口");
+            return;
+        }
+    };
+    if let Some(w) = probe(hwnd) {
+        if w.visible {
+            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+    }
+    println!("[{tag}] 已托盘化（visible=0）");
+    // 发生在某窗口的激活动作本身由调用者插入
+    let _ = tag;
+}
+
+/// 激活动作后等待并报告窗口状态
+fn report_after(tag: &str, hwnd: HWND, wait_ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+    let Some(w) = probe(hwnd) else {
+        println!("[{tag}] 窗口已失效！");
+        return;
+    };
+    let fg = unsafe { GetForegroundWindow() } == hwnd;
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let mut gti = GUITHREADINFO {
+        cbSize: core::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = unsafe { GetGUIThreadInfo(tid, &mut gti) }.is_ok();
+    println!(
+        "[{tag} +{wait_ms}ms] visible={} fg={} active=0x{:X} focus=0x{:X}（前台：{}）",
+        w.visible as u8,
+        fg as u8,
+        gti.hwndActive.0 as usize,
+        gti.hwndFocus.0 as usize,
+        fg_desc()
+    );
+}
+
+fn aumid_test() {
+    unsafe { let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED); }
+    let Some(hwnd) = find_soda() else {
+        println!("找不到汽水主窗口");
+        return;
+    };
+    tray_then_report("aumid");
+
+    // 尝试多个候选 AUMID（SMTC 报的字符串就是激活用 AUMID）
+    let candidates = ["汽水音乐", "com.baidu.soda", "com.bytedance.soda", "SodaMusic"];
+    for aumid in candidates {
+        let wide = aumid.encode_utf16().chain(core::iter::once(0)).collect::<Vec<_>>();
+        let empty: Vec<u16> = vec![0];
+        unsafe {
+            let mgr: windows::Win32::UI::Shell::IApplicationActivationManager =
+                match windows::Win32::System::Com::CoCreateInstance(
+                    &windows::Win32::UI::Shell::ApplicationActivationManager,
+                    None,
+                    CLSCTX_ALL,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        println!("ApplicationActivationManager 创建失败：{e}");
+                        return;
+                    }
+                };
+            match mgr.ActivateApplication(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::core::PCWSTR(empty.as_ptr()),
+                windows::Win32::UI::Shell::ACTIVATEOPTIONS(0),
+            ) {
+                Ok(pid) => {
+                    println!("ActivateApplication({aumid:?}) 成功，新进程 pid={pid}");
+                    report_after("aumid", hwnd, 1500);
+                    report_after("aumid", hwnd, 2000);
+                    return;
+                }
+                Err(e) => println!("ActivateApplication({aumid:?}) 失败：{e}"),
+            }
+        }
+    }
+    println!("全部候选 AUMID 均失败");
+}
+
+fn shell_test() {
+    unsafe { let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED); }
+    let lnk = r"C:\Users\caihongyi\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\汽水音 乐.lnk";
+    let Some(hwnd) = find_soda() else {
+        println!("找不到汽水主窗口");
+        return;
+    };
+    tray_then_report("shell");
+
+    let wide = lnk.encode_utf16().chain(core::iter::once(0)).collect::<Vec<_>>();
+    unsafe {
+        let h = windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        println!("ShellExecuteW(lnk) 返回 = {}（>32 为成功）", h.0 as isize);
+    }
+    report_after("shell", hwnd, 1500);
+    report_after("shell", hwnd, 2500);
+    report_after("shell", hwnd, 3000);
+}
+
+// ---------------------------------------------------------------- 托盘点击通道
+
+/// 点击汽水的系统托盘图标（真实 SendInput），等价于用户手动点托盘。
+/// 验证：窗口恢复 + 点 ×（右上角）能隐藏窗口 = 可交互实锤。
+fn tray_test() {
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
+    let Some(hwnd) = find_soda() else {
+        println!("找不到汽水主窗口");
+        return;
+    };
+    tray_then_report("tray");
+
+    // 1. 找托盘图标宿主窗口（Electron_NotifyIconHostWindow，找不到就用主窗口）
+    let pids = soda_pids();
+    let wins = enum_windows_of(&pids);
+    let host = wins
+        .iter()
+        .find(|w| w.class == "Electron_NotifyIconHostWindow")
+        .map(|w| w.hwnd)
+        .unwrap_or(hwnd);
+
+    // 2. Shell_NotifyIconGetRect 枚举 uID 0..64 找图标 rect
+    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
+    let mut rect: Option<RECT> = None;
+    for uid in 0..64u32 {
+        let ni = NOTIFYICONIDENTIFIER {
+            cbSize: core::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: host,
+            uID: uid,
+            guidItem: windows::core::GUID::zeroed(),
+        };
+        // SAFETY: ni 是合法的栈上标识符。
+        if let Ok(r) = unsafe { Shell_NotifyIconGetRect(&ni) } {
+            if r.right > r.left {
+                println!("托盘图标定位成功：uID={uid} rect=({},{},{},{})", r.left, r.top, r.right, r.bottom);
+                rect = Some(r);
+                break;
+            }
+        }
+    }
+    let Some(r) = rect else {
+        println!("未能定位托盘图标（Shell_NotifyIconGetRect 全失败）");
+        return;
+    };
+
+    // 3. SendInput 单击图标中心
+    let cx = (r.left + r.right) / 2;
+    let cy = (r.top + r.bottom) / 2;
+    // SAFETY: 标准系统指标查询。
+    let (sx, sy) = unsafe {
+        (
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN),
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN),
+        )
+    };
+    let ax = (cx * 65535) / sx.max(1);
+    let ay = (cy * 65535) / sy.max(1);
+    let mi = |flags: MOUSE_EVENT_FLAGS| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: ax, dy: ay, mouseData: 0,
+                dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
+                time: 0, dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        let _ = SendInput(&[mi(MOUSEEVENTF_MOVE)], core::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = SendInput(&[mi(MOUSEEVENTF_LEFTDOWN)], core::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let _ = SendInput(&[mi(MOUSEEVENTF_LEFTUP)], core::mem::size_of::<INPUT>() as i32);
+    }
+    println!("已点击托盘图标 ({cx},{cy})");
+    report_after("tray", hwnd, 1000);
+    report_after("tray", hwnd, 1500);
+
+    // 4. 可交互硬验证：点窗口右上角 ×（汽水设置=关闭即隐藏到托盘，无破坏）
+    let Some(w) = probe(hwnd) else {
+        println!("[verify] 窗口已销毁（点×之前就没了？）");
+        return;
+    };
+    if !w.visible {
+        println!("[verify] 窗口没恢复显示，跳过 × 验证");
+        return;
+    }
+    let (_, y0, x1, _) = w.rect;
+    let px = x1 - 44;
+    let py = y0 + 22;
+    let ax = (px * 65535) / sx.max(1);
+    let ay = (py * 65535) / sy.max(1);
+    let mi = |flags: MOUSE_EVENT_FLAGS| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: ax, dy: ay, mouseData: 0,
+                dwFlags: flags | MOUSEEVENTF_ABSOLUTE,
+                time: 0, dwExtraInfo: 0,
+            },
+        },
+    };
+    unsafe {
+        let _ = SendInput(&[mi(MOUSEEVENTF_MOVE)], core::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let _ = SendInput(&[mi(MOUSEEVENTF_LEFTDOWN)], core::mem::size_of::<INPUT>() as i32);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let _ = SendInput(&[mi(MOUSEEVENTF_LEFTUP)], core::mem::size_of::<INPUT>() as i32);
+    }
+    println!("[verify] 已点击 × ({px},{py})，等待 900ms……");
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    match probe(hwnd) {
+        Some(w) if w.visible => println!("[verify] 窗口仍显示 → 内容不可交互（卡死）"),
+        Some(_) => println!("[verify] 窗口已隐藏/最小化 → 可交互实锤 ✓"),
+        None => println!("[verify] 窗口已销毁 → 可交互实锤 ✓"),
     }
 }
 

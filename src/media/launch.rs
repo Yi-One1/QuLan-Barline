@@ -73,6 +73,8 @@ use core::time::Duration;
 pub enum Activation {
     /// 找到了主窗口并成功置前
     Window,
+    /// 通过模拟托盘图标点击恢复（CEF/Electron 托盘恢复型应用）
+    Tray,
     /// 走了 AUMID 激活
     Aumid,
     /// 全部失败
@@ -83,10 +85,30 @@ impl Activation {
     pub fn as_str(self) -> &'static str {
         match self {
             Activation::Window => "window",
+            Activation::Tray => "tray",
             Activation::Aumid => "aumid",
             Activation::Failed => "failed",
         }
     }
+}
+
+/// CEF/Electron「托盘恢复型」应用：窗口 Hide 到托盘后，**外部 `ShowWindow` +
+/// `SetForegroundWindow` 无论怎么组合都会让 CEF 输入管线挂起**——窗口显示、
+/// 甚至前台激活成功，但内容完全不可点击（`SendInput` 真实点击都无效），
+/// 只有用应用自己的托盘点击路径恢复才正常。
+///
+/// 这类应用走「模拟托盘图标点击」通道（[`tray_click_activate`]）：
+/// `Shell_NotifyIconGetRect` 精确定位**该进程注册的**托盘图标（按 hWnd+uID 匹配，
+/// 不会误点别的图标），`SendInput` 发一次真实左键单击——与应用被用户亲手点击
+/// 完全同源。v1.1.20 实测汽水音乐 3.1.x：恢复 + 前台 + 点击 × 验证全部正常。
+const TRAY_RECOVERY_APPS: &[&str] = &["sodamusic.exe"];
+
+/// 进程 / AUMID 是否命中托盘恢复型应用。
+fn is_tray_recovery_app(process_name: &str, aumid: &str) -> bool {
+    TRAY_RECOVERY_APPS
+        .iter()
+        .any(|n| process_name.eq_ignore_ascii_case(n))
+        || aumid == "汽水音乐"
 }
 
 /// 点击封面：把当前播放器拉到前台。永不 panic、永不返回错误。
@@ -102,6 +124,25 @@ pub fn activate_player(session: &MediaSessionInfo) -> Activation {
         session.process_name,
         pids
     );
+
+    // ---- 0. CEF/Electron 托盘恢复型应用：直接模拟托盘图标点击 ----
+    // （外部窗口激活链对这类应用必然产生「显示但内容不可点击」的卡死）
+    let tray_recovery = is_tray_recovery_app(&session.process_name, &session.aumid)
+        || pids.iter().any(|&pid| {
+            let name = process_image_name(pid);
+            is_tray_recovery_app(&name, "")
+        });
+    if tray_recovery {
+        crate::log_info!("托盘恢复型应用（CEF）：走托盘图标点击通道");
+        if let Some(hwnd) = tray_click_activate(&pids) {
+            crate::log_info!(
+                "已通过托盘点击恢复主窗口 hwnd=0x{:X}",
+                hwnd.0 as usize
+            );
+            return Activation::Tray;
+        }
+        crate::log_warn!("托盘点击通道未生效，回退窗口激活链");
+    }
 
     // ---- a. 按候选 PID 逐个找主窗口（含托盘最小化的隐藏窗口）----
     for pid in &pids {
@@ -285,6 +326,132 @@ fn pids_from_snapshot(name: &str) -> Vec<u32> {
         let _ = CloseHandle(snap);
     }
     out
+}
+
+// ---------------------------------------------------------------- 托盘点击通道
+
+/// [`top_level_windows_of`] 的 EnumWindows 回调上下文。
+struct CollectCtx {
+    pid: u32,
+    out: Vec<HWND>,
+}
+
+/// 收集进程的**全部**顶层窗口（含隐藏；托盘图标宿主通常是个隐藏小窗）。
+fn top_level_windows_of(pid: u32) -> Vec<HWND> {
+    let mut ctx = CollectCtx { pid, out: Vec::new() };
+    // SAFETY: ctx 地址在 EnumWindows 返回前有效；回调只写 ctx。
+    unsafe {
+        let _ = EnumWindows(Some(collect_proc), LPARAM(&mut ctx as *mut CollectCtx as isize));
+    }
+    ctx.out
+}
+
+unsafe extern "system" fn collect_proc(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+    // SAFETY: lparam 是 top_level_windows_of 传入的 &mut CollectCtx。
+    let ctx = unsafe { &mut *(lparam.0 as *mut CollectCtx) };
+    let mut wnd_pid: u32 = 0;
+    // SAFETY: 标准 Win32 查询。
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut wnd_pid)) };
+    if wnd_pid == ctx.pid {
+        ctx.out.push(hwnd);
+    }
+    windows::core::BOOL(1)
+}
+
+/// 模拟「用户点击系统托盘图标」恢复主窗口（托盘恢复型应用的唯一可靠通道）。
+///
+/// 步骤：枚举进程全部窗口 → 逐个试 `Shell_NotifyIconGetRect`（hWnd+uID 二元组
+/// 精确定位**该进程注册的**托盘图标，不会误点别人的）→ 记录光标位置 →
+/// `SendInput` 真实左键单击 → 恢复光标 → 等待主窗口重新可见。
+///
+/// 返回恢复后的主窗口 hwnd。全程阻塞 ≤ ~3s（点击 ~0.3s + 等待上限 ~1.5s）。
+fn tray_click_activate(pids: &[u32]) -> Option<HWND> {
+    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+
+    // SAFETY: 本函数全部为标准 Win32 调用；本地缓冲在作用域内有效。
+    unsafe {
+        let (vx, vy) = (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+        );
+        let (vw, vh) = (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
+        );
+
+        for pid in pids {
+            for hwnd in top_level_windows_of(*pid) {
+                for uid in 0..64u32 {
+                    let ni = NOTIFYICONIDENTIFIER {
+                        cbSize: core::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
+                        hWnd: hwnd,
+                        uID: uid,
+                        guidItem: windows::core::GUID::zeroed(),
+                    };
+                    let Ok(rect) = Shell_NotifyIconGetRect(&ni) else {
+                        continue;
+                    };
+                    if rect.right <= rect.left || rect.bottom <= rect.top {
+                        continue;
+                    }
+
+                    let cx = (rect.left + rect.right) / 2;
+                    let cy = (rect.top + rect.bottom) / 2;
+                    crate::log_info!(
+                        "定位托盘图标：pid={pid} uID={uid} rect=({},{},{},{})，模拟点击 ({cx},{cy})",
+                        rect.left, rect.top, rect.right, rect.bottom
+                    );
+
+                    // 虚拟屏坐标 → SendInput 绝对坐标（0..65535）
+                    let ax = ((cx - vx) * 65535) / (vw - 1);
+                    let ay = ((cy - vy) * 65535) / (vh - 1);
+                    let mi = |flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS| INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                dx: ax,
+                                dy: ay,
+                                mouseData: 0,
+                                dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    };
+
+                    // 记录光标 → 移动点击 → 恢复（尽量减少对用户操作的干扰）
+                    let mut origin = windows::Win32::Foundation::POINT::default();
+                    let _ = GetCursorPos(&mut origin);
+                    let _ = SendInput(&[mi(MOUSEEVENTF_MOVE)], core::mem::size_of::<INPUT>() as i32);
+                    std::thread::sleep(Duration::from_millis(90));
+                    let _ = SendInput(&[mi(MOUSEEVENTF_LEFTDOWN)], core::mem::size_of::<INPUT>() as i32);
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = SendInput(&[mi(MOUSEEVENTF_LEFTUP)], core::mem::size_of::<INPUT>() as i32);
+                    let _ = SetCursorPos(origin.x, origin.y);
+
+                    // 等待主窗口重新可见（最多 1.5s，100ms 步进）
+                    for _ in 0..15 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if let Some(main) = find_main_window(*pid) {
+                            if IsWindowVisible(main).as_bool() {
+                                return Some(main);
+                            }
+                        }
+                    }
+                    crate::log_debug!("托盘图标 uID={uid} 点击后主窗口未恢复，继续尝试");
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------- 窗口查找
