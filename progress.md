@@ -13,7 +13,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 |---|---|
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
-| 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(master,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
+| 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(main,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
 | 当前版本 | **v1.1.21**;交付包在 `deliverables/`,**只增不删** |
 | 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
 | 团队 | 交付总监(主理人)+ 寇豆码(software-engineer)+ 严过关(software-qa-engineer);团队 `software-barline-fix` 活跃,寇豆码上下文延续(可 SendMessage 继续) |
@@ -113,7 +113,7 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 
 ### 交付包现状(deliverables/,只增不删)
 `曲栏_Barline_v1.0.0.exe`、`.zip`、`v1.1.0.exe` ~ `v1.1.14.exe` 全序列。
-> 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout master」方式(已验证可行)。
+> 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout main」方式(已验证可行)。
 
 ---
 

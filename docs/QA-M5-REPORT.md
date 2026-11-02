@@ -1,7 +1,7 @@
 # 曲栏 Barline — M5 交付前终验报告(v1.0.0 / 84fe061)
 
 - **验收人**:Edward(software-qa-engineer)
-- **验收对象**:master **84fe061**(= 5b425ac 版本资源 1.0.0 + 84fe061 README/LICENSE);交付物 `deliverables/曲栏_Barline_v1.0.0.exe`(955 KB)+ `.zip`(341 KB)
+- **验收对象**:main **84fe061**(= 5b425ac 版本资源 1.0.0 + 84fe061 README/LICENSE);交付物 `deliverables/曲栏_Barline_v1.0.0.exe`(955 KB)+ `.zip`(341 KB)
 - **验收方式**:独立 worktree(基于 84fe061),全部构建 / 真机 / 便携包 / 远端核对自跑,不采信自述
 - **结论**:**通过 —— 建议发布 v1.0.0 Release**(无缺陷、无阻塞项)
 
@@ -45,8 +45,8 @@ cargo build --profile release: 退出码 0,零 warning,barline.exe = 954.5 KB(cr
 ## 5. 远端一致性 ✅
 
 ```
-git ls-remote origin master  →  84fe0612b5278e5aa013a48e7130d6362aa2190d
-本地 master HEAD             →  84fe061(同一哈希 ⇒ README/LICENSE 等全部内容一致)
+git ls-remote origin main  →  84fe0612b5278e5aa013a48e7130d6362aa2190d
+本地 main HEAD             →  84fe061(同一哈希 ⇒ README/LICENSE 等全部内容一致)
 ```
 
 ## 6. 文档抽查 ✅
