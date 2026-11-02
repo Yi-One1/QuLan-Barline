@@ -28,7 +28,22 @@
 //! [`limits::MEDIA_POLL_TIMELINE_BACKOFF_MS`]，出现非零值或状态跃迁再恢复——
 //! 别拿我们用不上的数据每秒去烦它。
 //!
-//! 事件订阅仍只做「置脏位 + 唤醒」；真正的读取统一走 [`PollState::tick`]。
+//! ## 事件驱动（G2 修复版第二轮：轮询降级为兜底）
+//!
+//! 用户实测 v1.4.2：卡顿消失（方向对了），但**切歌不跟手**（最坏等 2s 慢层）。
+//! 主通道改成会话级事件：`MediaPropertiesChanged`（标题/歌手/专辑 → 切歌）、
+//! `PlaybackInfoChanged`（状态跃迁）、`TimelinePropertiesChanged`（位置/时长）。
+//! 回调只置脏位 + 唤醒 UI（它们跑在 WinRT 线程池上，**严禁**在里面做 COM 重活），
+//! 脏位并入 `dirty`，下一轮按 `forced` 全量读（60ms 节流）。
+//! 订阅跟随 AUMID：换了播放器就重挂；token 保存在 [`SessionSubscriptions`]，
+//! Drop 时 `remove_*`（线程退出与会话清空都会走到）。某播放器不发事件时，
+//! 行为自动退化为纯轮询（= 上一版，不会更差）。
+//!
+//! ## 锚点规则（`position_at` 怎么取）
+//!
+//! `position_at` 是 UI 外推的基准，取错 = 歌词/进度漂移。v1.4.2 曾把它绑到
+//! `timeline_at`：对网易云（恒 0/0、时间线退避 5s、切歌由 2s 慢层发现）等于把
+//! 歌词钟拨快最多 5s。现在按 [`anchor_of`] 的三规则取值，细节见该函数注释。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -43,7 +58,8 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionMediaProperties,
     GlobalSystemMediaTransportControlsSessionPlaybackInfo,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
-    SessionsChangedEventArgs,
+    MediaPropertiesChangedEventArgs, PlaybackInfoChangedEventArgs,
+    SessionsChangedEventArgs, TimelinePropertiesChangedEventArgs,
 };
 
 use crate::config::defaults::limits;
@@ -250,6 +266,34 @@ fn due(last: Option<Instant>, now: Instant, interval_ms: u64) -> bool {
     }
 }
 
+/// **锚点规则**：这份快照的 `position_at`（UI 外推的基准）取哪个时刻。
+///
+/// 取错就是「歌词/进度与音频漂移」，三种情况（按顺序判）：
+/// 1. 本轮**读过时间线** → 用该次读取的时刻（`timeline_at`，恰好就是本轮 `now`）。
+///    位置是新鲜的，外推从读取时刻起算；
+/// 2. 本轮没读时间线，但 `track_id` 相对上一份快照**变了**（切歌）→ 用**检测时刻**。
+///    网易云恒报 `(0,0)`、时间线还在退避里，切歌只能由慢层发现——旧版歌词能同步，
+///    靠的正是「位置恒 0、歌词钟从检测时刻起走表」，这条规则把它显式化了；
+/// 3. 其余 → **沿用上一份快照的锚点**。绝不许退回陈旧的 `timeline_at`
+///    （v1.4.2 的 bug：退避下它是切歌之前 5s 的时刻，歌词直接快 5s）。
+///
+/// `prev` 是上一份快照的 `position_at`；首轮没有上一份时兜底用 `now`。
+fn anchor_of(
+    read_timeline_this_tick: bool,
+    timeline_at: Option<Instant>,
+    track_changed: bool,
+    now: Instant,
+    prev: Option<Instant>,
+) -> Instant {
+    if read_timeline_this_tick {
+        return timeline_at.unwrap_or(now);
+    }
+    if track_changed {
+        return now;
+    }
+    prev.unwrap_or(now)
+}
+
 // ---------------------------------------------------------------- 分层读数缓存
 
 /// 各层最近一次读到的数据。
@@ -296,8 +340,8 @@ fn parts_track_id(parts: &SessionParts) -> TrackId {
 }
 
 impl SessionParts {
-    /// 拼一份完整快照。
-    fn snapshot(&self) -> NowPlaying {
+    /// 拼一份完整快照。`anchor` 由 [`anchor_of`] 的三规则决定（见其注释）。
+    fn snapshot(&self, anchor: Instant) -> NowPlaying {
         let track = effective_track(self);
         NowPlaying {
             track_id: parts_track_id(self),
@@ -311,10 +355,9 @@ impl SessionParts {
             },
             state: self.state,
             position_ms: self.position_ms,
-            // **必须**带上「读到这份位置的时刻」：外推从那个时刻起算。
-            // 分层后时间线 1s 才读一次，若改用「发事件的时刻」当基准，
-            // 进度条会永久落后最多 1s。
-            position_at: self.timeline_at.unwrap_or_else(Instant::now),
+            // 锚点绝不许就地拍脑袋取 `Instant::now()`：分层后位置可能来自
+            // 上一轮（1s~5s 前），外推基准错了进度条/歌词钟就漂了。
+            position_at: anchor,
             can_prev: self.can_prev,
             can_next: self.can_next,
             can_seek: self.duration_ms > 0,
@@ -375,7 +418,7 @@ impl PollStats {
 
 /// 媒体线程的全部可变状态。
 struct PollState {
-    /// 上次广播的快照（`has_changed` 判重用）
+    /// 上次广播的快照（`has_changed` 判重用；**也是锚点规则 3 的来源**）
     last: Option<NowPlaying>,
     cover: CoverMemo,
     /// 各层缓存
@@ -384,10 +427,14 @@ struct PollState {
     stats: PollStats,
     /// 上次轮询时刻（`forced` 的 60ms 下限用）
     last_tick: Instant,
+    /// 事件脏位（管理器级 + 会话级事件共用；回调只置位，主循环消费）
+    dirty: Arc<AtomicBool>,
+    /// 会话级事件订阅（AUMID 变了就重挂；`None` = 还没挂过 / 会话已清空）
+    session_events: Option<SessionSubscriptions>,
 }
 
 impl PollState {
-    fn new() -> Self {
+    fn new(dirty: Arc<AtomicBool>) -> Self {
         Self {
             last: None,
             cover: CoverMemo::default(),
@@ -395,12 +442,56 @@ impl PollState {
             cadence: Cadence::default(),
             stats: PollStats::new(Instant::now()),
             last_tick: Instant::now(),
+            dirty,
+            session_events: None,
         }
     }
 
     /// 事件脏位是否已过 60ms 下限（不到点就先攒着，下一轮再读）。
     fn forced_due(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_tick) >= Duration::from_millis(FORCED_FLOOR_MS)
+    }
+
+    /// **主循环每轮（50ms）的调度**：统计落地 + forced 判定 + 分层计划。
+    ///
+    /// 与 COM 无关的部分集中在这里，`run` 只负责收发——这样「统计确实每轮都刷」
+    /// 和「脏位 → forced 的映射」才能被单测覆盖。
+    /// 返回 `(计划, 是否消费了 forced)`；落脏位由调用方做。
+    fn schedule(&mut self, now: Instant, dirty_set: bool) -> (Plan, bool) {
+        // 统计日志必须在**主循环**里落地，而不是藏在 tick 里——
+        // 否则「一组都没到点」的轮次会把统计窗口拖长，数字就不可信了。
+        self.stats.flush_if_due(now);
+        let forced = dirty_set && self.forced_due(now);
+        let plan = self.cadence.plan(now, forced);
+        (plan, forced)
+    }
+
+    /// 事件驱动的主通道：AUMID 变了（或还没挂过）就重挂会话级事件。
+    ///
+    /// 为什么跟着 AUMID 走：订阅挂在**具体会话对象**上，播放器切换后旧订阅
+    /// 不会再响；而「会话对象换了但 AUMID 相同」的场景由管理器级
+    /// `SessionsChanged` 事件兜底（它也会置脏位走 forced 全量读）。
+    fn ensure_session_events(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        sink: &EventSink<AppEvent>,
+    ) {
+        if self.parts.aumid.is_empty() {
+            return;
+        }
+        let need = match &self.session_events {
+            Some(s) => s.aumid != self.parts.aumid,
+            None => true,
+        };
+        if !need {
+            return;
+        }
+        self.session_events = Some(subscribe_session(
+            session,
+            &self.dirty,
+            sink,
+            self.parts.aumid.clone(),
+        ));
     }
 
     /// 按计划做一轮读取，diff 后决定是否广播。
@@ -414,9 +505,11 @@ impl PollState {
                     crate::log_info!("session cleared");
                     self.last = None;
                     self.cover.done = false;
-                    // 会话没了 → 分层缓存与节奏全部作废，下次会话从全量读开始
+                    // 会话没了 → 分层缓存、节奏、会话级订阅全部作废，
+                    // 下次会话从全量读开始
                     self.parts = SessionParts::default();
                     self.cadence = Cadence::default();
+                    self.session_events = None;
                     sink.send(AppEvent::SessionCleared);
                 }
                 return;
@@ -424,6 +517,8 @@ impl PollState {
         };
 
         // ---- 快层：播放状态（最轻，必须即时）----
+        // `read_timeline_now` 供锚点规则 1 使用
+        let mut read_timeline_now = false;
         let mut playback_info = None;
         if plan.playback {
             let (info, ms) = timed("smtc.playback", || session.GetPlaybackInfo().ok());
@@ -451,7 +546,9 @@ impl PollState {
             }
             self.parts.position_ms = position;
             self.parts.duration_ms = duration;
+            // **只有这里**许更新 timeline_at（锚点规则的依据，别处一律不碰）
             self.parts.timeline_at = Some(now);
+            read_timeline_now = true;
         }
 
         // ---- 慢层：AUMID + 元数据 + 播控标志 + 封面 ----
@@ -485,6 +582,8 @@ impl PollState {
                     // 封面按 track_id 记忆：换歌才解码一次（见 CoverMemo）
                     self.parts.cover = self.cover.get(parts_track_id(&self.parts), &props);
                     self.parts.props_ok = true;
+                    // 属性里带 AUMID → 在这里挂/重挂会话级事件（事件驱动主通道）
+                    self.ensure_session_events(&session, sink);
                 }
                 Err(e) => {
                     // 属性读失败：保留旧值继续用（分层的好处之一——
@@ -520,7 +619,18 @@ impl PollState {
             return;
         }
 
-        let snapshot = self.parts.snapshot();
+        // ---- 锚点（见 anchor_of 的三规则）----
+        let track_id = parts_track_id(&self.parts);
+        let track_changed = self.last.as_ref().map(|p| p.track_id) != Some(track_id);
+        let anchor = anchor_of(
+            read_timeline_now,
+            self.parts.timeline_at,
+            track_changed,
+            now,
+            self.last.as_ref().map(|p| p.position_at),
+        );
+
+        let snapshot = self.parts.snapshot(anchor);
         if let Some(prev) = self.last.as_ref() {
             if !has_changed(prev, &snapshot) {
                 return;
@@ -577,9 +687,8 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
 
     // 事件回调只做两件事：置脏位 + PostMessage 唤醒 UI。绝不在回调里做重活。
     let dirty = Arc::new(AtomicBool::new(true));
+    let mut state = PollState::new(dirty.clone());
     let _handlers = subscribe(&mgr, &dirty, &sink);
-
-    let mut state = PollState::new();
 
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(50)) {
@@ -593,15 +702,14 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
         }
 
         // 分层降频（G2 修复版）：每组调用各看各的节奏，一组都不到点就整轮跳过
-        // （连 GetCurrentSession 都不发）。
+        // （连 GetCurrentSession 都不发）。事件驱动（G2 二轮）只是把脏位置上，
+        // 节奏判定统一走 `schedule`，轮询永远作兜底。
         let now = Instant::now();
-        // 事件脏位带 60ms 下限防风暴；**不提前消费**——不到点就先攒着，
-        // 下一轮再读（旧实现先 swap 会把这一拍丢掉，靠 500ms 兜底才补回来）。
-        let forced = dirty.load(Ordering::Relaxed) && state.forced_due(now);
+        let (plan, forced) = state.schedule(now, state.dirty.load(Ordering::Relaxed));
         if forced {
-            dirty.store(false, Ordering::Relaxed);
+            // 消费脏位（schedule 判定过 60ms 下限才到这里）
+            state.dirty.store(false, Ordering::Relaxed);
         }
-        let plan = state.cadence.plan(now, forced);
         if plan.any() {
             state.tick(&mgr, &sink, now, plan);
         }
@@ -677,6 +785,95 @@ fn subscribe(
     Subscriptions {
         _current: current,
         _sessions: sessions,
+    }
+}
+
+// ---------------------------------------------------------------- 会话级事件（G2 二轮）
+
+/// 会话级事件订阅（切歌 / 状态跃迁 / 时间线变化的**主通道**）。
+///
+/// 与管理器级订阅的差别：它挂在**具体会话对象**上，所以必须跟着 AUMID 走——
+/// 换播放器就重挂；token 连同会话对象一起保存在这里，[`Drop::drop`] 时
+/// `Remove*`（媒体线程退出、会话清空都会走到；Drop 时 COM 还活着，
+/// 见 `run` 的构造顺序：`_com` 最先创建、最后销毁）。
+///
+/// 注意 windows-rs 0.62 的命名：args 类型不带会话前缀（`MediaPropertiesChangedEventArgs`），
+/// 反注册方法是 **PascalCase** 的 `Remove*`（与事件订阅的 `MediaPropertiesChanged` 不同）。
+struct SessionSubscriptions {
+    /// 会话对象：`Remove*` 需要它，不能只存 token
+    session: GlobalSystemMediaTransportControlsSession,
+    /// 订阅时的 AUMID（变了才重挂）
+    aumid: String,
+    props: TypedEventHandler<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs>,
+    playback: TypedEventHandler<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs>,
+    timeline: TypedEventHandler<
+        GlobalSystemMediaTransportControlsSession,
+        TimelinePropertiesChangedEventArgs,
+    >,
+    props_token: i64,
+    playback_token: i64,
+    timeline_token: i64,
+}
+
+impl Drop for SessionSubscriptions {
+    fn drop(&mut self) {
+        // token 无效时返回 Err，忽略即可（不 panic；Drop 里也不许 panic）。
+        let _ = self.session.RemoveMediaPropertiesChanged(self.props_token);
+        let _ = self.session.RemovePlaybackInfoChanged(self.playback_token);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline_token);
+        crate::log_debug!("会话级事件订阅已移除（aumid={}）", self.aumid);
+    }
+}
+
+/// 给一个会话挂上三个事件。**回调里只许置脏位 + 唤醒**——
+/// 它们跑在 WinRT 线程池上，做 COM 重活会把线程池拖垮（风险与收益完全不对等）。
+fn subscribe_session(
+    session: &GlobalSystemMediaTransportControlsSession,
+    dirty: &Arc<AtomicBool>,
+    sink: &EventSink<AppEvent>,
+    aumid: String,
+) -> SessionSubscriptions {
+    let d1 = dirty.clone();
+    let s1 = sink.clone();
+    let props = TypedEventHandler::new(move |_sender, _args| {
+        d1.store(true, Ordering::Relaxed);
+        s1.poke();
+        Ok(())
+    });
+
+    let d2 = dirty.clone();
+    let s2 = sink.clone();
+    let playback = TypedEventHandler::new(move |_sender, _args| {
+        d2.store(true, Ordering::Relaxed);
+        s2.poke();
+        Ok(())
+    });
+
+    let d3 = dirty.clone();
+    let s3 = sink.clone();
+    let timeline = TypedEventHandler::new(move |_sender, _args| {
+        d3.store(true, Ordering::Relaxed);
+        s3.poke();
+        Ok(())
+    });
+
+    // 订阅失败只记日志（token=0），轮询兜底仍然完整可用
+    let props_token = session.MediaPropertiesChanged(&props).unwrap_or(0);
+    let playback_token = session.PlaybackInfoChanged(&playback).unwrap_or(0);
+    let timeline_token = session.TimelinePropertiesChanged(&timeline).unwrap_or(0);
+    crate::log_info!(
+        "已订阅会话级事件（aumid={}）：MediaPropertiesChanged / PlaybackInfoChanged / TimelinePropertiesChanged",
+        aumid
+    );
+    SessionSubscriptions {
+        session: session.clone(),
+        aumid,
+        props,
+        playback,
+        timeline,
+        props_token,
+        playback_token,
+        timeline_token,
     }
 }
 
@@ -1085,8 +1282,119 @@ mod tests {
             ..Default::default()
         };
         parts.props_ok = true;
-        assert!(!parts.snapshot().can_seek);
+        // 锚点传「发事件时刻」：这条测试只关心 can_seek，不关心外推基准
+        let now = Instant::now();
+        assert!(!parts.snapshot(now).can_seek);
         parts.duration_ms = 180_000;
-        assert!(parts.snapshot().can_seek);
+        assert!(parts.snapshot(now).can_seek);
+    }
+
+    // ------------------------------------------------ 锚点 + 事件驱动（G2 二轮）
+
+    /// 规则 1：本轮读过时间线 → 锚点 = 该次读取时刻。
+    #[test]
+    fn anchor_rule_1_timeline_read_this_tick() {
+        let t0 = Instant::now();
+        let tl_at = at(t0, 100);
+        let now = at(t0, 150);
+        let a = anchor_of(true, Some(tl_at), false, now, Some(at(t0, 50)));
+        assert_eq!(a, tl_at, "锚点必须是时间线读取时刻，不是发事件的时刻");
+        // timeline_at 缺席（理论不可达）时退到 now，不许 panic
+        assert_eq!(anchor_of(true, None, false, now, Some(at(t0, 50))), now);
+    }
+
+    /// 规则 2（核心回归）：`(0,0)` 播放器在 5s 退避下切歌 ——
+    /// 本轮没读时间线，锚点必须是「检测时刻」，绝不许退回陈旧的 timeline_at。
+    #[test]
+    fn anchor_rule_2_track_change_without_timeline_uses_detection_moment() {
+        let t0 = Instant::now();
+        // 时间线上次读取在 5s 前（网易云退避期），此刻慢层发现切歌
+        let stale_timeline_at = Some(t0);
+        let detection = at(t0, 5_000);
+        let a = anchor_of(false, stale_timeline_at, true, detection, Some(at(t0, 4_000)));
+        assert_eq!(
+            a, detection,
+            "退回 timeline_at = 歌词钟快 5s（v1.4.2 的漂移 bug）"
+        );
+    }
+
+    /// 规则 3：没读时间线、也没切歌（普通事件，如播控标志变化）→
+    /// 锚点沿用上一份快照，位置与基准必须同进退。
+    #[test]
+    fn anchor_rule_3_plain_event_keeps_previous_anchor() {
+        let t0 = Instant::now();
+        let prev_anchor = at(t0, 500);
+        let now = at(t0, 3_000);
+        let a = anchor_of(false, Some(at(t0, 500)), false, now, Some(prev_anchor));
+        assert_eq!(a, prev_anchor, "锚点漂了，位置与基准就错位了");
+        // 首份快照没有上一份 → 用 now（此时 props_ok 门刚开，必然刚读过）
+        assert_eq!(anchor_of(false, Some(at(t0, 500)), false, now, None), now);
+    }
+
+    /// 锚点规则与节奏状态机的**串联**：`(0,0)` 播放器在退避期切歌，
+    /// cadence 判定「本轮不读时间线」+ anchor 判定「用检测时刻」——
+    /// 两个判定合起来才是 v1.4.2 漂移 bug 的完整复现。
+    #[test]
+    fn zero_player_backoff_track_change_gets_detection_anchor() {
+        let mut c = Cadence::default();
+        let t0 = Instant::now();
+        c.note_playback(t0, PlaybackState::Playing);
+        c.note_props(t0);
+        for i in 0..3 {
+            c.note_timeline(at(t0, i * 1_000), 0, 0);
+        }
+        assert!(c.timeline_backoff, "前置：网易云已进入退避");
+
+        // 退避期内（last_timeline = t0+2000，下次到点 t0+7000）慢层发现切歌
+        let detection = at(t0, 3_000);
+        let p = c.plan(detection, false);
+        assert!(!p.timeline, "退避期本轮不读时间线");
+
+        let anchor = anchor_of(
+            p.timeline,
+            Some(at(t0, 2_000)), // 退避前最后读时间线的时刻
+            true,                // 慢层发现 track_id 变了
+            detection,
+            Some(at(t0, 2_000)),
+        );
+        assert_eq!(
+            anchor, detection,
+            "锚点必须是检测时刻：网易云的歌词钟从这里起走表"
+        );
+    }
+
+    /// 需求③：主循环每轮都调 `schedule` → 统计窗口到点**必须**落地。
+    /// 这条测的是「接线」本身：`schedule` 里包含 `flush_if_due`。
+    #[test]
+    fn loop_schedule_flushes_stats_and_maps_dirty_to_forced() {
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+        let t0 = st.last_tick;
+        // 先「演」一轮全量读（真实主循环首轮就是全量）：三层计时起点都落在 t0
+        st.cadence.note_playback(t0, PlaybackState::Playing);
+        st.cadence.note_timeline(t0, 1_000, 180_000);
+        st.cadence.note_props(t0);
+
+        // 脏位 + 60ms 未到 → 不消费、不下全量（防事件风暴）
+        let (plan, forced) = st.schedule(at(t0, 10), true);
+        assert!(!forced, "60ms 内不许因事件全量读");
+        assert!(!plan.any(), "三层都没到点就该整轮跳过（连 GetCurrentSession 都不发）");
+
+        // 60ms 到 → forced 全量读
+        let (plan, forced) = st.schedule(at(t0, 60), true);
+        assert!(forced, "过 60ms 下限的事件必须映射成 forced");
+        assert!(plan.playback && plan.timeline && plan.props);
+
+        // 无脏位的普通轮次：走三层节奏，不触发 forced
+        let (_, forced) = st.schedule(at(t0, 100), false);
+        assert!(!forced);
+
+        // 统计接线：60s 后的普通轮次必须把窗口清零（flush 在 schedule 里）
+        st.stats.playback = 7;
+        st.stats.timeline = 3;
+        st.stats.props = 2;
+        let _ = st.schedule(at(t0, 60_000), false);
+        assert_eq!(st.stats.playback, 0, "主循环必须每轮落地统计（flush_if_due）");
+        assert_eq!(st.stats.timeline, 0);
+        assert_eq!(st.stats.props, 0);
     }
 }
