@@ -122,6 +122,24 @@ pub struct AppState {
     /// 存的是**字符串副本**而不是引用：切歌时 `lyrics` 会被换成 Loading，
     /// 旧那首的 `Arc<Lyrics>` 随时可能被释放。
     pub lyric_fade: Option<(String, Instant)>,
+    /// 前台窗口是否**全屏**（v1.4.4 / G2-B2）。
+    ///
+    /// 由 `sync_capture_freeze` 每秒顺带算出（与截图态探测共用**同一次**
+    /// `foreground_info()` 查询，零新增跨进程调用），心跳采样据此跳过：
+    /// 全屏视频 / 游戏时读桌面既贵又没意义。
+    ///
+    /// 只影响「静止态心跳」这一条路径——悬停进入 / 换壁纸 / 几何变化 / 退出截图态
+    /// 仍然立即采样（用户能感知的路径一条都不许变慢）。
+    ///
+    /// **必须配合 [`AppState::foreground_monitor`] 一起看**：只有全屏窗口就在
+    /// 小组件那块屏上时，跳过心跳才有意义（见 [`same_monitor`]）。
+    pub foreground_fullscreen: bool,
+    /// 前台窗口所在显示器的**整块**矩形（v1.4.4 补丁，物理像素）。
+    ///
+    /// 来自 `ForegroundInfo::monitor`（同一次 `foreground_info()` 查询就有，零新增调用）。
+    /// 与 [`App::widget_monitor`] 比较即可知道「全屏的那块屏是不是小组件所在的那块」：
+    /// 副屏全屏视频不该让主屏的字色自适应停摆。拿不到时全 0。
+    pub foreground_monitor: RECT,
 }
 
 impl AppState {
@@ -237,6 +255,20 @@ pub struct App {
     logged_rect: RECT,
     /// 已经为当前这次「窗口实际位置漂移」记过日志（避免每秒刷屏，v1.2.0）
     drift_logged: bool,
+    /// 上一次**真的**投递了背景采样请求的时刻（v1.4.4 / G2-B1）。
+    ///
+    /// 心跳从 1s 放宽到 `limits::BACKDROP_IDLE_MS`（3s）后，靠它算「离上次采样
+    /// 够不够久」。所有立即采样入口（悬停进入 / 换壁纸 / 几何变化 / 退出截图态）
+    /// 都走 `request_backdrop`，那里会刷新这个时刻——所以立即采样之后不会马上
+    /// 又补一次心跳，也不会因为刚补过心跳就推迟用户操作引起的采样。
+    last_backdrop: Instant,
+    /// **小组件自己**所在显示器的整块矩形（v1.4.4 补丁，物理像素）。
+    ///
+    /// 在 `relayout_with` 里随 `target_rect` 一起刷新（几何 / DPI / 显示器变化
+    /// 本来就会驱动重排，时机正好），取不到就是全 0。
+    /// 用途：判断「前台全屏的那块屏」是不是「小组件这块屏」——只有同屏才跳过心跳，
+    /// 否则副屏全屏视频会让主屏的字色自适应白白停摆。
+    widget_monitor: RECT,
 }
 
 /// 小组件窗口矩形变化的**来源**（诊断日志用，v1.2.0 / G5 问题 2）。
@@ -402,6 +434,12 @@ impl App {
             capture_frozen: false,
             logged_rect: target_rect,
             drift_logged: false,
+            // 启动时先当作「刚采过」：首帧背景由随后的 `relayout` → `request_backdrop`
+            // 立即投递，不必再叠一次心跳。
+            last_backdrop: Instant::now(),
+            // 由紧随其后的 `relayout()` 填真值；全 0 时 `same_monitor` 判 false，
+            // 也就是「继续采样」——安全方向。
+            widget_monitor: RECT::default(),
         });
 
         // 歌词行不透明度与初始宽度同步（歌词默认开启时首帧就是实色）
@@ -580,13 +618,30 @@ impl App {
         // 壁纸 / 主题变化有 `WM_SETTINGCHANGE` 精确通知，但**用户把窗口拖到小组件后面**
         // 不会有任何通知；只靠悬停才采样的话，静止态会一直用着旧背景算出来的文字颜色
         // （深色窗口滑到浅色壁纸后面 → 白字压在浅色上，直接看不清）。
-        // 这里按 1s 心跳补一次；采样线程自身有 300ms 节流，抓的只是小组件大小的
-        // 一小块像素，空闲 CPU 仍是 0 量级（实测 < 0.3%）。
+        //
+        // v1.4.4（G2-B1 / B2）：这条**只是兜底心跳**，所以两处降载——
+        //   1. 间隔 1s → `limits::BACKDROP_IDLE_MS`（3s）：静止态晚 2 秒才更新字色，
+        //      用户看不出来；抓屏次数直接降到 1/3（`BitBlt` 是残余卡顿的头号嫌疑）；
+        //   2. 前台全屏应用（视频 / 游戏）时整个跳过：读桌面既贵又没意义。
+        // **能感知的路径一律不受影响**：悬停进入、换壁纸 / 主题、几何变化、
+        // 退出截图态、切播放器导致的几何重排都直接调 `request_backdrop()`，不等心跳。
+        //
+        // v1.4.4 补丁：跳过的前提是**全屏的那块屏就是小组件这块屏**。
+        // 副屏全屏打游戏时主屏小组件仍要正常跟壁纸变字色——那条心跳存在的唯一理由
+        // 就是「用户把窗口拖到小组件后面」，与别的显示器上的全屏毫无关系。
         if self.state.visible && !self.is_hovering() && !self.capture_frozen {
-            // G2 诊断：这里只做「拷 Shared 状态 + mpsc 发送」，正常应是微秒级；
-            // 一旦慢就说明 Arc clone / 采样请求槽成了瓶颈（对应采样线程的 capture 段）。
-            let _sp = crate::platform::perf::Span::new("tick.backdrop");
-            self.request_backdrop();
+            let elapsed_ms = self.last_backdrop.elapsed().as_millis();
+            let skip = should_skip_idle_backdrop(
+                self.state.foreground_fullscreen,
+                self.state.foreground_monitor,
+                self.widget_monitor,
+            );
+            if idle_backdrop_due(elapsed_ms, skip) {
+                // G2 诊断：这里只做「拷 Shared 状态 + mpsc 发送」，正常应是微秒级；
+                // 一旦慢就说明 Arc clone / 采样请求槽成了瓶颈（对应采样线程的 capture 段）。
+                let _sp = crate::platform::perf::Span::new("tick.backdrop");
+                self.request_backdrop();
+            }
         }
     }
 
@@ -594,9 +649,40 @@ impl App {
     ///
     /// 只在**状态真的翻转**时记日志（1s 心跳下不能每秒刷一条）；
     /// 退出时立刻补一次 `request_backdrop()`——否则用户会看到字色慢一拍，
-    /// 要等下一个 1s 心跳才恢复。
+    /// 要等下一个心跳才恢复。
+    ///
+    /// v1.4.4（G2-B2）：**同一次** `foreground_info()` 查询顺带刷新「前台是否全屏」，
+    /// 供心跳采样判断复用——全屏判定因此**没有新增任何跨进程调用**。
+    ///
+    /// v1.4.4 补丁：同一次结果里的 `monitor` 也一并存下来（零额外调用）。
+    /// 它必须**无条件**刷新（不能只在全屏翻转时更新）：全屏窗口被拖到另一块屏时
+    /// `fullscreen` 一直是 `true`，但「在哪块屏」变了——不更新就会误判成同屏。
     fn sync_capture_freeze(&mut self) {
-        let now = self.detect_capture();
+        let info = crate::platform::capture::foreground_info();
+        self.state.foreground_monitor = info.monitor;
+        // 全屏标记先落地（下面可能因「状态没变」提前 return，但标记必须是最新的）
+        if info.fullscreen != self.state.foreground_fullscreen {
+            self.state.foreground_fullscreen = info.fullscreen;
+            if info.fullscreen {
+                crate::log_info!(
+                    "前台全屏 {}×{}（rect=({},{},{},{}) monitor=({},{},{},{})）→ 同屏时暂停静止态心跳采样（悬停/换壁纸仍立即采样）",
+                    info.monitor.right - info.monitor.left,
+                    info.monitor.bottom - info.monitor.top,
+                    info.rect.left,
+                    info.rect.top,
+                    info.rect.right,
+                    info.rect.bottom,
+                    info.monitor.left,
+                    info.monitor.top,
+                    info.monitor.right,
+                    info.monitor.bottom
+                );
+            } else {
+                crate::log_info!("退出前台全屏 → 恢复 3s 心跳背景采样");
+            }
+        }
+
+        let now = self.detect_capture_with(&info);
         if now == self.capture_frozen {
             return;
         }
@@ -609,9 +695,8 @@ impl App {
         }
     }
 
-    /// 前景窗口是不是已知的截图工具。
-    fn detect_capture(&self) -> bool {
-        let info = crate::platform::capture::foreground_info();
+    /// 前景窗口是不是已知的截图工具（用**已经取好**的前台信息，不重复查询）。
+    fn detect_capture_with(&self, info: &crate::platform::capture::ForegroundInfo) -> bool {
         if info.pid == 0 {
             return false;
         }
@@ -623,7 +708,7 @@ impl App {
     /// `WM_SETTINGCHANGE` / `WM_THEMECHANGED`：壁纸或主题变了 → 立即重新采样。
     ///
     /// PRD P0-07 要求「切换壁纸后 300ms 内完成黑白切换」，采样线程本身有 300ms 节流，
-    /// 所以这里必须**立刻**投递请求，不能等 1 秒心跳。
+    /// 所以这里必须**立刻**投递请求，不能等兜底心跳（`limits::BACKDROP_IDLE_MS` = 3s）。
     pub fn on_setting_changed(&mut self) {
         crate::log_debug!("系统设置 / 主题变化 → 重新采样背景");
         self.request_backdrop();
@@ -720,7 +805,12 @@ impl App {
         // 覆盖范围含消息处理里同步触发的重绘（`dispatch` → `redraw`），
         // 所以它与 `paint.frame` 会重叠：`msg.mouse` 明显更大就说明「重绘之外」
         // 还有别的活儿（命中测试 / 钩子安装 / 日志）。
-        let _sp = is_mouse_message(msg).then(|| crate::platform::perf::Span::new("msg.mouse"));
+        //
+        // v1.4.4（G2-A1）：右键会同步进 `TrackPopupMenuEx` 的**模态消息循环**，
+        // 菜单开着多久就被记成多慢（历史上那条 `450001ms` 是用户开着菜单 7.5 分钟，
+        // 不是卡顿）。所以 `WM_RBUTTONUP` 分支在弹菜单前显式 `finish()`，
+        // 见下面的 `sp.take()`。
+        let mut sp = is_mouse_message(msg).then(|| crate::platform::perf::Span::new("msg.mouse"));
 
         let layout = self.state.layout.clone();
         match msg {
@@ -769,6 +859,13 @@ impl App {
                 Some(LRESULT(0))
             }
             wam::WM_RBUTTONUP => {
+                // v1.4.4（G2-A1）：先把 span 结算掉再进菜单的模态循环——
+                // 否则「用户开着菜单看了 7.5 分钟」会被记成 `msg.mouse 耗时=450001ms`，
+                // 让之后每一次看日志的人（包括我自己）都误判成卡顿。
+                // 这里量到的是「弹菜单之前那点活儿」，菜单期间的耗时不再计入。
+                if let Some(sp) = sp.take() {
+                    sp.finish();
+                }
                 self.show_menu(lparam);
                 Some(LRESULT(0))
             }
@@ -1058,9 +1155,10 @@ impl App {
                 );
                 // 只有主题**真的变了**才重绘。
                 //
-                // 1s 心跳会周期性重新采样（见 `on_timer`），背景静止时结果完全一样；
-                // 无脑重绘等于每秒白跑一帧 D2D + WIC 回读 + UpdateLayeredWindow，
-                // 空闲 CPU 会从 ~0 涨到 0.5%（PRD P0-14 的硬指标就是 0.5%）。
+                // 静止态心跳会周期性重新采样（`limits::BACKDROP_IDLE_MS` = 3s，
+                // 见 `on_timer`），背景静止时结果完全一样；无脑重绘等于每 3 秒白跑
+                // 一帧 D2D + WIC 回读 + UpdateLayeredWindow，空闲 CPU 会从 ~0 涨到
+                // 0.5%（PRD P0-14 的硬指标就是 0.5%）。
                 let changed = !theme.same_paint(&self.state.theme);
                 self.state.theme = theme;
                 if changed { vec![Effect::Redraw] } else { Vec::new() }
@@ -1239,7 +1337,7 @@ impl App {
                     self.animate_lyric_width();
                 }
                 // 外观（背景模式/透明度）变了 → 立即重采样拿新主题 + 重绘，
-                // 不能等 1s 心跳（v1.1.12：idle_mode/hover_alpha/idle_alpha 同样走这里）
+                // 不能等兜底心跳（3s；v1.1.12：idle_mode/hover_alpha/idle_alpha 同样走这里）
                 let appearance_changed = path.starts_with("appearance.");
                 let mut effects = vec![
                     Effect::Relayout,
@@ -1920,6 +2018,15 @@ impl App {
             pw,
             ph,
         );
+        // v1.4.4 补丁：记住「小组件在哪块屏」——心跳要不要因前台全屏而跳过，靠它判断。
+        // `dpi::monitor_rect` 是 `MonitorFromWindow` + `GetMonitorInfoW`，纯本地查询，
+        // 而且这里本来就在重排（几何 / DPI / 显示器变化驱动），不是新增热路径。
+        //
+        // **必须放在 `apply_geometry` 之后**：窗口搬到另一块屏后（任务栏换屏 / 多显示器
+        // 重排），`MonitorFromWindow` 读的是窗口**当前**位置，先取会拿到旧屏。
+        // 注意：`relayout_with` 在开头就按 `self.geometry` 提前 return 的路径不会刷新它，
+        // 那种情况下 `widget_monitor` 保持旧值/全 0 —— 全 0 时 `same_monitor` 判 false，
+        // 也就是「继续采样」，安全方向。
         // v1.2.0 诊断：窗口矩形每次变化都留痕（old / new / reason）。
         // 「截图时左移」只能靠这条日志定位是哪条路径在遮罩期间改了 rect。
         self.log_rect_change(reason);
@@ -1928,6 +2035,12 @@ impl App {
                 crate::log_warn!("应用窗口几何失败：{e}");
             }
         }
+        self.widget_monitor = self
+            .widget
+            .as_ref()
+            .and_then(|h| crate::platform::dpi::monitor_rect(h.hwnd()))
+            .map(|m| m.monitor)
+            .unwrap_or_default();
 
         crate::log_debug!(
             "布局：{}×{} form={:?} 文本宽={:.0}/{:.0} target=({},{} {}×{})",
@@ -2128,6 +2241,9 @@ impl App {
     }
 
     /// 请求背景采样（亮度 → 文字对比度主题）。
+    ///
+    /// **所有采样入口都走这里**（悬停进入 / 换壁纸 / 几何变化 / 退出截图态 / 配置变更），
+    /// 所以「上次采样时刻」只需在这里刷新一处（v1.4.4 / G2-B1 的心跳节流依赖它）。
     fn request_backdrop(&mut self) {
         // v1.2.0（G5 问题 2）：截图态**不抓屏**。截图工具的置顶遮罩会把整屏压暗 /
         // 打上十字线，抓到的是被污染的像素 → 亮度突变 → 文字色可能翻一下。
@@ -2164,6 +2280,8 @@ impl App {
             ],
         };
         sampler.request(req);
+        // 真的投递了才刷新（上面三条 return 都没发请求，心跳下次还会再试）
+        self.last_backdrop = Instant::now();
     }
 
     /// 记一条「窗口矩形变化」诊断日志（v1.2.0 / G5 问题 2）。
@@ -2516,6 +2634,18 @@ fn probe_geometry(config: &Config) -> Option<TaskbarGeometry> {
 ///
 /// 只挑真正由鼠标输入驱动的消息：定时器 / 广播 / 唤醒消息的耗时另有 `tick.*`
 /// 与 `paint.frame` 覆盖，混进来会让「鼠标卡」这条线索失真。
+///
+/// ## ⚠️ 别被历史记录误导（v1.4.4 / G2-A1）
+///
+/// v1.4.1~v1.4.3 的日志里 `msg.mouse` 有三条慢记录，**全是假阳性**：
+/// `843ms` / `882ms` 与同一毫秒的 `[app] 收到 Quit` / `[app] 右键菜单：Quit` 重合，
+/// 而 `450001ms` 那条是**用户把右键菜单开着放了 7.5 分钟**——
+/// `WM_RBUTTONUP` 会同步进 `TrackPopupMenuEx` 的**模态消息循环**，
+/// 菜单开着的每一毫秒都被算进了这个 span。
+///
+/// 这不是卡顿。v1.4.4 起 `WM_RBUTTONUP` 分支在弹菜单**之前**就显式
+/// `Span::finish()`，菜单模态时间不再计入；看到 `msg.mouse` 慢记录时请先确认
+/// 日志里没有菜单相关行，再怀疑真的卡。
 fn is_mouse_message(msg: u32) -> bool {
     use windows::Win32::UI::WindowsAndMessaging as wam;
     matches!(
@@ -2529,6 +2659,46 @@ fn is_mouse_message(msg: u32) -> bool {
             | widget_wnd::WM_MOUSELEAVE
             | crate::platform::wake::WM_BARLINE_WHEEL
     )
+}
+
+/// 静止态心跳是否该补一次背景采样（v1.4.4 / G2-B1 + B2）——**纯函数**，可单测。
+///
+/// * `elapsed_ms`：距上次真的投递采样请求过了多久；
+/// * `skip`：这次心跳是否该**整段跳过**（当前唯一的来源是「前台全屏且与小组件同屏」，
+///   见 [`same_monitor`]）。
+///
+/// 只有「静止态心跳」用它；用户能感知的采样路径（悬停进入 / 换壁纸 / 几何变化 /
+/// 退出截图态）直接调 `request_backdrop()`，**不经过这个判定**。
+fn idle_backdrop_due(elapsed_ms: u128, skip: bool) -> bool {
+    if skip {
+        return false;
+    }
+    elapsed_ms >= crate::config::defaults::limits::BACKDROP_IDLE_MS as u128
+}
+
+/// 两个显示器矩形是不是**同一块屏**（v1.4.4 补丁）——**纯函数**，可单测。
+///
+/// 判据：四个字段完全相等。**任一方全 0 一律判 `false`**——
+/// 拿不到数据时必须走「继续采样」这个安全方向：宁可多抓一次屏，
+/// 也不要因为一次查询失败就让字色自适应永久停摆。
+fn same_monitor(a: RECT, b: RECT) -> bool {
+    if a == RECT::default() || b == RECT::default() {
+        return false;
+    }
+    a == b
+}
+
+/// 这次心跳要不要**因前台全屏而跳过**（v1.4.4 补丁）——**纯函数**，可单测。
+///
+/// 两个条件必须同时成立：
+/// 1. 前台窗口是全屏应用（读桌面既贵又没意义）；
+/// 2. **那块全屏的屏就是小组件所在的屏**。
+///
+/// 第 2 条是本轮补的缺口：副屏全屏打游戏 / 看视频时，主屏小组件的字色自适应
+/// 不该跟着停摆——那条心跳存在的唯一理由就是「用户把窗口拖到小组件后面」，
+/// 与别的显示器上的全屏毫无关系。
+fn should_skip_idle_backdrop(fullscreen: bool, fg_monitor: RECT, widget_monitor: RECT) -> bool {
+    fullscreen && same_monitor(fg_monitor, widget_monitor)
 }
 
 /// 从 `LPARAM` 里取客户区坐标（`GET_X_LPARAM` / `GET_Y_LPARAM` 的等价实现）。
@@ -2810,5 +2980,158 @@ mod marquee_tests {
         let a = marquee_frame(input(true, false, false, true, Some(400.0), 7_777, 10_000));
         let b = marquee_frame(input(true, false, false, true, Some(400.0), 7_777, 10_000));
         assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------ v1.4.4：心跳降载（B1 / B2）
+
+    /// 心跳间隔常量就是 3s（验收口径，改它等于改「降载 2/3」这个承诺）。
+    #[test]
+    fn idle_backdrop_interval_is_three_seconds() {
+        assert_eq!(crate::config::defaults::limits::BACKDROP_IDLE_MS, 3_000);
+        // 采样线程自己的节流更短，所以 3s 心跳不会被它吃掉
+        assert!(crate::config::defaults::limits::SAMPLE_THROTTLE_MS < 3_000);
+    }
+
+    /// 静止态：不到 3s 不补采，到点才补（边界含等号）。
+    #[test]
+    fn idle_backdrop_due_only_after_three_seconds() {
+        let ms = crate::config::defaults::limits::BACKDROP_IDLE_MS as u128;
+        assert!(!idle_backdrop_due(0, false));
+        assert!(!idle_backdrop_due(999, false), "1s 心跳时代的那次补采必须被吃掉");
+        assert!(!idle_backdrop_due(ms - 1, false));
+        assert!(idle_backdrop_due(ms, false), "恰好 3s 就要补（≥ 不是 >）");
+        assert!(idle_backdrop_due(10_000, false));
+    }
+
+    /// 前台全屏：无论过多久都不补（读桌面既贵又没意义）。
+    #[test]
+    fn idle_backdrop_never_due_when_foreground_is_fullscreen() {
+        assert!(!idle_backdrop_due(0, true));
+        assert!(!idle_backdrop_due(3_000, true));
+        assert!(!idle_backdrop_due(600_000, true), "全屏 10 分钟也不许补采");
+    }
+
+    /// 全屏标记默认必须是 `false`：拿不到前台信息时不能永久停掉采样。
+    #[test]
+    fn fullscreen_flag_defaults_to_false() {
+        assert!(!AppState::default().foreground_fullscreen);
+        assert_eq!(
+            AppState::default().foreground_monitor,
+            RECT::default(),
+            "默认必须是全 0（`same_monitor` 会因此判 false → 继续采样）"
+        );
+    }
+
+    // ------------------------------------------- v1.4.4 补丁：多显示器误伤（B2）
+
+    /// 一台 1920×1080 主显示器 / 一块偏移到右边的副屏。
+    fn mon_primary() -> RECT {
+        RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }
+    }
+
+    fn mon_secondary() -> RECT {
+        RECT {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1080,
+        }
+    }
+
+    /// 完全相同才算同一块屏；差 1px 就不算（矩形是整数物理像素，不该有"近似同屏"）。
+    #[test]
+    fn same_monitor_requires_exact_match() {
+        assert!(same_monitor(mon_primary(), mon_primary()));
+        assert!(same_monitor(mon_secondary(), mon_secondary()), "副屏偏移坐标同样成立");
+        for other in [
+            RECT {
+                left: 1,
+                ..mon_primary()
+            },
+            RECT {
+                left: -1,
+                ..mon_primary()
+            },
+            RECT {
+                right: 1921,
+                ..mon_primary()
+            },
+            RECT {
+                top: 1,
+                ..mon_primary()
+            },
+            RECT {
+                bottom: 1079,
+                ..mon_primary()
+            },
+        ] {
+            assert!(!same_monitor(mon_primary(), other), "差 1px 不算同屏：{other:?}");
+        }
+        assert!(!same_monitor(mon_primary(), mon_secondary()), "左右两块屏不是同屏");
+    }
+
+    /// 任一方全 0 → 一律判 false（安全方向：继续采样）。
+    #[test]
+    fn same_monitor_is_false_when_either_side_is_unknown() {
+        let zero = RECT::default();
+        assert!(!same_monitor(zero, zero), "两个都拿不到 ≠ 同一块屏");
+        assert!(!same_monitor(zero, mon_primary()));
+        assert!(!same_monitor(mon_primary(), zero));
+    }
+
+    /// **本轮核心断言**：前台全屏但在**别的**显示器上 → 小组件这块屏必须继续心跳采样。
+    #[test]
+    fn fullscreen_on_another_monitor_must_not_skip_sampling() {
+        let ms = crate::config::defaults::limits::BACKDROP_IDLE_MS as u128;
+        // 副屏全屏、小组件在主屏 → 不在同一块屏 → 不跳过 → 到点照常补采
+        let skip = should_skip_idle_backdrop(true, mon_secondary(), mon_primary());
+        assert!(!skip, "副屏全屏不该让主屏小组件跳过采样");
+        assert!(
+            idle_backdrop_due(ms, skip),
+            "到 3s 必须补采（这是 v1.4.4 补丁的修复点）"
+        );
+
+        // 对照：同一块屏全屏 → 跳过 → 永不补采
+        let skip_same = should_skip_idle_backdrop(true, mon_primary(), mon_primary());
+        assert!(skip_same);
+        assert!(!idle_backdrop_due(ms, skip_same));
+        assert!(!idle_backdrop_due(600_000, skip_same));
+    }
+
+    /// 组合矩阵：`foreground_fullscreen × same_monitor` 四格都要对。
+    #[test]
+    fn skip_matrix_covers_all_four_cases() {
+        let ms = crate::config::defaults::limits::BACKDROP_IDLE_MS as u128;
+        // (fullscreen, 前台屏, 小组件屏) → 到点时是否仍该补采
+        let cases = [
+            (false, mon_primary(), mon_primary(), true, "非全屏：同屏也照常补"),
+            (false, mon_secondary(), mon_primary(), true, "非全屏：不同屏照常补"),
+            (true, mon_primary(), mon_primary(), false, "同屏全屏：跳过"),
+            (true, mon_secondary(), mon_primary(), true, "异屏全屏：照常补"),
+        ];
+        for (fullscreen, fg, widget, want_due, why) in cases {
+            let skip = should_skip_idle_backdrop(fullscreen, fg, widget);
+            assert!(
+                idle_backdrop_due(ms, skip) == want_due,
+                "{why}（skip={skip}）"
+            );
+        }
+    }
+
+    /// `widget_monitor` 还没填（全 0，例如启动早期 / 重排失败）→ 必须继续采样。
+    #[test]
+    fn unknown_widget_monitor_keeps_sampling() {
+        let ms = crate::config::defaults::limits::BACKDROP_IDLE_MS as u128;
+        let skip = should_skip_idle_backdrop(true, mon_primary(), RECT::default());
+        assert!(!skip);
+        assert!(
+            idle_backdrop_due(ms, skip),
+            "拿不到小组件所在屏时必须继续采样（安全方向）"
+        );
     }
 }

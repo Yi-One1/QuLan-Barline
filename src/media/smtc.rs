@@ -396,18 +396,28 @@ impl PollStats {
     }
 
     /// 窗口到点记一条并清零。返回是否记了（单测断言用）。
+    ///
+    /// v1.4.4（G2-A4）：同一行**追加**采样线程的抓屏统计（`capture=N 慢M 最慢=Xms`）。
+    /// 采样线程用无锁原子累计，这里「取走即清零」，与其他字段同语义（都是本窗口的数）。
+    ///
+    /// 段名仍写 `smtc 轮询统计`：它是 `progress.md` 里登记的日志检索关键字，
+    /// 改名会让所有排查手册失效——宁可名字略窄，也不要让下一次接手的人 grep 不到。
     fn flush_if_due(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.window_start) < Duration::from_secs(STATS_WINDOW_SECS)
         {
             return false;
         }
+        let cap = perf::take_capture_window();
         crate::log_info!(
-            "[perf] smtc 轮询统计 {}s：playback={} props={} timeline={} 最慢={}ms",
+            "[perf] smtc 轮询统计 {}s：playback={} props={} timeline={} 最慢={}ms capture={} 慢={} capture最慢={}ms",
             STATS_WINDOW_SECS,
             self.playback,
             self.props,
             self.timeline,
-            self.max_ms
+            self.max_ms,
+            cap.count,
+            cap.slow,
+            cap.max_ms
         );
         *self = Self::new(now);
         true

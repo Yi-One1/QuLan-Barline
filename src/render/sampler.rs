@@ -261,9 +261,15 @@ fn sample(req: &SampleRequest, stabilizer: &mut LumaStabilizer) -> Option<Theme>
 
     // G2 诊断：抓屏单段计时。`GetDC(NULL)` + CreateDIBSection + **BitBlt** 全在里面，
     // BitBlt 读的是已合成桌面，会和 DWM / GPU 抢锁——这是「音乐卡一下」的头号嫌疑段。
+    //
+    // v1.4.4（A4）：这次抓屏的耗时同时喂给 60s 统计行的 `capture=N 慢M 最慢=Xms`
+    // （无锁原子计数，采样线程**不加锁、不阻塞**）；阈值降到 16ms 后单条慢记录
+    // 仍由 `Span` 自己写，但同段 60s 内最多 10 条（限流在 `perf` 里）。
     let pixels = {
-        let _sp = crate::platform::perf::Span::new("sampler.capture");
-        capture(req.rect.left, req.rect.top, w, h)?
+        let sp = crate::platform::perf::Span::new("sampler.capture");
+        let got = capture(req.rect.left, req.rect.top, w, h);
+        crate::platform::perf::record_capture(sp.elapsed_ms());
+        got?
     };
     // G2 诊断：像素统计单段计时（纯 CPU，正常 < 1ms；慢就说明这块真出问题了）
     let _analyze_sp = crate::platform::perf::Span::new("sampler.analyze");
