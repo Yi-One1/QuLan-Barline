@@ -1,7 +1,7 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
 > 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02 22:20,G5(渲染稳定性)已验收 → v1.2.0;下一组 G2 窗口与菜单。**
+> 最后更新:**2026-11-02 22:28,G2(窗口与菜单)已验收 → v1.2.1;下一组 G3 删界面缩放。**
 
 ---
 
@@ -14,7 +14,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
 | 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(main,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
-| 当前版本 | **v1.2.0**;交付包在 `deliverables/`,**只增不删** |
+| 当前版本 | **v1.2.1**;交付包在 `deliverables/`,**只增不删** |
 | 版本号策略(用户定 2026-11-02) | 改可见行为/新增能力 → 升第二位(1.2.0);纯修正/文案/内部重构 → 升第三位 |
 | 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
 | 团队 | 交付总监(主理人)+ 寇豆码(software-engineer);团队 `software-barline-12`(第三轮 12 项),后续每组按需 spawn |
@@ -26,6 +26,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 ## 1. 提交序列(git log,oneline)
 
 ```
+b8e6cbc feat: v1.2.1 — 设置窗口最小化还原(SW_RESTORE)+右键菜单背景项扩为4项(批次G2 问题4/6)
 ca6e151 fix: v1.2.0 — 修自适应过慢(删 EMA 改确定性三层+快速通道+反向冷却闸),换壁纸 1s 翻
 4f677f8 feat: v1.2.0 — 渲染稳定性三项(批次G5 问题1/3/2):过渡色偏/黑白闪烁+描边删除/截图冻结
 eade623 feat: v1.1.22 — 设置项文案与次序修正+歌词关闭整组置灰(批次G1 问题5/9/11/12);顺修关于对话框版本号写死 v0.0.1
@@ -135,6 +136,12 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - **关键教训**:`AppState::geometry_epoch` 每次 `geometry::probe()` 都 +1(1s 心跳每秒 probe)→ 它实际是"探测序号"不是"几何代次",任何拿它当稳定标识的逻辑都会被每秒重置。稳定器改用采样矩形指纹 `area_epoch`。
 - 测试 282 项(274→282),clippy 0 警告,release 1006 KB。
 
+**G2:问题 4/6 窗口与菜单(✅ 已验收 2026-11-02,v1.2.1 b8e6cbc)**
+- 问题4(最小化后「设置」唤不起):`SettingsService::open` 的「已存在→只前置」分支原本只调 `SW_SHOW`,而 **`SW_SHOW` 对最小化窗口是 no-op** → 窗口躺在任务栏里纹丝不动。改为 `IsIconic` 判定后走 `SW_RESTORE`;判定抽成纯函数 `reveal_action(iconic)`(唯一判定点,2 条单测),小组件菜单与托盘菜单两个入口同时修好。
+  连带修复:最小化时 `WM_SIZE` 派发 0×0 → `resize()` 原样把 `set_bounds(0,0,0,0)` 灌给 WebView2;加 `w<=0||h<=0` 守卫。
+- 问题6(右键菜单背景项):从 2 项扩为 **4 项**——`常规背景：透明/半透明`、`悬停背景：透明/半透明`,两组各自独立勾选(常规看 `idle_mode`、悬停看 `background_mode`),组内顺序统一「透明→半透明」。`MenuCommand` 重构为 4 个背景变体 + `bg_target()` 纯函数映射(有单测);`app.rs` 两段重复代码收敛为 `set_background(slot, mode)`(内部 `apply_bg_config` 就地同步 → 当帧重绘,遵守决策 21)。i18n 新增 4 键、删旧 2 键(已 grep 确认无其它引用)。托盘菜单故意不跟着扩。
+- 测试 286 项,clippy 0 警告,release 1006 KB。
+
 ### 交付包现状(deliverables/,只增不删)
 `曲栏_Barline_v1.0.0.exe`、`.zip`、`v1.1.0.exe` ~ `v1.1.14.exe` 全序列。
 > 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout main」方式(已验证可行)。
@@ -205,8 +212,8 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 |---|---|---|---|
 | G1 | 5 / 9 / 11 / 12 | 文案与控件次序 | ✅ 已验收 v1.1.22 |
 | G5 | 1 / 3 / 2 | 渲染稳定性(过渡色偏、黑白闪烁+描边、截图干扰) | ✅ 已验收 v1.2.0 |
-| G2 | 4 / 6 | 设置窗口最小化唤不起 + 右键菜单背景四项 | ⬜ 进行中(下一组) |
-| G3 | 8 | 删除「界面缩放」 | ⬜ |
+| G2 | 4 / 6 | 设置窗口最小化唤不起 + 右键菜单背景四项 | ✅ 已验收 v1.2.1 |
+| G3 | 8 | 删除「界面缩放」 | ⬜ 进行中(下一组) |
 | G4 | 10 | 快捷键体系(默认值/更改/逐行恢复) | ⬜ |
 | G6 | 7 | 歌词源扩充(模糊检索+网易云) | ⬜ |
 
