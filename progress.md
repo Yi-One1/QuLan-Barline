@@ -1,7 +1,7 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
 > 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02 22:33,G3(删界面缩放)已验收 → v1.2.2;下一组 G4 快捷键体系。**
+> 最后更新:**2026-11-02 22:48,G4(快捷键体系)已验收 → v1.2.3;下一组 G6 歌词源(最后一组)。**
 
 ---
 
@@ -14,7 +14,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
 | 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(main,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
-| 当前版本 | **v1.2.2**;交付包在 `deliverables/`,**只增不删** |
+| 当前版本 | **v1.2.3**;交付包在 `deliverables/`,**只增不删** |
 | 版本号策略(用户定 2026-11-02) | 改可见行为/新增能力 → 升第二位(1.2.0);纯修正/文案/内部重构 → 升第三位 |
 | 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
 | 团队 | 交付总监(主理人)+ 寇豆码(software-engineer);团队 `software-barline-12`(第三轮 12 项),后续每组按需 spawn |
@@ -26,6 +26,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 ## 1. 提交序列(git log,oneline)
 
 ```
+5f35598 feat: v1.2.3 — 快捷键体系(批次G4 问题10):默认改 Ctrl+Alt+*, 录制改「更改」, 逐行 ↺ 恢复默认
 5eb82a5 refactor: v1.2.2 — 删除死配置「界面缩放」(批次G3 问题8),旧配置兼容有测试兜底
 b8e6cbc feat: v1.2.1 — 设置窗口最小化还原(SW_RESTORE)+右键菜单背景项扩为4项(批次G2 问题4/6)
 ca6e151 fix: v1.2.0 — 修自适应过慢(删 EMA 改确定性三层+快速通道+反向冷却闸),换壁纸 1s 翻
@@ -150,6 +151,15 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - 文档:PRD 设置项表格删该行;ARCHITECTURE 字段定义与桥接示例改用 `hover_alpha`。`docs/TASKS.md:862` 的 m4 验收项属历史记录,已作废但不回改。
 - 测试 288 项,clippy 0 警告,release 1003 KB。
 
+**G4:问题 10 快捷键体系(✅ 已验收 2026-11-02,v1.2.3 5f35598)**
+- **默认值改回 `Ctrl+Alt+*`**:`HOTKEYS_VERSION` 1→2,6 组为 `Ctrl+Alt+P/←/→/L/M/H`。vk 字面量收敛到 `bindings_with(modifiers)` **唯一出处**,`Default`/`v0_defaults`/`v1_defaults`/`default_binding` 全部由它构造,三条测试钉住同源(vk 只写一处)。
+- **迁移矩阵**:全等 `v1_defaults()`(`Ctrl+Alt+Shift+*`)→迁到新默认(保留 `enabled`/`conflict_notified`);全等 `v0_defaults()`→只提版本号;用户自定义→原样保留;`version>=2`→返回 false。落盘由 `Config::load` 里既有 `if cfg.hotkeys.migrate() { save }` 承担(幂等安全)。
+- **逐行「恢复默认」**:新增 `HotkeyConfig::default_binding(action)` + `event::HotkeyAction::{as_str,parse,ALL}`(动作名表上提);bridge 新增白名单 `hotkeys.reset.<action>`(不认识的动作返回 false、不 panic),与整组重置共用 `set_binding` 唯一赋值点。
+- **前端**:「录制」→「更改」(中英含 `hotkeys.sub`);每行 `[kbd][更改][↺]`,`↺` 带 `title`/`aria-label`=「恢复默认」,点击先 `stopRecord()` 再 reset。
+- **可诊断性**:`hotkey::describe()` 把绑定渲染成 `Ctrl+Alt+P`/`Ctrl+Alt+←`,注册日志带**哪一组 + 组合 + 错误码**(1409 = 被占用)。
+- 测试 301 项,clippy 0 警告,release 1007 KB。
+- **验收插曲(勿误判为 bug)**:用户报「歌词开关/静音/显隐小组件三组热键无反应」,日志实证 `热键触发：ToggleLyrics`、`系统静音 → 开/关`、`静音切换 → true/false` 全部正常 → 实际是用户**没有打开「启用全局快捷键」这个开关**,非缺陷。排查中另一发现见 G6 条目(lrclib HTTP 400)。
+
 ### 交付包现状(deliverables/,只增不删)
 `曲栏_Barline_v1.0.0.exe`、`.zip`、`v1.1.0.exe` ~ `v1.1.14.exe` 全序列。
 > 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout main」方式(已验证可行)。
@@ -222,8 +232,8 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 | G5 | 1 / 3 / 2 | 渲染稳定性(过渡色偏、黑白闪烁+描边、截图干扰) | ✅ 已验收 v1.2.0 |
 | G2 | 4 / 6 | 设置窗口最小化唤不起 + 右键菜单背景四项 | ✅ 已验收 v1.2.1 |
 | G3 | 8 | 删除「界面缩放」 | ✅ 已验收 v1.2.2 |
-| G4 | 10 | 快捷键体系(默认值/更改/逐行恢复) | ⬜ 进行中(下一组) |
-| G6 | 7 | 歌词源扩充(模糊检索+网易云) | ⬜ |
+| G4 | 10 | 快捷键体系(默认值/更改/逐行恢复) | ✅ 已验收 v1.2.3 |
+| G6 | 7 | 歌词源扩充(模糊检索+网易云) | ⬜ 进行中(最后一组) |
 
 > 全部完成后:严过关独立 worktree 全量回归 + 用户终验。
 
