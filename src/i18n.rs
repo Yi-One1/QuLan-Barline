@@ -80,7 +80,8 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
             "Some hotkeys are taken by other apps. Rebind them in Settings."
         }
         (Lang::En, "tray.tip") => "Barline",
-        (Lang::Zh, "menu.settings") => "显示设置",
+        // v1.1.22：托盘菜单与小组件右键菜单共用这一条，中文去掉「显示」二字
+        (Lang::Zh, "menu.settings") => "设置",
         (Lang::En, "menu.settings") => "Settings",
         (Lang::Zh, "menu.toggle_widget") => "显示/隐藏小组件",
         (Lang::En, "menu.toggle_widget") => "Show/Hide widget",
@@ -117,18 +118,23 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
 
         (Lang::Zh, "about.title") => "关于 曲栏 Barline",
         (Lang::En, "about.title") => "About Barline",
-        (Lang::Zh, "about.text") => {
-            "曲栏 Barline v0.0.1\n\
-             Windows 11 任务栏媒体播控小组件\n\n\
-             单文件便携版 · 无安装 · 无管理员权限\n\
-             歌词数据来源：lrclib.net"
-        }
-        (Lang::En, "about.text") => {
-            "Barline v0.0.1\n\
-             Media control widget for the Windows 11 taskbar\n\n\
-             Portable single exe · no install · no admin rights\n\
-             Lyrics provided by lrclib.net"
-        }
+        // 版本号必须从 `Cargo.toml` 编译期取（v1.1.22 修：原来写死 v0.0.1，
+        // 与设置页用 `env!("CARGO_PKG_VERSION")` 显示的版本对不上）。
+        // `concat!` 产出 `&'static str`，与本函数返回类型一致；不要改成运行时 `format!`。
+        (Lang::Zh, "about.text") => concat!(
+            "曲栏 Barline v",
+            env!("CARGO_PKG_VERSION"),
+            "\nWindows 11 任务栏媒体播控小组件\n\n",
+            "单文件便携版 · 无安装 · 无管理员权限\n",
+            "歌词数据来源：lrclib.net、网易云音乐"
+        ),
+        (Lang::En, "about.text") => concat!(
+            "Barline v",
+            env!("CARGO_PKG_VERSION"),
+            "\nMedia control widget for the Windows 11 taskbar\n\n",
+            "Portable single exe · no install · no admin rights\n",
+            "Lyrics provided by lrclib.net and NetEase Cloud Music"
+        ),
 
         // ---------------- 兜底 ----------------
         (_, _) => key,
@@ -148,5 +154,62 @@ mod tests {
     #[test]
     fn unknown_key_falls_back_to_key() {
         assert_eq!(t(Lang::Zh, "no.such.key"), "no.such.key");
+    }
+
+    /// 契约回归（v1.1.22）：托盘菜单与右键菜单共用的「设置」项，中文只留两字。
+    /// 改回「显示设置」会让两个菜单一起变形，必须被这条测试拦住。
+    #[test]
+    fn menu_settings_label_is_short() {
+        assert_eq!(t(Lang::Zh, "menu.settings"), "设置");
+        assert_eq!(t(Lang::En, "menu.settings"), "Settings");
+    }
+
+    /// 契约回归（v1.1.22）：「关于」对话框的版本号必须来自 `Cargo.toml`。
+    ///
+    /// `show_about()` 直接把 `about.text` 塞进 `MessageBoxW`，而设置页用的是
+    /// `env!("CARGO_PKG_VERSION")`——词条里一旦写死版本号，两处就会打架
+    /// （历史上就写死过 `v0.0.1`）。这条测试同时钉住「用的是编译期版本」和
+    /// 「没有残留写死的字面量」两个方向。
+    #[test]
+    fn about_text_uses_compile_time_version() {
+        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        let zh = t(Lang::Zh, "about.text");
+        let en = t(Lang::En, "about.text");
+
+        assert!(
+            zh.contains(VERSION),
+            "中文关于文案没带编译期版本号 {VERSION}：{zh}"
+        );
+        assert!(
+            en.contains(VERSION),
+            "英文关于文案没带编译期版本号 {VERSION}：{en}"
+        );
+        assert!(!zh.contains("v0.0.1"), "中文关于文案仍写死旧版本号：{zh}");
+        assert!(!en.contains("v0.0.1"), "英文关于文案仍写死旧版本号：{en}");
+        // 顺手钉住前缀，避免以后有人把版本号挪到句尾导致「曲栏 Barline」后面空一截
+        assert!(
+            zh.starts_with(&format!("曲栏 Barline v{VERSION}")),
+            "中文关于文案首行应为「曲栏 Barline v{VERSION}」：{zh}"
+        );
+        assert!(
+            en.starts_with(&format!("Barline v{VERSION}")),
+            "英文关于文案首行应为「Barline v{VERSION}」：{en}"
+        );
+    }
+
+    /// 契约回归（v1.1.22 / 为 G6 铺路）：歌词来源文案必须同时提到 lrclib.net 与网易云，
+    /// 否则 G6 接入网易云兜底后还得再回来改一次文案。
+    #[test]
+    fn about_text_credits_both_lyric_sources() {
+        let zh = t(Lang::Zh, "about.text");
+        let en = t(Lang::En, "about.text");
+        assert!(
+            zh.contains("lrclib.net") && zh.contains("网易云音乐"),
+            "中文歌词来源应同时写 lrclib.net 与网易云音乐：{zh}"
+        );
+        assert!(
+            en.contains("lrclib.net") && en.contains("NetEase Cloud Music"),
+            "英文歌词来源应同时写 lrclib.net 与 NetEase Cloud Music：{en}"
+        );
     }
 }

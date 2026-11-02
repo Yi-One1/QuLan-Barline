@@ -102,6 +102,11 @@ h1 { font-size: 24px; line-height: 32px; font-weight: 600; margin: 0 0 4px; }
 .row .desc { font-size: 12px; color: var(--text-2); margin-top: 2px; }
 .row .right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
+/* v1.1.22：「显示歌词」关闭时，依赖歌词的整块降透明度（含标题与描述文字）。
+   交互由 JS 写 disabled 属性拦住，这里只负责视觉；主开关本身不加 dimmed。 */
+.row, .card { transition: opacity .12s ease; }
+.row.dimmed, .card.dimmed { opacity: .45; }
+
 /* ---------------- 控件 ---------------- */
 select, input[type="text"] {
   font-family: var(--font); font-size: 13px; color: var(--text);
@@ -127,6 +132,7 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
 .switch input:checked ~ .track { background: var(--accent); border-color: var(--accent); }
 .switch input:checked ~ .knob { transform: translateX(24px); background: #fff; }
 .switch input:disabled ~ .track { opacity: .5; }
+.switch input:disabled { cursor: default; }
 
 .btn {
   font-family: var(--font); font-size: 13px; padding: 6px 14px;
@@ -213,8 +219,8 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
           <div><div class="label" data-i18n="appearance.bg.hover">悬停背景</div>
             <div class="desc" data-i18n="appearance.bg.hover.desc">鼠标悬停时的底色；选「半透明」时用下方滑条调节深浅。</div></div>
           <div class="right"><select id="bg-mode">
-            <option value="translucent" data-i18n="appearance.bg.translucent">半透明</option>
             <option value="transparent" data-i18n="appearance.bg.transparent">透明</option>
+            <option value="translucent" data-i18n="appearance.bg.translucent">半透明</option>
           </select></div>
         </div>
         <div class="row">
@@ -245,26 +251,26 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
       <div class="card">
         <div class="row">
           <div><div class="label" data-i18n="lyrics.enabled">显示歌词</div>
-            <div class="desc" data-i18n="lyrics.enabled.desc">关闭后小组件收合到任务栏高度。</div></div>
+            <div class="desc" data-i18n="lyrics.enabled.desc">关闭后小组件不再显示歌词行，只保留歌名、歌手与播放控制。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-enabled"><span class="track"></span><span class="knob"></span></label></div>
         </div>
-        <div class="row">
+        <div class="row" data-dep="lyrics">
           <div><div class="label" data-i18n="lyrics.sweep">逐字扫光</div>
             <div class="desc" data-i18n="lyrics.sweep.desc">卡拉OK 效果；关闭后整行同色。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-sweep"><span class="track"></span><span class="knob"></span></label></div>
         </div>
-        <div class="row">
+        <div class="row" data-dep="lyrics">
           <div><div class="label" data-i18n="lyrics.scroll">长歌词滚动</div>
             <div class="desc" data-i18n="lyrics.scroll.desc">歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-scroll"><span class="track"></span><span class="knob"></span></label></div>
         </div>
-        <div class="row">
+        <div class="row" data-dep="lyrics">
           <div><div class="label" data-i18n="lyrics.online">在线歌词</div>
             <div class="desc" data-i18n="lyrics.online.desc">无本地文件时向 lrclib.net 查询。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-online"><span class="track"></span><span class="knob"></span></label></div>
         </div>
       </div>
-      <div class="card">
+      <div class="card" id="lyrics-dirs-card" data-dep="lyrics">
         <h2 data-i18n="lyrics.dirs">本地歌词目录</h2>
         <div class="list" id="dirs"></div>
         <div class="row" style="margin-top:8px">
@@ -331,10 +337,10 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
     <!-- ==================== 通用 ==================== -->
     <section id="group-general">
       <h1 data-i18n="nav.general">通用</h1>
-      <p class="sub" data-i18n="general.sub">开机自启、语言与显示开关。</p>
+      <p class="sub" data-i18n="general.sub">开机自启动、语言与显示开关。</p>
       <div class="card">
         <div class="row">
-          <div><div class="label" data-i18n="general.autostart">开机自启</div>
+          <div><div class="label" data-i18n="general.autostart">开机自启动</div>
             <div class="desc" data-i18n="general.autostart.desc">写入当前用户注册表，不需要管理员权限。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="autostart"><span class="track"></span><span class="knob"></span></label></div>
         </div>
@@ -397,7 +403,7 @@ const I18N = {
     "appearance.monitor": "显示显示器", "appearance.monitor.desc": "多显示器时小组件贴在哪块屏的任务栏上。",
     "appearance.monitor.primary": "主显示器",
     "lyrics.sub": "本地 .lrc 优先，其次 lrclib.net 在线歌词。",
-    "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件收合到任务栏高度。",
+    "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件不再显示歌词行，只保留歌名、歌手与播放控制。",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
     "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
     "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。",
@@ -417,8 +423,8 @@ const I18N = {
     "hotkeys.conflict": "被其它程序占用",
     "hk.play_pause": "播放 / 暂停", "hk.prev": "上一首", "hk.next": "下一首",
     "hk.toggle_lyrics": "歌词开关", "hk.mute": "静音", "hk.toggle_widget": "显示 / 隐藏小组件",
-    "general.sub": "开机自启、语言与显示开关。",
-    "general.autostart": "开机自启", "general.autostart.desc": "写入当前用户注册表，不需要管理员权限。",
+    "general.sub": "开机自启动、语言与显示开关。",
+    "general.autostart": "开机自启动", "general.autostart.desc": "写入当前用户注册表，不需要管理员权限。",
     "general.language": "界面语言", "general.lang.system": "跟随系统",
     "general.widget": "显示小组件", "general.widget.desc": "与托盘菜单里的「显示/隐藏小组件」同步。",
     "about.sub": "曲栏 Barline —— Windows 11 任务栏媒体播控小组件。",
@@ -440,7 +446,7 @@ const I18N = {
     "appearance.monitor": "Monitor", "appearance.monitor.desc": "Which taskbar the widget attaches to.",
     "appearance.monitor.primary": "Primary",
     "lyrics.sub": "Local .lrc first, then lrclib.net.",
-    "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off collapses the widget to the taskbar height.",
+    "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off hides the lyric line; title, artist and playback controls stay.",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
     "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
     "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put). Click the path to open it.",
@@ -563,6 +569,7 @@ function render() {
   document.getElementById("lyrics-scroll").checked = c.lyrics.scroll;
   document.getElementById("lyrics-online").checked = c.lyrics.online_enabled;
   renderDirs(c.lyrics.local_dirs);
+  syncLyricsDeps();   // v1.1.22：目录列表刚重建，置灰态要重新贴一遍
 
   // 音量
   document.getElementById("wheel-enabled").checked = c.volume.wheel_enabled;
@@ -622,6 +629,32 @@ function renderDirs(dirs) {
     row.appendChild(change);
     box.appendChild(row);
   });
+}
+
+/* ---------------- 歌词联动置灰（v1.1.22） ----------------
+   「显示歌词」关闭后，逐字扫光 / 长歌词滚动 / 在线歌词 / 本地歌词目录全部失去意义：
+   统一置灰（.dimmed）+ 写 disabled 属性挡住交互。
+   主开关 #lyrics-enabled 自己**不**置灰——否则用户没法再打开。
+   纯视觉函数，可重复调用（幂等），状态推送与用户点击后各调一次。 */
+function syncLyricsDeps() {
+  const master = document.getElementById("lyrics-enabled");
+  if (!master) return;
+  const on = !!master.checked;
+
+  document.querySelectorAll("[data-dep='lyrics']").forEach((el) => {
+    el.classList.toggle("dimmed", !on);
+  });
+
+  ["lyrics-sweep", "lyrics-scroll", "lyrics-online"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !on;
+  });
+
+  const add = document.getElementById("dir-add");
+  if (add) add.disabled = !on;
+
+  // 目录列表是 renderDirs 动态重建的，按钮要单独刷
+  document.querySelectorAll("#dirs .item .btn").forEach((b) => { b.disabled = !on; });
 }
 
 function renderHotkeys(hk) {
@@ -732,6 +765,8 @@ bind("lyrics-enabled", "lyrics.enabled", "bool");
 bind("lyrics-sweep", "lyrics.karaoke_sweep", "bool");
 bind("lyrics-scroll", "lyrics.scroll", "bool");
 bind("lyrics-online", "lyrics.online_enabled", "bool");
+// v1.1.22：主开关一动就立刻刷新置灰态，不等 Rust 回推 state（回推后 render() 还会再刷一次）
+document.getElementById("lyrics-enabled").addEventListener("change", syncLyricsDeps);
 bind("wheel-enabled", "volume.wheel_enabled", "bool");
 bind("volume-scope", "volume.scope", "str");
 bind("volume-step", "volume.step", "num");
