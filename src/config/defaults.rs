@@ -55,8 +55,23 @@ pub mod limits {
     pub const SAMPLE_THROTTLE_MS: u64 = 300;
     /// 任务栏轮询兜底周期
     pub const TASKBAR_POLL_MS: u32 = 500;
-    /// 媒体轮询周期
+    /// 媒体轮询周期 —— **快层**：播放状态（G2 修复版起它只是三层里的一层）
     pub const MEDIA_POLL_MS: u64 = 500;
+    /// 媒体轮询 —— **中层**：时间线（时长 + 位置）。UI 侧靠 `position_at` 本地外推，
+    /// 1s 校一次足够；位置用不上还要每 500ms 问，是 G2 定位到的「把网易云拖卡」主因之一。
+    pub const MEDIA_POLL_MID_MS: u64 = 1_000;
+    /// 媒体轮询 —— **慢层**：标题 / 歌手 / 专辑 / AUMID / 播控标志 + 封面。
+    /// 最重的一组（`TryGetMediaPropertiesAsync` 要跨进程拉元数据），2s 一次。
+    pub const MEDIA_POLL_SLOW_MS: u64 = 2_000;
+    /// 时间线**退避**间隔：连续 [`MEDIA_POLL_ZERO_STREAK`] 次读到 (0,0)（网易云特征）
+    /// 后，时间线轮询拉长到 5s，直到出现非零值或播放状态跃迁再恢复。
+    pub const MEDIA_POLL_TIMELINE_BACKOFF_MS: u64 = 5_000;
+    /// 触发时间线退避的连续 (0,0) 次数
+    pub const MEDIA_POLL_ZERO_STREAK: u8 = 3;
+    /// 「位置回退」判定阈值：比上次读到的位置倒退超过它 → 视为切歌 / 重播，
+    /// 立即补读属性（标题 / 歌手）。取 1.5s 是因为正常播放只会前进，
+    /// 而真实切歌的位置差通常是几十秒量级，1.5s 不会误伤。
+    pub const MEDIA_TIMELINE_REGRESS_MS: i64 = 1_500;
     /// 日志单文件上限
     pub const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 

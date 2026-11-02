@@ -28,9 +28,21 @@ use std::time::Instant;
 /// 阈值再低只会把日志淹掉，反而看不出随机卡顿的形态。
 pub const SLOW_MS: u128 = 50;
 
+/// **跨进程调用**专用的慢阈值（毫秒）。
+///
+/// 依据（G2 实测）：SMTC 的单次调用打到播放器进程后，正常在 1~3ms；
+/// 一旦超过 8ms 就说明对面进程被我们拖住了——而那正是「音乐卡一下」的成因，
+/// 所以这类段必须比 50ms 敏感得多，否则等到 50ms 记下来时已经晚了两轮。
+pub const SMTC_SLOW_MS: u128 = 8;
+
 /// 是否值得记一条（纯函数，单测直接断言）。
 pub fn is_slow(ms: u128) -> bool {
-    ms >= SLOW_MS
+    over(ms, SLOW_MS)
+}
+
+/// 「这段耗时算不算慢」的唯一判定（含边界：等于阈值就算）。
+pub fn over(ms: u128, threshold_ms: u128) -> bool {
+    ms >= threshold_ms
 }
 
 /// 一段耗时。RAII：活到作用域结束就自动结算。
@@ -40,6 +52,8 @@ pub struct Span {
     /// 可选备注（段名之外的补充，只在慢记录里出现）
     note: &'static str,
     start: Instant,
+    /// 本段的慢阈值（默认 [`SLOW_MS`]，跨进程调用可用 [`SMTC_SLOW_MS`]）
+    threshold: u128,
     /// 已经结算过（保证 Drop 只记一次）
     done: bool,
     /// 单测用：收进线程本地向量而不是写日志文件
@@ -48,9 +62,9 @@ pub struct Span {
 }
 
 impl Span {
-    /// 开始计一段。
+    /// 开始计一段（默认 50ms 阈值）。
     pub fn new(name: &'static str) -> Self {
-        Self::with_note(name, "")
+        Self::with_threshold(name, SLOW_MS)
     }
 
     /// 开始计一段，并在慢记录里附带一句备注。
@@ -59,6 +73,23 @@ impl Span {
             name,
             note,
             start: Instant::now(),
+            threshold: SLOW_MS,
+            done: false,
+            #[cfg(test)]
+            collect: false,
+        }
+    }
+
+    /// 开始计一段，**自带阈值**（不传就永远 50ms）。
+    ///
+    /// 为什么需要：同一套埋点里，跨进程调用的「慢」与一帧绘制的「慢」不是一个量级，
+    /// 用同一个阈值必然二选一地失真（见 [`SMTC_SLOW_MS`]）。
+    pub fn with_threshold(name: &'static str, threshold_ms: u128) -> Self {
+        Self {
+            name,
+            note: "",
+            start: Instant::now(),
+            threshold: threshold_ms,
             done: false,
             #[cfg(test)]
             collect: false,
@@ -87,7 +118,7 @@ impl Span {
         }
         self.done = true;
         let ms = self.elapsed_ms();
-        if !is_slow(ms) {
+        if !over(ms, self.threshold) {
             return;
         }
 
@@ -153,6 +184,14 @@ mod tests {
         Span {
             collect: true,
             ..Span::new(name)
+        }
+    }
+
+    /// 单测里只记录、不写日志，但用**自定义阈值**。
+    fn collecting_with(name: &'static str, threshold_ms: u128) -> Span {
+        Span {
+            collect: true,
+            ..Span::with_threshold(name, threshold_ms)
         }
     }
 
@@ -253,5 +292,49 @@ mod tests {
         assert!(s.elapsed_ms() >= SLOW_MS);
         s.cancel();
         assert!(take_recorded().is_empty(), "cancel 后不许残留记录");
+    }
+
+    // ------------------------------------------------ 自定义阈值（G2 修复版）
+
+    /// 阈值判定**含边界**：恰好等于就算慢（`smtc.*` 的 8ms 也走同一个函数）。
+    #[test]
+    fn over_threshold_is_inclusive_for_any_threshold() {
+        assert!(over(8, SMTC_SLOW_MS), "恰好 8ms 就要记（≥ 不是 >）");
+        assert!(!over(7, SMTC_SLOW_MS));
+        assert!(over(50, SLOW_MS));
+        assert!(!over(49, SLOW_MS));
+        // is_slow 是 50ms 的便捷入口，不许悄悄变语义
+        assert_eq!(SLOW_MS, 50);
+        assert_eq!(SMTC_SLOW_MS, 8);
+        assert_eq!(is_slow(50), true);
+        assert_eq!(is_slow(49), false);
+    }
+
+    /// 同样的耗时，自定义阈值（8ms）要记、默认阈值（50ms）**不许**记。
+    #[test]
+    fn custom_threshold_records_earlier_than_default() {
+        let _ = take_recorded();
+        // 12ms：够 8ms 阈值，不够 50ms 默认阈值
+        {
+            let _s = collecting_with("t.smtc", SMTC_SLOW_MS);
+            std::thread::sleep(Duration::from_millis(SMTC_SLOW_MS as u64 + 4));
+        }
+        {
+            let _s = collecting("t.default");
+            std::thread::sleep(Duration::from_millis(SMTC_SLOW_MS as u64 + 4));
+        }
+        let got = take_recorded();
+        assert_eq!(got.len(), 1, "只有自定义阈值那段该记：{got:?}");
+        assert_eq!(got[0].0, "t.smtc");
+    }
+
+    /// 自定义阈值的段同样受「Drop 只记一次」约束。
+    #[test]
+    fn custom_threshold_finish_is_single_shot() {
+        let _ = take_recorded();
+        let s = collecting_with("t.smtc.finish", SMTC_SLOW_MS);
+        std::thread::sleep(Duration::from_millis(SMTC_SLOW_MS as u64 + 4));
+        s.finish();
+        assert_eq!(take_recorded().len(), 1);
     }
 }
