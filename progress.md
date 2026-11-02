@@ -1,7 +1,7 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
 > 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02 22:48,G4(快捷键体系)已验收 → v1.2.3;下一组 G6 歌词源(最后一组)。**
+> 最后更新:**2026-11-02 23:08,第三轮 12 项 6 组全部闭环 → v1.3.1(含托盘勾选态修复)。**
 
 ---
 
@@ -14,7 +14,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
 | 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(main,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
-| 当前版本 | **v1.2.3**;交付包在 `deliverables/`,**只增不删** |
+| 当前版本 | **v1.3.1**;交付包在 `deliverables/`,**只增不删** |
 | 版本号策略(用户定 2026-11-02) | 改可见行为/新增能力 → 升第二位(1.2.0);纯修正/文案/内部重构 → 升第三位 |
 | 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
 | 团队 | 交付总监(主理人)+ 寇豆码(software-engineer);团队 `software-barline-12`(第三轮 12 项),后续每组按需 spawn |
@@ -26,6 +26,8 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 ## 1. 提交序列(git log,oneline)
 
 ```
+b15b966 fix: v1.3.1 — 托盘菜单「显示/隐藏小组件」勾选态反向(toggle_checked 集中换算)
+11e70d4 feat: v1.3.0 — 歌词源扩充(批次G6 问题7):修 400 + 标题清洗 + 模糊择优 + 网易云兜底
 5f35598 feat: v1.2.3 — 快捷键体系(批次G4 问题10):默认改 Ctrl+Alt+*, 录制改「更改」, 逐行 ↺ 恢复默认
 5eb82a5 refactor: v1.2.2 — 删除死配置「界面缩放」(批次G3 问题8),旧配置兼容有测试兜底
 b8e6cbc feat: v1.2.1 — 设置窗口最小化还原(SW_RESTORE)+右键菜单背景项扩为4项(批次G2 问题4/6)
@@ -160,6 +162,20 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - 测试 301 项,clippy 0 警告,release 1007 KB。
 - **验收插曲(勿误判为 bug)**:用户报「歌词开关/静音/显隐小组件三组热键无反应」,日志实证 `热键触发：ToggleLyrics`、`系统静音 → 开/关`、`静音切换 → true/false` 全部正常 → 实际是用户**没有打开「启用全局快捷键」这个开关**,非缺陷。排查中另一发现见 G6 条目(lrclib HTTP 400)。
 
+**G6:问题 7 歌词源扩充(✅ 已验收 2026-11-02,v1.3.0 11e70d4)**
+- **先修实证 bug**:用户日志里 `lrclib 响应：HTTP 400`,原因是 Edge 放 B 站视频时 SMTC 的 `artist` 是空串 → 拼出 `artist_name=` 空值。修法:空 artist 不拼该参数,且**跳过精确接口直接走模糊检索**(`build_url` + `LrclibProvider::fetch`)。这是「大量歌曲没歌词」最实的一个成因。
+- **新增 `src/lyric/query.rs`(纯函数)**:`clean_title`(去成对括注 + 砍 `- Live`/`feat.` 等噪声尾巴,10 组用例)、`title_variants`(≤4,顺序稳定)、`primary_artist`(多歌手拆分取主)、`search_keywords`(≤3)、`score_candidate`/`pick_best`(标题等 60/含 40/不沾边淘汰;歌手等 25/含 12;时长 ≤2s +30 / ≤5s +15 / **>10s 淘汰**;`MIN_PICK_SCORE=60` **宁可不中也不串歌**)。
+- **lrclib 双接口**:精确 `/api/get` → 模糊 `/api/search` 本地择优(命中即停)。
+- **新增 `src/lyric/netease.rs`**:搜索 `/api/search/get` + 歌词 `/api/song/lyric`(需 `Referer`,新增 `net::get_with_headers`),复用同一套择优;非 200/结构变化/空 lyric 一律静默降级 NotFound,最坏 4 个请求;受「在线歌词」单开关统管。
+- **负缓存加盐 `v2:`**(`MISS_KEY_VERSION`,文件名哈希随之变化)→ 旧 miss 全部作废;正缓存不动,旧文件留给 24h TTL 自然淘汰。
+- 设置页「在线歌词」描述改双源;「关于」补网易云来源链接(超清单,已报备)。日志每次查询打一条 `查 X - Y → 源=? 命中/全部未命中`(带候选与耗时,不打歌词正文)。
+- 仍未解决(**如实记录**):两源都没有的冷门曲/UP 主原创/纯音乐 BGM;只有 `plainLyrics` 无时间轴的条目(按既有约定算无歌词);歌名中外文差异过大(`周杰伦` vs `Jay Chou`)判不沾边而放弃;`duration_ms==0` 时只剩标题+歌手匹配,靠 `MIN_PICK_SCORE` 压误配。
+- 测试 318 项(301→318),clippy 0 警告,release 1033 KB。
+
+**补丁 v1.3.1:托盘菜单勾选态反向(用户 2026-11-02 验收 G6 时发现)**
+- 根因:`tray.rs` 的 `append(..., CMD_TOGGLE, hidden)` 把「是否隐藏」当勾选态传入 → 隐藏时打钩、显示时无钩。
+- 修法:新增纯函数 `tray::toggle_checked(widget_hidden)` **集中唯一取反点**;`show_menu` 形参改名 `widget_visible`;`app.rs` 调用点不再自行取反。新增测试 `toggle_checked_is_true_when_visible`。测试 319 项。
+
 ### 交付包现状(deliverables/,只增不删)
 `曲栏_Barline_v1.0.0.exe`、`.zip`、`v1.1.0.exe` ~ `v1.1.14.exe` 全序列。
 > 注:worktree 检出 `.ps1` 会触发 git working-tree-encoding 转码失败;**重建历史版本包**用「主仓库 detached checkout <hash> → build.ps1 build → 拷 exe → checkout main」方式(已验证可行)。
@@ -233,7 +249,7 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 | G2 | 4 / 6 | 设置窗口最小化唤不起 + 右键菜单背景四项 | ✅ 已验收 v1.2.1 |
 | G3 | 8 | 删除「界面缩放」 | ✅ 已验收 v1.2.2 |
 | G4 | 10 | 快捷键体系(默认值/更改/逐行恢复) | ✅ 已验收 v1.2.3 |
-| G6 | 7 | 歌词源扩充(模糊检索+网易云) | ⬜ 进行中(最后一组) |
+| G6 | 7 | 歌词源扩充(模糊检索+网易云) | ✅ 已验收 v1.3.0 |
 
 > 全部完成后:严过关独立 worktree 全量回归 + 用户终验。
 
