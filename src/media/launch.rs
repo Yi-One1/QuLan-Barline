@@ -50,6 +50,9 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, IsWindowEnabled, SetActiveWindow, SetFocus,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    keybd_event, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
@@ -63,6 +66,7 @@ use windows::Win32::Media::Audio::{
 };
 
 use crate::media::MediaSessionInfo;
+use core::time::Duration;
 
 /// 激活结果（用于日志与验收）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,16 +387,23 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> windows::core
     windows::core::BOOL(1)
 }
 
-/// 恢复 / 显示窗口后再抢前台（v1.1.18 重写）。
+/// 恢复 / 显示窗口后再抢前台（v1.1.19 重写：**验证-重试轮换策略**）。
 ///
-/// v1.1.17 实测缺陷：汽水托盘隐藏窗口用 `SW_SHOW` 显示——它**只显示不激活**，
-/// CEF/Electron 应用收不到 `WM_ACTIVATE` 就会挂起输入层，表现为「窗口能拖动
-/// （NC 区系统处理）但内容全部不可点击」。修复：
-/// 1. 隐藏窗口改用 `SW_RESTORE`（带激活语义，任务栏点击同款）；
-/// 2. 显示后检查 `IsWindowEnabled`——应用 hide 时可能禁用了窗口输入，
-///    外部显示必须恢复（禁用窗口的症状同样是「能拖不能点」）；
-/// 3. [`force_foreground`] 失败时用 `SwitchToThisWindow` 兜底（任务栏切窗口
-///    同款 API，绕前台锁且完全不碰输入队列）。
+/// 实测取证（v1.1.18 后的诊断程序 `examples/diag_soda.rs`，2026-11-02）：
+///
+/// 1. `SetForegroundWindow` **返回 true ≠ 前台真的转移**——存在返回 true 但
+///    前台几百毫秒内仍在原窗口（甚至漂到别的窗口）的竞态；旧代码见到 true
+///    就短路，永不重试，导致汽水窗口「显示了但从未激活」。
+/// 2. 窗口「显示但从未激活」是**死态**：模拟真实用户点击（SendInput）都无法
+///    激活它（前台纹丝不动），CEF 输入挂起，表现为「能拖动、内容全部点不动」。
+///    窗口线程内部 `GUITHREADINFO` 还显示 active/focus 指向自己（幽灵激活），
+///    但系统前台在别处。
+/// 3. 突破前台锁最有效的是 **ALT 键解锁**（`keybd_event(VK_MENU)` down/up，
+///    让系统认为刚有用户输入），比 `AttachThreadInput` 更可靠；后者在本机
+///    实测全部失败。
+///
+/// 因此激活改为「轮换策略 + 每步验证」：每次尝试后真正确认前台已转移，
+/// 没转移就换下一个策略，最多 6 步 ≈ 1.2s（成功路径通常第 0/1 步内完成）。
 fn show_and_foreground(hwnd: HWND) -> bool {
     // SAFETY: 标准窗口操作。
     unsafe {
@@ -405,54 +416,68 @@ fn show_and_foreground(hwnd: HWND) -> bool {
             let _ = EnableWindow(hwnd, true);
         }
     }
-    if force_foreground(hwnd) {
-        // SetForegroundWindow 返回 true 只表示「请求被接受」——记录前台是否
-        // 真的切过去了（v1.1.17 汽水卡死排查经验：返回 true ≠ 激活生效）
-        // SAFETY: 纯查询。
-        if unsafe { GetForegroundWindow() } != hwnd {
-            crate::log_warn!("置前返回成功但前台并非目标窗口，激活可能未生效");
-        }
+    if try_foreground(hwnd) {
         return true;
     }
-    // 兜底：任务栏切窗口同款，绕前台锁且不污染输入队列
-    // SAFETY: 标准窗口操作；fAltTab=false 不触发任务切换 UI。
-    unsafe {
-        SwitchToThisWindow(hwnd, false);
-    }
-    // SAFETY: 纯查询。
-    unsafe { GetForegroundWindow() == hwnd }
+    crate::log_warn!("轮换 6 步策略后前台仍未转移到目标窗口");
+    false
 }
 
-/// 把窗口拉到前台。失败时用 `AttachThreadInput` 绕过前台锁，最多 3 次。
+/// 轮换激活策略，每步真正验证前台转移，成功立即返回。
 ///
-/// 显示 / 恢复已由 [`show_and_foreground`] 处理——这里只管激活，避免对已
-/// 可见窗口重复 `SW_RESTORE` 造成闪屏（v1.1.18）。
-fn force_foreground(hwnd: HWND) -> bool {
-    // SAFETY: 标准窗口操作。
+/// 策略序：0 裸 `SetForegroundWindow` → 1/2 ALT 解锁前台锁 → 3/4
+/// `AttachThreadInput`+`SetFocus`/`SetActiveWindow` → 5 `SwitchToThisWindow`。
+/// 用户点封面时我们是前台进程，策略 0 通常直接成功（几十 ms）；
+/// 前台权被别的程序持有时 ALT 解锁兜住（diag 实测策略 1 成功）。
+fn try_foreground(hwnd: HWND) -> bool {
+    const VK_MENU: u8 = 0x12; // ALT
+    // SAFETY: 标准输入/窗口 API；所有查询在作用域内完成。
     unsafe {
-        if SetForegroundWindow(hwnd).as_bool() {
-            return true;
-        }
-
         let target_tid = GetWindowThreadProcessId(hwnd, None);
         let self_tid = windows::Win32::System::Threading::GetCurrentThreadId();
-        for attempt in 0..3 {
-            if target_tid != 0 && target_tid != self_tid {
-                let _ = AttachThreadInput(self_tid, target_tid, true);
+
+        for step in 0..6u32 {
+            match step {
+                1 | 2 => {
+                    // ALT 按下再抬起：系统视作刚有用户输入，前台锁放行
+                    keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0);
+                    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+                3 | 4 => {
+                    if target_tid != 0 && target_tid != self_tid {
+                        let _ = AttachThreadInput(self_tid, target_tid, true);
+                    }
+                    // 附加输入队列期间把焦点显式还给目标窗口
+                    let _ = SetFocus(Some(hwnd));
+                    let _ = SetActiveWindow(hwnd);
+                }
+                5 => {
+                    // 任务栏切窗口同款 API，绕前台锁且不碰输入队列
+                    SwitchToThisWindow(hwnd, false);
+                    std::thread::sleep(Duration::from_millis(200));
+                    if GetForegroundWindow() == hwnd {
+                        return true;
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            // 附加输入队列期间把焦点显式还给目标窗口——前台锁下仅
-            // SetForegroundWindow 可能不够，SetFocus/SetActiveWindow 补齐
-            let _ = SetFocus(Some(hwnd));
-            let _ = SetActiveWindow(hwnd);
+
             let ok = SetForegroundWindow(hwnd).as_bool();
-            if target_tid != 0 && target_tid != self_tid {
+            if target_tid != 0 && target_tid != self_tid && (step == 3 || step == 4) {
                 let _ = AttachThreadInput(self_tid, target_tid, false);
             }
-            if ok {
+            // 关键：返回 true 只代表「请求被接受」——必须等前台真的转移
+            std::thread::sleep(Duration::from_millis(180));
+            if GetForegroundWindow() == hwnd {
+                if !ok {
+                    crate::log_debug!("策略 {step}：SetForegroundWindow 返回 false 但前台已转移");
+                }
+                crate::log_debug!("策略 {step} 成功，前台已转移到目标窗口");
                 return true;
             }
-            crate::log_debug!("SetForegroundWindow 第 {} 次失败", attempt + 1);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            crate::log_debug!("策略 {step} 未生效（SetForegroundWindow={ok}），换下一个");
         }
     }
     false
