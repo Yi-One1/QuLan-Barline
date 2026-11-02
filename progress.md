@@ -1,7 +1,7 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
 > 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02 06:22,批次④(问题 8/11/12)v1.1.14 已验收;下一批:批次⑤(问题 6+9+7:会话音量+循环随机+封面激活,最后一批)。**
+> 最后更新:**2026-11-02 08:45,全部 12 项问题收尾闭环(v1.1.21):批次⑤完成,问题 6/7 用户裁决暂禁用留档(待办 A/D),问题 9 已删除;全量回归绿(clippy 0 警告 + 249 测试通过)。**
 
 ---
 
@@ -14,7 +14,7 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 | 语言/栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2 |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts/build.ps1 -Task check/clippy/test/build`(**禁止直接 `cargo build`**,见 §3 约束) |
 | 仓库 | 本地 `E:\APP\WorkBuddy\工作空间\曲栏Barline`;远端 **https://github.com/Yi-One1/QuLan-Barline.git**(master,上游跟踪已建;push 若遇会话代理 502,用 `git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push` 走本机 7890 代理) |
-| 当前版本 | **v1.1.14**;交付包在 `deliverables/`,**只增不删** |
+| 当前版本 | **v1.1.21**;交付包在 `deliverables/`,**只增不删** |
 | 快捷启动 | 根目录 **`启动曲栏.bat`**(增量构建+运行未打包 exe,用户自检最新改动用) |
 | 团队 | 交付总监(主理人)+ 寇豆码(software-engineer)+ 严过关(software-qa-engineer);团队 `software-barline-fix` 活跃,寇豆码上下文延续(可 SendMessage 继续) |
 | 推进节奏(用户定) | **一次只做一项 → 带有效测试 → 提交 → 用户验收 → 下一项**;全部完成后跑全量测试 |
@@ -25,6 +25,14 @@ Windows 任务栏「媒体小组件」:**Rust + Direct2D 逐像素透明分层�
 ## 1. 提交序列(git log,oneline)
 
 ```
+21b1e42  chore: v1.1.21 — 用户裁决搁置汽水激活(托盘点击抢鼠标,代码留档待办D);托盘态不激活
+bddc6b6  fix: v1.1.20 — 汽水改托盘图标点击通道(Shell_NotifyIconGetRect+SendInput,后经裁决停用)
+ed8d2b7  fix: v1.1.19 — 汽水激活轮换策略+每步验证前台真转移(ALT键解锁前台锁)
+70c78b6  fix: v1.1.18 — 汽水托盘恢复改SW_RESTORE+EnableWindow检查+SwitchToThisWindow兜底
+bf73e26  fix: v1.1.17 — 汽水AUMID中文章节+会话音量暂禁用+日志路径bug
+ce6906b  fix: v1.1.16 — 会话音量GUID/匹配修复+封面激活收编隐藏窗口删网页回退+删循环随机
+cfef1b1  feat: v1.1.15 — 会话音量/封面激活多进程/循环随机结论(批次⑤ 问题6/7/9)
+a597cb0  docs: progress.md — 批次④(问题8/11/12)闭环 v1.1.14;批次⑤(最后一批)成为当前
 16187f5  fix: v1.1.14 — 右键显示设置接通+设置页取消永久置顶+菜单不再被遮(批次④ 问题8/11/12)
 <docs>   docs: progress.md — 批次③(问题2+10)全闭环 v1.1.11→v1.1.13
 06651be  fix: v1.1.13 — 常规半透明不生效+滑条不即时(批次③ v1.1.12 反馈)
@@ -151,8 +159,8 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - **批次②**:[x] **5. 设置页音量「调节步进」始终显示空白**——✅ 已验收(v1.1.10,含滚轮 10% 被钳连带修复)
 - **批次③**:[x] **2. 悬停背景去模糊**——✅ 已验收(v1.1.11,模糊整链删除,后续 v1.1.12/v1.1.13 扩展两态+可调透明度)+ [x] **10. 紧凑排列下歌名有空间却被省略**——✅ 已验收(v1.1.11,ceil+换行检测)
 - **批次④**:[x] **8. 右键菜单「显示设置」无反应**(接通 on_second_instance)+ [x] **11. 设置页永久置顶**(force_foreground 补 NOTOPMOST 撤销)+ [x] **12. 右键菜单被小组件遮住**(menu_open 期间暂停 ensure_on_top)——✅ 已验收(v1.1.14)
-- **批次⑤(当前)**:[ ] **6. 音量范围「当前播放器」时滚轮仍改系统音量**(应改会话音量 ISimpleAudioVolume)+ [ ] **9. 右键菜单循环/随机播放不可用**(SMTC SetAutoRepeatMode/SetShuffle 写入链路;若播放器不支持需如实说明)+ [ ] **7. 单击封面激活播放器:汽水音乐/Edge(B站)失败,网易云成功**(launch.rs 激活链路)——媒体链路合并一批,用户分三场景一次验收
-- 全部完成后:严过关全量回归(独立 worktree)+ 用户终验。
+- **批次⑤(✅ 收尾闭环 2026-11-02)**:[x] **6. 会话音量**——v1.1.15/v1.1.16 两轮修复后用户裁决**暂时禁用**(留档待办 A);[x] **9. 循环/随机播放**——用户裁决**整体删除**(菜单+SMTC 写入链+字段,已验收);[x] **7. 封面激活**——网易云/Edge 已修好(v1.1.15~v1.1.16);汽水音乐经 v1.1.17~v1.1.20 五轮攻坚(实测根因:CEF/Electron 托盘恢复型应用任何外部 ShowWindow 都致输入挂起,托盘点击通道有效但抢鼠标),用户裁决**搁置**(留档待办 D,托盘态不激活不制造卡死窗口)
+- 全部完成后:严过关全量回归(独立 worktree)+ 用户终验——**2026-11-02 收尾回归绿**:clippy 0 警告、249 测试通过(1 ignored 为联网用例)、release 构建出包 v1.1.21。
 - 问题 1(歌词移入小组件)**✅ 已验收**(v1.1.0→v1.1.4,遗留 a/b 与验收反馈全部闭环)。
 
 ### 待办登记(2026-11-02 批次⑤验收反馈,用户裁决)
@@ -164,9 +172,17 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - 续修入口:src/media/wasapi.rs `session_simple_volume`(枚举处补逐会话 log_info 诊断);src/app.rs on_wheel 的 CurrentPlayer 分支(实现完整保留);禁用点 = Config::load 归一化 + bridge "volume.scope" 强制 System + 设置页 select disabled。
 - 禁用落地(v1.1.17):设置页「调节范围」置灰固定系统主音量;旧配置 current_player 加载时归一化。
 
-**B. 汽水激活(问题 7)——v1.1.17 已修**:汽水 SMTC AUMID 实测就是中文名「汽水音乐」(日志 aumid=汽水音乐、process 为空),player_map 补中文键 → process_name=sodamusic.exe → 快照枚举 7 个进程 → 主窗口(pid 36160,窗口标题「汽水音乐」)激活。待用户验收。
+**B. 汽水激活(问题 7)——终态:网易云/Edge 已修好,汽水部分用户裁决搁置(见 D)**:汽水 SMTC AUMID 实测就是中文名「汽水音乐」(日志 aumid=汽水音乐、process 为空),player_map 补中文键 → process_name=sodamusic.exe。
 
 **C. 日志路径 bug——v1.1.17 已修**:logger 启动时永远在默认根打开日志,而 relocate 只在「发生迁移」时执行 → active_data_dir 已是自定义目录后,日志**永远留在默认根** `%LOCALAPPDATA%\Barline\barline.log`(数据目录里看不到),排查极坑。修复:init_from_config 末尾无条件 relocate(内部同路径幂等跳过)。
+
+**D. 汽水封面激活卡死(问题 7 余项)——用户裁决 2026-11-02:搁置,以后再解决。登记如下供将来续修:**
+- 实测根因(诊断工具 `examples/diag_soda.rs`,五模式 enum/activate/click/fix/tray/fg):汽水(Electron/CEF)Hide 到托盘后,**任何外部 `ShowWindow`(SW_SHOW/SW_RESTORE)无论配什么前台技巧(SFW/ALT 解锁/AttachThreadInput/SwitchToThisWindow)都会让 CEF 输入管线挂起**——窗口显示、甚至前台与 GUITHREADINFO 激活态全部正常,但内容完全不可点击(窗口冻结帧,截图证据:× 按钮冻结在按下态)。诊断关键:**验证「卡死」必须用行为验证(点 × 能否隐藏窗口),前台/激活状态查询全是假阳性**。
+- 有效但被否的通道:v1.1.20 托盘图标点击(`Shell_NotifyIconGetRect` 按 hWnd+uID 精确定位该进程注册的图标 + `SendInput` 真实左键,恢复+行为验证全通)——**SendInput 会抢鼠标**(光标拉到托盘再恢复),用户裁决不启用。
+- 已排除:AUMID `ActivateApplication` 全候选 E_INVALIDARG;`ShellExecuteW`(开始菜单 lnk)触发汽水**重启接管**(旧实例退出中断播放)。
+- 现行行为(v1.1.21):汽水窗口**可见**时正常前台激活;**托盘隐藏态不做任何激活**(日志「激活暂禁用(缺陷搁置,待办 D)」),不制造卡死窗口、不抢鼠标。
+- 续修入口:src/media/launch.rs `tray_click_activate`(`#[allow(dead_code)]` 留档,注释含续修方向)、`TRAY_RECOVERY_APPS`/`is_tray_recovery_app`、activate_player 开头 tray_recovery 分支;诊断工具 examples/diag_soda.rs(临时文件,可复用后删除)。
+- 续修方向:①逆向 Electron NotifyIconHost 托盘回调消息号直接 `PostMessage`(零鼠标移动);②探测汽水 deep-link/second-instance 无重启唤起;③仅用户光标静止时模拟点击+光标恢复动画。
 
 ### 存量与可选(不阻塞)
 - QA 无真机证据项(M2 时代,勿视为通过):播控真实改状态/拖动跳转/封面激活前台/滚轮音量 HUD(进程外读 SMTC 被安全策略阻)、多显示器/DPI/四方位/自动隐藏等。
