@@ -1072,8 +1072,7 @@ pub struct AppearanceConfig {
     pub accent_source: AccentSource,
     /// 自定义强调色，形如 "#0078D4"
     pub accent_custom: String,
-    /// 界面缩放：1.0 / 1.1 / 1.25
-    pub ui_scale: f32,
+    // v1.2.2：`ui_scale` 已删除（死配置：渲染/布局层从未读取；高度锁死 48px 无法放大）
     /// 显示显示器：0 = 主显示器，否则为显示器序号
     pub monitor_index: u32,
 }
@@ -2629,7 +2628,7 @@ SettingsService::open(config)
 | `type` | `payload` | 说明 |
 | --- | --- | --- |
 | `ready` | `null` | 页面加载完成，请求初始配置 |
-| `set` | `{ "path": "appearance.ui_scale", "value": 1.25 }` | 单字段更新（点路径） |
+| `set` | `{ "path": "appearance.hover_alpha", "value": 85 }` | 单字段更新（点路径） |
 | `set_many` | `{ "patch": { ... } }` | 批量更新（如导入配置） |
 | `reset` | `{ "section": "hotkeys" }` | 重置某分组为默认 |
 | `hotkey_record` | `{ "action": "play_pause", "phase": "start" \| "stop" }` | 开始/结束录制 |
@@ -2653,9 +2652,9 @@ SettingsService::open(config)
 **安全**：
 - `open_url` 只允许 `https://` 且 host 在白名单（`lrclib.net`、`developer.microsoft.com`、
   `github.com`），否则丢弃并记日志。
-- `set` 的 `path` 用白名单枚举（`match path { "appearance.ui_scale" => ..., _ => return }`），
+- `set` 的 `path` 用白名单枚举（`match path { "appearance.hover_alpha" => ..., _ => return }`），
   **不用反射/动态字段名**，避免越权写。
-- `set` 的值做类型与范围校验（`ui_scale` 只允许 1.0/1.1/1.25；`step` 只允许 0.01/0.02/0.05）。
+- `set` 的值做类型与范围校验（`hover_alpha`/`idle_alpha` 1..=100；`step` 只允许 0.01/0.02/0.05）。
 
 ### 13.3 快捷键录制（`add_AcceleratorKeyPressed`）
 
@@ -2695,7 +2694,7 @@ JS set → bridge 校验 → AppEvent::ConfigChanged(new_config)
         general.widget_hidden → SetVisible
         window.*            → 无
       → SaveConfig（300ms 去抖后写盘）
-      → SettingsPush(patch) 回推规范化后的值（例如 ui_scale 被 clamp）
+      → SettingsPush(patch) 回推规范化后的值（例如 hover_alpha 被 clamp）
 ```
 
 **去抖**：拖动取色器会连续产生几十个 `set`。`SaveConfig` 用 300ms 去抖（`SetTimer`），
