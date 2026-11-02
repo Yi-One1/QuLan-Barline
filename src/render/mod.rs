@@ -11,6 +11,7 @@ pub mod d2d;
 pub mod layout;
 pub mod painter;
 pub mod sampler;
+pub mod stable;
 pub mod text;
 pub mod theme;
 

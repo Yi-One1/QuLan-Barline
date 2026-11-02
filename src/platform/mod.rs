@@ -1,5 +1,6 @@
 //! 平台层：最底层的 Win32 封装，只被依赖、不依赖任何业务模块（ARCHITECTURE.md 附录 A）。
 
+pub mod capture;
 pub mod com;
 pub mod dpi;
 pub mod single_instance;

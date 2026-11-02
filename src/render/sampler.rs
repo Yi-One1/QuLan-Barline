@@ -4,6 +4,15 @@
 //! **不再生产模糊背景**——悬停背景只有半透明/透明两档，本线程只负责
 //! 「壁纸亮度 → 文字对比度」的主题推导。
 //!
+//! ## v1.2.0（G5 问题 3）：亮度稳定化
+//!
+//! 亮度算出来之后**不再直接喂 `Theme`**，而是先过
+//! [`LumaStabilizer`]（EMA + 双阈值死区 + 连续确认）。稳定器**跨样本持有状态**，
+//! 所以它必须活在本线程的栈上（`run` 里），不能是 `sample()` 的局部变量。
+//! 结果通过 [`SampleRequest::epoch`] 感知几何代次：采样区域变了就重置状态。
+//!
+//! 「1px 反色描边」兜底已删除（用户明确要求去掉那一圈异常描边）。
+//!
 //! ## 核心难点 H3 / 风险 R5：抓屏会抓到自己
 //!
 //! `GetDC(NULL)` + `BitBlt` 拿到的是**已合成**的桌面，包含我们自己画的文字与封面。
@@ -40,7 +49,8 @@ use crate::event::AppEvent;
 use crate::media::Rgb;
 use crate::platform::wake::EventSink;
 use crate::render::layout::RectF;
-use crate::render::theme::{luma_to_srgb_gray, srgb8_to_linear, BackgroundMode, Theme};
+use crate::render::stable::LumaStabilizer;
+use crate::render::theme::{srgb8_to_linear, BackgroundMode, Theme};
 
 /// 上一帧的 alpha 覆盖率图（4×4 块粒度）。
 ///
@@ -198,6 +208,9 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
     let mut slot: Option<SampleRequest> = None;
     let mut last_done = Instant::now() - throttle;
     let mut sampled: u64 = 0;
+    // v1.2.0：亮度稳定器**跨样本持有**（EMA / 连续确认都需要历史），
+    // 所以只能放在这里而不是 `sample()` 里面。
+    let mut stabilizer = LumaStabilizer::new();
 
     loop {
         // 有空槽时等到节流窗口结束；无槽时阻塞 200ms（5 次/秒的空转，CPU ≈ 0）
@@ -215,12 +228,13 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
 
         if slot.is_some() && last_done.elapsed() >= throttle {
             if let Some(req) = slot.take() {
-                if let Some(theme) = sample(&req) {
+                if let Some(theme) = sample(&req, &mut stabilizer) {
                     sampled += 1;
                     crate::log_debug!(
-                        "采样 #{sampled}：luma={:.3} on_light={} epoch={}",
+                        "采样 #{sampled}：luma={:.3} on_light={} ema={:.3} epoch={}",
                         theme.backdrop_luma,
                         theme.on_light,
+                        stabilizer.ema().unwrap_or(theme.backdrop_luma),
                         req.epoch
                     );
                     sink.send(AppEvent::BackdropReady {
@@ -236,8 +250,8 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
     crate::log_info!("采样线程退出（共采样 {sampled} 次）");
 }
 
-/// 抓屏 + 统计 → 主题。
-fn sample(req: &SampleRequest) -> Option<Theme> {
+/// 抓屏 + 统计 → 主题（经亮度稳定器）。
+fn sample(req: &SampleRequest, stabilizer: &mut LumaStabilizer) -> Option<Theme> {
     let w = (req.rect.right - req.rect.left).max(1) as u32;
     let h = (req.rect.bottom - req.rect.top).max(1) as u32;
     // 防御：异常大的矩形直接拒绝，避免一次分配几十 MB
@@ -307,9 +321,7 @@ fn sample(req: &SampleRequest) -> Option<Theme> {
         bw,
         bh,
     };
-    let theme = compute_theme(&grid, req);
-
-    Some(theme)
+    Some(compute_theme(&grid, req, stabilizer))
 }
 
 /// 一次采样里「块网格 + 请求参数」的聚合体。
@@ -326,8 +338,34 @@ struct BlockGrid<'a> {
     bh: u32,
 }
 
+/// 采样区域指纹（v1.2.0）：**只看矩形**，不看 `AppState::geometry_epoch`。
+///
+/// 为什么不能用 `SampleRequest::epoch` 当稳定器的代次：UI 线程的几何代次
+/// 每次 `geometry::probe()` 都会 +1（`EPOCH.fetch_add`），而 1s 心跳每秒都 probe，
+/// 于是 `state.geometry_epoch` 实际上**每秒都在变**。拿它当稳定器的 epoch，
+/// EMA 会每秒归零一次，稳定化形同虚设（正好把「实测每秒重采样」这个前提毁掉）。
+///
+/// 稳定器真正关心的只是「这次采的是不是同一块屏幕区域」，所以按矩形打指纹：
+/// 位置 / 尺寸任何一个变了 → 指纹变 → 重置（那次变化本来也该重新判定）。
+fn area_epoch(rect: RECT) -> u64 {
+    let w = (rect.right - rect.left).max(0) as u64;
+    let h = (rect.bottom - rect.top).max(0) as u64;
+    let mut v = rect.left as u32 as u64;
+    v = v.wrapping_mul(1_000_003).wrapping_add(rect.top as u32 as u64);
+    v = v.wrapping_mul(1_000_003).wrapping_add(w);
+    v = v.wrapping_mul(1_000_003).wrapping_add(h);
+    v
+}
+
 /// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
-fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
+///
+/// v1.2.0：亮度不直接决定文字色，先过 `stabilizer`（EMA + 死区 + 连续确认）。
+/// 真正翻转时记一条 info（死区内不刷日志）。
+fn compute_theme(
+    grid: &BlockGrid<'_>,
+    req: &SampleRequest,
+    stabilizer: &mut LumaStabilizer,
+) -> Theme {
     let BlockGrid {
         block,
         valid,
@@ -407,15 +445,33 @@ fn compute_theme(grid: &BlockGrid<'_>, req: &SampleRequest) -> Theme {
         }
     };
 
-    let theme = Theme::from_backdrop(luma, accent, mode, idle_mode, hover_alpha, idle_alpha);
-    if theme.needs_outline {
-        crate::log_debug!(
-            "背景亮度 {:.3} 处于中灰带，文字对比度不足，启用 1px 描边（背景代表色 {:?}）",
-            luma,
-            luma_to_srgb_gray(luma)
-        );
+    // v1.2.0：稳定化之后的方向说了算（首帧立刻判定、死区保持、攒够确认才翻）。
+    // 代次用**采样区域指纹**而不是 `req.epoch`（后者每秒都变，见 `area_epoch` 注释）。
+    let area = area_epoch(req.rect);
+    let before = stabilizer.on_light();
+    let on_light = stabilizer.push(luma, area);
+    if let Some(prev) = before {
+        if prev != on_light {
+            crate::log_info!(
+                "文字色翻转：on_light={} (was {}) luma={:.3} ema={:.3} area={:#x}",
+                on_light,
+                prev,
+                luma,
+                stabilizer.ema().unwrap_or(luma),
+                area
+            );
+        }
     }
-    theme
+
+    Theme::from_backdrop_on(
+        on_light,
+        luma,
+        accent,
+        mode,
+        idle_mode,
+        hover_alpha,
+        idle_alpha,
+    )
 }
 
 /// 点是否落在 `w × h`、圆角 `r` 的矩形内（像素中心采样）。
@@ -529,7 +585,7 @@ mod tests {
         }
     }
 
-    /// 测试里构造块网格 + 请求，直接拿主题。
+    /// 测试里构造块网格 + 请求，直接拿主题（每次新建稳定器 = 首帧规则）。
     fn theme_of(
         block: &[u8],
         valid: &[bool],
@@ -543,7 +599,117 @@ mod tests {
             bw,
             bh,
         };
-        compute_theme(&grid, &sample_req(text_rects))
+        let mut stab = LumaStabilizer::new();
+        compute_theme(&grid, &sample_req(text_rects), &mut stab)
+    }
+
+    /// 用同一个稳定器连续采样，返回每次的主题（验证「线程级状态」真的接上了）。
+    fn theme_series(colors: &[u8], block_side: u32) -> Vec<Theme> {
+        let bw = block_side;
+        let bh = block_side;
+        let mut out = Vec::new();
+        let mut stab = LumaStabilizer::new();
+        for c in colors {
+            let mut block = vec![0u8; (bw * bh * 4) as usize];
+            for i in 0..(bw * bh) as usize {
+                block[i * 4] = *c;
+                block[i * 4 + 1] = *c;
+                block[i * 4 + 2] = *c;
+                block[i * 4 + 3] = 0xFF;
+            }
+            let valid = vec![true; (bw * bh) as usize];
+            let grid = BlockGrid {
+                block: &block,
+                valid: &valid,
+                bw,
+                bh,
+            };
+            out.push(compute_theme(&grid, &sample_req(Vec::new()), &mut stab));
+        }
+        out
+    }
+
+    /// **v1.2.0 问题 3 的接线测试**：`compute_theme` 必须把亮度喂给稳定器，
+    /// 而不是自己按单帧亮度硬切——否则抖动闪回原样。
+    ///
+    /// 序列：纯黑（首帧判深色）→ 三帧 0xDA（luma≈0.70）。
+    /// 第 2 帧 EMA≈0.175 落在死区（0.12..0.25）→ 保持深色；
+    /// 第 3 帧 EMA 出死区但只攒到 1 次确认 → 仍保持；
+    /// 第 4 帧攒够 2 次确认 → 才翻成浅色。
+    #[test]
+    fn theme_text_color_follows_stabilizer() {
+        let series = theme_series(&[0x00, 0xDA, 0xDA, 0xDA], 2);
+        let got: Vec<bool> = series.iter().map(|t| t.on_light).collect();
+        assert_eq!(
+            got,
+            vec![false, false, false, true],
+            "文字色没有跟着稳定器走（单帧硬切会得到 [false,true,true,true]）"
+        );
+        // 每帧的 luma 是真实值（主题里的 backdrop_luma 不受稳定化影响）
+        assert!((series[1].backdrop_luma - 0.70).abs() < 0.02, "luma = {}", series[1].backdrop_luma);
+        assert_eq!(series[0].text, Theme::LIGHT_TEXT);
+        assert_eq!(series[3].text, Theme::DARK_TEXT);
+    }
+
+    /// **关键回归（v1.2.0）**：稳定器绝不能用 `req.epoch` 当代次。
+    ///
+    /// UI 线程的 `AppState::geometry_epoch` 每秒都被 `probe()` 的 `EPOCH` 自增刷一遍，
+    /// 拿它当稳定器代次会让 EMA 每秒归零 —— 稳定化形同虚设。
+    /// 这里把「同一块矩形 + 每秒变化的 req.epoch」跑出来：必须和 `area_epoch` 版本一致，
+    /// 即第 3 帧仍不翻转（单帧硬切会得到 [false,true,true]）。
+    #[test]
+    fn epoch_bump_must_not_reset_stabilizer() {
+        let bw = 2u32;
+        let bh = 2u32;
+        let mut stab = LumaStabilizer::new();
+        let mut got = Vec::new();
+        for (i, c) in [0x00u8, 0xDA, 0xDA].iter().enumerate() {
+            let mut block = vec![0u8; (bw * bh * 4) as usize];
+            for k in 0..(bw * bh) as usize {
+                block[k * 4] = *c;
+                block[k * 4 + 1] = *c;
+                block[k * 4 + 2] = *c;
+                block[k * 4 + 3] = 0xFF;
+            }
+            let valid = vec![true; (bw * bh) as usize];
+            let grid = BlockGrid {
+                block: &block,
+                valid: &valid,
+                bw,
+                bh,
+            };
+            let mut req = sample_req(Vec::new());
+            req.epoch = 100 + i as u64; // 模拟「每秒 probe 都 +1」
+            got.push(compute_theme(&grid, &req, &mut stab).on_light);
+        }
+        assert_eq!(
+            got,
+            vec![false, false, false],
+            "req.epoch 把稳定器冲掉了（单帧硬切会是 [false,true,true]）"
+        );
+    }
+
+    /// 区域指纹：同一矩形稳定、任一分量变化都要变。
+    #[test]
+    fn area_epoch_tracks_the_sampling_rect_only() {
+        let a = RECT {
+            left: 100,
+            top: 200,
+            right: 400,
+            bottom: 260,
+        };
+        assert_eq!(area_epoch(a), area_epoch(a), "同一矩形必须同指纹");
+
+        let moved = RECT { left: 120, ..a };
+        let resized = RECT { right: 420, ..a };
+        let retopped = RECT { top: 180, ..a };
+        for other in [moved, resized, retopped] {
+            assert_ne!(
+                area_epoch(a),
+                area_epoch(other),
+                "矩形变了必须换指纹（否则采样区域变了还沿用旧 EMA）"
+            );
+        }
     }
 
     #[test]

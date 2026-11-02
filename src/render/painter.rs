@@ -71,7 +71,6 @@ struct TextDraw<'a> {
     text: &'a str,
     rect: crate::render::layout::RectF,
     color: Rgba,
-    outline: bool,
 }
 
 /// 一个药丸浮层（音量 HUD / 拖动时间气泡）的参数。
@@ -273,7 +272,6 @@ fn draw_texts(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Resul
             text: title_src,
             rect: layout.title,
             color: main,
-            outline: theme.needs_outline,
         },
     )?;
     draw_line(
@@ -285,13 +283,16 @@ fn draw_texts(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Resul
             text: artist_src,
             rect: layout.artist,
             color: dim,
-            outline: false,
         },
     )?;
     Ok(())
 }
 
-/// 画一行文本。`outline == true` 时先画一圈反色描边（中灰壁纸的兜底，§11.2 第 6 步）。
+/// 画一行文本。
+///
+/// v1.2.0：**取消了 1px 反色描边兜底**（G5 问题 3）。那条兜底只在
+/// luma ≈ 0.174~0.189 的窄带触发，画出来是一圈"异常描边"，用户明确要求去掉；
+/// 中灰背景的可读性由「按对比度择优 + 亮度稳定器」保证（`render::stable`）。
 fn draw_line(
     rt: &ID2D1RenderTarget,
     frame: &mut Frame,
@@ -299,7 +300,7 @@ fn draw_line(
     d: &TextDraw<'_>,
 ) -> Result<()> {
     let text = ctx.text;
-    let (kind, s, rect, color, outline) = (d.kind, d.text, d.rect, d.color, d.outline);
+    let (kind, s, rect, color) = (d.kind, d.text, d.rect, d.color);
     if s.is_empty() || rect.is_empty() {
         return Ok(());
     }
@@ -310,31 +311,8 @@ fn draw_line(
     let rect_d = d2d_rect(rect.x, rect.y, rect.w, rect.h);
     let format = text.get(kind);
 
-    if outline {
-        let inverse = if color.r > 0x80 {
-            Rgba::new(0x00, 0x00, 0x00, 0xB0)
-        } else {
-            Rgba::new(0xFF, 0xFF, 0xFF, 0xB0)
-        };
-        let ob = frame.brush(inverse)?;
-        for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-            let shifted = d2d_rect(rect.x + dx, rect.y + dy, rect.w, rect.h);
-            // SAFETY: 栈上矩形；ob 由本帧持有；utf16 生命周期覆盖调用。
-            unsafe {
-                rt.DrawText(
-                    &utf16,
-                    format,
-                    &shifted,
-                    &ob,
-                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                );
-            }
-        }
-    }
-
     let brush = frame.brush(color)?;
-    // SAFETY: 同上。
+    // SAFETY: 栈上矩形；brush 由本帧持有；utf16 生命周期覆盖调用。
     unsafe {
         rt.DrawText(
             &utf16,
@@ -638,7 +616,6 @@ fn draw_lyrics(
                         text: old_cur,
                         rect: shift(&layout.lyric_cur),
                         color: Rgba::from_rgb(theme.text, scale_a(a)),
-                        outline: false,
                     },
                 )?;
             }
@@ -657,7 +634,6 @@ fn draw_lyrics(
                 text: lyric.cur,
                 rect: layout.lyric_cur,
                 color: Rgba::from_rgb(theme.text_dim, scale_a(0xB0)),
-                outline: false,
             },
         );
     }
@@ -693,7 +669,6 @@ fn draw_lyrics(
                 text: lyric.cur,
                 rect: wide,
                 color: Rgba::from_rgb(theme.text_dim, scale_a(0x8C)),
-                outline: false,
             },
         );
         // 已唱部分：扫光边界换算到屏幕坐标（文本 x − 偏移），再与视口求交
@@ -717,7 +692,6 @@ fn draw_lyrics(
                             text: lyric.cur,
                             rect: wide,
                             color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
-                            outline: false,
                         },
                     );
                     // SAFETY: 与内层 Push 配对。
@@ -736,7 +710,6 @@ fn draw_lyrics(
                     text: lyric.cur,
                     rect: wide,
                     color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
-                    outline: false,
                 },
             ),
         };
@@ -760,7 +733,6 @@ fn draw_lyrics(
             text: lyric.cur,
             rect: layout.lyric_cur,
             color: unsung,
-            outline: false,
         },
     )?;
 
@@ -776,7 +748,6 @@ fn draw_lyrics(
                 text: lyric.cur,
                 rect: layout.lyric_cur,
                 color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
-                outline: false,
             },
         );
     };
@@ -808,7 +779,6 @@ fn draw_lyrics(
             text: lyric.cur,
             rect: layout.lyric_cur,
             color: Rgba::from_rgb(theme.text, scale_a(0xFF)),
-            outline: false,
         },
     );
     // SAFETY: 与上面的 PushAxisAlignedClip 配对；无论 draw_line 成功与否都要 Pop。

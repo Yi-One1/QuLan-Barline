@@ -86,6 +86,46 @@ impl TaskbarGeometry {
         )
     }
 
+    /// 列出与 `other` **实质不同**的字段名（诊断用，v1.2.0 / G5 问题 2）。
+    ///
+    /// 「几何变了 → 重排」的日志只写一句"几何变化"是没用的：G5 的「截图时左移」
+    /// 必须知道究竟是 `tray_rect` 变了、`dpi` 变了还是 `auto_hide` 变了。
+    /// 两份完全相同时返回空串。
+    pub fn diff(&self, other: &Self) -> String {
+        let mut out = String::new();
+        let mut add = |name: &str| {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(name);
+        };
+        if self.edge != other.edge {
+            add("edge");
+        }
+        if self.bar_rect != other.bar_rect {
+            add("bar_rect");
+        }
+        if self.tray_rect != other.tray_rect {
+            add("tray_rect");
+        }
+        if self.monitor_rect != other.monitor_rect {
+            add("monitor_rect");
+        }
+        if self.dpi != other.dpi {
+            add("dpi");
+        }
+        if self.auto_hide != other.auto_hide {
+            add("auto_hide");
+        }
+        if self.collapsed != other.collapsed {
+            add("collapsed");
+        }
+        if self.target != other.target {
+            add("target");
+        }
+        out
+    }
+
     /// 两份几何是否「实质相同」——**忽略 `epoch`**。
     ///
     /// `probe()` 每次都会 +1 epoch，直接比整个结构体永远不等，

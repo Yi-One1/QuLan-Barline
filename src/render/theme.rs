@@ -9,6 +9,17 @@
 //!    纯中灰（#808080，相对亮度 0.216）下白字只有 3.78:1、黑字有 4.98:1，
 //!    用 0.5 阈值会选错。正确的交叉点是 0.179（`(L+0.05)² = 0.05·1.05` 的解）。
 //! 2. 强调色必须做**亮度归一化**（§11.4 第 6 步），否则深色封面会让进度条在深色壁纸上消失。
+//!
+//! ## v1.2.0 两处修正（G5）
+//!
+//! * **透明档的背景色必须携带基色**：原先透明写 `Rgba::new(0,0,0,0)` 把 RGB 谎报成
+//!   黑色，`mix_rgba` 四通道一起插值后，悬停淡入的中点会是一块**半透明中灰**
+//!   （先变灰后变白）。现在透明档保留同一个 `on_light` 基色、只把 alpha 置 0，
+//!   插值全程无色偏。
+//! * **删除 1px 反色描边兜底**：它只在 luma ≈ 0.174~0.189 这一窄带触发（该带最高
+//!   对比度 4.36:1，达不到 AA），画出来的是一圈"异常描边"，用户明确要求去掉。
+//!   文字色仍按对比度择优（[`pick_on_light`]），中灰背景选深色字（4.98:1 ≥ 4.5）。
+//!   抖动导致的每秒翻转由 [`crate::render::stable::LumaStabilizer`] 解决。
 
 use serde::{Deserialize, Serialize};
 
@@ -112,8 +123,6 @@ pub struct Theme {
     pub idle_bg: Rgba,
     /// 进度条轨道色
     pub track_bg: Rgba,
-    /// 对比度推到极端仍不达标（背景正好是中灰）→ 文字需要 1px 反色描边
-    pub needs_outline: bool,
 }
 
 impl Default for Theme {
@@ -143,6 +152,9 @@ impl Theme {
     /// `luma` 是 0..=1 的**相对亮度**（已做 sRGB → 线性）。
     /// `mode` / `idle_mode`：悬停 / 常规背景模式；`hover_alpha` / `idle_alpha`：
     /// 两态半透明的不透明度百分比（1..=100）。
+    ///
+    /// 文字色由 [`pick_on_light`] 按对比度择优决定。**采样线程不走这里**——
+    /// 它用 [`Theme::from_backdrop_on`] 传入稳定器算好的 `on_light`（v1.2.0）。
     pub fn from_backdrop(
         luma: f32,
         accent: Rgb,
@@ -152,20 +164,41 @@ impl Theme {
         idle_alpha: u8,
     ) -> Self {
         let luma = luma.clamp(0.0, 1.0);
+        Self::from_backdrop_on(
+            pick_on_light(luma),
+            luma,
+            accent,
+            mode,
+            idle_mode,
+            hover_alpha,
+            idle_alpha,
+        )
+    }
 
-        // 用「与该亮度等效的中性灰」作为背景代表色，做对比度择优。
+    /// 由**指定的** `on_light` 组装主题（v1.2.0：给亮度稳定器用）。
+    ///
+    /// 与 [`Theme::from_backdrop`] 的唯一区别是文字色方向由调用方决定：
+    /// 采样线程把 [`crate::render::stable::LumaStabilizer`] 稳定后的结论传进来，
+    /// 这样「深/浅字」不会因为单帧亮度抖动而翻转。其余推导（次要文字 alpha、
+    /// 强调色归一化、轨道色、背景两态）完全一致。
+    pub fn from_backdrop_on(
+        on_light: bool,
+        luma: f32,
+        accent: Rgb,
+        mode: BackgroundMode,
+        idle_mode: BackgroundMode,
+        hover_alpha: u8,
+        idle_alpha: u8,
+    ) -> Self {
+        let luma = luma.clamp(0.0, 1.0);
+
+        // 用「与该亮度等效的中性灰」作为背景代表色，算次要文字的合成对比度。
         let bg_gray = luma_to_srgb_gray(luma);
-        let dark = Self::DARK_TEXT;
-        let light = Self::LIGHT_TEXT;
-        let c_dark = contrast_ratio(dark, bg_gray);
-        let c_light = contrast_ratio(light, bg_gray);
-        let (text, on_light) = if c_dark >= c_light {
-            (dark, true)
+        let text = if on_light {
+            Self::DARK_TEXT
         } else {
-            (light, false)
+            Self::LIGHT_TEXT
         };
-        let best = c_dark.max(c_light);
-        let needs_outline = best < crate::config::defaults::limits::MIN_CONTRAST;
 
         // 次要文字：颜色与主文字同色，靠 `dim_alpha` 做淡化——
         // 这样"合成后对比度"是可计算的（见 `dim_alpha_for`），不会被颜色混合
@@ -189,10 +222,10 @@ impl Theme {
             text_dim,
             dim_alpha,
             accent,
-            hover_bg: Rgba::new(0, 0, 0, 0),
-            idle_bg: Rgba::new(0, 0, 0, 0),
+            // 两态背景必须由 `apply_bg_config` 填：透明档要保留基色（v1.2.0）
+            hover_bg: Rgba::TRANSPARENT,
+            idle_bg: Rgba::TRANSPARENT,
             track_bg,
-            needs_outline,
         };
         theme.apply_bg_config(mode, idle_mode, hover_alpha, idle_alpha);
         theme
@@ -201,7 +234,9 @@ impl Theme {
     /// 按背景配置**就地**更新两态背景色（v1.1.12）。
     ///
     /// 基色取「浅背景用白、深背景用近黑」（PRD §4.2），模式为「透明」时
-    /// alpha 归零（绘制层见 alpha==0 跳过），半透明档由百分比换算。
+    /// **只把 alpha 归零、RGB 保留基色**（v1.2.0 修：原先写死 `(0,0,0,0)`，
+    /// 让 `mix_rgba` 在 idle→hover 插值时把 RGB 从黑拉到白，中点是一块半透明中灰，
+    /// 表现为「悬停先变灰后变白」）。半透明档由百分比换算。
     /// [`Theme::from_backdrop`] 组装时调用；设置页改模式 / 透明度时也用它
     /// **就地同步**当前主题——滑条拖动即时可见，不必等下一次采样回来。
     pub fn apply_bg_config(
@@ -217,12 +252,13 @@ impl Theme {
             (0x1A, 0x1A, 0x1E)
         };
         self.hover_bg = if mode == BackgroundMode::Transparent {
-            Rgba::new(0, 0, 0, 0)
+            // 透明档：RGB 仍然是基色，只有 alpha = 0（插值时无色偏）
+            Rgba::new(r, g, b, 0)
         } else {
             Rgba::new(r, g, b, alpha_pct(hover_alpha))
         };
         self.idle_bg = if idle_mode == BackgroundMode::Transparent {
-            Rgba::new(0, 0, 0, 0)
+            Rgba::new(r, g, b, 0)
         } else {
             Rgba::new(r, g, b, alpha_pct(idle_alpha))
         };
@@ -247,8 +283,19 @@ impl Theme {
             && self.hover_bg == other.hover_bg
             && self.idle_bg == other.idle_bg
             && self.track_bg == other.track_bg
-            && self.needs_outline == other.needs_outline
     }
+}
+
+/// 按对比度择优：浅色背景要深色文字（`true`），深色背景要浅色文字（`false`）。
+///
+/// 只有「两种文字色都对背景做 WCAG 对比度」这一个判据，**没有**任何阈值魔法数。
+/// 交叉点约 luma = 0.179；中灰（luma ≈ 0.216）下深色字 4.98:1 胜出。
+///
+/// v1.2.0：从 [`Theme::from_backdrop`] 里提出来，供
+/// [`crate::render::stable::LumaStabilizer`] 的首帧判定复用。
+pub fn pick_on_light(luma: f32) -> bool {
+    let bg_gray = luma_to_srgb_gray(luma.clamp(0.0, 1.0));
+    contrast_ratio(Theme::DARK_TEXT, bg_gray) >= contrast_ratio(Theme::LIGHT_TEXT, bg_gray)
 }
 
 /// 不透明度百分比（1..=100）→ 0..=255 alpha。
@@ -275,8 +322,8 @@ pub fn mix_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
 /// 同时尽量淡。下限 78%（PRD §4.1 写的是 60% 不透明度，但那在中灰背景上
 /// 只有 ~3:1，QA 实测不达标，所以改成按背景算）。
 ///
-/// 返回值是 0..=255 的 alpha；连 100% 都达不到时返回 0xFF（此时
-/// `needs_outline` 会兜底加 1px 反色描边）。
+/// 返回值是 0..=255 的 alpha；连 100% 都达不到时返回 0xFF（此时次要文字退化为
+/// 与主文字同色、同不透明度——v1.2.0 删掉了 1px 反色描边，不再有描边兜底）。
 pub fn dim_alpha_for(fg: Rgb, bg: Rgb) -> u8 {
     const FLOOR: f32 = 0.78;
     let mut a = FLOOR;
@@ -392,6 +439,9 @@ mod tests {
     }
 
     /// 纯中灰是最容易选错的一档：白字 3.78:1 不达标，黑字 4.98:1 达标。
+    ///
+    /// v1.2.0：删掉「描边兜底」后，中灰背景必须严格选深色文字并达标——
+    /// 这条测试是该承诺的唯一守卫。
     #[test]
     fn mid_gray_picks_the_readable_side() {
         let luma = relative_luminance(Rgb::new(0x80, 0x80, 0x80));
@@ -402,7 +452,7 @@ mod tests {
             "中灰背景对比度 {} 未达 AA",
             t.text_contrast()
         );
-        assert!(!t.needs_outline);
+        assert!(pick_on_light(luma), "pick_on_light 与 from_backdrop 必须同判");
     }
 
     #[test]
@@ -550,5 +600,109 @@ mod tests {
         let dark = Theme::from_backdrop(0.02, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         let light = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
         assert!(!dark.same_paint(&light));
+    }
+
+    /// **v1.2.0 问题 1 的核心回归**：透明档的背景色必须携带基色，
+    /// 否则 `idle(0,0,0,0) → hover(白,不透明)` 的中点是一块半透明中灰
+    /// （画面表现为「悬停先变灰后变白」）。
+    #[test]
+    fn transparent_bg_keeps_base_color_so_midpoint_is_not_gray() {
+        // 浅色壁纸：悬停半透明 / 常规透明
+        let t = Theme::from_backdrop(
+            0.95,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        assert_eq!(t.idle_bg.a, 0, "透明档 alpha 必须为 0");
+        assert_eq!(
+            (t.idle_bg.r, t.idle_bg.g, t.idle_bg.b),
+            (0xF2, 0xF2, 0xF4),
+            "透明档必须保留浅色基色，不能谎报成黑色"
+        );
+
+        let mid = mix_rgba(t.idle_bg, t.hover_bg, 0.5);
+        // 中点 RGB 必须≈悬停基色（±1），不能是中灰
+        assert!(
+            (mid.r as i32 - 0xF2).abs() <= 1
+                && (mid.g as i32 - 0xF2).abs() <= 1
+                && (mid.b as i32 - 0xF4).abs() <= 1,
+            "中点色偏了：({},{},{})",
+            mid.r,
+            mid.g,
+            mid.b
+        );
+        assert!(
+            mid.r > 0xDC && mid.g > 0xDC && mid.b > 0xDC,
+            "浅色基色下中点三分量都应 > 0xDC，实际 ({},{},{})",
+            mid.r,
+            mid.g,
+            mid.b
+        );
+
+        // 深色壁纸：同理，中点必须仍是深色基色而不是中灰
+        let d = Theme::from_backdrop(
+            0.02,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        assert_eq!(
+            (d.idle_bg.r, d.idle_bg.g, d.idle_bg.b),
+            (0x1A, 0x1A, 0x1E),
+            "深色透明档必须保留深色基色"
+        );
+        let dm = mix_rgba(d.idle_bg, d.hover_bg, 0.5);
+        assert!(
+            dm.r < 0x30 && dm.g < 0x30 && dm.b < 0x30,
+            "深色基色下中点三分量都应 < 0x30，实际 ({},{},{})",
+            dm.r,
+            dm.g,
+            dm.b
+        );
+    }
+
+    /// 悬停淡入的两个端点仍然是「原地插值」：0 → idle，1 → hover。
+    #[test]
+    fn transparent_mode_still_interpolates_endpoints() {
+        let t = Theme::from_backdrop(
+            0.95,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        assert_eq!(mix_rgba(t.idle_bg, t.hover_bg, 0.0), t.idle_bg);
+        assert_eq!(mix_rgba(t.idle_bg, t.hover_bg, 1.0), t.hover_bg);
+    }
+
+    /// `from_backdrop_on` 必须与「用稳定器结论覆盖 on_light」等价：
+    /// 传进去的方向说了算，亮度只影响次要文字 alpha 等派生量。
+    #[test]
+    fn from_backdrop_on_honours_the_given_direction() {
+        let auto = Theme::from_backdrop(0.95, Rgb::SYSTEM_ACCENT_FALLBACK, BackgroundMode::Translucent, BackgroundMode::Transparent, 70, 50);
+        assert!(auto.on_light);
+
+        // 强行指定深色背景（浅色文字）：文字色 / 轨道色必须跟着翻
+        let forced = Theme::from_backdrop_on(
+            false,
+            0.95,
+            Rgb::SYSTEM_ACCENT_FALLBACK,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        assert!(!forced.on_light);
+        assert_eq!(forced.text, Theme::LIGHT_TEXT);
+        assert_ne!(forced.text, auto.text);
+        assert_ne!(forced.track_bg, auto.track_bg);
+        // 方向翻了两态背景的基色也要跟着翻（否则悬停块与文字撞色）
+        assert_ne!(forced.hover_bg, auto.hover_bg);
     }
 }

@@ -15,8 +15,8 @@ use windows::Win32::Graphics::Gdi::{
     BLENDFUNCTION, HDC, AC_SRC_ALPHA, AC_SRC_OVER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, SWP_NOACTIVATE,
-    SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WINDOW_EX_STYLE, WS_EX_LAYERED,
+    CreateWindowExW, GetWindowRect, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST,
+    SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WINDOW_EX_STYLE, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -120,6 +120,20 @@ impl TaskbarHost {
             )?;
         }
         Ok(())
+    }
+
+    /// 读窗口**实际**的屏幕矩形（诊断用，v1.2.0）。
+    ///
+    /// 为什么需要它：`target_rect` 是我们「以为」窗口在哪，
+    /// 而 `UpdateLayeredWindow` 的 `pptdst` 会改位置——两条路径一旦不一致，
+    /// 小组件就会「莫名位移」。G5 的「截图时左移」就是靠对比这两个矩形定位的。
+    pub fn window_rect(&self) -> Option<RECT> {
+        let mut r = RECT::default();
+        // SAFETY: hwnd 有效；r 是本地栈变量，GetWindowRect 只写它。
+        match unsafe { GetWindowRect(self.hwnd, &mut r) } {
+            Ok(()) => Some(r),
+            Err(_) => None,
+        }
     }
 
     /// 仅重新置顶（z-order 维持，§10.5）。

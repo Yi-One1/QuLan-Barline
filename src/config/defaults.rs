@@ -109,6 +109,17 @@ pub mod limits {
     pub const TEXT_LIGHT: u8 = 0xFA;
     /// WCAG AA 最小对比度
     pub const MIN_CONTRAST: f32 = 4.5;
+
+    // ------------------------------------------------- M5（v1.2.0）亮度稳定化
+    /// 稳定化：EMA 高于它才算「浅色背景」（要深色文字）。见 `render::stable`。
+    pub const LUMA_LIGHT_MIN: f32 = 0.25;
+    /// 稳定化：EMA 低于它才算「深色背景」（要浅色文字）。
+    /// 与 [`LUMA_LIGHT_MIN`] 之间是**死区**：亮度抖动落在死区里不翻转文字色。
+    pub const LUMA_DARK_MAX: f32 = 0.12;
+    /// 稳定化：EMA 的系数 α（新样本权重）。0.25 → 约 4 个样本收敛。
+    pub const LUMA_EMA_ALPHA: f32 = 0.25;
+    /// 稳定化：连续多少个样本与当前值冲突才真的翻转（1s 心跳下 = 2 秒）
+    pub const LUMA_CONFIRM_SAMPLES: u32 = 2;
 }
 
 /// 配置结构版本。`Config.version < CURRENT_VERSION` 时走迁移链。

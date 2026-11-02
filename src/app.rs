@@ -230,6 +230,48 @@ pub struct App {
     /// 右键菜单正在打开（v1.1.14 问题 12）：期间暂停 `ensure_on_top`——
     /// 1s 心跳把 topmost 的小组件抬到菜单之上会遮住菜单内容
     menu_open: bool,
+    /// 截图态（v1.2.0 / G5 问题 2）：前景窗口是截图工具时冻结「跟屏幕变」的两件事
+    /// （背景采样 + 任务栏几何重排），其余刷新（进度 / 歌词 / 封面 / 动画）照常
+    capture_frozen: bool,
+    /// 上一次记录的 `target_rect`（只在诊断日志里对比用，v1.2.0）
+    logged_rect: RECT,
+    /// 已经为当前这次「窗口实际位置漂移」记过日志（避免每秒刷屏，v1.2.0）
+    drift_logged: bool,
+}
+
+/// 小组件窗口矩形变化的**来源**（诊断日志用，v1.2.0 / G5 问题 2）。
+///
+/// 「截图时左移」这条缺陷唯一的线索就是：究竟哪条路径在遮罩期间改了窗口矩形。
+/// 每个影响到 `target_rect` / 窗口位置的入口都必须显式带一个原因，
+/// 不允许再出现 "reason=Unknown" 之外的模糊日志。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RectChangeReason {
+    /// 任务栏几何探测结果变了（`on_timer` 心跳 / `TaskbarCreated`）
+    TaskbarGeometry,
+    /// 置顶轮询时发现**窗口实际位置**已经和 `target_rect` 不一致
+    EnsureOnTop,
+    /// 尺寸类变化：歌词开关宽度动画、配置变更、标题宽度变化
+    Resize,
+    /// `WM_DISPLAYCHANGE`（分辨率 / DPI / 显示器增删）
+    DpiChange,
+    /// 兜底：`Effect::Relayout` 之外的纯刷新入口（第二实例唤起等）。
+    ///
+    /// 日志里出现 `reason=Unknown` 不代表有 bug，但它**不提供线索**——
+    /// 定位「左移」时应优先看 `TaskbarGeometry` / `EnsureOnTop`。
+    Unknown,
+}
+
+impl RectChangeReason {
+    /// 日志友好名（**稳定字符串**，日志检索依赖它）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RectChangeReason::TaskbarGeometry => "TaskbarGeometry",
+            RectChangeReason::EnsureOnTop => "EnsureOnTop",
+            RectChangeReason::Resize => "Resize",
+            RectChangeReason::DpiChange => "DpiChange",
+            RectChangeReason::Unknown => "Unknown",
+        }
+    }
 }
 
 /// 歌词区宽度过渡动画（v1.1：歌词区移入条带后，收合动画从高度改为宽度）。
@@ -357,6 +399,9 @@ impl App {
             skipped_frames: 0,
             geom_failed: false,
             menu_open: false,
+            capture_frozen: false,
+            logged_rect: target_rect,
+            drift_logged: false,
         });
 
         // 歌词行不透明度与初始宽度同步（歌词默认开启时首帧就是实色）
@@ -465,40 +510,55 @@ impl App {
     /// 1 秒定时器：几何兜底探测 + 乐观更新对账。
     pub fn on_timer(&mut self) {
         self.tick_optimistic();
+        self.sync_capture_freeze();
 
-        match geometry::probe() {
-            Some(g) => {
-                let changed = match self.geometry.as_ref() {
-                    Some(old) => !old.same_shape(&g),
-                    None => true,
-                };
-                let epoch_changed = self.geometry.as_ref().map(|o| o.epoch) != Some(g.epoch);
+        // ---- 截图态：冻结「跟屏幕变」的两件事（v1.2.0 / G5 问题 2）----
+        //
+        // 截图工具的置顶遮罩会改变抓屏内容（整屏压暗 / 十字线），也会让任务栏几何
+        // 短暂抖动。这两样一旦跟着变，用户就会看到「截图时文字闪一下 / 小组件左移」。
+        // 所以截图态期间：**不探测几何、不置顶、不采样**。
+        // 播放进度、歌词、封面、动画帧全部照常（它们在 `on_tick` / `TIMER_ANIM` 里）。
+        if !self.capture_frozen {
+            match geometry::probe() {
+                Some(g) => {
+                    let changed = match self.geometry.as_ref() {
+                        Some(old) => !old.same_shape(&g),
+                        None => true,
+                    };
+                    let epoch_changed = self.geometry.as_ref().map(|o| o.epoch) != Some(g.epoch);
+                    // 诊断（v1.2.0）：只说"几何变化"没法定位「左移」，必须列出变了的字段
+                    let fields = self.geometry.as_ref().map(|old| old.diff(&g)).unwrap_or_default();
 
-                crate::log_debug!("geometry: {}", g.summary());
-                self.geometry = Some(g);
-                self.geom_failed = false;
+                    crate::log_debug!("geometry: {}", g.summary());
+                    self.geometry = Some(g);
+                    self.geom_failed = false;
 
-                if changed {
-                    crate::log_info!("几何变化 → 重新布局：{}", g.summary());
-                    self.relayout();
-                } else if epoch_changed {
-                    self.state.geometry_epoch = g.epoch;
+                    if changed {
+                        crate::log_info!(
+                            "几何变化（字段={}）→ 重新布局：{}",
+                            if fields.is_empty() { "?" } else { fields.as_str() },
+                            g.summary()
+                        );
+                        self.relayout_with(RectChangeReason::TaskbarGeometry);
+                    } else if epoch_changed {
+                        self.state.geometry_epoch = g.epoch;
+                    }
+                }
+                None => {
+                    if !self.geom_failed {
+                        crate::log_warn!("geometry: probe 失败（任务栏不可用，Explorer 可能在重启）");
+                        self.geom_failed = true;
+                    }
                 }
             }
-            None => {
-                if !self.geom_failed {
-                    crate::log_warn!("geometry: probe 失败（任务栏不可用，Explorer 可能在重启）");
-                    self.geom_failed = true;
-                }
-            }
-        }
 
-        // 风险 R1 的最小缓解：任务栏与小组件同为 WS_EX_TOPMOST，同层窗口按「最近置顶」排序。
-        // 我们从不激活，所以任何被后来置顶的 topmost 窗口都会压住小组件。
-        // v1.1.14 问题 12：右键菜单打开期间必须暂停——TrackPopupMenuEx 的模态
-        // 循环会照常派发 WM_TIMER，每秒把小组件抬到菜单之上（菜单非 topmost）。
-        if !self.menu_open {
-            self.ensure_on_top();
+            // 风险 R1 的最小缓解：任务栏与小组件同为 WS_EX_TOPMOST，同层窗口按「最近置顶」排序。
+            // 我们从不激活，所以任何被后来置顶的 topmost 窗口都会压住小组件。
+            // v1.1.14 问题 12：右键菜单打开期间必须暂停——TrackPopupMenuEx 的模态
+            // 循环会照常派发 WM_TIMER，每秒把小组件抬到菜单之上（菜单非 topmost）。
+            if !self.menu_open {
+                self.ensure_on_top();
+            }
         }
 
         // 背景兜底重采样（PRD P0-07「窗口移动时 300ms 内刷新」的近似）。
@@ -508,9 +568,39 @@ impl App {
         // （深色窗口滑到浅色壁纸后面 → 白字压在浅色上，直接看不清）。
         // 这里按 1s 心跳补一次；采样线程自身有 300ms 节流，抓的只是小组件大小的
         // 一小块像素，空闲 CPU 仍是 0 量级（实测 < 0.3%）。
-        if self.state.visible && !self.is_hovering() {
+        if self.state.visible && !self.is_hovering() && !self.capture_frozen {
             self.request_backdrop();
         }
+    }
+
+    /// 截图态探测 + 进入/退出日志（v1.2.0 / G5 问题 2）。
+    ///
+    /// 只在**状态真的翻转**时记日志（1s 心跳下不能每秒刷一条）；
+    /// 退出时立刻补一次 `request_backdrop()`——否则用户会看到字色慢一拍，
+    /// 要等下一个 1s 心跳才恢复。
+    fn sync_capture_freeze(&mut self) {
+        let now = self.detect_capture();
+        if now == self.capture_frozen {
+            return;
+        }
+        self.capture_frozen = now;
+        if now {
+            crate::log_info!("进入截图态：冻结背景采样与几何重排（媒体 / 歌词 / 动画照常）");
+        } else {
+            crate::log_info!("退出截图态：恢复刷新，立即补一次背景采样");
+            self.request_backdrop();
+        }
+    }
+
+    /// 前景窗口是不是已知的截图工具。
+    fn detect_capture(&self) -> bool {
+        let info = crate::platform::capture::foreground_info();
+        if info.pid == 0 {
+            return false;
+        }
+        // 平台层不解析进程名（避免反向依赖 media），这里补上最后一步
+        let process = crate::media::launch::process_image_name(info.pid);
+        crate::platform::capture::is_capture_tool(&process, &info.class)
     }
 
     /// `WM_SETTINGCHANGE` / `WM_THEMECHANGED`：壁纸或主题变了 → 立即重新采样。
@@ -539,7 +629,7 @@ impl App {
         if let Some(t) = self.tray.as_mut() {
             t.add(self.lang);
         }
-        self.relayout();
+        self.relayout_with(RectChangeReason::TaskbarGeometry);
         self.ensure_on_top();
     }
 
@@ -548,7 +638,7 @@ impl App {
         crate::log_info!("WM_DISPLAYCHANGE：重建渲染目标");
         self.geometry = None;
         self.last_coverage = None;
-        self.relayout();
+        self.relayout_with(RectChangeReason::DpiChange);
     }
 
     /// `WM_HOTKEY`：全局快捷键按下。
@@ -589,7 +679,8 @@ impl App {
     /// 第二个实例请求唤起：打开（或前置）设置页。
     pub fn on_second_instance(&mut self) {
         crate::log_info!("第二个实例请求唤起 → 打开设置页");
-        self.relayout();
+        // 纯刷新（几何没变、窗口不该动）：用兜底原因，日志里不会被误当成位移来源
+        self.relayout_with(RectChangeReason::Unknown);
         let effects = self.reduce(AppEvent::SettingsOpenRequest);
         self.apply(effects);
     }
@@ -720,7 +811,7 @@ impl App {
         self.sync_interaction();
         if width_changed {
             // 宽度变了必须整条重排（窗口尺寸 + 渲染目标 + 采样区域都要跟着变）
-            self.relayout();
+            self.relayout_with(RectChangeReason::Resize);
             return;
         }
         if redraw || fade_done || self.interact.animating() || self.lyric_fade_active() {
@@ -1071,7 +1162,7 @@ impl App {
                 self.lang = Lang::from_serde(cfg.general.language);
                 self.config = *cfg;
                 self.animate_lyric_width();
-                self.relayout();
+                self.relayout_with(RectChangeReason::Resize);
                 let json = self.settings_state_json();
                 self.settings.push(&json);
                 vec![Effect::RefreshTrayMenu]
@@ -1631,7 +1722,7 @@ impl App {
     pub fn apply(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
-                Effect::Relayout => self.relayout(),
+                Effect::Relayout => self.relayout_with(RectChangeReason::Resize),
                 Effect::Redraw => self.redraw(),
                 Effect::SetVisible(v) => {
                     if let Some(h) = self.widget.as_mut() {
@@ -1707,7 +1798,15 @@ impl App {
     // ---------------------------------------------------------------- 渲染
 
     /// 重算布局 → 应用几何 → 重建目标（如需）→ 填文本缓存 → 重绘 → 同步可见性。
+    ///
+    /// 不知道原因时用它（等价于 [`App::relayout_with`] + [`RectChangeReason::Unknown`]）；
+    /// 有明确来源的入口请用 `relayout_with`，否则诊断日志里分不清是谁挪的窗口。
     pub fn relayout(&mut self) {
+        self.relayout_with(RectChangeReason::Unknown);
+    }
+
+    /// 同 [`App::relayout`]，但显式声明**为什么**要重排（v1.2.0 诊断用）。
+    pub fn relayout_with(&mut self, reason: RectChangeReason) {
         let Some(geo) = self.geometry else {
             // 没有几何信息（Explorer 未就绪）→ 隐藏，等下一次探测
             if let Some(h) = self.widget.as_mut() {
@@ -1780,6 +1879,9 @@ impl App {
             pw,
             ph,
         );
+        // v1.2.0 诊断：窗口矩形每次变化都留痕（old / new / reason）。
+        // 「截图时左移」只能靠这条日志定位是哪条路径在遮罩期间改了 rect。
+        self.log_rect_change(reason);
         if let Some(h) = self.widget.as_mut() {
             if let Err(e) = h.apply_geometry(self.target_rect) {
                 crate::log_warn!("应用窗口几何失败：{e}");
@@ -1900,6 +2002,7 @@ impl App {
         lyric_rect.hash(&mut h);
 
         // ---- 主题（只取影响像素的字段，忽略 luma 抖动）----
+        // v1.2.0：`needs_outline` 已删除（描边整链移除），指纹里不再有它。
         let theme = [
             rgb_key(st.theme.text),
             rgb_key(st.theme.text_dim),
@@ -1908,7 +2011,6 @@ impl App {
             st.theme.idle_bg.packed(),
             st.theme.track_bg.packed(),
             st.theme.dim_alpha as u32,
-            st.theme.needs_outline as u32,
         ];
         theme.hash(&mut h);
 
@@ -1982,6 +2084,12 @@ impl App {
 
     /// 请求背景采样（亮度 → 文字对比度主题）。
     fn request_backdrop(&mut self) {
+        // v1.2.0（G5 问题 2）：截图态**不抓屏**。截图工具的置顶遮罩会把整屏压暗 /
+        // 打上十字线，抓到的是被污染的像素 → 亮度突变 → 文字色可能翻一下。
+        // 退出截图态时由 `sync_capture_freeze` 立刻补一次，不会漏采样。
+        if self.capture_frozen {
+            return;
+        }
         if self.geometry.is_none() {
             return;
         }
@@ -2011,6 +2119,33 @@ impl App {
             ],
         };
         sampler.request(req);
+    }
+
+    /// 记一条「窗口矩形变化」诊断日志（v1.2.0 / G5 问题 2）。
+    ///
+    /// 格式固定为 `old=(l,t,r,b) new=(l,t,r,b) reason=...`，便于 grep
+    /// 「截图前后到底是哪条路径改了 rect」。矩形没变则不记。
+    fn log_rect_change(&mut self, reason: RectChangeReason) {
+        let old = self.logged_rect;
+        let new = self.target_rect;
+        if old == new {
+            return;
+        }
+        self.logged_rect = new;
+        // 位置变了就必须允许下一次漂移再记一条（否则漂移只报一次就静默）
+        self.drift_logged = false;
+        crate::log_info!(
+            "widget rect 变化：old=({},{},{},{}) new=({},{},{},{}) reason={}",
+            old.left,
+            old.top,
+            old.right,
+            old.bottom,
+            new.left,
+            new.top,
+            new.right,
+            new.bottom,
+            reason.as_str()
+        );
     }
 
     // ---------------------------------------------------------------- 交互辅助
@@ -2213,7 +2348,7 @@ impl App {
 
     /// 配置改动后：重排 + 重绘 + 落盘。返回要执行的 Effect。
     fn commit_config(&mut self) -> Vec<Effect> {
-        self.relayout();
+        self.relayout_with(RectChangeReason::Resize);
         vec![Effect::SaveConfig(Box::new(self.config.clone()))]
     }
 
@@ -2233,6 +2368,34 @@ impl App {
 
     /// 重新把小组件窗口放到 topmost 带的最前面（`SWP_NOACTIVATE`，不改焦点）。
     fn ensure_on_top(&mut self) {
+        // v1.2.0 诊断：置顶轮询顺便对账「窗口实际矩形 vs target_rect」。
+        // 正常情况下两者恒等（`relayout` 用 `apply_geometry` 写、`redraw` 用
+        // `present` 的 pptdst 再写一次，用的都是同一个 target_rect）。一旦不等，
+        // 说明有第三方（截图遮罩 / DPI 虚拟化 / 系统贴靠）动过窗口——
+        // 这是「截图时左移」唯一能落到日志上的直接证据。
+        if let Some(actual) = self.widget.as_ref().and_then(|h| h.window_rect()) {
+            if actual != self.target_rect {
+                if !self.drift_logged {
+                    self.drift_logged = true;
+                    crate::log_info!(
+                        "widget 实际位置漂移：actual=({},{},{},{}) target=({},{},{},{}) \
+                         reason={}（下一次 present 会拉回目标位置）",
+                        actual.left,
+                        actual.top,
+                        actual.right,
+                        actual.bottom,
+                        self.target_rect.left,
+                        self.target_rect.top,
+                        self.target_rect.right,
+                        self.target_rect.bottom,
+                        RectChangeReason::EnsureOnTop.as_str()
+                    );
+                }
+            } else {
+                self.drift_logged = false;
+            }
+        }
+
         if let Some(h) = self.widget.as_ref() {
             if let Err(e) = h.raise() {
                 crate::log_debug!("重新置顶失败：{e}");
