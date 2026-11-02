@@ -198,7 +198,6 @@ impl Default for AppearanceConfig {
             idle_alpha: 50,
             accent_source: AccentSource::Cover,
             accent_custom: String::from("#0078D4"),
-            ui_scale: 1.0,
             monitor_index: 0,
         }
     }

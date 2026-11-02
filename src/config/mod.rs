@@ -90,8 +90,6 @@ pub struct AppearanceConfig {
     pub accent_source: AccentSource,
     /// 自定义强调色，形如 "#0078D4"
     pub accent_custom: String,
-    /// 界面缩放：1.0 / 1.1 / 1.25
-    pub ui_scale: f32,
     /// 显示显示器：0 = 主显示器，否则为显示器序号
     pub monitor_index: u32,
 }
@@ -246,10 +244,9 @@ impl Config {
         match serde_json::from_slice::<Config>(&raw) {
             Ok(mut cfg) => {
                 crate::log_info!(
-                    "配置已加载：version={} lyrics.mode={:?} ui_scale={}",
+                    "配置已加载：version={} lyrics.mode={:?}",
                     cfg.version,
-                    cfg.lyrics.mode,
-                    cfg.appearance.ui_scale
+                    cfg.lyrics.mode
                 );
                 // v1.1.17（用户裁决）：会话音量（「当前播放器」范围）实测在
                 // 网易云/汽水/Edge 上均无法生效（连匹配环节都失败，根因见
@@ -316,7 +313,9 @@ mod tests {
         let back: Config = serde_json::from_slice(&json).expect("反序列化不应失败");
 
         assert_eq!(back.version, cfg.version);
-        assert_eq!(back.appearance.ui_scale, cfg.appearance.ui_scale);
+        // v1.2.2：`ui_scale` 已删除（死配置），改用它旁边的两个背景模式字段
+        assert_eq!(back.appearance.background_mode, cfg.appearance.background_mode);
+        assert_eq!(back.appearance.idle_mode, cfg.appearance.idle_mode);
         assert_eq!(back.appearance.accent_custom, cfg.appearance.accent_custom);
         assert_eq!(back.lyrics.mode, cfg.lyrics.mode);
         assert_eq!(back.lyrics.enabled, cfg.lyrics.enabled);
@@ -359,14 +358,29 @@ mod tests {
         assert!(back.lyrics.scroll, "旧配置缺省 scroll 必须为 true（默认开）");
     }
 
+    /// **v1.2.2 旧配置兼容（删除 `ui_scale` 后最重要的回归保障）**：
+    /// 用户机器上现存的 `config.json` 里还留着 `appearance.ui_scale`，
+    /// 字段删掉之后必须**照常加载**（serde 默认忽略未知字段），
+    /// 且同级的其它字段照常解析、缺省字段照常落默认值。
     #[test]
-    fn missing_fields_fall_back_to_defaults() {
-        // 只给一个字段，其余全靠 #[serde(default)]
-        let json = br#"{"version":1,"appearance":{"ui_scale":1.25}}"#;
-        let cfg: Config = serde_json::from_slice(json).expect("缺字段应能用默认值补齐");
-        assert_eq!(cfg.appearance.ui_scale, 1.25);
+    fn legacy_ui_scale_field_is_ignored() {
+        // 一段「旧版本写出来的真实配置形状」：既有已删的 ui_scale，也有正常字段
+        let json = br#"{
+            "version": 1,
+            "appearance": {"ui_scale": 1.25, "background_mode": "transparent", "hover_alpha": 85},
+            "lyrics": {"enabled": false}
+        }"#;
+        let cfg: Config =
+            serde_json::from_slice(json).expect("带已删除字段 ui_scale 的旧配置必须仍能加载");
+
+        // 旧字段被忽略（不报错），同级字段照常解析
+        assert_eq!(cfg.appearance.background_mode, BackgroundMode::Transparent);
+        assert_eq!(cfg.appearance.hover_alpha, 85);
+        assert_eq!(cfg.appearance.idle_mode, BackgroundMode::Transparent, "缺省字段落默认值");
+        assert!(!cfg.lyrics.enabled);
+
+        // 其余字段全靠 `#[serde(default)]` 补齐，不能因缺字段而失败
         assert_eq!(cfg.appearance.accent_custom, "#0078D4");
-        assert!(cfg.lyrics.enabled);
         assert_eq!(cfg.volume.step, 0.02);
         assert!(cfg.hotkeys.play_pause.is_bound());
     }

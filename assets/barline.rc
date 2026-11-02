@@ -25,12 +25,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "The Barline Authors"
       VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
-      VALUE "FileVersion",      "1.2.1"
+      VALUE "FileVersion",      "1.2.2"
       VALUE "InternalName",     "barline"
       VALUE "LegalCopyright",   "MIT License. The Barline Authors."
       VALUE "OriginalFilename", "barline.exe"
       VALUE "ProductName",      "曲栏 Barline"
-      VALUE "ProductVersion",   "1.2.1"
+      VALUE "ProductVersion",   "1.2.2"
     END
   END
   BLOCK "VarFileInfo"

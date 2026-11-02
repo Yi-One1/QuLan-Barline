@@ -84,6 +84,31 @@ mod tests {
         );
     }
 
+    /// 契约回归（v1.2.2 / G3）：「界面缩放」整项已删除，页面里不许再出现任何痕迹。
+    ///
+    /// `ui_scale` 曾经是**死配置**（渲染层与布局层从未读取），删除后若有人
+    /// "顺手加回来"，控件、i18n 词条、`bind` 调用会一起复活并再次误导用户。
+    /// 这里逐个关键字扫一遍，中英标签都查。
+    #[test]
+    fn ui_scale_widget_is_gone() {
+        for needle in [
+            "id=\"ui-scale\"",
+            "appearance.ui_scale",
+            "界面缩放",
+            "UI scale",
+            "appearance.scale",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(needle),
+                "设置页仍残留已删除的「界面缩放」痕迹：{needle}"
+            );
+        }
+        // 反向确认没有把整块外观设置删坏：相邻的两个 row 必须还在
+        for keep in ["id=\"bg-mode\"", "id=\"bg-idle-mode\"", "id=\"monitor\""] {
+            assert!(INDEX_HTML.contains(keep), "误删了外观设置里的 {keep}");
+        }
+    }
+
     /// 契约回归（v1.1.22）：「开机自启」已改名为「开机自启动」，设置页不得有残留。
     ///
     /// 注意「开机自启动」本身包含「开机自启」子串，所以逐处命中后要求后一个字符必须是

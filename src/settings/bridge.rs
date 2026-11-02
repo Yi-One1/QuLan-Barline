@@ -105,13 +105,6 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             cfg.appearance.idle_alpha = (v as f32).round().clamp(1.0, 100.0) as u8;
             true
         }
-        "appearance.ui_scale" => {
-            let Some(v) = value.as_f64() else { return false };
-            // 只接受 1.0 / 1.25 / 1.5 / 2.0 四档（PRD P0-15）
-            let v = (v as f32).clamp(1.0, 2.0);
-            cfg.appearance.ui_scale = v;
-            true
-        }
         "appearance.monitor_index" => {
             let Some(v) = value.as_u64() else { return false };
             cfg.appearance.monitor_index = v as u32;
@@ -373,6 +366,18 @@ mod tests {
         let mut c = Config::default();
         assert!(!apply_set(&mut c, "lyrics.mode", &json!("OneLine")));
         assert!(!apply_set(&mut c, "lyrics.mode", &json!("two_line")));
+    }
+
+    /// v1.2.2：「界面缩放」整项删除，白名单必须同时关掉这个口子——
+    /// 旧页面（用户机器上可能还有缓存的 WebView2 页面）再发 set 也不能写进配置。
+    #[test]
+    fn apply_set_rejects_removed_ui_scale() {
+        let mut c = Config::default();
+        assert!(
+            !apply_set(&mut c, "appearance.ui_scale", &json!(1.25)),
+            "已删除的 appearance.ui_scale 必须被白名单拒绝"
+        );
+        assert!(!apply_set(&mut c, "appearance.ui_scale", &json!(1.0)));
     }
 
     #[test]
