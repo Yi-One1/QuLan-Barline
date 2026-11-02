@@ -9,9 +9,10 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_ADDREQ_FLAG_ADD, WINHTTP_ADDREQ_FLAG_REPLACE, WINHTTP_FLAG_SECURE,
     WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
 };
 
@@ -105,6 +106,19 @@ pub fn get(url: &str, user_agent: &str) -> Result<Response, NetError> {
 
 /// 发一个 GET 请求。`url` 必须是 `https://host/path?query` 形式。
 pub fn get_with(url: &str, user_agent: &str, t: Timeouts) -> Result<Response, NetError> {
+    get_with_headers(url, user_agent, &[], t)
+}
+
+/// 发一个 GET 请求，并附带**额外请求头**（v1.3.0：网易云要求 `Referer`）。
+///
+/// `headers` 里每项是 `(name, value)`，会以 `Name: Value` 的形式追加到请求上
+/// （同名头会被替换，不会重复）。
+pub fn get_with_headers(
+    url: &str,
+    user_agent: &str,
+    headers: &[(&str, &str)],
+    t: Timeouts,
+) -> Result<Response, NetError> {
     let (host, port, path, secure) = split_url(url)?;
 
     let agent = to_wide(user_agent);
@@ -151,6 +165,27 @@ pub fn get_with(url: &str, user_agent: &str, t: Timeouts) -> Result<Response, Ne
     });
     if request.0.is_null() {
         return Err(NetError::Transport("WinHttpOpenRequest 失败".into()));
+    }
+
+    // ---- 额外请求头（v1.3.0）：`Referer` 之类 ----
+    for (name, value) in headers {
+        let line = format!("{name}: {value}");
+        // 去掉结尾 NUL：WinHTTP 的 `&[u16]` 入参按切片长度当作"头长度"，带 NUL 会多算一个字符
+        let mut wide = to_wide(&line);
+        wide.pop();
+        // SAFETY: request 有效；wide 是本地 UTF-16 缓冲，生命周期覆盖调用；
+        // windows-rs 用切片长度自动填 dwHeadersLength（单位字符，不含 NUL）。
+        let ok = unsafe {
+            WinHttpAddRequestHeaders(
+                request.0,
+                &wide,
+                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
+            )
+        };
+        if ok.is_err() {
+            // 加头失败不该整条查询失败：最坏是服务端不认这个源
+            crate::log_debug!("附加请求头 {name} 失败");
+        }
     }
 
     // SAFETY: request 有效；没有额外请求头（UA 已在 WinHttpOpen 里给），

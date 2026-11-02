@@ -117,13 +117,26 @@ impl ProviderChain {
     /// - `Network` **也不短路**，但会记下来——链走完还没有结果时，
     ///   优先报 `NetworkError`（可重试）而不是 `NotFound`（不可重试）。
     pub fn query(&self, q: &LyricQuery<'_>) -> (Option<Lyrics>, LyricMissReason) {
+        let (l, reason, _) = self.query_with_source(q);
+        (l, reason)
+    }
+
+    /// 同 [`ProviderChain::query`]，但额外返回**命中的源名**（v1.3.0）。
+    ///
+    /// 存在的唯一理由是可观测性：现在链上有 lrclib 与网易云两个在线源，
+    /// 用户日志必须能看出「到底是谁命中的」（否则调覆盖率时两眼一抹黑）。
+    /// 未命中时源名为空串。
+    pub fn query_with_source(
+        &self,
+        q: &LyricQuery<'_>,
+    ) -> (Option<Lyrics>, LyricMissReason, &'static str) {
         let mut saw_network = false;
         for p in &self.providers {
             if !p.is_enabled() {
                 continue;
             }
             match p.fetch(q) {
-                Ok(l) if !l.lines.is_empty() => return (Some(l), LyricMissReason::NotFound),
+                Ok(l) if !l.lines.is_empty() => return (Some(l), LyricMissReason::NotFound, p.name()),
                 Ok(_) => continue,
                 Err(ProviderError::NotFound) => continue,
                 Err(ProviderError::Parse(e)) => {
@@ -139,9 +152,9 @@ impl ProviderChain {
             }
         }
         if saw_network {
-            (None, LyricMissReason::NetworkError)
+            (None, LyricMissReason::NetworkError, "")
         } else {
-            (None, LyricMissReason::NotFound)
+            (None, LyricMissReason::NotFound, "")
         }
     }
 }

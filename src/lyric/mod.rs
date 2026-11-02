@@ -5,8 +5,10 @@
 //! parser.rs    文本 → Lyrics（LRC / 增强 LRC 状态机）
 //! interp.rs    一行文本 → 扫光单元（CJK 逐字 / 拉丁按词）+ 时间插值
 //! locate.rs    本地 .lrc 查找（文件名匹配）
+//! query.rs     在线查询的纯函数：标题清洗 / 候选 / 择优（v1.3.0）
 //! provider.rs  LyricProvider trait + 有序链（本地 → 在线）
-//! lrclib.rs    lrclib.net 实现
+//! lrclib.rs    lrclib.net 实现（精确 + 模糊检索）
+//! netease.rs   网易云音乐实现（兜底，v1.3.0）
 //! net.rs       WinHTTP GET（零依赖）
 //! cache.rs     内存 LRU + 磁盘正缓存 + 负缓存
 //! service.rs   T2 线程：请求 → 查询 → AppEvent
@@ -20,8 +22,10 @@ pub mod interp;
 pub mod locate;
 pub mod lrclib;
 pub mod net;
+pub mod netease;
 pub mod parser;
 pub mod provider;
+pub mod query;
 pub mod service;
 
 use std::sync::Arc;

@@ -26,6 +26,32 @@ use crate::media::Ms;
 const POS_TTL_SECS: i64 = limits::LYRIC_DISK_TTL_DAYS * 86_400;
 /// 负缓存保留小时 → 秒。
 const NEG_TTL_SECS: i64 = limits::LYRIC_MISS_TTL_HOURS * 3_600;
+
+/// **负缓存 key 的版本前缀**（v1.3.0 / G6 问题 7）。
+///
+/// 为什么要它：v1.3.0 换了歌词查询策略（artist 为空不再走精确接口 + 模糊检索 +
+/// 网易云兜底），**以前查不到的歌现在有可能查到**。但那些失败的曲目已经写进了
+/// 24h 负缓存，升级后会被直接拦住，等于新功能完全白干。
+///
+/// 做法：负缓存的文件名改成 `fnv1a64("v2:" + key)`——旧文件名（`fnv1a64(key)`）
+/// 从此不再命中，**旧 miss 自动作废**；旧文件留在目录里等 TTL 清理自然淘汰
+/// （不主动删：删除是破坏性操作，且旧文件最多留 24h）。
+///
+/// **正缓存不受影响**（正缓存里的歌词永远是对的，没必要重下）。
+///
+/// 以后如果再换查询策略，把这里的版本号 +1 即可。
+const MISS_KEY_VERSION: &str = "v2:";
+
+/// 负缓存的**逻辑 key**（`版本前缀 + track.key()`）。
+///
+/// 单独暴露成函数是为了可测：任何人都能断言"新版 key 与旧的不同"，
+/// 防止以后有人手滑把它改回不带前缀（那会让升级后仍然命中旧 miss）。
+pub fn miss_cache_key(track_key: &str) -> String {
+    let mut s = String::with_capacity(MISS_KEY_VERSION.len() + track_key.len());
+    s.push_str(MISS_KEY_VERSION);
+    s.push_str(track_key);
+    s
+}
 /// 磁盘缓存总大小上限（5 MB）。
 const MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// **内存** LRU 的字节上限（512 KB）。
@@ -323,9 +349,14 @@ impl Cache {
         self.dir.join(format!("{:016x}.json", fnv1a64(key.as_bytes())))
     }
 
+    /// 负缓存文件路径。
+    ///
+    /// v1.3.0：文件名哈希的是**带版本前缀的 key**（见 [`MISS_KEY_VERSION`]），
+    /// 升级后旧 miss 文件自动不再命中。
     fn miss_path(&self, key: &str) -> PathBuf {
+        let versioned = miss_cache_key(key);
         self.dir
-            .join(format!("miss-{:016x}.json", fnv1a64(key.as_bytes())))
+            .join(format!("miss-{:016x}.json", fnv1a64(versioned.as_bytes())))
     }
 }
 
@@ -517,6 +548,28 @@ mod tests {
         assert_eq!(c.miss_reason("k2"), Some(LyricMissReason::NetworkError));
         c.put_miss("k3", LyricMissReason::NotFound);
         assert_eq!(c.miss_reason("k3"), Some(LyricMissReason::NotFound));
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    /// **v1.3.0 负缓存作废的回归**：逻辑 key 必须带版本前缀，且**落盘文件名**必须
+    /// 与不带前缀时不同——否则升级后旧 miss 仍然命中，新查询策略等于白干。
+    #[test]
+    fn negative_cache_key_changed() {
+        let key = "张杰|天下|240000";
+        let versioned = miss_cache_key(key);
+        assert_ne!(versioned, key, "负缓存 key 必须与旧版不同");
+        assert!(versioned.starts_with(MISS_KEY_VERSION), "必须带版本前缀");
+        assert!(versioned.ends_with(key), "前缀之外要保留原 key，便于日志对照");
+
+        // 真正决定"会不会命中旧文件"的是哈希后的文件名
+        let c = tmp_cache("miss_version");
+        let new_path = c.miss_path(key);
+        let old_name = format!("miss-{:016x}.json", fnv1a64(key.as_bytes()));
+        assert_ne!(
+            new_path.file_name().and_then(|n| n.to_str()),
+            Some(old_name.as_str()),
+            "新旧负缓存文件名相同 → 升级后仍会命中旧 miss"
+        );
         let _ = std::fs::remove_dir_all(&c.dir);
     }
 

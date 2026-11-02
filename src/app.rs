@@ -1423,6 +1423,21 @@ impl App {
                     );
                 }
             }
+            // v1.3.0（G6）：歌词来源现在有两个，「关于」页各给一个链接
+            "openNetease" => {
+                let w = to_wide("https://music.163.com");
+                // SAFETY: 同上。
+                unsafe {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(w.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+            }
             "ready" => {
                 // 页面加载完了：补推一次全量状态
                 self.settings.on_webview_ready();

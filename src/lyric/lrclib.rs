@@ -1,14 +1,27 @@
 //! lrclib.net provider（`ARCHITECTURE.md` §12.4）。
 //!
-//! `GET https://lrclib.net/api/get?track_name=..&artist_name=..&album_name=..&duration=..`
+//! 两个接口（v1.3.0 起都用）：
 //!
-//! 响应（200）：
+//! * 精确：`GET /api/get?track_name=..&artist_name=..&album_name=..&duration=..`
+//! * 模糊：`GET /api/search?q=<标题 + 主歌手>`
+//!
+//! 响应（200，`/api/get`）：
 //! ```json
 //! { "id": 1, "trackName": "...", "artistName": "...",
 //!   "syncedLyrics": "[00:12.34]词", "plainLyrics": "词\n词" }
 //! ```
+//! `/api/search` 返回**同样结构的数组**，所以一次搜索就能拿到元数据 + 歌词，
+//! 本地择优（[`crate::lyric::query::pick_best`]）后直接用选中那条的 `syncedLyrics`。
+//!
 //! **只认 `syncedLyrics`**：`plainLyrics` 没有时间轴，无法扫光/滚动，
 //! 按 §12.4 的约定视为「没有歌词」（而不是"有歌词但不滚动"——那会让用户以为功能坏了）。
+//!
+//! ## v1.3.0 修的一个实证 400（G6 问题 7）
+//!
+//! 用户日志：Edge 放 B 站视频时 SMTC 的 `artist` 是空串，拼出
+//! `…&artist_name=&duration=357`，lrclib 直接 **HTTP 400**。
+//! 现在 [`build_url`] **不拼空的 `artist_name`**，并且 [`LrclibProvider::fetch`]
+//! 在 artist 为空时**根本不走精确接口**，直接进模糊检索（用标题单独查）。
 //!
 //! lrclib **要求可识别的 User-Agent**（默认的 WinHTTP UA 会被 403），
 //! 所以这里显式带上项目地址。
@@ -16,10 +29,13 @@
 use crate::lyric::net::{self, NetError};
 use crate::lyric::parser;
 use crate::lyric::provider::{LyricProvider, LyricQuery, ProviderError};
+use crate::lyric::query::{self, Candidate, Want};
 use crate::lyric::{LyricKind, Lyrics};
 
-/// lrclib 的接口根。
-const BASE: &str = "https://lrclib.net/api/get";
+/// lrclib 的精确查询接口。
+const BASE_GET: &str = "https://lrclib.net/api/get";
+/// lrclib 的模糊搜索接口（v1.3.0）。
+const BASE_SEARCH: &str = "https://lrclib.net/api/search";
 /// 项目 UA（lrclib 要求能识别调用方）。
 pub const USER_AGENT: &str = "Barline/0.0.1 (https://github.com/Yi-One1/QuLan-Barline-Next)";
 
@@ -51,19 +67,30 @@ impl LyricProvider for LrclibProvider {
         if t.title.trim().is_empty() {
             return Err(ProviderError::NotFound);
         }
+        let artist = query::primary_artist(&t.artist);
 
-        let url = build_url(t);
-        crate::log_info!("请求 lrclib：{url}");
-        match self.fetch_once(&url) {
-            // 超时 / 5xx：**立刻**重试一次（总预算 12s × 2 = 24s ≤ 25s）。
-            // 为什么不用 service 的退避（5s/15s/60s）：那个是给"整首查不到"用的，
-            // 而这里只是"这一次慢了"，等 5s 再试等于白白多等 5s。
-            Err(ProviderError::Network(e)) => {
-                crate::log_warn!("lrclib 首次失败（{e}），立刻重试一次");
-                self.fetch_once(&url)
+        // ---- 1. 精确查询：**artist 为空时直接跳过**（空参数会让 lrclib 返回 400）----
+        if !artist.is_empty() {
+            let url = build_url(t);
+            crate::log_debug!("请求 lrclib(get)：{url}");
+            match self.fetch_once(&url) {
+                Ok(l) => return Ok(l),
+                // 超时 / 5xx：**立刻**重试一次（总预算 12s × 2 = 24s ≤ 25s）
+                Err(ProviderError::Network(e)) => {
+                    crate::log_warn!("lrclib 精确查询失败（{e}），立刻重试一次");
+                    match self.fetch_once(&url) {
+                        Ok(l) => return Ok(l),
+                        Err(e2) => crate::log_debug!("lrclib 精确查询二次失败：{}", e2.as_str()),
+                    }
+                }
+                Err(e) => crate::log_debug!("lrclib 精确未命中：{}", e.as_str()),
             }
-            other => other,
+        } else {
+            crate::log_debug!("SMTC 未提供歌手，跳过 lrclib 精确查询（空 artist_name 会 400）");
         }
+
+        // ---- 2. 模糊检索 + 本地择优 ----
+        self.search(t)
     }
 }
 
@@ -75,7 +102,7 @@ impl LrclibProvider {
             NetError::Transport(s) => ProviderError::Network(s),
             NetError::BadRequest(s) => ProviderError::Parse(s),
         })?;
-        crate::log_info!(
+        crate::log_debug!(
             "lrclib 响应：HTTP {} / {} 字节 / {:.1}s",
             resp.status,
             resp.bytes,
@@ -88,16 +115,91 @@ impl LrclibProvider {
             s => Err(ProviderError::Network(format!("HTTP {s}"))),
         }
     }
+
+    /// 模糊检索：逐个关键词试（最多 [`query::MAX_SEARCH_KEYWORDS`] 条），命中即停。
+    fn search(&self, track: &crate::media::Track) -> Result<Lyrics, ProviderError> {
+        let want = Want::of(track);
+        let keywords = query::search_keywords(&track.title, &track.artist);
+        if keywords.is_empty() {
+            return Err(ProviderError::NotFound);
+        }
+        let mut saw_network = false;
+        for kw in &keywords {
+            let url = build_search_url(kw);
+            crate::log_debug!("请求 lrclib(search)：{url}");
+            let t0 = std::time::Instant::now();
+            let resp = match net::get_with(&url, USER_AGENT, net::TIMEOUT_SEARCH) {
+                Ok(r) => r,
+                Err(NetError::Transport(s)) => {
+                    crate::log_debug!("lrclib 搜索网络失败：{s}");
+                    saw_network = true;
+                    continue;
+                }
+                Err(NetError::BadRequest(s)) => {
+                    crate::log_debug!("lrclib 搜索请求非法：{s}");
+                    continue;
+                }
+            };
+            crate::log_debug!(
+                "lrclib 搜索响应：HTTP {} / {} 字节 / {:.1}s（关键词={kw}）",
+                resp.status,
+                resp.bytes,
+                t0.elapsed().as_secs_f32()
+            );
+            if resp.status != 200 {
+                if resp.status >= 500 {
+                    saw_network = true;
+                }
+                continue;
+            }
+            let hits = parse_search_body(&resp.body);
+            if hits.is_empty() {
+                continue;
+            }
+            let cands: Vec<Candidate> = hits.iter().map(|h| h.cand.clone()).collect();
+            let Some((idx, score)) = query::pick_best(&want, &cands) else {
+                crate::log_debug!(
+                    "lrclib 搜索有 {} 条结果但无一达标（关键词={kw}）",
+                    cands.len()
+                );
+                continue;
+            };
+            let hit = &hits[idx];
+            crate::log_info!(
+                "lrclib 搜索命中：id={} 「{} - {}」score={score}（关键词={kw}）",
+                hit.cand.id,
+                hit.cand.title,
+                hit.cand.artist
+            );
+            if hit.synced.trim().is_empty() {
+                // 选中那条只有 plainLyrics → 换下一个关键词再试
+                crate::log_debug!("lrclib 选中的结果没有时间轴，继续下一个关键词");
+                continue;
+            }
+            return lyrics_from_lrc(hit.synced.as_str(), &hit.cand);
+        }
+        if saw_network {
+            Err(ProviderError::Network("lrclib 搜索网络失败".into()))
+        } else {
+            Err(ProviderError::NotFound)
+        }
+    }
 }
 
-/// 构造请求 URL。`duration` 只在播放器上报了时长时才带。
+/// 构造**精确查询** URL。`duration` 只在播放器上报了时长时才带。
+///
+/// `artist` 清洗后为空时**不拼 `artist_name=`**——空值会让 lrclib 返回 HTTP 400
+/// （v1.3.0 修的实证 bug）。
 pub fn build_url(track: &crate::media::Track) -> String {
     let mut url = String::with_capacity(160);
-    url.push_str(BASE);
+    url.push_str(BASE_GET);
     url.push_str("?track_name=");
     url.push_str(&net::percent_encode(track.title.trim()));
-    url.push_str("&artist_name=");
-    url.push_str(&net::percent_encode(track.artist.trim()));
+    let artist = query::primary_artist(&track.artist);
+    if !artist.is_empty() {
+        url.push_str("&artist_name=");
+        url.push_str(&net::percent_encode(&artist));
+    }
     if !track.album.trim().is_empty() {
         url.push_str("&album_name=");
         url.push_str(&net::percent_encode(track.album.trim()));
@@ -107,6 +209,83 @@ pub fn build_url(track: &crate::media::Track) -> String {
         url.push_str(&(track.duration_ms / 1000).to_string());
     }
     url
+}
+
+/// 构造**模糊搜索** URL（v1.3.0）。
+pub fn build_search_url(query_text: &str) -> String {
+    let mut url = String::with_capacity(120);
+    url.push_str(BASE_SEARCH);
+    url.push_str("?q=");
+    url.push_str(&net::percent_encode(query_text.trim()));
+    url
+}
+
+/// 搜索响应里的一条（元数据 + 可能带歌词）。
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub cand: Candidate,
+    pub synced: String,
+}
+
+/// 解析 `/api/search` 的响应体（数组）。结构不符的条目**跳过**，不整体失败。
+pub fn parse_search_body(body: &str) -> Vec<SearchHit> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(id) = item.get("id").and_then(|x| x.as_i64()) else {
+            continue;
+        };
+        let title = item
+            .get("trackName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let artist = item
+            .get("artistName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // lrclib 的 duration 是**秒**
+        let duration_ms = item
+            .get("duration")
+            .and_then(|x| x.as_f64())
+            .map(|s| (s * 1000.0) as i64)
+            .unwrap_or(0);
+        let synced = item
+            .get("syncedLyrics")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push(SearchHit {
+            cand: Candidate {
+                id,
+                title,
+                artist,
+                duration_ms,
+            },
+            synced,
+        });
+    }
+    out
+}
+
+/// `syncedLyrics` 文本 → `Lyrics`。
+fn lyrics_from_lrc(synced: &str, cand: &Candidate) -> Result<Lyrics, ProviderError> {
+    let mut lyrics = parser::parse(synced, LyricKind::Line);
+    if lyrics.lines.is_empty() {
+        return Err(ProviderError::Parse("syncedLyrics 解析不出行".into()));
+    }
+    lyrics.title = cand.title.clone();
+    lyrics.artist = cand.artist.clone();
+    Ok(lyrics)
 }
 
 /// 解析响应体。
@@ -121,12 +300,23 @@ fn parse_body(body: &str) -> Result<Lyrics, ProviderError> {
         // 只有 plainLyrics → 无时间轴 → 按"没有歌词"处理
         return Err(ProviderError::NotFound);
     }
-    let lyrics = parser::parse(synced, LyricKind::Line);
-    if lyrics.lines.is_empty() {
-        return Err(ProviderError::Parse("syncedLyrics 解析不出行".into()));
-    }
+    let cand = Candidate {
+        id: v.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+        title: v
+            .get("trackName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        artist: v
+            .get("artistName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        duration_ms: 0,
+    };
+    let lyrics = lyrics_from_lrc(synced, &cand)?;
     crate::log_info!(
-        "lrclib 命中：{} 行（kind={:?}）",
+        "lrclib 精确命中：{} 行（kind={:?}）",
         lyrics.lines.len(),
         lyrics.kind
     );
@@ -206,5 +396,59 @@ mod tests {
             parse_body(body),
             Err(ProviderError::Parse(_))
         ));
+    }
+
+    /// **v1.3.0 修 HTTP 400 的回归**：artist 为空时不拼 `artist_name=`。
+    #[test]
+    fn url_omits_empty_artist() {
+        let u = build_url(&track("粉碎", ""));
+        assert!(!u.contains("artist_name"), "空 artist 会让 lrclib 返回 400：{u}");
+        assert!(u.contains("track_name="));
+        assert!(u.contains("duration=213"));
+
+        // 只有空白也算空
+        let u2 = build_url(&track("粉碎", "   "));
+        assert!(!u2.contains("artist_name"));
+
+        // 多歌手优先用主歌手
+        let u3 = build_url(&track("因为爱情", "陈奕迅/王菲"));
+        assert!(u3.contains("artist_name=%E9%99%88%E5%A5%95%E8%BF%85"), "应只带主歌手：{u3}");
+        assert!(!u3.contains("%E7%8E%8B%E8%8F%B2"), "副歌手不该进精确查询");
+    }
+
+    #[test]
+    fn search_url_is_encoded() {
+        let u = build_search_url("晴天 周杰伦");
+        assert!(u.starts_with("https://lrclib.net/api/search?q="));
+        assert!(u.contains("%20"), "空格必须编码成 %20（不是 +）：{u}");
+    }
+
+    /// 用裁剪过的真实响应形状做夹具：数组元素带 `trackName/artistName/duration(秒)`。
+    #[test]
+    fn search_body_parses_and_converts_seconds() {
+        let body = r#"[
+          {"id": 11, "trackName": "晴天", "artistName": "周杰伦", "duration": 269.0,
+           "syncedLyrics": "[00:01.00]第一句", "plainLyrics": "第一句"},
+          {"id": 12, "trackName": "晴天 (Live)", "artistName": "周杰伦", "duration": 300.2,
+           "syncedLyrics": null}
+        ]"#;
+        let hits = parse_search_body(body);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].cand.id, 11);
+        assert_eq!(hits[0].cand.title, "晴天");
+        assert_eq!(hits[0].cand.duration_ms, 269_000, "lrclib 的 duration 是秒，要换算");
+        assert!(hits[0].synced.starts_with("[00:01"));
+        assert!(hits[1].synced.is_empty(), "null 的 syncedLyrics 当空串");
+    }
+
+    #[test]
+    fn search_body_tolerates_garbage() {
+        assert!(parse_search_body("not json").is_empty());
+        assert!(parse_search_body("{}").is_empty(), "对象不是数组");
+        // 缺 id 的条目跳过，其余照收
+        let body = r#"[{"trackName":"x"},{"id":3,"trackName":"y"}]"#;
+        let hits = parse_search_body(body);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cand.id, 3);
     }
 }

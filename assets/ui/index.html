@@ -263,7 +263,7 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
         </div>
         <div class="row" data-dep="lyrics">
           <div><div class="label" data-i18n="lyrics.online">在线歌词</div>
-            <div class="desc" data-i18n="lyrics.online.desc">无本地文件时向 lrclib.net 查询。</div></div>
+            <div class="desc" data-i18n="lyrics.online.desc">无本地文件时依次向 lrclib.net、网易云音乐查询。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-online"><span class="track"></span><span class="knob"></span></label></div>
         </div>
       </div>
@@ -372,7 +372,7 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
       <p class="sub" data-i18n="about.sub">曲栏 Barline —— Windows 11 任务栏媒体播控小组件。</p>
       <div class="card">
         <div class="about-line"><span class="k" data-i18n="about.version">版本</span><span id="about-version">—</span></div>
-        <div class="about-line"><span class="k" data-i18n="about.lyrics">歌词来源</span><span class="link" id="open-lrclib">lrclib.net</span></div>
+        <div class="about-line"><span class="k" data-i18n="about.lyrics">歌词来源</span><span class="link" id="open-lrclib">lrclib.net</span><span class="link" id="open-netease" data-i18n="about.lyrics.netease">网易云音乐</span></div>
         <div class="about-line"><span class="k" data-i18n="about.license">开源许可</span><span>MIT License</span></div>
         <div class="about-line"><span class="k" data-i18n="about.thanks">致谢</span><span>Windows API · Direct2D · WebView2 · lrclib</span></div>
       </div>
@@ -404,7 +404,7 @@ const I18N = {
     "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
     "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。",
     "storage.browse": "更改", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
-    "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时向 lrclib.net 查询。",
+    "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时依次向 lrclib.net、网易云音乐查询。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
     "volume.wheel": "滚轮调节", "volume.wheel.desc": "仅指针悬停在小组件上时生效。",
@@ -426,6 +426,7 @@ const I18N = {
     "general.widget": "显示小组件", "general.widget.desc": "与托盘菜单里的「显示/隐藏小组件」同步。",
     "about.sub": "曲栏 Barline —— Windows 11 任务栏媒体播控小组件。",
     "about.version": "版本", "about.lyrics": "歌词来源",
+    "about.lyrics.netease": "网易云音乐",
     "about.license": "开源许可", "about.thanks": "致谢",
     "toast.saved": "已应用"
   },
@@ -447,7 +448,7 @@ const I18N = {
     "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
     "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put). Click the path to open it.",
     "storage.browse": "Change", "storage.reset": "Reset", "storage.pending": "applies after restart",
-    "lyrics.online": "Online lyrics", "lyrics.online.desc": "Query lrclib.net when no local file exists.",
+    "lyrics.online": "Online lyrics", "lyrics.online.desc": "Queries lrclib.net, then NetEase Cloud Music, when no local file exists.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
@@ -469,6 +470,7 @@ const I18N = {
     "general.widget": "Show widget", "general.widget.desc": "Synced with the tray menu item.",
     "about.sub": "Barline — a Windows 11 taskbar media widget.",
     "about.version": "Version", "about.lyrics": "Lyrics",
+    "about.lyrics.netease": "NetEase Cloud Music",
     "about.license": "License", "about.thanks": "Built with",
     "toast.saved": "Applied"
   }
@@ -797,6 +799,7 @@ document.getElementById("storage-dir").addEventListener("click", () => post({ ty
 document.getElementById("storage-browse").addEventListener("click", () => post({ type: "action", payload: "browseStorageDir" }));
 document.getElementById("storage-reset").addEventListener("click", () => post({ type: "action", payload: "resetStorageDir" }));
 document.getElementById("open-lrclib").addEventListener("click", () => post({ type: "action", payload: "openLrclib" }));
+document.getElementById("open-netease").addEventListener("click", () => post({ type: "action", payload: "openNetease" }));
 
 /* ---------------- 消息接收 ---------------- */
 if (window.chrome && chrome.webview) {

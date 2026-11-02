@@ -23,6 +23,7 @@ use crate::config::defaults::limits;
 use crate::event::{AppEvent, LyricRequest};
 use crate::lyric::cache::Cache;
 use crate::lyric::lrclib::LrclibProvider;
+use crate::lyric::netease::NeteaseProvider;
 use crate::lyric::provider::{LocalProvider, LyricProvider, LyricQuery, ProviderChain};
 use crate::lyric::LyricMissReason;
 use crate::media::TrackId;
@@ -219,7 +220,7 @@ fn handle_request_with_attempt(
         return None;
     }
 
-    // ---- 5. 在线 ----
+    // ---- 5. 在线（v1.3.0：lrclib 精确/模糊 → 网易云兜底，一次查询两个源）----
     if !req.online_enabled {
         sink.send(AppEvent::LyricMissing {
             track_id,
@@ -228,16 +229,50 @@ fn handle_request_with_attempt(
         return None;
     }
 
-    let chain = ProviderChain::with(vec![Box::new(LrclibProvider::new(true))]);
-    let (found, reason) = chain.query(&query);
+    // 候选关键词先算出来：既要交给 provider，也要进那条汇总日志
+    let keywords = crate::lyric::query::search_keywords(&req.track.title, &req.track.artist);
+    let t0 = Instant::now();
+
+    let chain = ProviderChain::with(vec![
+        Box::new(LrclibProvider::new(true)),
+        Box::new(NeteaseProvider::new(true)),
+    ]);
+    let (found, reason, source) = chain.query_with_source(&query);
+    let elapsed_ms = t0.elapsed().as_millis();
+
     if let Some(l) = found {
-        cache.put(&key, &l, "lrclib");
+        cache.put(&key, &l, source);
+        // 用户日志要求：一眼看出「谁命中的」+ 候选关键词 + 耗时（不打歌词正文）
+        crate::log_info!(
+            "歌词查询：{} - {} → 源={} 命中（候选={:?} 耗时={}ms）",
+            req.track.title,
+            if req.track.artist.trim().is_empty() {
+                "<无歌手>"
+            } else {
+                req.track.artist.trim()
+            },
+            source,
+            keywords,
+            elapsed_ms
+        );
         sink.send(AppEvent::LyricReady {
             track_id,
             lyrics: std::sync::Arc::new(l),
         });
         return None;
     }
+
+    crate::log_info!(
+        "歌词查询：{} - {} → 全部未命中（候选={:?} 耗时={}ms）",
+        req.track.title,
+        if req.track.artist.trim().is_empty() {
+            "<无歌手>"
+        } else {
+            req.track.artist.trim()
+        },
+        keywords,
+        elapsed_ms
+    );
 
     match reason {
         LyricMissReason::NetworkError => {
@@ -291,7 +326,11 @@ pub fn query_once(
         local_dirs: &req.local_dirs,
         online_enabled: req.online_enabled,
     };
-    let chain = ProviderChain::new(Box::new(LrclibProvider::new(req.online_enabled)));
+    let chain = ProviderChain::with(vec![
+        Box::new(LocalProvider),
+        Box::new(LrclibProvider::new(req.online_enabled)),
+        Box::new(NeteaseProvider::new(req.online_enabled)),
+    ]);
     let (l, reason) = chain.query(&q);
     if let Some(ref got) = l {
         cache.put(&key, got, "test");
