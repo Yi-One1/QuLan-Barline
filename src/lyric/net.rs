@@ -32,31 +32,57 @@ pub struct Timeouts {
     pub connect: i32,
     pub send: i32,
     pub receive: i32,
+    /// 一次请求的**总**预算（毫秒）。
+    ///
+    /// `WinHttpSetTimeouts` 的 receive 是「单次接收操作」的超时，不是总时长：
+    /// 实测 lrclib 一个 404 也能拖 22.4s（数据一点点滴出来，每次都小于 12s）。
+    /// 所以需要这道总闸，超过就主动放弃——否则歌词线程会被一个请求卡住半分钟。
+    ///
+    /// **为什么放进 `Timeouts` 而不是再加一个函数参数**：总预算是「这次请求愿意
+    /// 等多久」的一部分，和四段超时是同一件事；放进结构体后，所有调用点
+    /// （`get` / `get_with_headers`）的签名一个都不用改，也就不会为了传参
+    /// 再造出 `get_with_headers_and_budget` 这类分叉。
+    pub total_ms: u128,
 }
 
-/// `/api/get`（单曲精确查询）：实测 6.6s，给到 12s。
+/// `/api/get`（单曲精确查询）：实测 6.6s，给到 12s。**非歌词路径的默认值**。
 pub const TIMEOUT_GET: Timeouts = Timeouts {
     resolve: 5_000,
     connect: 5_000,
     send: 5_000,
     receive: 12_000,
+    total_ms: 25_000,
 };
 
-/// `/api/search`（模糊搜索）：实测 12s，给到 15s。
-pub const TIMEOUT_SEARCH: Timeouts = Timeouts {
-    resolve: 5_000,
-    connect: 5_000,
-    send: 5_000,
-    receive: 15_000,
+/// **歌词查询专用**（G1 提速）：单请求 receive 4s、总预算 6s。
+///
+/// 依据：日志里 19 次联网查询有 5 次 >30s（最慢 83.8s），其中绝大多数时间
+/// 耗在「一个请求慢慢滴数据」上——四段超时管不住这种滴流（每次都小于 receive），
+/// 只有总预算能掐断。现在整链还有一道 8s 硬截止（`service::ONLINE_DEADLINE_MS`），
+/// 单请求必须显著小于它，否则一个源就能把整个预算吃干。
+///
+/// ⚠️ **自觉取舍**：receive 从 12s 压到 4s，而上面记的 `/api/get` 实测是 6.64s——
+/// 也就是说「lrclib 本机很慢」时这条腿会被我们自己掐断。这么定是因为两条腿现在
+/// **并发**：lrclib 慢的时候网易云通常在 2s 内就答了；反过来把 receive 留在 12s，
+/// 就等于每次都要等满 8s 硬截止，用户看到的是「歌词一直在加载」。
+/// 若真机验收发现 lrclib 命中率明显下降，把这里改回 6_000 即可（一行，无需改逻辑）。
+pub const TIMEOUT_LYRIC: Timeouts = Timeouts {
+    resolve: 3_000,
+    connect: 3_000,
+    send: 3_000,
+    receive: 4_000,
+    total_ms: 6_000,
 };
+
+/// **一个 provider 在一次查询里**的时间预算（毫秒）。
+///
+/// 必须略小于 `service::ONLINE_DEADLINE_MS`（8000）：预留约 2.5s 让「另一条腿」
+/// 与结果回传、缓存写入、事件投递跑完。超过它就停止再发新请求（关键词循环里检查），
+/// 这样两个源并发时谁也不会把全局截止全吃掉。
+pub const LYRIC_PROVIDER_BUDGET_MS: u128 = 5_500;
+
 /// 单次响应体上限：歌词 JSON 最大也就几十 KB，1 MB 是安全阀。
 const MAX_BODY: usize = 1024 * 1024;
-/// 一次请求的**总**预算（毫秒）。
-///
-/// `WinHttpSetTimeouts` 的 receive 是「单次接收操作」的超时，不是总时长：
-/// 实测 lrclib 一个 404 也能拖 22.4s（数据一点点滴出来，每次都小于 12s）。
-/// 所以这里再加一道总闸，超过就主动放弃——否则歌词线程会被一个请求卡住半分钟。
-const TOTAL_BUDGET_MS: u128 = 25_000;
 
 /// 网络错误分类。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +138,7 @@ pub fn get_with(url: &str, user_agent: &str, t: Timeouts) -> Result<Response, Ne
 /// 发一个 GET 请求，并附带**额外请求头**（v1.3.0：网易云要求 `Referer`）。
 ///
 /// `headers` 里每项是 `(name, value)`，会以 `Name: Value` 的形式追加到请求上
-/// （同名头会被替换，不会重复）。
+/// （同名头会被替换，不会重复）。四段超时与总预算都来自 `t`（见 [`Timeouts`]）。
 pub fn get_with_headers(
     url: &str,
     user_agent: &str,
@@ -198,7 +224,7 @@ pub fn get_with_headers(
     }
 
     let status = query_status(request.0).unwrap_or(0);
-    let body = read_body(request.0)?;
+    let body = read_body(request.0, t.total_ms)?;
     let bytes = body.len();
     Ok(Response { status, body, bytes })
 }
@@ -221,16 +247,16 @@ fn query_status(request: *mut core::ffi::c_void) -> Option<u32> {
     ok.ok().map(|_| code)
 }
 
-/// 循环读响应体直到没有数据。
-fn read_body(request: *mut core::ffi::c_void) -> Result<String, NetError> {
+/// 循环读响应体直到没有数据。`budget_ms` 是总预算，超了立刻放弃。
+fn read_body(request: *mut core::ffi::c_void, budget_ms: u128) -> Result<String, NetError> {
     let started = std::time::Instant::now();
     let mut out: Vec<u8> = Vec::with_capacity(4096);
     let mut buf = vec![0u8; 8192];
     loop {
-        if started.elapsed().as_millis() > TOTAL_BUDGET_MS {
+        if started.elapsed().as_millis() > budget_ms {
             return Err(NetError::Transport(format!(
-                "总耗时超过 {}s 预算（已收 {} 字节）",
-                TOTAL_BUDGET_MS / 1000,
+                "总耗时超过 {}ms 预算（已收 {} 字节）",
+                budget_ms,
                 out.len()
             )));
         }

@@ -59,12 +59,21 @@ impl NeteaseProvider {
             return Err(ProviderError::NotFound);
         }
         let mut saw_network = false;
+        let started = std::time::Instant::now();
 
         for kw in &keywords {
+            // G1 提速：本源预算用尽就不再发新请求（网易云只是兜底源，不该吃满 8s）
+            if started.elapsed().as_millis() >= net::LYRIC_PROVIDER_BUDGET_MS {
+                crate::log_debug!(
+                    "netease 本源预算 {}ms 用尽，放弃剩余关键词（已试到 {kw}）",
+                    net::LYRIC_PROVIDER_BUDGET_MS
+                );
+                break;
+            }
             let url = build_search_url(kw);
             crate::log_debug!("请求 netease(search)：{url}");
             let t0 = std::time::Instant::now();
-            let resp = match net::get_with_headers(&url, USER_AGENT, HEADERS, net::TIMEOUT_SEARCH) {
+            let resp = match net::get_with_headers(&url, USER_AGENT, HEADERS, net::TIMEOUT_LYRIC) {
                 Ok(r) => r,
                 Err(NetError::Transport(s)) => {
                     crate::log_debug!("netease 搜索网络失败：{s}");
@@ -125,7 +134,7 @@ impl NeteaseProvider {
         let url = build_lyric_url(cand.id);
         crate::log_debug!("请求 netease(lyric)：{url}");
         let t0 = std::time::Instant::now();
-        let resp = net::get_with_headers(&url, USER_AGENT, HEADERS, net::TIMEOUT_GET).map_err(
+        let resp = net::get_with_headers(&url, USER_AGENT, HEADERS, net::TIMEOUT_LYRIC).map_err(
             |e| match e {
                 NetError::Transport(s) => ProviderError::Network(s),
                 NetError::BadRequest(s) => ProviderError::Parse(s),

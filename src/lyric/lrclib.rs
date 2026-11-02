@@ -38,6 +38,13 @@ const BASE_GET: &str = "https://lrclib.net/api/get";
 const BASE_SEARCH: &str = "https://lrclib.net/api/search";
 /// 项目 UA（lrclib 要求能识别调用方）。
 pub const USER_AGENT: &str = "Barline/0.0.1 (https://github.com/Yi-One1/QuLan-Barline-Next)";
+/// 模糊搜索里**最多**取前几条候选做本地择优（G1 提速）。
+///
+/// 为什么砍到 2：`/api/search` 实测 12s 才回，一次搜索就能烧掉整个 8s 预算。
+/// 而 lrclib 的返回顺序本身就带相关性（同名的录音室版通常在最前），
+/// 第 3 条之后的候选只是为了冷门歌，代价是让所有歌都变慢——不值得。
+/// 择优阈值（`MIN_PICK_SCORE`）与「时长差 >10s 淘汰」都还在，砍候选**不会**放宽质量门槛。
+const MAX_SEARCH_CANDIDATES: usize = 2;
 
 /// lrclib.net 歌词源。
 pub struct LrclibProvider {
@@ -75,14 +82,10 @@ impl LyricProvider for LrclibProvider {
             crate::log_debug!("请求 lrclib(get)：{url}");
             match self.fetch_once(&url) {
                 Ok(l) => return Ok(l),
-                // 超时 / 5xx：**立刻**重试一次（总预算 12s × 2 = 24s ≤ 25s）
-                Err(ProviderError::Network(e)) => {
-                    crate::log_warn!("lrclib 精确查询失败（{e}），立刻重试一次");
-                    match self.fetch_once(&url) {
-                        Ok(l) => return Ok(l),
-                        Err(e2) => crate::log_debug!("lrclib 精确查询二次失败：{}", e2.as_str()),
-                    }
-                }
+                // G1 提速：**不再「网络失败立刻重试一次」**。
+                // 那个重试会把最坏耗时直接翻倍（12s → 24s），而 service 侧还有
+                // 一道 8s 硬截止与最多 1 次整链重试；单源自己再重试等于叠三层退避。
+                // 失败就交给模糊检索（它对「精确接口挂掉」这件事本来就不敏感）。
                 Err(e) => crate::log_debug!("lrclib 精确未命中：{}", e.as_str()),
             }
         } else {
@@ -98,9 +101,11 @@ impl LrclibProvider {
     /// 发一次请求并计时（日志里带 HTTP 状态码、字节数、耗时，便于验收）。
     fn fetch_once(&self, url: &str) -> Result<Lyrics, ProviderError> {
         let t0 = std::time::Instant::now();
-        let resp = net::get(url, USER_AGENT).map_err(|e| match e {
-            NetError::Transport(s) => ProviderError::Network(s),
-            NetError::BadRequest(s) => ProviderError::Parse(s),
+        let resp = net::get_with_headers(url, USER_AGENT, &[], net::TIMEOUT_LYRIC).map_err(|e| {
+            match e {
+                NetError::Transport(s) => ProviderError::Network(s),
+                NetError::BadRequest(s) => ProviderError::Parse(s),
+            }
         })?;
         crate::log_debug!(
             "lrclib 响应：HTTP {} / {} 字节 / {:.1}s",
@@ -117,6 +122,9 @@ impl LrclibProvider {
     }
 
     /// 模糊检索：逐个关键词试（最多 [`query::MAX_SEARCH_KEYWORDS`] 条），命中即停。
+    ///
+    /// G1 提速：关键词循环前先看**本源还剩多少预算**（[`net::LYRIC_PROVIDER_BUDGET_MS`]）——
+    /// 前一条请求慢了就少试一条关键词，绝不让一个源把 8s 全局截止全吃掉。
     fn search(&self, track: &crate::media::Track) -> Result<Lyrics, ProviderError> {
         let want = Want::of(track);
         let keywords = query::search_keywords(&track.title, &track.artist);
@@ -124,11 +132,19 @@ impl LrclibProvider {
             return Err(ProviderError::NotFound);
         }
         let mut saw_network = false;
+        let started = std::time::Instant::now();
         for kw in &keywords {
+            if started.elapsed().as_millis() >= net::LYRIC_PROVIDER_BUDGET_MS {
+                crate::log_debug!(
+                    "lrclib 本源预算 {}ms 用尽，放弃剩余关键词（已试到 {kw}）",
+                    net::LYRIC_PROVIDER_BUDGET_MS
+                );
+                break;
+            }
             let url = build_search_url(kw);
             crate::log_debug!("请求 lrclib(search)：{url}");
             let t0 = std::time::Instant::now();
-            let resp = match net::get_with(&url, USER_AGENT, net::TIMEOUT_SEARCH) {
+            let resp = match net::get_with_headers(&url, USER_AGENT, &[], net::TIMEOUT_LYRIC) {
                 Ok(r) => r,
                 Err(NetError::Transport(s)) => {
                     crate::log_debug!("lrclib 搜索网络失败：{s}");
@@ -156,15 +172,18 @@ impl LrclibProvider {
             if hits.is_empty() {
                 continue;
             }
-            let cands: Vec<Candidate> = hits.iter().map(|h| h.cand.clone()).collect();
+            // 只在**前 2 条**候选里择优（见 MAX_SEARCH_CANDIDATES 的说明）
+            let head = &hits[..hits.len().min(MAX_SEARCH_CANDIDATES)];
+            let cands: Vec<Candidate> = head.iter().map(|h| h.cand.clone()).collect();
             let Some((idx, score)) = query::pick_best(&want, &cands) else {
                 crate::log_debug!(
-                    "lrclib 搜索有 {} 条结果但无一达标（关键词={kw}）",
+                    "lrclib 搜索有 {} 条结果（取前 {} 条）无一达标（关键词={kw}）",
+                    hits.len(),
                     cands.len()
                 );
                 continue;
             };
-            let hit = &hits[idx];
+            let hit = &head[idx];
             crate::log_info!(
                 "lrclib 搜索命中：id={} 「{} - {}」score={score}（关键词={kw}）",
                 hit.cand.id,

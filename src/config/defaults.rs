@@ -15,8 +15,12 @@ pub mod limits {
     pub const LYRIC_DISK_TTL_DAYS: i64 = 30;
     /// 负缓存保留小时数（PRD 6.2：同一曲目失败后 24h 内不再请求）
     pub const LYRIC_MISS_TTL_HOURS: i64 = 24;
-    /// 在线歌词重试退避（毫秒）
-    pub const LYRIC_RETRY_BACKOFF_MS: [u64; 3] = [5_000, 15_000, 60_000];
+    /// 在线歌词重试退避（毫秒）。**表长 = 重试次数上限**。
+    ///
+    /// v1.3.2（G1 提速）从 `[5s, 15s, 60s]` 收敛成只剩一项：原来的三连退避叠上
+    /// 「单源网络失败立刻重试」后，一次查询最坏能烧到分钟级（日志实测 83.8s）。
+    /// 现在整链有 8s 硬截止，再退回三连只是在已经确定慢的路上继续等。
+    pub const LYRIC_RETRY_BACKOFF_MS: [u64; 1] = [3_000];
     /// 小组件宽度范围（100% DPI 逻辑像素）
     pub const WIDGET_MIN_W: f32 = 200.0;
     pub const WIDGET_MAX_W: f32 = 340.0;

@@ -259,6 +259,179 @@ fn push_keyword(out: &mut Vec<String>, s: &str) {
     }
 }
 
+// ---------------------------------------------------------------- 缓存键归一化（G1）
+
+/// 平台挂在标题尾巴上的来源标记（B 站最常见）。
+///
+/// **为什么必须摘掉**：日志里同一个视频在 SMTC 里出现两种写法——
+/// `「山东天后」S&M - Rihanna 蕾哈娜 百万级装备试听【Hi-Res】_哔哩哔哩_bilibili`
+/// 与 `…【Hi-Res】`（没有来源后缀）。`Track::key()` 是「原样小写」，
+/// 于是同一首歌变成两个 key，各花一次 25~80s 的联网查询。
+const PLATFORM_SUFFIXES: &[&str] = &[
+    "_哔哩哔哩_bilibili",
+    "_哔哩哔哩",
+    "_bilibili",
+    "-bilibili",
+];
+
+/// **版本标记**：出现在首尾括注里时**不摘**。
+///
+/// 这是「宁可不中也不串歌」的延伸：`晴天【Live】` 与 `晴天` 是两版，时长与断句
+/// 都不同；折成同一个缓存 key 后，先播的那版歌词会被后来的那版直接复用。
+const VERSION_MARKERS: &[&str] = &[
+    "live",
+    "现场",
+    "remix",
+    "dj",
+    "acoustic",
+    "不插电",
+    "伴奏",
+    "纯音乐",
+    "instrumental",
+    "karaoke",
+    "demo",
+    "cover",
+    "翻唱",
+    "钢琴",
+    "piano",
+    "吉他",
+    "guitar",
+    "slowed",
+    "speed",
+    "nightcore",
+    "片段",
+    "副歌",
+    "女声",
+    "男声",
+    "升调",
+    "降调",
+];
+
+/// 首尾修饰段的括号对（CJK 修饰括号 + ASCII 方括号）。
+///
+/// **刻意不含 `(` / `)`**：标题里圆括号常用于写版本（`완전 미쳤네 (Korean Ver.)`、
+/// `Lake Arrowhead (Radio Mix)`），摘掉会把两个版本折成同一首歌。
+const EDGE_PAIRS: &[(char, char)] = &[
+    ('【', '】'),
+    ('「', '」'),
+    ('〔', '〕'),
+    ('〖', '〗'),
+    ('『', '』'),
+    ('[', ']'),
+];
+
+/// 一段括注里的内容能不能整段丢掉。
+///
+/// 只挡「版本标记」；其余一律丢——`【Hi-Res】`、`【MV】`、`【私藏馆】`、
+/// `【2026双十一充电头推荐】` 都是装饰，留着只会让同一个视频裂成两个 key。
+fn is_droppable_decor(content: &str) -> bool {
+    let t = collapse_spaces(&fold_width(content)).to_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    !VERSION_MARKERS.iter().any(|m| t.contains(m))
+}
+
+/// 摘掉末尾的平台来源标记（可叠加多层，最多几轮就收敛）。
+fn strip_platform_suffix(raw: &str) -> String {
+    let mut cur = raw.trim().to_string();
+    loop {
+        let lower = cur.to_lowercase();
+        let Some(suffix) = PLATFORM_SUFFIXES.iter().find(|s| {
+            lower.ends_with(**s) && lower.chars().count() > s.chars().count()
+        }) else {
+            return cur;
+        };
+        // 按**字符数**截断：`to_lowercase()` 理论上可能改变字节长度，
+        // 用字节下标切字符串有落到字符中间的风险。
+        let keep = cur.chars().count() - suffix.chars().count();
+        cur = cur
+            .chars()
+            .take(keep)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+    }
+}
+
+fn strip_leading_decor(s: &str) -> String {
+    for (open, close) in EDGE_PAIRS {
+        let Some(rest) = s.strip_prefix(*open) else {
+            continue;
+        };
+        let Some(pos) = rest.find(*close) else {
+            // 括号不配对（脏数据）：不动，宁可多一个 key 也不误删
+            return s.to_string();
+        };
+        if is_droppable_decor(&rest[..pos]) {
+            return rest[pos + close.len_utf8()..].trim().to_string();
+        }
+        return s.to_string();
+    }
+    s.to_string()
+}
+
+fn strip_trailing_decor(s: &str) -> String {
+    for (open, close) in EDGE_PAIRS {
+        let Some(rest) = s.strip_suffix(*close) else {
+            continue;
+        };
+        let Some(pos) = rest.rfind(*open) else {
+            return s.to_string();
+        };
+        if is_droppable_decor(&rest[pos + open.len_utf8()..]) {
+            return rest[..pos].trim().to_string();
+        }
+        return s.to_string();
+    }
+    s.to_string()
+}
+
+/// 反复摘首尾修饰段，直到不再变化（`【MV】【高清】歌名` 要摘两轮）。
+fn strip_edge_decor(raw: &str) -> String {
+    let mut cur = raw.trim().to_string();
+    loop {
+        let before = cur.clone();
+        cur = strip_leading_decor(&cur);
+        cur = strip_trailing_decor(&cur).trim().to_string();
+        if cur == before {
+            return cur;
+        }
+    }
+}
+
+/// **只用于缓存键**的标题归一化（不参与查询、不影响任何显示）。
+///
+/// 三步：摘平台后缀 → 摘首尾修饰段 → 全角半角归一 + 空白折叠 + 小写。
+/// 空标题返回空串（不 panic）。
+pub fn cache_title_key(raw: &str) -> String {
+    let s = strip_platform_suffix(raw);
+    let s = strip_edge_decor(&s);
+    collapse_spaces(&fold_width(&s)).to_lowercase()
+}
+
+/// 歌手 / 专辑这类「不挂平台后缀」的字段：只做全角半角 + 空白 + 大小写归一。
+fn cache_part_key(raw: &str) -> String {
+    collapse_spaces(&fold_width(raw)).to_lowercase()
+}
+
+/// **歌词缓存键**（`Track::key()` 的归一化版本）。
+///
+/// 与 `Track::key()` 的区别只有标题那一格：同一视频的不同写法归一后同键，
+/// 从而不再重复联网。时长仍按 3s 粒度取整（沿用原规则，防播放器上报 ±1s）。
+///
+/// 为什么不直接改 `Track::key()`：它还兼任 SMTC 的 `track_id`
+/// （`media/smtc.rs` 用 `fnv1a64(track.key())`），动它等于动整条代次链。
+pub fn cache_key(track: &crate::media::Track) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        cache_title_key(&track.title),
+        cache_part_key(&track.artist),
+        cache_part_key(&track.album),
+        track.duration_ms / 3000
+    )
+}
+
 // ---------------------------------------------------------------- 择优
 
 /// 一条候选搜索结果（**provider 无关**：lrclib 与网易云都归一成它）。
@@ -507,5 +680,89 @@ mod tests {
         };
         let (idx, _) = pick_best(&want2, &[cand(7, "粉碎", "", 357_000)]).expect("应命中");
         assert_eq!(idx, 0);
+    }
+
+    // ------------------------------------------------ 缓存键归一化（G1）
+
+    /// **同一视频的两种写法必须同键**（否则每换一种写法就多一次 25~80s 查询）。
+    #[test]
+    fn cache_title_key_merges_same_video_spellings() {
+        // 日志里的真实一对：带 `_哔哩哔哩_bilibili` 与不带
+        let with_suffix =
+            cache_title_key("「山东天后」S&M - Rihanna 蕾哈娜 百万级装备试听_哔哩哔哩_bilibili");
+        let without_suffix = cache_title_key("「山东天后」S&M - Rihanna 蕾哈娜 百万级装备试听");
+        assert_eq!(with_suffix, without_suffix, "平台后缀没摘干净");
+
+        // 日志里的真实第二对：尾部的 `【Hi-Res】` 只是音质装饰
+        let with_tag = cache_title_key("「山东天后」S&M - Rihanna 蕾哈娜 百万级装备试听【Hi-Res】");
+        assert_eq!(with_tag, without_suffix, "首尾修饰段没摘干净");
+
+        // 两种差异叠在一起也要收敛到同一个键
+        let both = cache_title_key(
+            "「山东天后」S&M - Rihanna 蕾哈娜 百万级装备试听【Hi-Res】_哔哩哔哩_bilibili",
+        );
+        assert_eq!(both, without_suffix);
+        assert_eq!(without_suffix, "s&m - rihanna 蕾哈娜 百万级装备试听");
+
+        // Track 级别的保证：两个 Track 的缓存键必须完全相同
+        let a = crate::media::Track {
+            title: "「山东天后」S&M【Hi-Res】_哔哩哔哩_bilibili".into(),
+            artist: "Rihanna".into(),
+            album: String::new(),
+            duration_ms: 213_000,
+        };
+        let b = crate::media::Track {
+            title: "「山东天后」S&M".into(),
+            ..a.clone()
+        };
+        assert_eq!(cache_key(&a), cache_key(&b));
+    }
+
+    /// **不同歌归一化后必须不同键**（防串歌）；版本标记不许被抹平。
+    #[test]
+    fn cache_title_key_keeps_different_songs_apart() {
+        assert_ne!(cache_title_key("晴天"), cache_title_key("七里香"));
+        assert_ne!(cache_title_key("晴天"), cache_title_key("晴天 现场版"));
+        // 版本标记写在首尾括注里 → 保留差异
+        assert_ne!(cache_title_key("晴天【Live】"), cache_title_key("晴天"));
+        assert_ne!(cache_title_key("晴天 [伴奏]"), cache_title_key("晴天"));
+        assert_ne!(cache_title_key("晴天「翻唱」"), cache_title_key("晴天"));
+        // 圆括号里的版本信息一律不动（日志里的 `(Korean Ver.)` / `(Radio Mix)`）
+        assert_ne!(
+            cache_title_key("완전 미쳤네 (Korean Ver.)"),
+            cache_title_key("완전 미쳤네")
+        );
+        // 时长不同的同名曲也不同键（沿用 3s 粒度）
+        let t1 = crate::media::Track {
+            title: "晴天".into(),
+            duration_ms: 269_000,
+            ..Default::default()
+        };
+        let t2 = crate::media::Track {
+            duration_ms: 300_000,
+            ..t1.clone()
+        };
+        assert_ne!(cache_key(&t1), cache_key(&t2));
+    }
+
+    #[test]
+    fn cache_title_key_normalizes_width_and_spaces() {
+        // 全角 / 空白 / 大小写差异在归一后同键，但**不能**把不同歌折在一起
+        assert_eq!(cache_title_key("  Shape   of You "), cache_title_key("shape of you"));
+        assert_eq!(cache_title_key("ＳＨＡＰＥ"), cache_title_key("shape"));
+        assert_ne!(cache_title_key("Shape of You"), cache_title_key("Shape of You 2"));
+    }
+
+    /// 空标题 / 脏数据（不配对括号）不许 panic。
+    #[test]
+    fn cache_title_key_handles_empty_and_dirty_input() {
+        assert_eq!(cache_title_key(""), "");
+        assert_eq!(cache_title_key("   "), "");
+        assert_eq!(cache_title_key("【】"), "");
+        // 整串就是平台标记 → 摘到剩下最短的非空形式（绝不产出空键去撞别的歌）
+        assert_eq!(cache_title_key("_哔哩哔哩_bilibili"), "_哔哩哔哩");
+        // 只有开括号 / 只有闭括号 → 原样保留，不 panic、不无限循环
+        assert_eq!(cache_title_key("晴天【Live"), "晴天[live");
+        assert_eq!(cache_title_key("晴天]"), "晴天]");
     }
 }

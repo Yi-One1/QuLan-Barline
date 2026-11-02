@@ -1,21 +1,39 @@
 //! 歌词线程（T2）与状态机（`ARCHITECTURE.md` §12.6 / T11 第 5–6 条）。
 //!
-//! 线程职责单一：**收到 `LyricRequest` → 查（本地 → 缓存 → 在线）→ 发 `AppEvent`**。
-//! 它不认识 UI、不认识窗口、不认识渲染，只认识 `EventSink`。
+//! 线程职责单一：**收到 `LyricRequest` → 查（记忆 → 磁盘 → 本地 → 负缓存 → 在线）→
+//! 发 `AppEvent`**。它不认识 UI、不认识窗口、不认识渲染，只认识 `EventSink`。
 //!
-//! ## 为什么查询顺序是「本地 → 缓存 → 负缓存 → 在线」
+//! ## 为什么查询顺序是「内存 → 磁盘 → 本地 → 负缓存 → 在线」
 //!
-//! 1. **本地文件最优先**：命中就**一个网络包都不发**（PRD P0-08 要求抓包可验证）；
-//! 2. 内存 / 磁盘缓存次之（重启后也命中）；
+//! 1. 内存 / 磁盘缓存最优先（重启后也命中，0 网络包）；
+//! 2. **本地文件**紧随其后：命中就**一个网络包都不发**（PRD P0-08 要求抓包可验证）；
 //! 3. **负缓存挡在在线之前**：24h 内查不到的歌不再打网络（PRD §6.2）；
 //! 4. 最后才联网。
 //!
+//! ## G1 提速：主循环为什么不再自己做网络查询
+//!
+//! v1.3.1 及以前的 `run()` 是**单线程串行 worker**：一条查询卡 83.8s（日志实测），
+//! 用户换的新歌只能排队——这才是「查过的歌再放也要等 10 秒以上」的真凶。
+//!
+//! 现在主循环只做**毫秒级**的四步（缓存 / 本地 / 负缓存），一旦需要联网就把活儿
+//! 丢给独立线程（[`spawn_dispatcher`]），自己立刻回到 `recv_timeout`。
+//! 在线结果经同一条消息队列回主循环处理，于是：
+//!
+//! - 换歌**永不排队**：新请求在 100ms 内被受理（最坏就是一次 `IDLE_POLL_MS`）；
+//! - 旧结果用**代次守卫**丢弃（`TrackId` 本就单调递增，见 `media::TrackId` 的注释），
+//!   既不推 `LyricReady`，也不写负缓存——避免新歌被旧结论污染；
+//! - 在线查询本身有 8 秒**硬截止**（[`ONLINE_DEADLINE_MS`]），两个源并发。
+//!
 //! ## 重试
 //!
-//! 只有 `NetworkError` 会重试，退避 5s / 15s / 60s（`limits::LYRIC_RETRY_BACKOFF_MS`），
-//! 3 次后降级为 `NotFound`（不再重试、不再联网）。`NotFound` 直接进负缓存。
+//! 只有「在线查询**明确**网络失败」才会重试，退避 3s、**最多 1 次**
+//! （`limits::LYRIC_RETRY_BACKOFF_MS`，只含一项）。两条铁律：
+//!
+//! 1. **超时不重试**：8 秒截止到点说明两个源都已给过机会，再来一轮只是让用户多等；
+//! 2. **换歌就作废**：重试前必查当前代次，旧曲目的重试绝不执行。
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -24,37 +42,105 @@ use crate::event::{AppEvent, LyricRequest};
 use crate::lyric::cache::Cache;
 use crate::lyric::lrclib::LrclibProvider;
 use crate::lyric::netease::NeteaseProvider;
-use crate::lyric::provider::{LocalProvider, LyricProvider, LyricQuery, ProviderChain};
+use crate::lyric::provider::{
+    LocalProvider, LyricProvider, LyricQuery, ParallelOutcome, ProviderChain,
+};
+use crate::lyric::query;
 use crate::lyric::LyricMissReason;
 use crate::media::TrackId;
 use crate::platform::wake::EventSink;
 
 /// 线程空闲时的最长阻塞时间（也决定重试计时的精度）。
+///
+/// 100ms 是「换歌响应」与「空转功耗」的折中：新请求由 channel 直接唤醒，
+/// 这个值只影响重试计时与在线结果到达时的额外延迟。
 const IDLE_POLL_MS: u64 = 100;
+
+/// 在线查询的**硬截止**（毫秒）：到点必须给用户一个结论。
+///
+/// 与 `net::LYRIC_PROVIDER_BUDGET_MS`（5500）配合：单源预算先到就先收手，
+/// 全局截止只兜「两个源都慢」的底。
+const ONLINE_DEADLINE_MS: u64 = 8_000;
+
+// ---------------------------------------------------------------- 线程内消息
+
+/// 线程内消息：**请求与在线结果共用一条队列**。
+///
+/// 为什么合成一条：主循环只能阻塞在一个 `recv_timeout` 上。分成两条 channel 就得
+/// 轮询两条或者用 select，前者白白增加延迟、后者要额外依赖——合成一条消息枚举最简单。
+/// worker 自己持有发送端的克隆（在线线程需要它），所以退出信号只能是显式消息，
+/// 不能指望 `Disconnected`（见 [`LyricService::shutdown`]）。
+enum Msg {
+    /// 来自 UI 线程的新请求
+    Request(LyricRequest),
+    /// 来自在线线程的查询结果（`Box` 一下：否则整个枚举按最大变体 336 字节走）
+    Online(Box<OnlineOutcome>),
+    /// 关线程（`LyricService::shutdown` 发出）
+    Shutdown,
+}
+
+/// 一次在线查询的任务快照（主循环 → 在线线程）。
+struct OnlineJob {
+    /// 原请求（线程要自己组 `LyricQuery`，还得带着 `track_id` 回来做代次守卫）
+    req: LyricRequest,
+    /// 已重试过的次数（0 = 首次）
+    attempt: u8,
+    /// 候选关键词，只为了日志
+    keywords: Vec<String>,
+}
+
+/// 在线查询结果（在线线程 → 主循环）。
+struct OnlineOutcome {
+    req: LyricRequest,
+    attempt: u8,
+    keywords: Vec<String>,
+    result: ParallelOutcome,
+}
 
 /// 待重试的任务。
 struct Retry {
     track_id: TrackId,
     request: LyricRequest,
-    /// 已经重试过的次数（0 表示还没重试过）
+    /// 这一次是**第几次**重试（1 起）
     attempt: u8,
     due: Instant,
 }
 
+/// 事件出口。
+///
+/// 抽成 trait 只为一件事：`EventSink` 需要真实 HWND，单测里造不出来，
+/// 而「旧代结果不许产生事件」这条必须能被断言。
+trait EventOut {
+    fn emit(&self, evt: AppEvent);
+}
+
+impl EventOut for EventSink<AppEvent> {
+    fn emit(&self, evt: AppEvent) {
+        self.send(evt);
+    }
+}
+
+/// 派发器：把在线查询丢到独立线程。`Err` = 线程起不来。
+type Dispatcher = Box<dyn Fn(OnlineJob) -> Result<(), String> + Send + Sync>;
+
+// ---------------------------------------------------------------- 对外句柄
+
 /// 歌词服务句柄（UI 线程持有）。
 pub struct LyricService {
-    tx: std::sync::mpsc::Sender<LyricRequest>,
+    tx: Sender<Msg>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl LyricService {
     /// 起线程。失败返回 `None`（歌词不可用，但小组件照常工作）。
     pub fn spawn(sink: EventSink<AppEvent>) -> Option<Self> {
-        let (tx, rx) = std::sync::mpsc::channel::<LyricRequest>();
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        // worker 自己的发送端：在线线程靠它把结果送回主循环
+        let job_tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name(String::from("barline-lyric"))
             .stack_size(512 * 1024)
-            .spawn(move || run(sink, rx));
+            .spawn(move || run(sink, rx, job_tx));
         match spawned {
             Ok(handle) => Some(Self {
                 tx,
@@ -69,19 +155,23 @@ impl LyricService {
 
     /// 投递一次歌词请求。线程已退出时静默丢弃。
     pub fn send(&self, req: LyricRequest) {
-        if self.tx.send(req).is_err() {
+        if self.tx.send(Msg::Request(req)).is_err() {
             crate::log_warn!("歌词线程已退出，请求被丢弃");
         }
     }
 
     /// 通知退出。
     ///
-    /// **刻意不 `join`**：歌词线程可能正卡在一次最长 25 秒的网络请求里
-    /// （`net::TOTAL_BUDGET_MS`），等它会把「点退出 → 进程消失」拖成 25 秒。
-    /// 断开命令通道后线程会在下一次 `recv_timeout` 返回 Disconnected 时自行退出；
-    /// 即使它晚几毫秒才醒，进程也已经在退出了，OS 会回收——detach 是安全的
-    /// （`EventSink::send` 在接收端销毁后只是静默失败，不会 panic）。
+    /// **刻意不 `join`**：在线查询最长 8 秒（[`ONLINE_DEADLINE_MS`]，更短的网络请求
+    /// 预算在 `net::TIMEOUT_LYRIC`），等它会把「点退出 → 进程消失」拖成好几秒。
+    /// 在线线程本身是 detach 的，进程退出时由 OS 回收；`EventSink::send` 在接收端
+    /// 销毁后只是静默失败，不会 panic。
+    ///
+    /// **为什么必须显式发 `Shutdown`**：worker 自己持有一份发送端（在线线程要用），
+    /// 所以「把 `tx` 换成永远失败的 sender」**不会**让 `recv_timeout` 返回
+    /// `Disconnected`——队列永远有活着的发送端。给一条明确的退出消息最省事。
     pub fn shutdown(&mut self) {
+        let _ = self.tx.send(Msg::Shutdown);
         self.tx = closed_sender();
         // drop JoinHandle = detach
         let _ = self.handle.take();
@@ -94,221 +184,318 @@ impl Drop for LyricService {
     }
 }
 
-/// 一个永远发送失败的 `Sender`（`shutdown` 里替换用，让线程的 `recv` 立刻返回 Disconnected）。
-fn closed_sender() -> std::sync::mpsc::Sender<LyricRequest> {
-    let (tx, rx) = std::sync::mpsc::channel::<LyricRequest>();
+/// 一个永远发送失败的 `Sender`（`shutdown` 里替换用，之后所有 `send` 静默失败）。
+fn closed_sender() -> Sender<Msg> {
+    let (tx, rx) = std::sync::mpsc::channel::<Msg>();
     drop(rx);
     tx
 }
 
-/// 线程主循环。
-fn run(sink: EventSink<AppEvent>, rx: Receiver<LyricRequest>) {
+// ---------------------------------------------------------------- 线程主循环
+
+/// 线程主循环：只做分发，不做任何耗时活儿。
+fn run(sink: EventSink<AppEvent>, rx: Receiver<Msg>, job_tx: Sender<Msg>) {
     crate::log_info!("歌词线程启动");
-    let mut cache = Cache::new(crate::platform::data_dir().join("lyrics-cache"));
-    let mut pending: Option<Retry> = None;
+    let mut worker = Worker {
+        out: sink,
+        cache: Cache::new(crate::platform::data_dir().join("lyrics-cache")),
+        dispatch: spawn_dispatcher(job_tx),
+        current_track: 0,
+        pending: None,
+    };
 
     loop {
-        let timeout = match &pending {
-            Some(p) => {
-                let left = p.due.saturating_duration_since(Instant::now());
-                left.max(Duration::from_millis(10))
-            }
-            None => Duration::from_millis(IDLE_POLL_MS),
-        };
-
+        let timeout = worker.poll_timeout();
         match rx.recv_timeout(timeout) {
-            Ok(req) => {
-                // 新请求 = 换歌，旧的重试作废
-                pending = handle_request(&sink, &mut cache, req);
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(p) = pending.take() {
-                    if Instant::now() >= p.due {
-                        crate::log_info!(
-                            "重试歌词（第 {} 次，track={}）",
-                            p.attempt + 1,
-                            p.track_id
-                        );
-                        let mut req = p.request;
-                        req.retry = true;
-                        pending = handle_request_with_attempt(&sink, &mut cache, req, p.attempt + 1);
-                    } else {
-                        pending = Some(p);
-                    }
-                }
-            }
+            Ok(Msg::Request(req)) => worker.on_request(req),
+            Ok(Msg::Online(out)) => worker.on_online(*out),
+            Ok(Msg::Shutdown) => break,
+            Err(RecvTimeoutError::Timeout) => worker.on_tick(Instant::now()),
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     crate::log_info!("歌词线程退出");
 }
 
-/// 处理一次请求（首次，attempt = 0）。
-fn handle_request(
-    sink: &EventSink<AppEvent>,
-    cache: &mut Cache,
-    req: LyricRequest,
-) -> Option<Retry> {
-    handle_request_with_attempt(sink, cache, req, 0)
+/// 造一个「起线程跑在线查询」的派发器。
+fn spawn_dispatcher(job_tx: Sender<Msg>) -> Dispatcher {
+    Box::new(move |job: OnlineJob| {
+        let tx = job_tx.clone();
+        std::thread::Builder::new()
+            .name(String::from("barline-lyric-net"))
+            .stack_size(256 * 1024)
+            .spawn(move || run_online_job(tx, job))
+            // drop JoinHandle = detach：主循环绝不为回收线程再等一次
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
 }
 
-/// 处理一次请求。`attempt` 是**已经失败过**的次数（0 = 首次）。
-///
-/// 返回 `Some(Retry)` 表示需要延后重试。
-fn handle_request_with_attempt(
-    sink: &EventSink<AppEvent>,
-    cache: &mut Cache,
-    req: LyricRequest,
-    attempt: u8,
-) -> Option<Retry> {
-    let track_id = req.track_id;
-    let key = req.track.key();
-
-    // 元数据不够：SMTC 只给了个空标题，什么也查不到
-    if req.track.title.trim().is_empty() {
-        sink.send(AppEvent::LyricMissing {
-            track_id,
-            reason: LyricMissReason::InsufficientMetadata,
-        });
-        return None;
-    }
-
-    sink.send(AppEvent::LyricLoading { track_id });
-
-    // ---- 1. 内存 ----
-    if let Some(l) = cache.get_mem(&key) {
-        crate::log_debug!("歌词内存命中：{key}");
-        sink.send(AppEvent::LyricReady {
-            track_id,
-            lyrics: l,
-        });
-        return None;
-    }
-    // ---- 2. 磁盘 ----
-    if let Some(l) = cache.get_disk(&key) {
-        crate::log_info!("歌词磁盘命中：{key}");
-        sink.send(AppEvent::LyricReady {
-            track_id,
-            lyrics: l,
-        });
-        return None;
-    }
-
-    let query = LyricQuery {
-        track: &req.track,
-        local_dirs: &req.local_dirs,
-        online_enabled: req.online_enabled,
-    };
-
-    // ---- 3. 本地文件（命中则完全不联网）----
-    match LocalProvider.fetch(&query) {
-        Ok(l) => {
-            cache.put(&key, &l, "local");
-            sink.send(AppEvent::LyricReady {
-                track_id,
-                lyrics: std::sync::Arc::new(l),
-            });
-            return None;
-        }
-        Err(e) => crate::log_debug!("本地未命中：{}", e.as_str()),
-    }
-
-    // ---- 4. 负缓存 ----
-    if let Some(reason) = cache.miss_reason(&key) {
-        crate::log_info!("歌词负缓存命中（{reason:?}），24h 内不再请求：{key}");
-        sink.send(AppEvent::LyricMissing { track_id, reason });
-        return None;
-    }
-
-    // ---- 5. 在线（v1.3.0：lrclib 精确/模糊 → 网易云兜底，一次查询两个源）----
-    if !req.online_enabled {
-        sink.send(AppEvent::LyricMissing {
-            track_id,
-            reason: LyricMissReason::OnlineDisabled,
-        });
-        return None;
-    }
-
-    // 候选关键词先算出来：既要交给 provider，也要进那条汇总日志
-    let keywords = crate::lyric::query::search_keywords(&req.track.title, &req.track.artist);
-    let t0 = Instant::now();
-
+/// 在线线程主体：并发查询 → 结果回传主循环。
+fn run_online_job(tx: Sender<Msg>, job: OnlineJob) {
     let chain = ProviderChain::with(vec![
         Box::new(LrclibProvider::new(true)),
         Box::new(NeteaseProvider::new(true)),
     ]);
-    let (found, reason, source) = chain.query_with_source(&query);
-    let elapsed_ms = t0.elapsed().as_millis();
+    let query = LyricQuery {
+        track: &job.req.track,
+        local_dirs: &job.req.local_dirs,
+        online_enabled: job.req.online_enabled,
+    };
+    let result = chain.query_parallel(&query, ONLINE_DEADLINE_MS);
+    // 主循环可能已经退出（进程在关）：send 失败是正常路径
+    let _ = tx.send(Msg::Online(Box::new(OnlineOutcome {
+        req: job.req,
+        attempt: job.attempt,
+        keywords: job.keywords,
+        result,
+    })));
+}
 
-    if let Some(l) = found {
-        cache.put(&key, &l, source);
-        // 用户日志要求：一眼看出「谁命中的」+ 候选关键词 + 耗时（不打歌词正文）
-        crate::log_info!(
-            "歌词查询：{} - {} → 源={} 命中（候选={:?} 耗时={}ms）",
-            req.track.title,
-            if req.track.artist.trim().is_empty() {
-                "<无歌手>"
-            } else {
-                req.track.artist.trim()
-            },
-            source,
-            keywords,
-            elapsed_ms
-        );
-        sink.send(AppEvent::LyricReady {
-            track_id,
-            lyrics: std::sync::Arc::new(l),
-        });
-        return None;
+// ---------------------------------------------------------------- 状态机
+
+/// 歌词线程的全部可变状态。抽成结构体是为了能脱离线程单测
+/// （判代次、判重试这些纯决策不该只能靠「跑起来看日志」验证）。
+struct Worker<O: EventOut> {
+    out: O,
+    cache: Cache,
+    dispatch: Dispatcher,
+    /// 最近一次被受理的请求代次（在线结果与重试的唯一守卫）
+    current_track: TrackId,
+    pending: Option<Retry>,
+}
+
+impl<O: EventOut> Worker<O> {
+    /// 下一次 `recv_timeout` 等多久。
+    fn poll_timeout(&self) -> Duration {
+        match &self.pending {
+            Some(p) => p
+                .due
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(10)),
+            None => Duration::from_millis(IDLE_POLL_MS),
+        }
     }
 
-    crate::log_info!(
-        "歌词查询：{} - {} → 全部未命中（候选={:?} 耗时={}ms）",
-        req.track.title,
-        if req.track.artist.trim().is_empty() {
-            "<无歌手>"
-        } else {
-            req.track.artist.trim()
-        },
-        keywords,
-        elapsed_ms
-    );
+    /// 收到新请求：先记账（换代次、作废旧重试），再走毫秒级快路径。
+    fn on_request(&mut self, req: LyricRequest) {
+        self.current_track = req.track_id;
+        // 新请求 = 换歌（或用户手动重试）：旧的重试计时一律作废
+        self.pending = None;
+        self.query_fast_path(req, 0);
+    }
 
-    match reason {
-        LyricMissReason::NetworkError => {
-            let backoff = limits::LYRIC_RETRY_BACKOFF_MS;
-            let idx = attempt as usize;
-            if idx >= backoff.len() {
-                crate::log_warn!("歌词重试 {idx} 次仍失败，降级为「暂无歌词」");
-                cache.put_miss(&key, LyricMissReason::NotFound);
-                sink.send(AppEvent::LyricMissing {
+    /// 毫秒级快路径：缓存 → 本地 → 负缓存 → （需要时）丢给在线线程。
+    fn query_fast_path(&mut self, req: LyricRequest, attempt: u8) {
+        let t0 = Instant::now();
+        let track_id = req.track_id;
+        let key = query::cache_key(&req.track);
+
+        // 元数据不够：SMTC 只给了个空标题，什么也查不到
+        if req.track.title.trim().is_empty() {
+            self.out.emit(AppEvent::LyricMissing {
+                track_id,
+                reason: LyricMissReason::InsufficientMetadata,
+            });
+            return;
+        }
+
+        self.out.emit(AppEvent::LyricLoading { track_id });
+
+        // ---- 1. 内存 ----
+        if let Some(l) = self.cache.get_mem(&key) {
+            crate::log_info!("歌词内存命中：{key} 耗时={}ms", t0.elapsed().as_millis());
+            self.out.emit(AppEvent::LyricReady {
+                track_id,
+                lyrics: l,
+            });
+            return;
+        }
+
+        // ---- 2. 磁盘 ----
+        if let Some(l) = self.cache.get_disk(&key) {
+            crate::log_info!("歌词磁盘命中：{key} 耗时={}ms", t0.elapsed().as_millis());
+            self.out.emit(AppEvent::LyricReady {
+                track_id,
+                lyrics: l,
+            });
+            return;
+        }
+
+        let lq = LyricQuery {
+            track: &req.track,
+            local_dirs: &req.local_dirs,
+            online_enabled: req.online_enabled,
+        };
+
+        // ---- 3. 本地文件（命中则完全不联网）----
+        match LocalProvider.fetch(&lq) {
+            Ok(l) => {
+                self.cache.put(&key, &l, "local");
+                crate::log_info!("歌词本地命中：{key} 耗时={}ms", t0.elapsed().as_millis());
+                self.out.emit(AppEvent::LyricReady {
                     track_id,
-                    reason: LyricMissReason::NotFound,
+                    lyrics: Arc::new(l),
                 });
-                return None;
+                return;
             }
-            let wait = backoff[idx];
-            crate::log_info!("歌词网络失败，{wait}ms 后重试（第 {} 次）", idx + 1);
-            sink.send(AppEvent::LyricMissing {
+            Err(e) => crate::log_debug!("本地未命中：{}", e.as_str()),
+        }
+
+        // ---- 4. 负缓存 ----
+        if let Some(reason) = self.cache.miss_reason(&key) {
+            crate::log_info!(
+                "歌词负缓存命中（{reason:?}），{}h 内不再请求：{key}",
+                limits::LYRIC_MISS_TTL_HOURS
+            );
+            self.out.emit(AppEvent::LyricMissing { track_id, reason });
+            return;
+        }
+
+        // ---- 5. 在线：丢给独立线程，主循环立刻回到 recv ----
+        if !req.online_enabled {
+            self.out.emit(AppEvent::LyricMissing {
+                track_id,
+                reason: LyricMissReason::OnlineDisabled,
+            });
+            return;
+        }
+
+        let keywords = query::search_keywords(&req.track.title, &req.track.artist);
+        let job = OnlineJob {
+            req,
+            attempt,
+            keywords,
+        };
+        if let Err(e) = (self.dispatch)(job) {
+            crate::log_err!("在线歌词线程启动失败：{e}");
+            self.out.emit(AppEvent::LyricMissing {
                 track_id,
                 reason: LyricMissReason::NetworkError,
             });
-            Some(Retry {
-                track_id,
-                request: req,
-                attempt,
-                due: Instant::now() + Duration::from_millis(wait),
-            })
-        }
-        other => {
-            cache.put_miss(&key, other);
-            sink.send(AppEvent::LyricMissing {
-                track_id,
-                reason: other,
-            });
-            None
         }
     }
+
+    /// 收到在线结果：先判代次，再决定「写缓存 / 写负缓存 / 安排重试」。
+    fn on_online(&mut self, out: OnlineOutcome) {
+        // ---- 代次守卫（关键）----
+        // 结果回来时用户可能已经换了三首歌。旧代结果**不许**产生任何副作用：
+        // 推 LyricReady 会污染新歌的歌词，写负缓存会让新歌 24h 不再查询。
+        if out.req.track_id != self.current_track {
+            crate::log_debug!(
+                "丢弃过期在线结果（结果 track={}，当前 track={}）",
+                out.req.track_id,
+                self.current_track
+            );
+            return;
+        }
+
+        let track_id = out.req.track_id;
+        let key = query::cache_key(&out.req.track);
+        // 日志里「谁命中的 / 候选 / 耗时」三件套照旧（不打歌词正文）
+        let who = display_who(&out.req);
+
+        if let Some(l) = out.result.lyrics {
+            self.cache.put(&key, &l, out.result.source);
+            crate::log_info!(
+                "歌词查询：{who} → 源={} 命中（候选={:?} 耗时={}ms）",
+                out.result.source,
+                out.keywords,
+                out.result.elapsed_ms
+            );
+            self.out.emit(AppEvent::LyricReady {
+                track_id,
+                lyrics: Arc::new(l),
+            });
+            self.pending = None;
+            return;
+        }
+
+        crate::log_info!(
+            "歌词查询：{who} → 全部未命中（候选={:?} 耗时={}ms 超时={}）",
+            out.keywords,
+            out.result.elapsed_ms,
+            out.result.timed_out
+        );
+
+        match out.result.reason {
+            LyricMissReason::NetworkError => {
+                if out.result.timed_out {
+                    // 8 秒截止到点：两个源都已给过机会，**不重试**（重跑只会让用户多等）
+                    crate::log_warn!("在线查询超过 {}ms 截止，本次放弃", ONLINE_DEADLINE_MS);
+                    self.out.emit(AppEvent::LyricMissing {
+                        track_id,
+                        reason: LyricMissReason::NetworkError,
+                    });
+                    self.pending = None;
+                    return;
+                }
+                let backoff = limits::LYRIC_RETRY_BACKOFF_MS;
+                let idx = out.attempt as usize;
+                if idx >= backoff.len() {
+                    crate::log_warn!("歌词重试 {idx} 次仍失败，降级为「暂无歌词」");
+                    self.cache.put_miss(&key, LyricMissReason::NotFound);
+                    self.out.emit(AppEvent::LyricMissing {
+                        track_id,
+                        reason: LyricMissReason::NotFound,
+                    });
+                    self.pending = None;
+                    return;
+                }
+                let wait = backoff[idx];
+                crate::log_info!("歌词网络失败，{wait}ms 后重试（第 {} 次）", idx + 1);
+                self.out.emit(AppEvent::LyricMissing {
+                    track_id,
+                    reason: LyricMissReason::NetworkError,
+                });
+                self.pending = Some(Retry {
+                    track_id,
+                    request: out.req,
+                    attempt: out.attempt + 1,
+                    due: Instant::now() + Duration::from_millis(wait),
+                });
+            }
+            other => {
+                self.cache.put_miss(&key, other);
+                self.out.emit(AppEvent::LyricMissing {
+                    track_id,
+                    reason: other,
+                });
+                self.pending = None;
+            }
+        }
+    }
+
+    /// 定时器：到点才重试，且**只对当前代次**重试。
+    fn on_tick(&mut self, now: Instant) {
+        let Some(p) = self.pending.take() else {
+            return;
+        };
+        if p.track_id != self.current_track {
+            crate::log_debug!(
+                "丢弃过期重试（track={}，当前 track={}）",
+                p.track_id,
+                self.current_track
+            );
+            return;
+        }
+        if now < p.due {
+            self.pending = Some(p);
+            return;
+        }
+        crate::log_info!("重试歌词（第 {} 次，track={}）", p.attempt, p.track_id);
+        self.query_fast_path(p.request, p.attempt);
+    }
+}
+
+/// 日志用的「标题 - 歌手」（空歌手写成 `<无歌手>`，与既有日志格式一致）。
+fn display_who(req: &LyricRequest) -> String {
+    let artist = if req.track.artist.trim().is_empty() {
+        "<无歌手>"
+    } else {
+        req.track.artist.trim()
+    };
+    format!("{} - {artist}", req.track.title)
 }
 
 /// 供单测使用：跑一次查询（不启线程）。
@@ -317,7 +504,7 @@ pub fn query_once(
     cache: &mut Cache,
     req: &LyricRequest,
 ) -> (Option<crate::lyric::Lyrics>, LyricMissReason) {
-    let key = req.track.key();
+    let key = query::cache_key(&req.track);
     if let Some(l) = cache.get_mem(&key) {
         return (Some((*l).clone()), LyricMissReason::NotFound);
     }
@@ -341,11 +528,88 @@ pub fn query_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lyric::{LyricLine, Lyrics};
     use crate::media::Track;
 
+    // ------------------------------------------------ 测试脚手架
+
+    /// 收集事件的最小出口（`EventSink` 需要真实 HWND，测试里造不出来）。
+    #[derive(Default)]
+    struct Collector {
+        events: std::sync::Mutex<Vec<AppEvent>>,
+    }
+
+    impl Collector {
+        fn take(&self) -> Vec<AppEvent> {
+            let mut g = match self.events.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            std::mem::take(&mut *g)
+        }
+
+        fn ready(&self) -> usize {
+            self.take()
+                .iter()
+                .filter(|e| matches!(e, AppEvent::LyricReady { .. }))
+                .count()
+        }
+
+        fn missing(&self) -> usize {
+            self.take()
+                .iter()
+                .filter(|e| matches!(e, AppEvent::LyricMissing { .. }))
+                .count()
+        }
+    }
+
+    impl EventOut for Arc<Collector> {
+        fn emit(&self, evt: AppEvent) {
+            let mut g = match self.events.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            g.push(evt);
+        }
+    }
+
+    /// 不启线程的投递器：只把 job 记下来（断言「有没有派发」用）。
+    fn recording_dispatch_jobs() -> (Dispatcher, Receiver<OnlineJob>) {
+        let (tx, rx) = std::sync::mpsc::channel::<OnlineJob>();
+        let d: Dispatcher = Box::new(move |job| {
+            let _ = tx.send(job);
+            Ok(())
+        });
+        (d, rx)
+    }
+
+    fn never_dispatch() -> Dispatcher {
+        Box::new(|_job: OnlineJob| Ok(()))
+    }
+
+    fn worker(tag: &str, out: Arc<Collector>, dispatch: Dispatcher) -> Worker<Arc<Collector>> {
+        Worker {
+            out,
+            cache: cache(tag),
+            dispatch,
+            current_track: 0,
+            pending: None,
+        }
+    }
+
     fn request(title: &str, artist: &str, dirs: Vec<String>, online: bool) -> LyricRequest {
+        request_with_id(7, title, artist, dirs, online)
+    }
+
+    fn request_with_id(
+        id: TrackId,
+        title: &str,
+        artist: &str,
+        dirs: Vec<String>,
+        online: bool,
+    ) -> LyricRequest {
         LyricRequest {
-            track_id: 7,
+            track_id: id,
             track: Track {
                 title: title.into(),
                 artist: artist.into(),
@@ -363,6 +627,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Cache::new(dir)
     }
+
+    fn one_line_lyrics(text: &str) -> Lyrics {
+        Lyrics {
+            lines: vec![LyricLine {
+                start_ms: 0,
+                end_ms: 1000,
+                text: text.into(),
+                words: Vec::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn outcome(
+        req: &LyricRequest,
+        attempt: u8,
+        lyrics: Option<Lyrics>,
+        reason: LyricMissReason,
+        timed_out: bool,
+    ) -> OnlineOutcome {
+        OnlineOutcome {
+            req: req.clone(),
+            attempt,
+            keywords: vec!["候选".into()],
+            result: ParallelOutcome {
+                lyrics,
+                reason,
+                source: "lrclib",
+                elapsed_ms: 123,
+                timed_out,
+            },
+        }
+    }
+
+    // ------------------------------------------------ 既有行为（语义不变）
 
     #[test]
     fn local_file_hit_never_touches_network() {
@@ -404,5 +703,210 @@ mod tests {
         // 这条走的是 handle_request 的早退分支，这里直接验证条件成立
         let req = request("   ", "x", vec![], true);
         assert!(req.track.title.trim().is_empty());
+    }
+
+    // ------------------------------------------------ 快路径 / 派发（G1）
+
+    /// 缓存命中必须是**毫秒级且不派发在线任务**（否则等于白查一遍）。
+    #[test]
+    fn cache_hit_answers_without_dispatch() {
+        let col = Arc::new(Collector::default());
+        let (dispatch, jobs) = recording_dispatch_jobs();
+        let mut w = worker("fast_hit", Arc::clone(&col), dispatch);
+
+        let req = request("晴天", "周杰伦", vec![], true);
+        w.on_request(req.clone());
+        // 第一次必然派发在线任务
+        assert!(jobs.try_recv().is_ok(), "首次查询应派发在线任务");
+        assert_eq!(col.ready(), 0, "还没有歌词可给");
+
+        // 模拟在线命中 → 写进缓存
+        w.on_online(outcome(
+            &req,
+            0,
+            Some(one_line_lyrics("第一句")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+        assert_eq!(col.ready(), 1, "命中应推 LyricReady");
+
+        // 同一首歌再来一次 → 内存命中，不许再派发
+        w.on_request(req);
+        assert!(jobs.try_recv().is_err(), "缓存命中不该再联网");
+        assert_eq!(col.ready(), 1, "缓存命中也要推 LyricReady");
+    }
+
+    /// 负缓存命中也不许派发（24h 内不再请求，PRD §6.2）。
+    #[test]
+    fn negative_cache_hit_answers_without_dispatch() {
+        let col = Arc::new(Collector::default());
+        let (dispatch, jobs) = recording_dispatch_jobs();
+        let mut w = worker("neg_hit", Arc::clone(&col), dispatch);
+
+        let req = request("冷门歌", "没人听过", vec![], true);
+        let key = query::cache_key(&req.track);
+        w.cache.put_miss(&key, LyricMissReason::NotFound);
+
+        w.on_request(req);
+        assert!(jobs.try_recv().is_err(), "负缓存命中不该联网");
+        assert_eq!(col.missing(), 1);
+    }
+
+    /// 在线关闭时不许派发，且原因必须是 `OnlineDisabled`。
+    #[test]
+    fn online_disabled_does_not_dispatch() {
+        let col = Arc::new(Collector::default());
+        let (dispatch, jobs) = recording_dispatch_jobs();
+        let mut w = worker("online_off", Arc::clone(&col), dispatch);
+
+        w.on_request(request("晴天", "周杰伦", vec![], false));
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(col.missing(), 1);
+    }
+
+    // ------------------------------------------------ 代次守卫（G1 关键）
+
+    /// **旧代结果必须被丢弃**：不推事件、不写正缓存、不写负缓存。
+    #[test]
+    fn stale_online_result_is_discarded() {
+        let col = Arc::new(Collector::default());
+        let mut w = worker("gen_guard", Arc::clone(&col), never_dispatch());
+
+        // 用户先点了 A（track 7），立刻换到 B（track 9）
+        let a = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        let b = request_with_id(9, "七里香", "周杰伦", vec![], true);
+        w.on_request(a.clone());
+        w.on_request(b);
+        let _ = col.take();
+
+        // A 的查询迟到回来（歌词 + 未命中两种都要丢）
+        w.on_online(outcome(
+            &a,
+            0,
+            Some(one_line_lyrics("迟到的歌词")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+        w.on_online(outcome(&a, 0, None, LyricMissReason::NotFound, false));
+
+        let events = col.take();
+        assert_eq!(events.len(), 0, "旧代结果不许产生任何事件");
+        let key = query::cache_key(&a.track);
+        assert!(
+            w.cache.get_mem(&key).is_none(),
+            "旧代歌词不许进缓存"
+        );
+        assert!(
+            w.cache.miss_reason(&key).is_none(),
+            "旧代的「没有」不许污染负缓存"
+        );
+        assert!(w.pending.is_none(), "旧代结果不许安排重试");
+    }
+
+    /// 守卫不能宽到把**当前代**的结果也丢掉。
+    #[test]
+    fn current_generation_result_is_accepted() {
+        let col = Arc::new(Collector::default());
+        let mut w = worker("gen_ok", Arc::clone(&col), never_dispatch());
+
+        let a = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        w.on_request(a.clone());
+        let _ = col.take();
+
+        w.on_online(outcome(
+            &a,
+            0,
+            Some(one_line_lyrics("第一句")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+        assert_eq!(col.ready(), 1);
+        assert!(w.cache.get_mem(&query::cache_key(&a.track)).is_some());
+    }
+
+    // ------------------------------------------------ 重试收敛（G1）
+
+    /// 超时 → 报 `NetworkError` 但**不安排整链重试**。
+    #[test]
+    fn timeout_does_not_schedule_retry() {
+        let col = Arc::new(Collector::default());
+        let mut w = worker("timeout", Arc::clone(&col), never_dispatch());
+        let req = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        w.on_request(req.clone());
+        let _ = col.take();
+
+        w.on_online(outcome(&req, 0, None, LyricMissReason::NetworkError, true));
+        assert_eq!(col.missing(), 1);
+        assert!(w.pending.is_none(), "超时不许触发重试");
+    }
+
+    /// 明确网络失败 → 只重试 1 次，且退避 3s（`LYRIC_RETRY_BACKOFF_MS` 只有一项）。
+    #[test]
+    fn network_error_retries_at_most_once() {
+        let col = Arc::new(Collector::default());
+        let mut w = worker("retry_once", Arc::clone(&col), never_dispatch());
+        let req = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        w.on_request(req.clone());
+        let _ = col.take();
+
+        // 第 1 次失败 → 安排第 1 次重试
+        w.on_online(outcome(&req, 0, None, LyricMissReason::NetworkError, false));
+        let p = w.pending.as_ref().expect("应安排一次重试");
+        assert_eq!(p.attempt, 1);
+        assert_eq!(
+            limits::LYRIC_RETRY_BACKOFF_MS.len(),
+            1,
+            "整链重试次数上限由退避表长度决定"
+        );
+
+        // 重试也失败 → 不再安排，降级为 NotFound 并写负缓存
+        w.on_online(outcome(&req, 1, None, LyricMissReason::NetworkError, false));
+        assert!(w.pending.is_none(), "最多重试 1 次");
+        assert_eq!(
+            w.cache.miss_reason(&query::cache_key(&req.track)),
+            Some(LyricMissReason::NotFound),
+            "重试用尽后按「暂无歌词」进负缓存"
+        );
+    }
+
+    /// 到点才重试；**换歌之后旧重试直接作废**（不许为上一首歌发网络请求）。
+    #[test]
+    fn retry_is_dropped_after_track_change() {
+        let col = Arc::new(Collector::default());
+        let (dispatch, jobs) = recording_dispatch_jobs();
+        let mut w = worker("retry_stale", Arc::clone(&col), dispatch);
+
+        let a = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        w.on_request(a.clone());
+        let _ = jobs.try_recv();
+        w.on_online(outcome(&a, 0, None, LyricMissReason::NetworkError, false));
+        assert!(w.pending.is_some());
+
+        // 用户换歌 → 旧重试作废
+        w.on_request(request_with_id(9, "七里香", "周杰伦", vec![], true));
+        let _ = jobs.try_recv();
+        assert!(w.pending.is_none(), "换歌应清掉旧重试");
+
+        // 即使时间到点，也不该再为 A 派发
+        w.on_tick(Instant::now() + Duration::from_secs(10));
+        assert!(jobs.try_recv().is_err(), "旧代重试不许再联网");
+    }
+
+    /// 重试到点后走的是**同一条快路径**（仍然派发到独立线程，不阻塞主循环）。
+    #[test]
+    fn retry_due_dispatches_again() {
+        let col = Arc::new(Collector::default());
+        let (dispatch, jobs) = recording_dispatch_jobs();
+        let mut w = worker("retry_due", Arc::clone(&col), dispatch);
+
+        let a = request_with_id(7, "晴天", "周杰伦", vec![], true);
+        w.on_request(a.clone());
+        let _ = jobs.try_recv();
+        w.on_online(outcome(&a, 0, None, LyricMissReason::NetworkError, false));
+
+        w.on_tick(Instant::now() + Duration::from_secs(10));
+        let job = jobs.try_recv().expect("到点应再次派发");
+        assert_eq!(job.attempt, 1, "重试次数要带上去，结果回来后才知道该不该再试");
+        assert_eq!(job.req.track_id, 7);
     }
 }
