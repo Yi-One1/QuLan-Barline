@@ -510,7 +510,12 @@ impl App {
     /// 1 秒定时器：几何兜底探测 + 乐观更新对账。
     pub fn on_timer(&mut self) {
         self.tick_optimistic();
-        self.sync_capture_freeze();
+        // G2 诊断：截图态探测要碰**前台进程**（OpenProcess + 查询镜像名），
+        // 它有被安全软件挂钩拖慢的可能，单独计时。
+        {
+            let _sp = crate::platform::perf::Span::new("tick.capture");
+            self.sync_capture_freeze();
+        }
 
         // ---- 截图态：冻结「跟屏幕变」的两件事（v1.2.0 / G5 问题 2）----
         //
@@ -519,7 +524,13 @@ impl App {
         // 所以截图态期间：**不探测几何、不置顶、不采样**。
         // 播放进度、歌词、封面、动画帧全部照常（它们在 `on_tick` / `TIMER_ANIM` 里）。
         if !self.capture_frozen {
-            match geometry::probe() {
+            // G2 诊断：probe 里有 FindWindowW / GetWindowRect / **SHAppBarMessage**
+            // （后者是跨进程调用），是「随机卡一下」的头号嫌疑段。
+            let probe_result = {
+                let _sp = crate::platform::perf::Span::new("tick.probe");
+                geometry::probe()
+            };
+            match probe_result {
                 Some(g) => {
                     let changed = match self.geometry.as_ref() {
                         Some(old) => !old.same_shape(&g),
@@ -557,6 +568,9 @@ impl App {
             // v1.1.14 问题 12：右键菜单打开期间必须暂停——TrackPopupMenuEx 的模态
             // 循环会照常派发 WM_TIMER，每秒把小组件抬到菜单之上（菜单非 topmost）。
             if !self.menu_open {
+                // G2 诊断：ensure_on_top 里有 GetWindowRect + **SetWindowPos**（每秒一次），
+                // 后者会触发 z-order 重排与 DWM 重合成，是「整屏顿一下」的嫌疑段。
+                let _sp = crate::platform::perf::Span::new("tick.ontop");
                 self.ensure_on_top();
             }
         }
@@ -569,6 +583,9 @@ impl App {
         // 这里按 1s 心跳补一次；采样线程自身有 300ms 节流，抓的只是小组件大小的
         // 一小块像素，空闲 CPU 仍是 0 量级（实测 < 0.3%）。
         if self.state.visible && !self.is_hovering() && !self.capture_frozen {
+            // G2 诊断：这里只做「拷 Shared 状态 + mpsc 发送」，正常应是微秒级；
+            // 一旦慢就说明 Arc clone / 采样请求槽成了瓶颈（对应采样线程的 capture 段）。
+            let _sp = crate::platform::perf::Span::new("tick.backdrop");
             self.request_backdrop();
         }
     }
@@ -698,6 +715,12 @@ impl App {
         lparam: LPARAM,
     ) -> Option<LRESULT> {
         use windows::Win32::UI::WindowsAndMessaging as wam;
+
+        // G2 诊断：只给**鼠标消息**计时（键盘 / 广播消息不在排查范围）。
+        // 覆盖范围含消息处理里同步触发的重绘（`dispatch` → `redraw`），
+        // 所以它与 `paint.frame` 会重叠：`msg.mouse` 明显更大就说明「重绘之外」
+        // 还有别的活儿（命中测试 / 钩子安装 / 日志）。
+        let _sp = is_mouse_message(msg).then(|| crate::platform::perf::Span::new("msg.mouse"));
 
         let layout = self.state.layout.clone();
         match msg {
@@ -1948,6 +1971,10 @@ impl App {
             return;
         };
         let t = self.target_rect;
+        // G2 诊断：「D2D 绘制 + 位图上传 + UpdateLayeredWindow」整帧耗时。
+        // UpdateLayeredWindow 是**同步**提交给 DWM 的，DWM 忙（播放视频 / 合成抖动）
+        // 时这一句会阻塞，所以它和「鼠标同时卡」高度相关。
+        let _sp = crate::platform::perf::Span::new("paint.frame");
         match renderer.render(&self.state, self.lang) {
             Ok((hdc, w, h, coverage)) => {
                 if let Err(e) = host.present(hdc, t.left, t.top, w, h) {
@@ -2483,6 +2510,25 @@ impl App {
 fn probe_geometry(config: &Config) -> Option<TaskbarGeometry> {
     let _ = config;
     geometry::probe()
+}
+
+/// 是不是「鼠标类」窗口消息（G2 诊断：`msg.mouse` 只给这类消息计时）。
+///
+/// 只挑真正由鼠标输入驱动的消息：定时器 / 广播 / 唤醒消息的耗时另有 `tick.*`
+/// 与 `paint.frame` 覆盖，混进来会让「鼠标卡」这条线索失真。
+fn is_mouse_message(msg: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging as wam;
+    matches!(
+        msg,
+        wam::WM_MOUSEMOVE
+            | wam::WM_LBUTTONDOWN
+            | wam::WM_LBUTTONUP
+            | wam::WM_RBUTTONUP
+            | wam::WM_MOUSEWHEEL
+            | wam::WM_CAPTURECHANGED
+            | widget_wnd::WM_MOUSELEAVE
+            | crate::platform::wake::WM_BARLINE_WHEEL
+    )
 }
 
 /// 从 `LPARAM` 里取客户区坐标（`GET_X_LPARAM` / `GET_Y_LPARAM` 的等价实现）。

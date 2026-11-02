@@ -1,6 +1,6 @@
 [package]
 name         = "barline"
-version      = "1.4.0"
+version      = "1.4.1"
 edition      = "2021"
 rust-version = "1.82"
 description  = "曲栏 Barline — Windows 11 任务栏媒体播控小组件"

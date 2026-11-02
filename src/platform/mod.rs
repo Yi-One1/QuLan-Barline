@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod com;
 pub mod dpi;
+pub mod perf;
 pub mod single_instance;
 pub mod wake;
 pub mod wide;

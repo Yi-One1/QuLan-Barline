@@ -62,7 +62,12 @@ impl CoverMemo {
             return self.cover.clone();
         }
         self.track_id = track_id;
-        self.cover = load_cover(props);
+        // G2 诊断：封面解码 = 跨进程读缩略图流 + WIC 全解码，只在换歌时发生，
+        // 但很容易上百毫秒（媒体线程被它占住 → 进度/歌词/播控状态停更）。
+        self.cover = {
+            let _sp = crate::platform::perf::Span::new("cover.decode");
+            load_cover(props)
+        };
         self.done = true;
         match self.cover.as_ref() {
             Some(c) => crate::log_info!(
@@ -116,6 +121,9 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
         // 事件驱动的补采也要有下限，避免播放器高频事件导致采样风暴
         if due || (forced && elapsed >= Duration::from_millis(60)) {
             last_poll = Instant::now();
+            // G2 诊断：一次 SMTC 轮询的整段耗时（含跨进程读属性、封面解码）。
+            // 它跑在媒体线程上，卡了不会直接卡鼠标，但会让「歌词/进度/封面」停更。
+            let _sp = crate::platform::perf::Span::new("smtc.tick");
             poll_once(&mgr, &sink, &mut last, &mut cover_memo);
         }
     }
