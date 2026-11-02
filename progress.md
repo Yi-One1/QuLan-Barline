@@ -1,7 +1,7 @@
 # 曲栏 Barline — 开发进度交接文档(progress.md)
 
 > 用途:供「新开对话 / 接手者」快速恢复上下文。本文档与 `docs/` 下的 PRD / ARCHITECTURE / 各 QA 报告互补,本文件是**唯一需要通读就能上手**的索引。
-> 最后更新:**2026-11-02 08:45,全部 12 项问题收尾闭环(v1.1.21):批次⑤完成,问题 6/7 用户裁决暂禁用留档(待办 A/D),问题 9 已删除;全量回归绿(clippy 0 警告 + 249 测试通过)。**
+> 最后更新:**2026-11-02 09:14,全 12 项问题收尾闭环(v1.1.21);本轮收尾:GitHub 默认分支 master→main 迁移 + 文档同步 + 项目文件整理(ui 空目录/examples 诊断工具已删)。**
 
 ---
 
@@ -117,6 +117,13 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 
 ---
 
+### 本轮收尾整理(2026-11-02 09:14,本对话)
+- **GitHub 仓库默认分支 master→main 迁移(完成)**:本地 `git branch -m master main` → 推 origin main → GitHub 网页 rename master→main(自动设为默认) → `git fetch -p` 清理 origin/master + `git remote set-head origin -a` 对齐;远端现仅 `main` 且为默认,本地 `main` 跟踪 `origin/main`,工作区干净。迁移零数据损失(全部 27 提交保留在 main)。
+- **文档分支名同步(完成)**:`progress.md` / `docs/QA-M5-REPORT.md` 中硬编码 `master` 改为 `main`(歌名 `Remastered` 不受影响);`.github/` 目录不存在,无 CI 工作流需改。
+- **项目文件整理(完成)**:删除 `ui/` 空目录(无任何文件)、`examples/diag_soda.rs`(v1.1.19/1.1.20 汽水激活排查临时诊断工具,待办 D 已注明可删;汽水激活搁置后无复用价值)。
+
+---
+
 ## 3. 关键决策(拍板记录,避免推翻重来)
 
 ### 本轮新增
@@ -181,7 +188,7 @@ be7f8d9 / b9d204b / 1f66500 / b29e619  v0.0.5~v0.0.2(M4 第一批/QA 清零/M3/M
 - 有效但被否的通道:v1.1.20 托盘图标点击(`Shell_NotifyIconGetRect` 按 hWnd+uID 精确定位该进程注册的图标 + `SendInput` 真实左键,恢复+行为验证全通)——**SendInput 会抢鼠标**(光标拉到托盘再恢复),用户裁决不启用。
 - 已排除:AUMID `ActivateApplication` 全候选 E_INVALIDARG;`ShellExecuteW`(开始菜单 lnk)触发汽水**重启接管**(旧实例退出中断播放)。
 - 现行行为(v1.1.21):汽水窗口**可见**时正常前台激活;**托盘隐藏态不做任何激活**(日志「激活暂禁用(缺陷搁置,待办 D)」),不制造卡死窗口、不抢鼠标。
-- 续修入口:src/media/launch.rs `tray_click_activate`(`#[allow(dead_code)]` 留档,注释含续修方向)、`TRAY_RECOVERY_APPS`/`is_tray_recovery_app`、activate_player 开头 tray_recovery 分支;诊断工具 examples/diag_soda.rs(临时文件,可复用后删除)。
+- 续修入口:src/media/launch.rs `tray_click_activate`(`#[allow(dead_code)]` 留档,注释含续修方向)、`TRAY_RECOVERY_APPS`/`is_tray_recovery_app`、activate_player 开头 tray_recovery 分支。(注:`examples/diag_soda.rs` 诊断工具已于 2026-11-02 整理时删除,续修如需复现需在 examples/ 下重建等效诊断程序。)
 - 续修方向:①逆向 Electron NotifyIconHost 托盘回调消息号直接 `PostMessage`(零鼠标移动);②探测汽水 deep-link/second-instance 无重启唤起;③仅用户光标静止时模拟点击+光标恢复动画。
 
 ### 存量与可选(不阻塞)
