@@ -49,6 +49,16 @@ pub struct Tray {
     added: bool,
 }
 
+/// 托盘菜单「显示/隐藏小组件」的勾选态：**小组件正在显示 → 打钩**。
+///
+/// 单独抽成纯函数，是因为这里历史上出过一个反向 bug：`show_menu` 直接把
+/// `config.general.widget_hidden`（是否**隐藏**）当成勾选态传进去，
+/// 结果「隐藏时打钩、显示时没钩」，与开关语义完全相反。
+/// 现在调用链上**只允许经过本函数**做换算，调用点不许自己写取反。
+pub fn toggle_checked(widget_hidden: bool) -> bool {
+    !widget_hidden
+}
+
 impl Tray {
     /// 注册窗口类并创建一个隐藏的顶层窗口。
     ///
@@ -181,14 +191,25 @@ impl Tray {
             crate::log_warn!("托盘气泡弹出失败");
         }
     }
+}
 
+impl Tray {
     /// 弹出右键菜单并返回选中的命令。
-    pub fn show_menu(&self, lang: Lang, hidden: bool) -> Option<TrayCommand> {
+    ///
+    /// `widget_visible` = **小组件当前是否显示**（勾选态语义）。
+    /// 传进来的必须是"可见与否"，不是配置里的 `widget_hidden`——
+    /// 换算统一走 [`toggle_checked`]，避免再次传反。
+    pub fn show_menu(&self, lang: Lang, widget_visible: bool) -> Option<TrayCommand> {
         // SAFETY: 菜单句柄由本函数创建并在末尾销毁；所有字符串缓冲在调用期间存活。
         unsafe {
             let menu = CreatePopupMenu().ok()?;
             append(menu, i18n::t(lang, "menu.settings"), CMD_OPEN, false);
-            append(menu, i18n::t(lang, "menu.toggle_widget"), CMD_TOGGLE, hidden);
+            append(
+                menu,
+                i18n::t(lang, "menu.toggle_widget"),
+                CMD_TOGGLE,
+                widget_visible,
+            );
             // SAFETY: 分隔线不需要文本。
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             append(menu, i18n::t(lang, "menu.quit"), CMD_QUIT, false);
@@ -314,6 +335,18 @@ pub fn is_double_click(lparam: LPARAM) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.3.1：托盘菜单勾选态 = 「小组件正在显示」。
+    ///
+    /// **历史上这里传错成 `widget_hidden`**（是否隐藏），导致「隐藏时打钩、
+    /// 显示时没钩」——与开关语义完全相反。这条测试把正确的换算钉死。
+    #[test]
+    fn toggle_checked_is_true_when_visible() {
+        // 小组件显示中（widget_hidden = false）→ 打钩
+        assert!(toggle_checked(false), "显示中必须打钩");
+        // 小组件已隐藏（widget_hidden = true）→ 不打钩
+        assert!(!toggle_checked(true), "隐藏时不许打钩");
+    }
 
     #[test]
     fn lparam_low_word_is_the_mouse_event() {

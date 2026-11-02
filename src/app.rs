@@ -660,10 +660,13 @@ impl App {
         }
         if crate::ui::tray::is_right_up(lparam) {
             crate::log_info!("托盘回调：右键抬起，弹菜单");
+            // v1.3.1：勾选态 = 「小组件正在显示」。换算只能经过 tray::toggle_checked，
+            // 历史 bug 就是这里把 `widget_hidden` 直接当勾选态传进去（勾选态反了）。
+            let widget_visible = crate::ui::tray::toggle_checked(self.config.general.widget_hidden);
             let cmd = self
                 .tray
                 .as_ref()
-                .and_then(|t| t.show_menu(self.lang, self.config.general.widget_hidden));
+                .and_then(|t| t.show_menu(self.lang, widget_visible));
             if let Some(cmd) = cmd {
                 let effects = self.reduce(AppEvent::TrayCommand(cmd));
                 self.apply(effects);
