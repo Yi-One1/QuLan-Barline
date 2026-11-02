@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::config::{Config, HotkeyBinding, LangSerde, VolumeScope};
+use crate::config::{Config, HotkeyBinding, HotkeyConfig, LangSerde, VolumeScope};
 use crate::render::theme::BackgroundMode;
 
 /// JS → Rust 的一条消息。
@@ -229,6 +229,16 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             true
         }
         _ => {
+            // v1.2.3（G4）：逐行「恢复默认」——`hotkeys.reset.<action>`
+            // （整组重置是上面的 `hotkeys.reset`，两者前缀重叠，所以必须**先**判这条）
+            if let Some(action) = path.strip_prefix("hotkeys.reset.") {
+                let Some(action) = crate::event::HotkeyAction::parse(action) else {
+                    crate::log_warn!("设置页请求恢复未知快捷键动作：{path}");
+                    return false;
+                };
+                set_binding(&mut cfg.hotkeys, action, HotkeyConfig::default_binding(action));
+                return true;
+            }
             // hotkeys.<action> = { modifiers, vk }
             if let Some(action) = path.strip_prefix("hotkeys.") {
                 return apply_binding(&mut cfg.hotkeys, action, value);
@@ -251,33 +261,37 @@ fn apply_binding(cfg: &mut crate::config::HotkeyConfig, action: &str, value: &Va
     if mods == 0 || vk == 0 {
         return false;
     }
+    let Some(action) = crate::event::HotkeyAction::parse(action) else {
+        return false;
+    };
     let b = HotkeyBinding {
         modifiers: (mods as u32) & 0x000F, // 只保留 ALT/CONTROL/SHIFT/WIN
         vk: vk as u32,
     };
-    match action {
-        "play_pause" => cfg.play_pause = b,
-        "prev" => cfg.prev = b,
-        "next" => cfg.next = b,
-        "toggle_lyrics" => cfg.toggle_lyrics = b,
-        "mute" => cfg.mute = b,
-        "toggle_widget" => cfg.toggle_widget = b,
-        _ => return false,
-    }
+    set_binding(cfg, action, b);
     true
+}
+
+/// 把某个动作的绑定写进配置（v1.2.3：`apply_binding` 与逐行「恢复默认」共用）。
+fn set_binding(
+    cfg: &mut crate::config::HotkeyConfig,
+    action: crate::event::HotkeyAction,
+    b: HotkeyBinding,
+) {
+    use crate::event::HotkeyAction as A;
+    match action {
+        A::PlayPause => cfg.play_pause = b,
+        A::Prev => cfg.prev = b,
+        A::Next => cfg.next = b,
+        A::ToggleLyrics => cfg.toggle_lyrics = b,
+        A::Mute => cfg.mute = b,
+        A::ToggleWidget => cfg.toggle_widget = b,
+    }
 }
 
 /// 动作名（日志 / 冲突上报用）。
 pub fn action_name(a: crate::event::HotkeyAction) -> &'static str {
-    use crate::event::HotkeyAction as A;
-    match a {
-        A::PlayPause => "play_pause",
-        A::Prev => "prev",
-        A::Next => "next",
-        A::ToggleLyrics => "toggle_lyrics",
-        A::Mute => "mute",
-        A::ToggleWidget => "toggle_widget",
-    }
+    a.as_str()
 }
 
 /// 语言枚举 → 页面用的字符串。
@@ -392,6 +406,74 @@ mod tests {
         let mut c = Config::default();
         assert!(!apply_set(&mut c, "lyrics.enabled", &json!("yes")));
         assert!(!apply_set(&mut c, "volume.step", &json!("big")));
+    }
+
+    /// v1.2.3（G4）：逐行「恢复默认」只动**目标那一组**，其它 5 组必须原样保留
+    /// （否则用户精心改过的组合会被一个 ↺ 全清掉）。
+    #[test]
+    fn reset_one_hotkey_restores_that_binding() {
+        use crate::event::HotkeyAction as A;
+        use crate::config::defaults::mods;
+        let mut c = Config::default();
+        // 先把 6 组都改成非默认值，才能证明"只动一组"
+        let custom = json!({"modifiers": mods::CONTROL | mods::ALT | mods::SHIFT, "vk": 0x51});
+        for action in A::ALL {
+            assert!(apply_set(
+                &mut c,
+                &format!("hotkeys.{}", action.as_str()),
+                &custom
+            ));
+        }
+        assert_eq!(c.hotkeys.prev.vk, 0x51);
+
+        assert!(apply_set(&mut c, "hotkeys.reset.prev", &json!(true)));
+
+        let want = HotkeyConfig::default_binding(A::Prev);
+        assert_eq!(c.hotkeys.prev, want, "prev 必须回到默认 Ctrl+Alt+←");
+        assert_eq!((c.hotkeys.prev.modifiers, c.hotkeys.prev.vk), (mods::CONTROL | mods::ALT, crate::config::defaults::vk::LEFT));
+        // 其余 5 组不受影响
+        for action in [A::PlayPause, A::Next, A::ToggleLyrics, A::Mute, A::ToggleWidget] {
+            let now = match action {
+                A::PlayPause => c.hotkeys.play_pause,
+                A::Next => c.hotkeys.next,
+                A::ToggleLyrics => c.hotkeys.toggle_lyrics,
+                A::Mute => c.hotkeys.mute,
+                _ => c.hotkeys.toggle_widget,
+            };
+            assert_eq!(now.vk, 0x51, "{} 被逐行恢复误伤", action.as_str());
+            assert_eq!(now, custom_binding());
+        }
+    }
+
+    /// 上面那条用的自定义绑定（与 JSON 里写的一致）。
+    fn custom_binding() -> HotkeyBinding {
+        use crate::config::defaults::mods;
+        HotkeyBinding {
+            modifiers: mods::CONTROL | mods::ALT | mods::SHIFT,
+            vk: 0x51,
+        }
+    }
+
+    /// 未知动作名必须被拒绝（不许 panic、不许静默成功）。
+    #[test]
+    fn reset_unknown_action_is_rejected() {
+        let mut c = Config::default();
+        assert!(!apply_set(&mut c, "hotkeys.reset.bogus", &json!(true)));
+        assert!(!apply_set(&mut c, "hotkeys.reset.", &json!(true)));
+        assert!(!apply_set(&mut c, "hotkeys.reset.PlayPause", &json!(true)));
+        // 整组重置仍然可用（不能被新前缀抢走）
+        c.hotkeys.prev.vk = 0x51;
+        assert!(apply_set(&mut c, "hotkeys.reset", &json!(true)));
+        assert_eq!(c.hotkeys.prev, HotkeyConfig::default_binding(crate::event::HotkeyAction::Prev));
+    }
+
+    /// `default_binding` 必须与 `HotkeyConfig::default()` 逐项一致（防两处漂移）。
+    #[test]
+    fn default_binding_matches_default_config() {
+        let d = HotkeyConfig::default();
+        for (action, binding) in crate::hotkey::bindings(&d) {
+            assert_eq!(HotkeyConfig::default_binding(action), *binding, "{:?}", action);
+        }
     }
 
     #[test]

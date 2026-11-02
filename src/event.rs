@@ -101,6 +101,46 @@ pub enum HotkeyAction {
     ToggleWidget,
 }
 
+impl HotkeyAction {
+    /// 动作名（**稳定字符串**）：设置页的 `<action>`、配置路径、日志都用它。
+    ///
+    /// v1.2.3（G4）：从 `settings::bridge::action_name` 上提到这里，
+    /// 让「设置页写入 / 逐行恢复默认 / 日志」共用同一张名字表。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HotkeyAction::PlayPause => "play_pause",
+            HotkeyAction::Prev => "prev",
+            HotkeyAction::Next => "next",
+            HotkeyAction::ToggleLyrics => "toggle_lyrics",
+            HotkeyAction::Mute => "mute",
+            HotkeyAction::ToggleWidget => "toggle_widget",
+        }
+    }
+
+    /// 动作名 → 动作。不认识返回 `None`（**不 panic、不静默成功**）。
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "play_pause" => HotkeyAction::PlayPause,
+            "prev" => HotkeyAction::Prev,
+            "next" => HotkeyAction::Next,
+            "toggle_lyrics" => HotkeyAction::ToggleLyrics,
+            "mute" => HotkeyAction::Mute,
+            "toggle_widget" => HotkeyAction::ToggleWidget,
+            _ => return None,
+        })
+    }
+
+    /// 全部 6 个动作（测试 / 遍历用）。
+    pub const ALL: [HotkeyAction; 6] = [
+        HotkeyAction::PlayPause,
+        HotkeyAction::Prev,
+        HotkeyAction::Next,
+        HotkeyAction::ToggleLyrics,
+        HotkeyAction::Mute,
+        HotkeyAction::ToggleWidget,
+    ];
+}
+
 /// 托盘菜单命令。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
@@ -225,3 +265,21 @@ pub enum ToastLevel {
 
 /// 便捷别名，减少调用点的类型噪音。
 pub type Sink = EventSink<AppEvent>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.2.3（G4）：动作名是配置路径 / 前端 `<action>` / 日志的共同约定，
+    /// 必须**双向一致**——写错一个字符，逐行「恢复默认」就会静默失败。
+    #[test]
+    fn hotkey_action_names_roundtrip() {
+        for a in HotkeyAction::ALL {
+            assert_eq!(HotkeyAction::parse(a.as_str()), Some(a), "{} 双向不一致", a.as_str());
+        }
+        assert_eq!(HotkeyAction::ALL.len(), 6);
+        assert_eq!(HotkeyAction::parse("bogus"), None);
+        assert_eq!(HotkeyAction::parse(""), None);
+        assert_eq!(HotkeyAction::parse("PlayPause"), None, "必须是小写蛇形名");
+    }
+}

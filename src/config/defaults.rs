@@ -152,11 +152,17 @@ pub mod mods {
 
 /// 快捷键默认值的版本号。
 ///
-/// 0 = M2/M3 时代的 `Ctrl+Alt+*`；1 = 现在的 `Ctrl+Alt+Shift+*`。
+/// 0 = M2/M3 时代的 `Ctrl+Alt+*`；
+/// 1 = v1.1.x 线上默认 `Ctrl+Alt+Shift+*`（当年因 `Ctrl+Alt+*` 被其它软件占用
+///     而临时加 Shift）；
+/// 2 = **v1.2.3 起**回到用户要的 `Ctrl+Alt+*`。与 0 内容相同但语义不同
+///     （那是"历史上的旧默认"，这是"现在的默认"），所以迁移判定用两个独立函数
+///     [`HotkeyConfig::v0_defaults`] / [`HotkeyConfig::v1_defaults`]。
+///
 /// 为什么要版本号：旧配置里存的是**旧默认值**，但那也可能是用户**手动选过的**
-/// 同款组合。只有"6 组全都等于旧默认值"才能判定为"用户没改过"→ 可以迁移；
-/// 改过任何一组就原样保留（见 `HotkeyConfig::migrate`）。
-pub const HOTKEYS_VERSION: u32 = 1;
+/// 同款组合。只有"6 组全都等于某一代旧默认值"才能判定为"用户没改过"→ 可以迁移；
+/// 改过任何一组就原样保留。
+pub const HOTKEYS_VERSION: u32 = 2;
 
 /// 常用虚拟键码（`RegisterHotKey` 用）。
 pub mod vk {
@@ -231,40 +237,77 @@ impl Default for VolumeConfig {
 }
 
 impl HotkeyConfig {
-    /// **旧**默认值（`Ctrl+Alt+*`）。只用于迁移判定，不要拿来注册。
+    /// 给定修饰位，产出一整套绑定表。
     ///
-    /// 实测这台机器上 `Ctrl+Alt+P / ← / → / L / M` 全被其它软件占用（1409），
-    /// 所以默认值整体换成 `Ctrl+Alt+Shift+*`。
-    pub fn legacy_defaults() -> Self {
-        let ctrl_alt = mods::CONTROL | mods::ALT;
+    /// **vk 表（P / ← / → / L / M / H）跨代不变**——v0 / v1 / v2 只差修饰位。
+    /// 把它集中在这一处，是为了让 [`HotkeyConfig::default`]、
+    /// [`HotkeyConfig::v0_defaults`]、[`HotkeyConfig::v1_defaults`]、
+    /// [`HotkeyConfig::default_binding`] 全部**同源**：vk 字面量只在
+    /// 这里出现一次，不可能出现"改了默认值忘了改逐行恢复"的漂移。
+    /// （`hotkeys_version` 由调用方决定，这里给 0 表示"未标注代次"。）
+    fn bindings_with(modifiers: u32) -> Self {
         Self {
             enabled: true,
             hotkeys_version: 0,
             conflict_notified: false,
             play_pause: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::P,
             },
             prev: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::LEFT,
             },
             next: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::RIGHT,
             },
             toggle_lyrics: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::L,
             },
             mute: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::M,
             },
             toggle_widget: HotkeyBinding {
-                modifiers: ctrl_alt,
+                modifiers,
                 vk: vk::H,
             },
+        }
+    }
+
+    /// **v0 默认值**（M2/M3 时代）：`Ctrl+Alt+*`。**只用于迁移判定**，不要拿来注册。
+    ///
+    /// 与 v2 新默认内容相同是**有意为之**（v1.2.3 回到用户要的组合），
+    /// 但两个函数语义不同（一个是"历史上的旧默认"，一个是"现在的默认"），
+    /// 迁移判定必须分别比对，故不合并。
+    pub fn v0_defaults() -> Self {
+        Self::bindings_with(mods::CONTROL | mods::ALT)
+    }
+
+    /// **v1 默认值**（v1.1.x 线上默认）：`Ctrl+Alt+Shift+*`。**只用于迁移判定**。
+    ///
+    /// 当年临时加 Shift 的原因：实测那台机器上 `Ctrl+Alt+P / ← / → / L / M`
+    /// 全被其它软件占用（错误码 1409）。v1.2.3 起按用户要求回到 `Ctrl+Alt+*`。
+    pub fn v1_defaults() -> Self {
+        Self::bindings_with(mods::CONTROL | mods::ALT | mods::SHIFT)
+    }
+
+    /// 某个动作在**当前默认值**下的绑定（v1.2.3：设置页逐行「恢复默认」）。
+    ///
+    /// 实现上直接取 [`HotkeyConfig::default`]，**绝不另抄一份 vk 字面量**——
+    /// 否则默认值与逐行恢复两处必然漂移。
+    pub fn default_binding(action: crate::event::HotkeyAction) -> HotkeyBinding {
+        use crate::event::HotkeyAction as A;
+        let d = Self::default();
+        match action {
+            A::PlayPause => d.play_pause,
+            A::Prev => d.prev,
+            A::Next => d.next,
+            A::ToggleLyrics => d.toggle_lyrics,
+            A::Mute => d.mute,
+            A::ToggleWidget => d.toggle_widget,
         }
     }
 
@@ -278,22 +321,40 @@ impl HotkeyConfig {
             && self.toggle_widget == other.toggle_widget
     }
 
-    /// 旧配置迁移：只有「版本 0 + 6 组全是旧默认值」才换成新默认值。
-    /// 返回 `true` 表示配置被改动，调用方应落盘。
+    /// 旧配置迁移（v1.2.3：目标版本 2，矩阵见下）。
+    ///
+    /// | 当前 6 组绑定 | 处理 |
+    /// |---|---|
+    /// | 全等于 [`v1_defaults`](Self::v1_defaults)（`Ctrl+Alt+Shift+*`） | 迁到新默认 `Ctrl+Alt+*` |
+    /// | 全等于 [`v0_defaults`](Self::v0_defaults)（`Ctrl+Alt+*`） | 内容不变，只提版本号 |
+    /// | 其它（用户手动改过任意一组） | **原样保留，绝不覆盖** |
+    /// | `hotkeys_version >= 2` | 直接返回 `false`（不写盘） |
+    ///
+    /// 返回值语义不变：`true` ＝ 配置被改动（或版本号被提升）、调用方应落盘。
     pub fn migrate(&mut self) -> bool {
         if self.hotkeys_version >= HOTKEYS_VERSION {
             return false;
         }
-        let legacy = Self::legacy_defaults();
-        if self.same_bindings(&legacy) {
-            let enabled = self.enabled;
-            let notified = self.conflict_notified;
+        let enabled = self.enabled;
+        let notified = self.conflict_notified;
+
+        if self.same_bindings(&Self::v1_defaults()) {
+            // 线上默认 → 新默认。保留用户自己的开关与"已提示过冲突"标记
             *self = Self::default();
             self.enabled = enabled;
             self.conflict_notified = notified;
-            crate::log_info!("快捷键默认值已从 Ctrl+Alt+* 迁移到 Ctrl+Alt+Shift+*");
+            crate::log_info!(
+                "快捷键默认值已从 Ctrl+Alt+Shift+* 迁移到 Ctrl+Alt+*（版本 1 → {}）",
+                HOTKEYS_VERSION
+            );
+        } else if self.same_bindings(&Self::v0_defaults()) {
+            // 已经是新默认的内容，只把版本号提上去（绑定一个字不动）
+            crate::log_info!(
+                "快捷键已是 Ctrl+Alt+* 默认值，仅把版本号提到 {}（绑定不变）",
+                HOTKEYS_VERSION
+            );
         } else {
-            crate::log_info!("快捷键默认值保持用户自定义值（不迁移）");
+            crate::log_info!("快捷键保持用户自定义值（不迁移），仅把版本号提到 {HOTKEYS_VERSION}");
         }
         self.hotkeys_version = HOTKEYS_VERSION;
         true
@@ -301,37 +362,12 @@ impl HotkeyConfig {
 }
 
 impl Default for HotkeyConfig {
+    /// 新默认（v1.2.3 / 版本 2）：`Ctrl+Alt+*` —— 播放/暂停 P、上一首 ←、
+    /// 下一首 →、歌词开关 L、静音 M、显隐小组件 H。
     fn default() -> Self {
-        let ctrl_alt_shift = mods::CONTROL | mods::ALT | mods::SHIFT;
-        Self {
-            enabled: true,
-            hotkeys_version: HOTKEYS_VERSION,
-            conflict_notified: false,
-            play_pause: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::P,
-            },
-            prev: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::LEFT,
-            },
-            next: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::RIGHT,
-            },
-            toggle_lyrics: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::L,
-            },
-            mute: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::M,
-            },
-            toggle_widget: HotkeyBinding {
-                modifiers: ctrl_alt_shift,
-                vk: vk::H,
-            },
-        }
+        let mut cfg = Self::bindings_with(mods::CONTROL | mods::ALT);
+        cfg.hotkeys_version = HOTKEYS_VERSION;
+        cfg
     }
 }
 
@@ -392,5 +428,142 @@ mod tests {
         assert!(limits::WIDGET_MIN_W < limits::WIDGET_MAX_W);
         assert!(limits::TRAY_GAP > 0.0);
         assert_eq!(limits::LOG_MAX_BYTES, crate::log::LOG_MAX_BYTES);
+    }
+
+    // ------------------------------------------------ v1.2.3（G4）快捷键体系
+
+    /// 用户明确要求：所有默认按键回到 `Ctrl+Alt+对应按键`。
+    /// 逐项对键位（不是只数数量），并用 `hotkey::bindings` 走真实遍历路径。
+    #[test]
+    fn default_hotkeys_are_ctrl_alt() {
+        use crate::event::HotkeyAction as A;
+        let cfg = HotkeyConfig::default();
+        let want = mods::CONTROL | mods::ALT;
+        let expected = [
+            (A::PlayPause, vk::P),
+            (A::Prev, vk::LEFT),
+            (A::Next, vk::RIGHT),
+            (A::ToggleLyrics, vk::L),
+            (A::Mute, vk::M),
+            (A::ToggleWidget, vk::H),
+        ];
+        let got = crate::hotkey::bindings(&cfg);
+        assert_eq!(got.len(), expected.len(), "必须有 6 组");
+        for ((action, binding), (want_action, want_vk)) in got.iter().zip(expected.iter()) {
+            assert_eq!(*action, *want_action, "动作顺序/映射错位");
+            assert_eq!(
+                binding.modifiers, want,
+                "{:?} 的默认修饰键必须是 Ctrl+Alt",
+                action
+            );
+            assert_eq!(binding.vk, *want_vk, "{:?} 的默认键位错", action);
+        }
+        assert_eq!(cfg.hotkeys_version, HOTKEYS_VERSION);
+    }
+
+    /// 迁移矩阵①：全等于 v1 默认（`Ctrl+Alt+Shift+*`）→ 迁到新默认。
+    /// 同时验证 `enabled` / `conflict_notified` 被保留。
+    #[test]
+    fn migrate_from_v1_defaults_to_new() {
+        let mut cfg = HotkeyConfig::v1_defaults();
+        cfg.hotkeys_version = 1;
+        cfg.enabled = false;
+        cfg.conflict_notified = true;
+
+        assert!(cfg.migrate(), "版本落后且有可迁移内容时必须返回 true（调用方要落盘）");
+        assert_eq!(cfg.hotkeys_version, HOTKEYS_VERSION);
+        assert!(cfg.same_bindings(&HotkeyConfig::default()), "必须迁到新默认 Ctrl+Alt+*");
+        assert_eq!(cfg.play_pause.modifiers, mods::CONTROL | mods::ALT);
+        assert!(!cfg.enabled, "enabled 必须保留用户设置");
+        assert!(cfg.conflict_notified, "conflict_notified 必须保留");
+    }
+
+    /// 迁移矩阵②：全等于 v0 默认（`Ctrl+Alt+*`）→ 绑定不变，只提版本号。
+    #[test]
+    fn migrate_from_v0_defaults_bumps_version_only() {
+        let mut cfg = HotkeyConfig::v0_defaults();
+        cfg.hotkeys_version = 0;
+        let before = cfg.clone();
+
+        assert!(cfg.migrate(), "版本号被提升也算改动");
+        assert_eq!(cfg.hotkeys_version, HOTKEYS_VERSION);
+        assert!(
+            cfg.same_bindings(&before),
+            "已是新默认内容时，绑定一个字都不许动"
+        );
+    }
+
+    /// 迁移矩阵③：用户手动改过任意一组 → **原样保留**，绝不覆盖。
+    #[test]
+    fn migrate_keeps_user_custom() {
+        let mut cfg = HotkeyConfig::v1_defaults();
+        cfg.hotkeys_version = 1;
+        // 用户把播放/暂停改成 Ctrl+Alt+Q，其余仍是 v1 默认
+        cfg.play_pause = HotkeyBinding {
+            modifiers: mods::CONTROL | mods::ALT,
+            vk: 0x51,
+        };
+        let before = cfg.clone();
+
+        assert!(cfg.migrate());
+        assert_eq!(cfg.hotkeys_version, HOTKEYS_VERSION);
+        assert_eq!(cfg.play_pause, before.play_pause, "自定义项不许被覆盖");
+        assert_eq!(cfg.prev, before.prev, "其余组也不许被覆盖");
+        assert_eq!(cfg.toggle_widget, before.toggle_widget);
+    }
+
+    /// 迁移矩阵④：已经是当前版本 → 什么都不做、不写盘。
+    #[test]
+    fn migrate_is_noop_at_current_version() {
+        let mut cfg = HotkeyConfig::default();
+        assert_eq!(cfg.hotkeys_version, HOTKEYS_VERSION);
+        assert!(!cfg.migrate(), "当前版本必须返回 false（不落盘）");
+
+        // 用户改过 + 已是当前版本：同样不许动
+        cfg.mute = HotkeyBinding {
+            modifiers: mods::CONTROL | mods::ALT | mods::SHIFT,
+            vk: 0x51,
+        };
+        let before = cfg.clone();
+        assert!(!cfg.migrate());
+        assert!(cfg.same_bindings(&before), "当前版本下不许改任何绑定");
+        assert_eq!(cfg.hotkeys_version, before.hotkeys_version);
+    }
+
+    /// `default_binding`（逐行恢复默认用）必须与 `HotkeyConfig::default()` 逐项一致。
+    #[test]
+    fn default_binding_matches_default_config() {
+        let d = HotkeyConfig::default();
+        for (action, binding) in crate::hotkey::bindings(&d) {
+            assert_eq!(
+                HotkeyConfig::default_binding(action),
+                *binding,
+                "{:?} 的 default_binding 与默认配置不一致（两处 vk 字面量漂移了）",
+                action
+            );
+        }
+    }
+
+    /// v0 / v1 / v2 三代默认值只差修饰位，vk 表必须一致——
+    /// 这是"vk 字面量只写一处"的护栏。
+    #[test]
+    fn hotkey_generations_differ_only_in_modifiers() {
+        let v0 = HotkeyConfig::v0_defaults();
+        let v1 = HotkeyConfig::v1_defaults();
+        let cur = HotkeyConfig::default();
+        assert!(v0.same_bindings(&cur), "v2 内容应与 v0 相同（都是 Ctrl+Alt+*）");
+        assert!(!v0.same_bindings(&v1), "v1 必须是 Ctrl+Alt+Shift+*，与 v0 不同");
+        let pairs = [
+            (v1.play_pause, v0.play_pause),
+            (v1.prev, v0.prev),
+            (v1.next, v0.next),
+            (v1.toggle_lyrics, v0.toggle_lyrics),
+            (v1.mute, v0.mute),
+            (v1.toggle_widget, v0.toggle_widget),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(a.vk, b.vk, "两代默认值的 vk 必须相同");
+            assert_eq!(a.modifiers, b.modifiers | mods::SHIFT, "v1 只多一个 Shift");
+        }
     }
 }

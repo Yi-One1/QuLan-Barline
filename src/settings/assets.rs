@@ -84,6 +84,45 @@ mod tests {
         );
     }
 
+    /// 契约回归（v1.2.3 / G4）：快捷键体系三件套必须在页面里落地——
+    /// ①「录制」已改名「更改」；②每行有 ↺ 单行恢复默认按钮；③前端确实接了
+    /// `hotkeys.reset.<action>` 这条配置路径。
+    ///
+    /// 改名那条是硬要求：`录制` / `Record` 一个都不许再出现（含 i18n 字典）。
+    #[test]
+    fn hotkey_ui_uses_change_and_per_row_reset() {
+        // ① 单行恢复默认：图标 + i18n 键 + 配置路径
+        assert!(INDEX_HTML.contains("↺"), "缺少单行恢复默认的 ↺ 图标");
+        assert!(
+            INDEX_HTML.contains("hotkeys.reset_one"),
+            "缺少 hotkeys.reset_one 词条/引用"
+        );
+        assert!(
+            INDEX_HTML.contains("hotkeys.reset."),
+            "前端没有拼出 hotkeys.reset.<action> 配置路径"
+        );
+        assert!(
+            INDEX_HTML.contains("btn icon"),
+            "↺ 按钮应使用 class=\"btn icon\"（不影响 .btn 本体）"
+        );
+
+        // ② 「录制」改名「更改」：中英都不许残留
+        for gone in ["\"hotkeys.record\": \"录制\"", "\"hotkeys.record\": \"Record\"", "「录制」"] {
+            assert!(
+                !INDEX_HTML.contains(gone),
+                "「录制」未改名干净，仍存在：{gone}"
+            );
+        }
+        assert!(
+            INDEX_HTML.contains("\"hotkeys.record\": \"更改\""),
+            "中文按钮文案应为「更改」"
+        );
+        assert!(
+            INDEX_HTML.contains("\"hotkeys.record\": \"Change\""),
+            "英文按钮文案应为 Change"
+        );
+    }
+
     /// 契约回归（v1.2.2 / G3）：「界面缩放」整项已删除，页面里不许再出现任何痕迹。
     ///
     /// `ui_scale` 曾经是**死配置**（渲染层与布局层从未读取），删除后若有人

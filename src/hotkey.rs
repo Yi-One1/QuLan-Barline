@@ -50,6 +50,62 @@ pub fn action_of_id(id: i32) -> Option<HotkeyAction> {
     })
 }
 
+/// 把一组绑定渲染成**人可读**文本（日志专用）：`Ctrl+Alt+P`、`Ctrl+Alt+←`。
+///
+/// v1.2.3（G4）：默认值回到 `Ctrl+Alt+*` 之后，`P / L / M / H / ← / →` 这几组
+/// 在这台机器上**历史上曾被其它软件占用（错误码 1409）**，所以注册失败的日志
+/// 必须能一眼看出「哪一组动作 + 什么组合 + 什么错误码」，用户复现时直接截图即可。
+/// 格式与设置页的 `bindingText()` 保持一致（同一套修饰键顺序与键名）。
+pub fn describe(binding: HotkeyBinding) -> String {
+    use crate::config::defaults::mods;
+    let mut out = String::with_capacity(24);
+    if binding.modifiers & mods::CONTROL != 0 {
+        out.push_str("Ctrl+");
+    }
+    if binding.modifiers & mods::ALT != 0 {
+        out.push_str("Alt+");
+    }
+    if binding.modifiers & mods::SHIFT != 0 {
+        out.push_str("Shift+");
+    }
+    if binding.modifiers & mods::WIN != 0 {
+        out.push_str("Win+");
+    }
+    push_vk_name(&mut out, binding.vk);
+    out
+}
+
+/// 键码 → 可读名（只覆盖常用键，其余退化为 `VK(0x..)`，永不失败）。
+fn push_vk_name(out: &mut String, vk: u32) {
+    match vk {
+        0x08 => out.push_str("Backspace"),
+        0x09 => out.push_str("Tab"),
+        0x0D => out.push_str("Enter"),
+        0x1B => out.push_str("Esc"),
+        0x20 => out.push_str("Space"),
+        0x25 => out.push('←'),
+        0x26 => out.push('↑'),
+        0x27 => out.push('→'),
+        0x28 => out.push('↓'),
+        0x30..=0x39 | 0x41..=0x5A => {
+            // 0x30..=0x39 是 '0'..='9'，0x41..=0x5A 是 'A'..='Z'（ASCII 码点即字符）
+            match char::from_u32(vk) {
+                Some(c) => out.push(c),
+                None => out.push('?'),
+            }
+        }
+        0x70..=0x87 => {
+            out.push('F');
+            out.push_str(&(vk - 0x6F).to_string());
+        }
+        other => {
+            out.push_str("VK(0x");
+            out.push_str(&format!("{other:02X}"));
+            out.push(')');
+        }
+    }
+}
+
 /// 一次注册失败的记录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conflict {
@@ -92,19 +148,18 @@ impl Hotkeys {
                 Ok(()) => {
                     self.active.push(action);
                     crate::log_info!(
-                        "热键已注册：{:?} = mods=0x{:X} vk=0x{:X}",
-                        action,
-                        binding.modifiers,
-                        binding.vk
+                        "热键已注册：{} = {}",
+                        action.as_str(),
+                        describe(*binding)
                     );
                 }
                 Err(e) => {
                     let code = e.code().0 as u32;
+                    // v1.2.3：日志必须带「哪一组 + 什么组合 + 错误码」，用户复现时直接截图
                     crate::log_warn!(
-                        "热键注册失败：{:?} = mods=0x{:X} vk=0x{:X}，错误码 {}（{}）",
-                        action,
-                        binding.modifiers,
-                        binding.vk,
+                        "热键注册失败：{} = {}，错误码 {}（{}）",
+                        action.as_str(),
+                        describe(*binding),
                         code,
                         if code == ERROR_HOTKEY_ALREADY_REGISTERED {
                             "已被其它程序占用"
@@ -222,6 +277,40 @@ mod tests {
         assert_eq!(action_of_id(0), None);
         assert_eq!(action_of_id(7), None);
         assert_eq!(action_of_id(-1), None);
+    }
+
+    /// v1.2.3（G4）：注册日志要能一眼看出「哪一组 + 什么组合」。
+    /// 这里钉住默认 6 组的可读文本，并验证冷门键位的兜底格式不 panic。
+    #[test]
+    fn describe_renders_default_combos() {
+        use crate::config::defaults::{mods, vk};
+        let b = |vk| HotkeyBinding {
+            modifiers: mods::CONTROL | mods::ALT,
+            vk,
+        };
+        assert_eq!(describe(b(vk::P)), "Ctrl+Alt+P");
+        assert_eq!(describe(b(vk::L)), "Ctrl+Alt+L");
+        assert_eq!(describe(b(vk::M)), "Ctrl+Alt+M");
+        assert_eq!(describe(b(vk::H)), "Ctrl+Alt+H");
+        assert_eq!(describe(b(vk::LEFT)), "Ctrl+Alt+←");
+        assert_eq!(describe(b(vk::RIGHT)), "Ctrl+Alt+→");
+
+        // 三代默认值里的 v1（带 Shift）
+        assert_eq!(
+            describe(HotkeyBinding {
+                modifiers: mods::CONTROL | mods::ALT | mods::SHIFT,
+                vk: vk::P
+            }),
+            "Ctrl+Alt+Shift+P"
+        );
+        // 冷门键位退化为 VK(0x..)，不 panic、不丢信息
+        assert_eq!(
+            describe(HotkeyBinding {
+                modifiers: mods::WIN,
+                vk: 0xE0
+            }),
+            "Win+VK(0xE0)"
+        );
     }
 
     #[test]
