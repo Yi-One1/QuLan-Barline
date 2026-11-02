@@ -21,9 +21,10 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsWindow,
-    LoadIconW, RegisterClassW, SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, SW_SHOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsIconic,
+    IsWindow, LoadIconW, RegisterClassW, SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, SW_RESTORE,
+    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_DESTROY, WM_SIZE, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 
 use crate::event::AppEvent;
@@ -31,6 +32,33 @@ use crate::platform::wake::EventSink;
 
 /// 设置窗口类名。
 pub const SETTINGS_CLASS: PCWSTR = w!("BarlineSettingsWnd");
+
+/// 「窗口已存在」时该用哪个 `ShowWindow` 命令把它呈现给用户（v1.2.1 / G2 问题 4）。
+///
+/// 抽成枚举 + 纯函数 [`reveal_action`] 的唯一理由是**可测**：Win32 没法单测，
+/// 但"最小化 vs 未最小化该调什么"这个决策可以。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reveal {
+    /// 窗口被最小化（在任务栏里躺着）→ 必须 `SW_RESTORE` 才会还原
+    Restore,
+    /// 窗口正常但被别的窗口盖住 → `SW_SHOW` + 抢前台即可
+    Show,
+}
+
+/// 决策：窗口最小化了吗？→ 该还原还是只显示。
+///
+/// **这是本模块唯一的判定逻辑**，真实调用点（[`SettingsService::open`]）必须用它，
+/// 不允许再写一份 `if iconic { ... } else { ... }` 的并行分支。
+///
+/// 为什么重要：`SW_SHOW` 对一个**最小化**窗口是 no-op（不会 un-minimize），
+/// 用户点「设置」看到的是"窗口还在任务栏躺着、什么也没发生"。
+pub fn reveal_action(iconic: bool) -> Reveal {
+    if iconic {
+        Reveal::Restore
+    } else {
+        Reveal::Show
+    }
+}
 
 /// DwmSetWindowAttribute 的属性号。
 ///
@@ -80,10 +108,24 @@ impl SettingsService {
     ) {
         if let Some(h) = self.hwnd {
             if unsafe_is_window(h) {
-                // 已经开着：只前置
+                // 已经开着：只前置。
+                //
+                // v1.2.1（G2 问题 4）：`SW_SHOW` 对**最小化**窗口是 no-op（不会还原），
+                // 用户点了「设置」看到的却是"窗口还躺在任务栏里"。所以先问一句
+                // `IsIconic`，最小化时改用 `SW_RESTORE`；还原后系统会派发一条
+                // `WM_SIZE`（带真实尺寸），WebView2 的 bounds 由 `on_settings_resize`
+                // → `resize` 自动跟上，这里不需要额外处理。
+                let iconic = unsafe_is_iconic(h);
+                let reveal = reveal_action(iconic);
                 // SAFETY: h 是有效的设置窗口。
                 unsafe {
-                    let _ = ShowWindow(h, SW_SHOW);
+                    let _ = match reveal {
+                        Reveal::Restore => ShowWindow(h, SW_RESTORE),
+                        Reveal::Show => ShowWindow(h, SW_SHOW),
+                    };
+                }
+                if iconic {
+                    crate::log_debug!("设置窗口处于最小化，已用 SW_RESTORE 还原");
                 }
                 crate::platform::force_foreground(h);
                 self.push(&state_json);
@@ -189,6 +231,11 @@ impl SettingsService {
     }
 
     /// 窗口尺寸变化 → 同步 WebView2 的 bounds。
+    ///
+    /// v1.2.1（G2 问题 4）：加了一道 `0×0` 守卫。最小化时系统会派发
+    /// `WM_SIZE(SIZE_MINIMIZED)`，`GetClientRect` 拿到的是 `0×0`——直接传给
+    /// `set_bounds` 会让 WebView2 白做一次"缩到零再长回来"的布局。还原时
+    /// 系统会再派发一条带真实尺寸的 `WM_SIZE`，所以这里直接跳过没有副作用。
     pub fn resize(&self, hwnd: HWND) {
         let mut rc = RECT::default();
         // SAFETY: hwnd 有效；rc 是本地栈结构体。
@@ -196,6 +243,10 @@ impl SettingsService {
             let _ = GetClientRect(hwnd, &mut rc);
         }
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            // 最小化 / 尚未完成布局：不把 0×0 传给 WebView2
+            return;
+        }
         if let Some(wv) = self.slot.borrow().as_ref() {
             wv.set_bounds(0, 0, w, h);
         }
@@ -288,6 +339,12 @@ fn unsafe_is_window(hwnd: HWND) -> bool {
     unsafe { IsWindow(Some(hwnd)).as_bool() }
 }
 
+/// 窗口是否处于最小化（在任务栏里）。
+fn unsafe_is_iconic(hwnd: HWND) -> bool {
+    // SAFETY: IsIconic 对任意句柄都安全（只返回真假）。
+    unsafe { IsIconic(hwnd).as_bool() }
+}
+
 /// Mica + 圆角 + 明暗（失败不致命：老系统没有这些属性）。
 fn apply_fluent(hwnd: HWND, dark: bool) {
     let backdrop = DWMSBT_MAINWINDOW;
@@ -324,4 +381,22 @@ fn centered(w: i32, h: i32) -> (i32, i32) {
     let sw = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let sh = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     ((sw - w) / 2, (sh - h) / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.2.1（G2 问题 4）：最小化的设置窗口必须 `SW_RESTORE`——
+    /// `SW_SHOW` 对最小化窗口是 no-op，用户会以为「点了设置没反应」。
+    #[test]
+    fn iconic_window_is_restored() {
+        assert_eq!(reveal_action(true), Reveal::Restore);
+    }
+
+    /// 未最小化（只是被别的窗口盖住）→ `SW_SHOW` + 抢前台即可，不需要还原。
+    #[test]
+    fn visible_window_is_only_shown() {
+        assert_eq!(reveal_action(false), Reveal::Show);
+    }
 }

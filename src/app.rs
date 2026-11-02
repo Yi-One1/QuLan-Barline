@@ -2304,34 +2304,17 @@ impl App {
         };
         crate::log_info!("右键菜单：{}", menu::command_name(cmd));
 
+        // v1.2.1（G2 问题 6）：背景 4 项统一走一个入口，避免四份复制粘贴。
+        // `bg_target()` 是 `ui::menu` 里的纯函数（有单测），这里只负责执行。
+        if let Some((slot, mode)) = cmd.bg_target() {
+            self.set_background(slot, mode);
+            return;
+        }
+
         match cmd {
             MenuCommand::ToggleLyrics => {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
                 self.animate_lyric_width();
-                let effects = self.commit_config();
-                self.apply(effects);
-            }
-            MenuCommand::BgTranslucent => {
-                self.config.appearance.background_mode = BackgroundMode::Translucent;
-                self.state.theme.apply_bg_config(
-                    self.config.appearance.background_mode,
-                    self.config.appearance.idle_mode,
-                    self.config.appearance.hover_alpha,
-                    self.config.appearance.idle_alpha,
-                );
-                self.request_backdrop();
-                let effects = self.commit_config();
-                self.apply(effects);
-            }
-            MenuCommand::BgTransparent => {
-                self.config.appearance.background_mode = BackgroundMode::Transparent;
-                self.state.theme.apply_bg_config(
-                    self.config.appearance.background_mode,
-                    self.config.appearance.idle_mode,
-                    self.config.appearance.hover_alpha,
-                    self.config.appearance.idle_alpha,
-                );
-                self.request_backdrop();
                 let effects = self.commit_config();
                 self.apply(effects);
             }
@@ -2343,7 +2326,41 @@ impl App {
             }
             MenuCommand::ShowAbout => self.show_about(),
             MenuCommand::Quit => self.apply(vec![Effect::Quit]),
+            // 4 个背景项已在上面由 `bg_target()` 分支统一处理
+            MenuCommand::IdleTransparent
+            | MenuCommand::IdleTranslucent
+            | MenuCommand::HoverTransparent
+            | MenuCommand::HoverTranslucent => {}
         }
+    }
+
+    /// 改一组背景模式（v1.2.1 / G2 问题 6）。
+    ///
+    /// 顺序很重要，**不能靠异步采样回填**（决策 21：切换后必须立即重绘）：
+    /// 1. 写配置字段（`BgSlot::Idle` → `idle_mode`；`BgSlot::Hover` → `background_mode`）；
+    /// 2. `apply_bg_config` **就地**更新当前主题的两态背景色（同一帧就生效）；
+    /// 3. `request_backdrop()` 补一次采样（背景色没变，但重新对账亮度也无害）；
+    /// 4. `commit_config()` → `relayout` + `redraw` + 落盘，`apply` 执行副作用。
+    fn set_background(&mut self, slot: crate::ui::menu::BgSlot, mode: BackgroundMode) {
+        use crate::ui::menu::BgSlot;
+        match slot {
+            BgSlot::Idle => self.config.appearance.idle_mode = mode,
+            BgSlot::Hover => self.config.appearance.background_mode = mode,
+        }
+        crate::log_info!(
+            "右键菜单：背景 slot={} mode={:?}",
+            slot.as_str(),
+            mode
+        );
+        self.state.theme.apply_bg_config(
+            self.config.appearance.background_mode,
+            self.config.appearance.idle_mode,
+            self.config.appearance.hover_alpha,
+            self.config.appearance.idle_alpha,
+        );
+        self.request_backdrop();
+        let effects = self.commit_config();
+        self.apply(effects);
     }
 
     /// 配置改动后：重排 + 重绘 + 落盘。返回要执行的 Effect。

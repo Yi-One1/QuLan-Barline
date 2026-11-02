@@ -91,10 +91,17 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         // ---------------- 右键菜单（M2/T08） ----------------
         (Lang::Zh, "menu.toggle_lyrics") => "显示歌词",
         (Lang::En, "menu.toggle_lyrics") => "Show lyrics",
-        (Lang::Zh, "menu.bg_translucent") => "背景：半透明",
-        (Lang::En, "menu.bg_translucent") => "Background: Translucent",
-        (Lang::Zh, "menu.bg_transparent") => "背景：透明",
-        (Lang::En, "menu.bg_transparent") => "Background: Transparent",
+        // v1.2.1（G2 问题 6）：背景从 2 项扩成 4 项——常规背景 / 悬停背景各有
+        // 透明 / 半透明两档，两组各自独立勾选。术语与设置页两个下拉保持一致
+        //（`idle` = 常规背景，`hover` = 悬停背景）。
+        (Lang::Zh, "menu.bg.idle.transparent") => "常规背景：透明",
+        (Lang::En, "menu.bg.idle.transparent") => "Idle background: Transparent",
+        (Lang::Zh, "menu.bg.idle.translucent") => "常规背景：半透明",
+        (Lang::En, "menu.bg.idle.translucent") => "Idle background: Translucent",
+        (Lang::Zh, "menu.bg.hover.transparent") => "悬停背景：透明",
+        (Lang::En, "menu.bg.hover.transparent") => "Hover background: Transparent",
+        (Lang::Zh, "menu.bg.hover.translucent") => "悬停背景：半透明",
+        (Lang::En, "menu.bg.hover.translucent") => "Hover background: Translucent",
         // v1.1.16：menu.shuffle / menu.repeat 已随菜单项删除（播放器普遍拒绝
         // SMTC 远程循环/随机，功能形同虚设）
         (Lang::Zh, "menu.about") => "关于",
@@ -162,6 +169,29 @@ mod tests {
     fn menu_settings_label_is_short() {
         assert_eq!(t(Lang::Zh, "menu.settings"), "设置");
         assert_eq!(t(Lang::En, "menu.settings"), "Settings");
+    }
+
+    /// 契约回归（v1.2.1）：4 个背景菜单项的词条必须存在、非空，且中文术语要与
+    /// 设置页一致（「常规背景」/「悬停背景」）——防止以后又被改回「背景：透明」
+    /// 这种分不清是哪一组的写法。
+    #[test]
+    fn menu_background_labels_are_split_by_slot() {
+        for (key, zh_head, en_head) in [
+            ("menu.bg.idle.transparent", "常规背景", "Idle background"),
+            ("menu.bg.idle.translucent", "常规背景", "Idle background"),
+            ("menu.bg.hover.transparent", "悬停背景", "Hover background"),
+            ("menu.bg.hover.translucent", "悬停背景", "Hover background"),
+        ] {
+            let zh = t(Lang::Zh, key);
+            let en = t(Lang::En, key);
+            assert_ne!(zh, key, "中文词条缺失：{key}");
+            assert!(!zh.is_empty(), "中文词条为空：{key}");
+            assert!(zh.starts_with(zh_head), "{key} 的中文应以「{zh_head}」开头，实际「{zh}」");
+            assert!(en.starts_with(en_head), "{key} 的英文应以「{en_head}」开头，实际「{en}」");
+        }
+        // 旧的合并写法必须已删除（否则菜单会出现两套并存的说法）
+        assert_eq!(t(Lang::Zh, "menu.bg_translucent"), "menu.bg_translucent");
+        assert_eq!(t(Lang::Zh, "menu.bg_transparent"), "menu.bg_transparent");
     }
 
     /// 契约回归（v1.1.22）：「关于」对话框的版本号必须来自 `Cargo.toml`。
