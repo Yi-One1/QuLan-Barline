@@ -6,10 +6,10 @@
 //!
 //! ## v1.2.0（G5 问题 3）：亮度稳定化
 //!
-//! 亮度算出来之后**不再直接喂 `Theme`**，而是先过
-//! [`LumaStabilizer`]（EMA + 双阈值死区 + 连续确认）。稳定器**跨样本持有状态**，
-//! 所以它必须活在本线程的栈上（`run` 里），不能是 `sample()` 的局部变量。
-//! 结果通过 [`SampleRequest::epoch`] 感知几何代次：采样区域变了就重置状态。
+//! 亮度算出来之后**不再直接喂 `Theme`**，而是先过 [`LumaStabilizer`]
+//! （双阈值死区 + 连续确认 + 大幅跳变快速通道；**无 EMA**）。稳定器**跨样本
+//! 持有状态**，所以它必须活在本线程的栈上（`run` 里），不能是 `sample()` 的局部变量。
+//! 结果通过采样区域指纹感知几何代次：采样区域变了就重置状态（见 [`area_epoch`]）。
 //!
 //! 「1px 反色描边」兜底已删除（用户明确要求去掉那一圈异常描边）。
 //!
@@ -208,7 +208,7 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
     let mut slot: Option<SampleRequest> = None;
     let mut last_done = Instant::now() - throttle;
     let mut sampled: u64 = 0;
-    // v1.2.0：亮度稳定器**跨样本持有**（EMA / 连续确认都需要历史），
+    // v1.2.0：亮度稳定器**跨样本持有**（连续确认 / 死区判定都需要上一帧结论），
     // 所以只能放在这里而不是 `sample()` 里面。
     let mut stabilizer = LumaStabilizer::new();
 
@@ -231,10 +231,9 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<SampleRequest>) {
                 if let Some(theme) = sample(&req, &mut stabilizer) {
                     sampled += 1;
                     crate::log_debug!(
-                        "采样 #{sampled}：luma={:.3} on_light={} ema={:.3} epoch={}",
+                        "采样 #{sampled}：raw={:.3} on_light={} epoch={}",
                         theme.backdrop_luma,
                         theme.on_light,
-                        stabilizer.ema().unwrap_or(theme.backdrop_luma),
                         req.epoch
                     );
                     sink.send(AppEvent::BackdropReady {
@@ -343,7 +342,7 @@ struct BlockGrid<'a> {
 /// 为什么不能用 `SampleRequest::epoch` 当稳定器的代次：UI 线程的几何代次
 /// 每次 `geometry::probe()` 都会 +1（`EPOCH.fetch_add`），而 1s 心跳每秒都 probe，
 /// 于是 `state.geometry_epoch` 实际上**每秒都在变**。拿它当稳定器的 epoch，
-/// EMA 会每秒归零一次，稳定化形同虚设（正好把「实测每秒重采样」这个前提毁掉）。
+/// 每帧都会被当"首帧"重判，确认计数永远攒不起来（稳定化形同虚设）。
 ///
 /// 稳定器真正关心的只是「这次采的是不是同一块屏幕区域」，所以按矩形打指纹：
 /// 位置 / 尺寸任何一个变了 → 指纹变 → 重置（那次变化本来也该重新判定）。
@@ -359,7 +358,7 @@ fn area_epoch(rect: RECT) -> u64 {
 
 /// 加权亮度 → 主题。§11.2 第 3/4/5/6 步。
 ///
-/// v1.2.0：亮度不直接决定文字色，先过 `stabilizer`（EMA + 死区 + 连续确认）。
+/// v1.2.0：亮度不直接决定文字色，先过 `stabilizer`（死区 + 连续确认 + 快速通道）。
 /// 真正翻转时记一条 info（死区内不刷日志）。
 fn compute_theme(
     grid: &BlockGrid<'_>,
@@ -445,19 +444,20 @@ fn compute_theme(
         }
     };
 
-    // v1.2.0：稳定化之后的方向说了算（首帧立刻判定、死区保持、攒够确认才翻）。
-    // 代次用**采样区域指纹**而不是 `req.epoch`（后者每秒都变，见 `area_epoch` 注释）。
+    // v1.2.0：稳定化之后的方向说了算（首帧立刻判定、死区保持、确认区 2 帧、
+    // 大幅跳变 1 帧）。代次用**采样区域指纹**而不是 `req.epoch`
+    //（后者每秒都变，见 `area_epoch` 注释）。
     let area = area_epoch(req.rect);
     let before = stabilizer.on_light();
     let on_light = stabilizer.push(luma, area);
     if let Some(prev) = before {
         if prev != on_light {
             crate::log_info!(
-                "文字色翻转：on_light={} (was {}) luma={:.3} ema={:.3} area={:#x}",
+                "文字色翻转：on_light={} (was {}) raw={:.3} confirm={} area={:#x}",
                 on_light,
                 prev,
                 luma,
-                stabilizer.ema().unwrap_or(luma),
+                stabilizer.confirm(),
                 area
             );
         }
@@ -630,40 +630,44 @@ mod tests {
     }
 
     /// **v1.2.0 问题 3 的接线测试**：`compute_theme` 必须把亮度喂给稳定器，
-    /// 而不是自己按单帧亮度硬切——否则抖动闪回原样。
+    /// 而不是自己按单帧亮度硬切。
     ///
-    /// 序列：纯黑（首帧判深色）→ 三帧 0xDA（luma≈0.70）。
-    /// 第 2 帧 EMA≈0.175 落在死区（0.12..0.25）→ 保持深色；
-    /// 第 3 帧 EMA 出死区但只攒到 1 次确认 → 仍保持；
-    /// 第 4 帧攒够 2 次确认 → 才翻成浅色。
+    /// 串：纯黑（首帧判深色）→ 连续 `0x93`（luma ≈ 0.29，落在**确认区**
+    /// 0.25..0.30 之内，正好绕开快速通道）。
+    /// 单帧硬切（`pick_on_light(0.29)`）会在**第 1 帧**就判浅色；
+    /// 稳定器版本必须**精确 2 帧**才翻（第 1 帧只记确认）。
     #[test]
     fn theme_text_color_follows_stabilizer() {
-        let series = theme_series(&[0x00, 0xDA, 0xDA, 0xDA], 2);
+        let series = theme_series(&[0x00, 0x93, 0x93], 2);
         let got: Vec<bool> = series.iter().map(|t| t.on_light).collect();
+        assert!(
+            (series[1].backdrop_luma - 0.29).abs() < 0.03,
+            "0x93 的 luma 应≈0.29，实际 {}",
+            series[1].backdrop_luma
+        );
         assert_eq!(
             got,
-            vec![false, false, false, true],
-            "文字色没有跟着稳定器走（单帧硬切会得到 [false,true,true,true]）"
+            vec![false, false, true],
+            "确认区必须精确 2 帧翻转（单帧硬切会得到 [false,true,true]）"
         );
-        // 每帧的 luma 是真实值（主题里的 backdrop_luma 不受稳定化影响）
-        assert!((series[1].backdrop_luma - 0.70).abs() < 0.02, "luma = {}", series[1].backdrop_luma);
-        assert_eq!(series[0].text, Theme::LIGHT_TEXT);
-        assert_eq!(series[3].text, Theme::DARK_TEXT);
+        assert_eq!(series[0].text, Theme::LIGHT_TEXT, "深色背景用浅色字");
+        assert_eq!(series[2].text, Theme::DARK_TEXT, "最终浅色背景用深色字");
     }
 
     /// **关键回归（v1.2.0）**：稳定器绝不能用 `req.epoch` 当代次。
     ///
     /// UI 线程的 `AppState::geometry_epoch` 每秒都被 `probe()` 的 `EPOCH` 自增刷一遍，
-    /// 拿它当稳定器代次会让 EMA 每秒归零 —— 稳定化形同虚设。
-    /// 这里把「同一块矩形 + 每秒变化的 req.epoch」跑出来：必须和 `area_epoch` 版本一致，
-    /// 即第 3 帧仍不翻转（单帧硬切会得到 [false,true,true]）。
+    /// 拿它当稳定器代次会让状态**每秒归零** —— 稳定化形同虚设。
+    /// 这里用同一块矩形 + 每秒变化的 `req.epoch`，喂确认区的 `0x93`（luma≈0.29）：
+    /// 若被 epoch 冲掉，第 2 帧就会按首帧规则立刻判浅色（`[false,true,true]`）；
+    /// 正确实现是精确 2 帧（`[false,false,true]`）。
     #[test]
     fn epoch_bump_must_not_reset_stabilizer() {
         let bw = 2u32;
         let bh = 2u32;
         let mut stab = LumaStabilizer::new();
         let mut got = Vec::new();
-        for (i, c) in [0x00u8, 0xDA, 0xDA].iter().enumerate() {
+        for (i, c) in [0x00u8, 0x93, 0x93].iter().enumerate() {
             let mut block = vec![0u8; (bw * bh * 4) as usize];
             for k in 0..(bw * bh) as usize {
                 block[k * 4] = *c;
@@ -684,8 +688,8 @@ mod tests {
         }
         assert_eq!(
             got,
-            vec![false, false, false],
-            "req.epoch 把稳定器冲掉了（单帧硬切会是 [false,true,true]）"
+            vec![false, false, true],
+            "req.epoch 把稳定器冲掉了（每帧都按首帧规则重判 → [false,true,true]）"
         );
     }
 
@@ -707,7 +711,7 @@ mod tests {
             assert_ne!(
                 area_epoch(a),
                 area_epoch(other),
-                "矩形变了必须换指纹（否则采样区域变了还沿用旧 EMA）"
+                "矩形变了必须换指纹（否则采样区域变了还沿用旧区域的确认计数）"
             );
         }
     }
