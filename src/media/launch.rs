@@ -125,23 +125,38 @@ pub fn activate_player(session: &MediaSessionInfo) -> Activation {
         pids
     );
 
-    // ---- 0. CEF/Electron 托盘恢复型应用：直接模拟托盘图标点击 ----
-    // （外部窗口激活链对这类应用必然产生「显示但内容不可点击」的卡死）
+    // ---- 0. CEF/Electron 托盘恢复型应用（汽水）——用户裁决（2026-11-02）：搁置 ----
+    // 实测结论：这类应用 Hide 到托盘后，**任何外部 ShowWindow 都会让 CEF 输入
+    // 管线挂起**（窗口显示但内容不可点击，点 × 都无响应）；唯一可靠的恢复通道
+    // 是模拟托盘图标点击（[`tray_click_activate`]，实现保留），但 SendInput 会
+    // **抢鼠标**（光标被拉到托盘再回来），用户裁决不启用、以后再解决。
+    // 现行策略：窗口可见（非托盘态）时正常前台激活；托盘隐藏态**不做任何
+    // 激活**——不制造卡死窗口、不抢鼠标，由用户点汽水托盘自行恢复。
     let tray_recovery = is_tray_recovery_app(&session.process_name, &session.aumid)
         || pids.iter().any(|&pid| {
             let name = process_image_name(pid);
             is_tray_recovery_app(&name, "")
         });
     if tray_recovery {
-        crate::log_info!("托盘恢复型应用（CEF）：走托盘图标点击通道");
-        if let Some(hwnd) = tray_click_activate(&pids) {
-            crate::log_info!(
-                "已通过托盘点击恢复主窗口 hwnd=0x{:X}",
-                hwnd.0 as usize
-            );
-            return Activation::Tray;
+        for pid in &pids {
+            if let Some(hwnd) = find_main_window(*pid) {
+                let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+                if visible && show_and_foreground(hwnd) {
+                    crate::log_info!(
+                        "已激活播放器窗口 hwnd=0x{:X} pid={pid}（托盘恢复型：可见窗口）",
+                        hwnd.0 as usize
+                    );
+                    return Activation::Window;
+                }
+                if !visible {
+                    crate::log_info!(
+                        "汽水等托盘恢复型应用处于托盘隐藏态：激活暂禁用（缺陷搁置，待办 D），不制造卡死窗口"
+                    );
+                    return Activation::Failed;
+                }
+            }
         }
-        crate::log_warn!("托盘点击通道未生效，回退窗口激活链");
+        crate::log_debug!("托盘恢复型应用未找到主窗口，继续窗口激活链");
     }
 
     // ---- a. 按候选 PID 逐个找主窗口（含托盘最小化的隐藏窗口）----
@@ -365,6 +380,13 @@ unsafe extern "system" fn collect_proc(hwnd: HWND, lparam: LPARAM) -> windows::c
 /// `SendInput` 真实左键单击 → 恢复光标 → 等待主窗口重新可见。
 ///
 /// 返回恢复后的主窗口 hwnd。全程阻塞 ≤ ~3s（点击 ~0.3s + 等待上限 ~1.5s）。
+///
+/// **当前未启用**（用户裁决 2026-11-02）：SendInput 会把用户光标拉到托盘再
+/// 恢复，「抢鼠标」不可接受。续修方向（待办 D）：① 逆向托盘回调消息号直接
+/// `PostMessage`（零鼠标移动，Electron NotifyIconHost 的 WM_APP 消息）；②
+/// 探测汽水 deep-link / second-instance 无重启唤起通道；③ 仅在用户光标静止
+/// 时才模拟点击 + 光标恢复动画。实现经 diag 实测有效（恢复+点击×验证通过）。
+#[allow(dead_code)]
 fn tray_click_activate(pids: &[u32]) -> Option<HWND> {
     use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, NOTIFYICONIDENTIFIER};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -713,6 +735,7 @@ mod tests {
     #[test]
     fn activation_labels_are_stable() {
         assert_eq!(Activation::Window.as_str(), "window");
+        assert_eq!(Activation::Tray.as_str(), "tray");
         assert_eq!(Activation::Failed.as_str(), "failed");
     }
 }
