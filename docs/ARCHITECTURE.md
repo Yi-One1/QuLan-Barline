@@ -908,7 +908,7 @@ pub struct LyricView {
     pub track_id: TrackId,
     pub lyrics: Option<Arc<Lyrics>>,
     pub line_idx: Option<usize>,
-    /// 已尝试重试次数（0..=3）
+    /// 已尝试重试次数（v1.4.0：0..=1）
     pub retry: u8,
 }
 ```
@@ -1195,8 +1195,8 @@ pub mod limits {
     pub const LYRIC_DISK_TTL_DAYS: i64 = 30;
     /// 负缓存保留小时数（PRD 6.2：同一曲目失败后 24h 内不再请求）
     pub const LYRIC_MISS_TTL_HOURS: i64 = 24;
-    /// 在线歌词重试退避（毫秒）
-    pub const LYRIC_RETRY_BACKOFF_MS: [u64; 3] = [5_000, 15_000, 60_000];
+    /// 在线歌词重试退避（毫秒）。**v1.4.0：表长即重试上限**，只留一次 3s
+    pub const LYRIC_RETRY_BACKOFF_MS: [u64; 1] = [3_000];
     /// 小组件宽度范围（100% DPI 逻辑像素）
     pub const WIDGET_MIN_W: f32 = 200.0;
     pub const WIDGET_MAX_W: f32 = 340.0;
@@ -2482,14 +2482,15 @@ pub trait LyricProvider: Send + Sync {
 #[derive(Debug, Clone)]
 pub enum ProviderError {
     NotFound,          // 404 / 无结果 → 负缓存 24h，不重试
-    Network(String),   // 超时 / 连接失败 → 指数退避重试 3 次
+    Network(String),   // 超时 / 连接失败 → 退避重试 1 次（3s）；8s 截止不算
     Parse(String),     // 返回了但解析不出歌词 → 视为 NotFound
     Disabled,          // 用户关闭
 }
 
-/// 有序链：本地 → 在线。任一成功即返回。
+/// 源链：本地 → 在线。v1.4.0 起**在线源并发**（`query_parallel`，首个命中即返回，
+/// 全局 8s 硬截止）；串行 `query` 保留给本地源与单测。
 pub struct ProviderChain {
-    providers: Vec<Box<dyn LyricProvider>>,
+    providers: Vec<Arc<dyn LyricProvider>>,
 }
 
 impl ProviderChain {
@@ -2564,9 +2565,9 @@ GET https://lrclib.net/api/get?track_name=<t>&artist_name=<a>&album_name=<al>&du
         （淡入 120ms）      (reason=NotFound)        (reason=NetworkError)
               │                       │                        │
               │                 保持占位，不重试          保持占位 + 退避重试
-              │                 "♪ 暂无歌词"           5s / 15s / 60s，最多 3 次
+              │                 "♪ 暂无歌词"           3s 后重试 1 次，超时不重试
               │                       │                        │
-              │                       │                  3 次后 → NotFound
+              │                       │                  用尽后 → NotFound
               ▼                       ▼                        ▼
            （稳定）                （稳定）                 （稳定）
 ```
