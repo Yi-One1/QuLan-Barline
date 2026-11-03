@@ -230,6 +230,8 @@ impl WidgetLayout {
     /// [`limits::DISMISS_RIGHT_MARGIN`] 承担）。
     /// v1.5.3：× 那一列 = 右边距 4 + 命中 16 + 净距 **2** = 22（v1.5.2 是 28），
     /// 故固定件从 182 收到 176（= v1.4.4 的 162 + 14）。
+    /// v1.5.4：命中 16 → **14**（字形 8 → 6），这一列 = 4 + 14 + 2 = **20**，
+    /// 固定件 176 → **174**（= v1.4.4 的 162 + 12）。
     /// 这里必须与 [`compute_full`] 的 `fixed` 严格同源，否则日志里的调试宽度会
     /// 与真实窗口对不上。
     pub fn fixed_width(&self) -> f32 {
@@ -251,7 +253,7 @@ impl WidgetLayout {
     /// （`painter` 的绘制需要 D2D 上下文，单测跑不了）。
     ///
     /// 返回值语义上恒等于 `hit_dismiss`：底色就是那一格，**不**向外扩、
-    /// **不**做 1px 内缩（内缩会让 8px 字形在 0x14 的淡底上看起来偏位）。
+    /// **不**做 1px 内缩（内缩会让 6px 字形在 0x14 的淡底上看起来偏位）。
     pub fn dismiss_bg_rect(&self) -> RectF {
         self.hit_dismiss
     }
@@ -337,11 +339,15 @@ pub fn compute_full(
     // 距窗口右缘 8px，与左侧 `CONTENT_PAD` 完全对称。这列因此 = 4 + 16 + 8 = 28*s。
     // v1.5.3（用户反馈「× 左侧的按键和内容可以右移」）：`DISMISS_GAP` 8 → 2，
     // 这列收到 4 + 16 + 2 = **22*s**，固定件 182 → **176**（= v1.4.4 的 162 + 14）。
+    // v1.5.4（用户反馈「× 大小改为 6px」）：`DISMISS_HIT` 16 → 14，这列再收到
+    // 4 + 14 + 2 = **20*s**，固定件 176 → **174**（= v1.4.4 的 162 + 12）。
+    // 净距 2 与右距 4 一个字没动 —— 用户要求的两条视觉量（图标↔× 12px、
+    // 字形右缘↔窗口右缘 8px）都靠这两个不变值 + 新的居中余量 4 维持。
     //
-    // 两种场景表现不同，这正是用户要的「右移」，不是「变窄」：
+    // 两种场景表现不同，这正是用户 v1.5.3 要的「右移」，v1.5.4 再右移 2px：
     //   * 窗口被 `WIDGET_MIN_W` 钳住时（无文本 / 极短文本）：窗口宽度不变，
-    //     三键整体右移 6px，吃掉原来信息区里那块空白；
-    //   * 正常有文本时：窗口窄 6px，三键**绝对位置不动**，右边界左收 6px。
+    //     三键整体右移（v1.5.3 +6px，v1.5.4 再 +2px），吃掉原来信息区那块空白；
+    //   * 正常有文本时：窗口再窄 2px，三键**绝对位置不动**，右边界左收 2px。
     let dismiss_col = (limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP) * s;
     let fixed = pad + cover_side + gap_ct + gap_tb + btn_group + dismiss_col;
     let width = (((fixed + info_w) as i32).max((limits::WIDGET_MIN_W * s).round() as i32)).max(1);
@@ -359,7 +365,7 @@ pub fn compute_full(
     // 封面 32×32（×scale），在主行内垂直居中
     let cover = RectF::new(pad, ((mh - cover_side) * 0.5).max(0.0), cover_side, cover_side);
 
-    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（右边距 4 + 命中 16 + 净距 2）
+    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（右边距 4 + 命中 14 + 净距 2 = 20）
     let btn_y = ((mh - btn) * 0.5).max(0.0);
     let btn_next = RectF::new(w - dismiss_col - btn, btn_y, btn, btn);
     let btn_toggle = RectF::new(btn_next.x - bgap - btn, btn_y, btn, btn);
@@ -424,13 +430,15 @@ pub fn compute_full(
         .min((main_bottom - 2.0).max(0.0));
     let hit_progress = RectF::new(0.0, prog_hit_top, w, (main_bottom - prog_hit_top).max(2.0));
 
-    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8；v1.5.2 右距收到 4；v1.5.3 净距收到 2）----
+    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8；v1.5.2 右距收到 4；
+    //      v1.5.3 净距收到 2；v1.5.4 命中 14 / 字形 6）----
     // 命中区贴右上角：右缘 = 客户区右缘 − DISMISS_RIGHT_MARGIN，y 从 0 开始
     // （纵向占满 DISMISS_HIT*s）。右缘距窗口只有 4（而不是 CONTENT_PAD 的 8），
     // 加上字形在热区内的 4px 居中余量，字形右缘正好落在「窗口右缘 − 8」，
-    // 与左侧 CONTENT_PAD 对称 —— 那是 v1.5.2 的验收本质，v1.5.3 一个字没动。
+    // 与左侧 CONTENT_PAD 对称 —— 那是 v1.5.2 的验收本质，v1.5.4 一个字没动
+    // （`(14 − 6) / 2` 仍然是 4）。
     // 纵向不居中是有意的——「右上角」是用户对位置的描述，贴角比居中更像常驻角标，
-    // 而且条带高度（48@100%）远大于 16，居中/贴角的点击差异可以忽略。
+    // 而且条带高度（48@100%）远大于 14，居中/贴角的点击差异可以忽略。
     let dismiss_hit = limits::DISMISS_HIT * s;
     let hit_dismiss = RectF::new(
         w - limits::DISMISS_RIGHT_MARGIN * s - dismiss_hit,
@@ -438,7 +446,7 @@ pub fn compute_full(
         dismiss_hit,
         dismiss_hit,
     );
-    // 字形在命中区内**居中**：8 字形 / 16 命中 → 每边 4px 余量（v1.5.1）。
+    // 字形在命中区内**居中**：6 字形 / 14 命中 → 每边 4px 余量（v1.5.4）。
     let icon = limits::DISMISS_ICON * s;
     let dismiss = RectF::new(
         hit_dismiss.x + (dismiss_hit - icon) * 0.5,
@@ -506,18 +514,18 @@ mod tests {
 
     #[test]
     fn lyric_form_widens_info_area_to_min_160() {
-        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 176 + 信息区 160 = 336
-        // （固定件 176 = v1.4.4 的 162 + 14：v1.5.3 的 ×「右距 4 + 命中 16 + 净距 2」）
+        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 174 + 信息区 160 = 334
+        // （固定件 174 = v1.4.4 的 162 + 12：v1.5.4 的 ×「右距 4 + 命中 14 + 净距 2」）
         let off = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         let on = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
         assert_eq!(off.width, 200);
-        assert_eq!(on.width, 336);
-        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 176 + 200 = 376；
-        // 文本自然宽顶到信息区上限 340：宽 = 176 + 340 = 516
+        assert_eq!(on.width, 334);
+        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 174 + 200 = 374；
+        // 文本自然宽顶到信息区上限 340：宽 = 174 + 340 = 514
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0);
-        assert_eq!(mid.width, 176 + 200);
+        assert_eq!(mid.width, 174 + 200);
         let wide = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(wide.width, 176 + 340);
+        assert_eq!(wide.width, 174 + 340);
     }
 
     #[test]
@@ -553,13 +561,13 @@ mod tests {
         assert_eq!(TaskbarEdge::from_appbar_edge(99), TaskbarEdge::Bottom);
     }
 
-    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 176+340）。
+    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 174+340）。
     #[test]
     fn width_clamps_between_min_and_max() {
         let short = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0);
         assert_eq!(short.width, 200);
         let long = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(long.width, 176 + 340);
+        assert_eq!(long.width, 174 + 340);
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0);
         assert!(mid.width > 200 && mid.width < 340, "mid.width = {}", mid.width);
     }
@@ -652,10 +660,10 @@ mod tests {
                 // QA 补充（G1）：`hit_dismiss` 是**唯一**刻意小于 HIT_MIN 的命中区，
                 // 所以它不在上面的 ≥HIT_MIN 循环里。这个例外必须有断言兜底，否则
                 // 就是「被悄悄跳过」：
-                //   - 命中区恰为 16*s（不是"差不多"）；
+                //   - 命中区恰为 14*s（不是"差不多"）；
                 //   - 低于 HIT_MIN 的理由写在 `limits::DISMISS_HIT` 的注释里
                 //     （× 独占右上角、与 next 有 DISMISS_GAP 净距，误触靠"不相邻"而不是放大热区；
-                //     放大反而更容易压到 next 并吃掉 +14*s 的宽度预算）。
+                //     放大反而更容易压到 next 并吃掉 +12*s 的宽度预算）。
                 assert!(
                     (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001
                         && (l.hit_dismiss.h - limits::DISMISS_HIT * scale).abs() < 0.001,
@@ -836,36 +844,40 @@ mod tests {
     // 距窗口右缘 = 8（= 左侧 CONTENT_PAD），宽度增量从 +24 变成 +20。
     // v1.5.3：净距 DISMISS_GAP 8 → 2（用户反馈「× 左侧的按键和内容可以右移」），
     // 宽度增量 +20 → +14；三键尺寸/间距一个字没动，整组右移。
+    // v1.5.4：字形 8 → **6**、命中 16 → **14**、笔画 1.0 → **1.2**
+    // （用户反馈「大小改为 6px」「不透明度与下一首一致」），宽度增量 +14 → **+12**；
+    // 净距 2 / 右距 4 / 居中余量 4 全部不变，于是「图标↔× 12px」与
+    // 「字形右缘↔窗口右缘 8px」两条验收量原样保留。
     // 下面所有断言仍**写死真值**，不放宽成区间。
 
-    /// 宽度：× 的「右距 4 + 命中 16 + 净距 2」让窗口**必须**比 v1.4.4 宽 14*s。
+    /// 宽度：× 的「右距 4 + 命中 14 + 净距 2」让窗口**必须**比 v1.4.4 宽 12*s。
     ///
     /// 这里把 v1.4.4 的绝对宽度（362 / 452）**写死**而不是从公式推——这样任何人
-    /// 想「优化掉」那 14px（例如偷偷把 × 叠到 next 上、或把净距 2 也吃掉）都会
+    /// 想「优化掉」那 12px（例如偷偷把 × 叠到 next 上、或把净距 2 也吃掉）都会
     /// 立刻被这条断言拦住。
     ///
     /// 容差 0.51 而不是 0：`compute_full` 最后一步是 `(fixed + info_w) as i32`
-    /// **截断**，scale=1.25 时 fixed = 176*1.25 = 220、info_w = 250 都是整点，
-    /// 但 v1.4.4 基线 452 本身是 452.5 截断来的，于是 452 + 17.5 与实测 470
-    /// 差 0.5。这不是放宽，是把截断误差算进来——精确值写在下面两条 `assert_eq!`。
+    /// **截断**，scale=1.25 时 fixed = 174*1.25 = 217.5、info_w = 250，
+    /// 和 = 467.5 截断成 467，与公式 467 差 0.5 以内。这不是放宽，是把截断误差
+    /// 算进来——精确值写在下面的字面量 `assert_eq!` 里。
     ///
     /// 改名史：v1.5.0 `..._adds_32_...` → v1.5.1 `..._adds_24_...`
-    /// → v1.5.2 `..._adds_20_...` → v1.5.3 `..._adds_14_...`。
+    /// → v1.5.2 `..._adds_20_...` → v1.5.3 `..._adds_14_...` → v1.5.4 `..._adds_12_...`。
     #[test]
-    fn dismiss_column_adds_14_logical_px_to_width() {
+    fn dismiss_column_adds_12_logical_px_to_width() {
         for (scale, width_v144) in [(1.0f32, 362.0f32), (1.25, 452.0)] {
             let bar = (48.0 * scale) as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 14.0 * scale;
+            let want = width_v144 + 12.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
-                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 14*{scale} = {want}",
+                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 12*{scale} = {want}",
                 l.width
             );
         }
     }
 
-    /// × 的命中区：贴右上角（right = w − DISMISS_RIGHT_MARGIN、y = 0），边长 16*s。
+    /// × 的命中区：贴右上角（right = w − DISMISS_RIGHT_MARGIN、y = 0），边长 14*s。
     #[test]
     fn dismiss_hit_sits_in_top_right_corner() {
         for scale in [1.0f32, 1.25, 1.5] {
@@ -873,7 +885,7 @@ mod tests {
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
             let margin = limits::DISMISS_RIGHT_MARGIN * scale;
             let side = limits::DISMISS_HIT * scale;
-            assert!((side - 16.0 * scale).abs() < 0.001, "DISMISS_HIT 应已缩到 16");
+            assert!((side - 14.0 * scale).abs() < 0.001, "DISMISS_HIT 应已缩到 14");
             assert!((margin - 4.0 * scale).abs() < 0.001, "DISMISS_RIGHT_MARGIN 应为 4");
             assert!((l.hit_dismiss.right() - (l.width as f32 - margin)).abs() < 0.001);
             assert!(l.hit_dismiss.y.abs() < 0.001, "× 必须从客户区顶部开始");
@@ -886,6 +898,10 @@ mod tests {
     /// 误触防线：× 命中区与「下一首」命中区**水平净距恰为 2*s**（绝不重叠）。
     ///
     /// v1.5.3：净距从 8 收到 2（用户授权「只要按键之间不冲突即可」）。
+    /// v1.5.4：命中区 16 → 14，但净距**结构上恒等于 `DISMISS_GAP*s`**——
+    /// `hit_dismiss.x = w − RM − HIT` 而 `hit_next.right = w − (RM + HIT + GAP)`，
+    /// 两者相减只剩 GAP。所以缩字号只会让 × 的左缘与三键**一起**右移 2px，
+    /// 缝本身不动（这正是用户「按键整体右移」的要求）。
     /// 这里用**等号**而不是 `≥`：布局里净距与按钮右缘是同一个减法，
     /// 任何「顺手多让一点 / 多占一点」的改动都必须先在这里红。
     #[test]
@@ -911,7 +927,7 @@ mod tests {
         }
     }
 
-    /// 字形在命中区内居中：每边余量 = (16 − 8) / 2 * s = 4*s（v1.5.1）。
+    /// 字形在命中区内居中：每边余量 = (14 − 6) / 2 * s = 4*s（v1.5.4）。
     #[test]
     fn dismiss_glyph_is_centred_in_hit() {
         let s = 1.0f32;
@@ -927,33 +943,40 @@ mod tests {
         assert!((hx - cx).abs() < 0.001 && (hy - cy).abs() < 0.001, "字形必须居中");
     }
 
-    /// **v1.5.1 新增**：字形 8*s、命中区 16*s，四周余量**写死 4*s**。
+    /// **v1.5.4**：字形 6*s、命中区 14*s，四周余量**写死 4*s**。
     ///
     /// 上面那条用 `DISMISS_HIT − DISMISS_ICON` 反推余量，两个常量一起错（例如
-    /// 有人把字形改回 12、命中改回 20）它照样通过。这条把「8 和 16」与「4/4/4/4」
+    /// 有人把字形改回 8、命中改回 16）它照样通过。这条把「6 和 14」与「4/4/4/4」
     /// 全写成字面量，缩字号这件事才算真被锁住。
+    ///
+    /// 改名史：v1.5.1 `..._8px_with_4px_margin_in_16px_hit`
+    /// → v1.5.4 `..._6px_with_4px_margin_in_14px_hit`。
     #[test]
-    fn dismiss_glyph_is_8px_with_4px_margin_in_16px_hit() {
-        // 常量层：8 / 16，且 8 在 16 里每边留 4
-        assert!((limits::DISMISS_ICON - 8.0).abs() < 0.001, "字形应缩到 8");
-        assert!((limits::DISMISS_HIT - 16.0).abs() < 0.001, "命中区应缩到 16");
-        assert!((limits::DISMISS_LINE - 1.0).abs() < 0.001, "8px 字形配 1.0px 笔画");
+    fn dismiss_glyph_is_6px_with_4px_margin_in_14px_hit() {
+        // 常量层：6 / 14，且 6 在 14 里每边留 4
+        assert!((limits::DISMISS_ICON - 6.0).abs() < 0.001, "字形应缩到 6");
+        assert!((limits::DISMISS_HIT - 14.0).abs() < 0.001, "命中区应缩到 14");
+        assert!(
+            (limits::DISMISS_LINE - 1.2).abs() < 0.001,
+            "6px 字形配 1.2px 笔画（v1.5.4：加粗以对齐三键的墨色浓度），实为 {}",
+            limits::DISMISS_LINE
+        );
 
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
 
-            // 字形边长 = 8*s，命中区 = 16*s
+            // 字形边长 = 6*s，命中区 = 14*s
             assert!(
-                (l.dismiss.w - 8.0 * scale).abs() < 0.001
-                    && (l.dismiss.h - 8.0 * scale).abs() < 0.001,
-                "scale={scale}: 字形 = {}×{}，应为 8*{scale}",
+                (l.dismiss.w - 6.0 * scale).abs() < 0.001
+                    && (l.dismiss.h - 6.0 * scale).abs() < 0.001,
+                "scale={scale}: 字形 = {}×{}，应为 6*{scale}",
                 l.dismiss.w,
                 l.dismiss.h
             );
             assert!(
-                (l.hit_dismiss.w - 16.0 * scale).abs() < 0.001,
-                "scale={scale}: 命中区 = {}，应为 16*{scale}",
+                (l.hit_dismiss.w - 14.0 * scale).abs() < 0.001,
+                "scale={scale}: 命中区 = {}，应为 14*{scale}",
                 l.hit_dismiss.w
             );
 
@@ -1042,14 +1065,14 @@ mod tests {
         }
     }
 
-    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+14*s）。
+    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+12*s）。
     #[test]
     fn fixed_width_matches_computed_width() {
         // 162（v1.4.4 固定件，含**左右两份** CONTENT_PAD 8+8）
         // − 8（右侧那份 pad 被 DISMISS_RIGHT_MARGIN 取代）
-        // + 4（右距）+ 16（命中）+ 2（净距，v1.5.3）= 176
+        // + 4（右距）+ 14（命中，v1.5.4）+ 2（净距，v1.5.3）= 174
         let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, 0.0);
-        assert!((l.fixed_width() - 176.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
+        assert!((l.fixed_width() - 174.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
         // 换算出每一项，把「三个常量一起漂移」的等价改动也拦住
         assert!(
             (l.fixed_width() - (162.0 - 8.0 + limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP))
@@ -1060,10 +1083,10 @@ mod tests {
             limits::DISMISS_HIT,
             limits::DISMISS_GAP
         );
-        // 字面量版本（不经过常量，锁死 176 这个数本身）
+        // 字面量版本（不经过常量，锁死 174 这个数本身）
         assert!(
-            (l.fixed_width() - (162.0 - 8.0 + 4.0 + 16.0 + 2.0)).abs() < 0.001,
-            "固定件必须 = 154 + 4 + 16 + 2 = 176"
+            (l.fixed_width() - (162.0 - 8.0 + 4.0 + 14.0 + 2.0)).abs() < 0.001,
+            "固定件必须 = 154 + 4 + 14 + 2 = 174"
         );
     }
 
@@ -1079,7 +1102,7 @@ mod tests {
     /// 五条断言对应最容易回归的五件事：
     /// 1. `height == bar_thickness`（不变量，× 不许改变高度）；
     /// 2. × 命中区贴右边缘（`right = width − DISMISS_RIGHT_MARGIN`，v1.5.2）、
-    ///    `y = 0`、边长 `16*s`；
+    ///    `y = 0`、边长 `14*s`；
     /// 3. 与「下一首」命中区水平净距**恰为** `DISMISS_GAP*s`（v1.5.3 = 2*s，
     ///    仍严格不相交）；
     /// 4. 与「进度条」命中区**不重叠**——进度条命中区是**整宽**，最容易被忽略；
@@ -1161,7 +1184,7 @@ mod tests {
                         l.height
                     );
 
-                    // 字形 8*s 且居中于命中区（v1.5.1：16 → 8）
+                    // 字形 6*s 且居中于命中区（v1.5.4：8 → 6）
                     assert!(
                         (l.dismiss.w - limits::DISMISS_ICON * scale).abs() < 0.001,
                         "{tag}: 字形边长 = {}，应为 {}",
@@ -1180,36 +1203,38 @@ mod tests {
     }
 
     /// **B6 组**：最小窗宽场景——`compute(Compact, 1.0, 48)`，无文本、宽度被
-    /// `WIDGET_MIN_W = 200` 钳住（固定件 176 + 信息区 0 被吃掉 24px）。
+    /// `WIDGET_MIN_W = 200` 钳住（固定件 174 + 信息区 0 被吃掉 26px）。
     ///
     /// 这是 × 最可能出问题的角落：窗口只剩 200px，净距压到 2 之后**余量极小**。
     /// 任何一处微调（右边距/按钮宽/净距）都会先在这里破防，
     /// 所以必须把实际数值写进断言消息，失败时一眼能看出被谁挤掉了。
     ///
-    /// v1.5.3 的真值（width = 200 固定）：
-    /// - `hit_dismiss = (180, 0, 16, 16)`，`right = 196 = 200 − DISMISS_RIGHT_MARGIN 4`
-    ///   —— **与 v1.5.2 完全相同**：× 的位置一个字没动
-    /// - `btn_next.x = 150 = 200 − dismiss_col 22 − btn 28`（v1.5.2 是 144 → **右移 6px**）
-    /// - `hit_next.right() = 178`（v1.5.2 是 172）
-    /// - 净距 = 180 − 178 = **2**
+    /// v1.5.4 的真值（width = 200 固定）：
+    /// - `hit_dismiss = (182, 0, 14, 14)`，`right = 196 = 200 − DISMISS_RIGHT_MARGIN 4`
+    ///   —— **与 v1.5.3 完全相同**：× 的右缘一个字没动，只是左边薄了 2px
+    /// - `btn_next.x = 152 = 200 − dismiss_col 20 − btn 28`（v1.5.3 是 150 → **右移 2px**）
+    /// - `hit_next.right() = 180`（v1.5.3 是 178）
+    /// - 净距 = 182 − 180 = **2**
     /// - 字形右缘 = 196 − 4（居中余量）= 192 → 距窗口右缘 **8** = 左侧 CONTENT_PAD（不变）
+    /// - 字形左缘 = 182 + 4 = 186；「下一首」图标右缘 = 152 + 22 = 174 →
+    ///   墨迹缝 = 186 − 174 = **12**（用户要求「间距 12px 不变」）
     ///
-    /// 这一段就是用户 v1.5.3 要的「右移」：窗口被下限钳住时宽度**不变**，
-    /// 三键整体右移 6px，吃掉原来信息区里那块空白（三键本身没被压缩）。
+    /// 这一段就是用户这一轮要的「× 变小 → 左侧内容整体右移」：窗口被下限钳住时
+    /// 宽度**不变**，三键再右移 2px（v1.5.3 已右移 6px，累计相对 v1.5.2 右移 8px）。
     #[test]
     fn dismiss_fits_in_minimum_width_window() {
         let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         assert_eq!(l.width, 200, "无文本时窗口宽度应被 WIDGET_MIN_W 钳住");
         assert!(
-            (l.fixed_width() - 176.0).abs() < 0.001,
-            "固定件 = {}，应为 176（v1.4.4 的 162 + 右距 4 + 16 命中 + 2 净距）",
+            (l.fixed_width() - 174.0).abs() < 0.001,
+            "固定件 = {}，应为 174（v1.4.4 的 162 + 右距 4 + 14 命中 + 2 净距）",
             l.fixed_width()
         );
 
-        // 实际数值：hit_dismiss = (180, 0, 16, 16)
+        // 实际数值：hit_dismiss = (182, 0, 14, 14)
         assert!(
-            (l.hit_dismiss.x - 180.0).abs() < 0.001,
-            "hit_dismiss.x = {}，应为 180（200 − 右距 4 − 16）",
+            (l.hit_dismiss.x - 182.0).abs() < 0.001,
+            "hit_dismiss.x = {}，应为 182（200 − 右距 4 − 14）",
             l.hit_dismiss.x
         );
         assert!(
@@ -1218,22 +1243,22 @@ mod tests {
             l.hit_dismiss.right()
         );
         assert!(
-            (l.hit_dismiss.w - 16.0).abs() < 0.001 && (l.hit_dismiss.h - 16.0).abs() < 0.001,
-            "hit_dismiss = {}×{}，应为 16×16",
+            (l.hit_dismiss.w - 14.0).abs() < 0.001 && (l.hit_dismiss.h - 14.0).abs() < 0.001,
+            "hit_dismiss = {}×{}，应为 14×14",
             l.hit_dismiss.w,
             l.hit_dismiss.h
         );
         assert!(l.hit_dismiss.x >= 0.0 && l.hit_dismiss.right() <= l.width as f32);
 
-        // 三键的真实落点（写死）：next.x = 150、命中区右缘 = 178
+        // 三键的真实落点（写死）：next.x = 152、命中区右缘 = 180
         assert!(
-            (l.btn_next.x - 150.0).abs() < 0.001,
-            "btn_next.x = {}，应为 150（200 − dismiss_col 22 − btn 28）",
+            (l.btn_next.x - 152.0).abs() < 0.001,
+            "btn_next.x = {}，应为 152（200 − dismiss_col 20 − btn 28）",
             l.btn_next.x
         );
         assert!(
-            (l.hit_next.right() - 178.0).abs() < 0.001,
-            "hit_next.right = {}，应为 178",
+            (l.hit_next.right() - 180.0).abs() < 0.001,
+            "hit_next.right = {}，应为 180",
             l.hit_next.right()
         );
 
@@ -1258,10 +1283,18 @@ mod tests {
             l.hit_prev.x
         );
 
-        // v1.5.3 的「右移」实证：v1.5.2 的 next.x = 144，现在 150（吃掉 6px 空白）
+        // 整条等式写死：next.x = 200 − dismiss_col(4+14+2) − btn 28 = 152
+        // （用三个字面量重算，避开"只改一处也能过"的隐患）
         assert!(
-            (l.btn_next.x - (144.0 + 6.0)).abs() < 0.001,
-            "btn_next.x = {} 应为 v1.5.2 的 144 + 6",
+            (l.btn_next.x - (200.0 - (4.0 + 14.0 + 2.0) - 28.0)).abs() < 0.001,
+            "btn_next.x = {}，应为 200 − 20 − 28 = 152",
+            l.btn_next.x
+        );
+
+        // v1.5.4 的「右移 2px」实证：v1.5.3 的 next.x = 150，现在 152
+        assert!(
+            (l.btn_next.x - (150.0 + 2.0)).abs() < 0.001,
+            "btn_next.x = {} 应为 v1.5.3 的 150 + 2",
             l.btn_next.x
         );
         // 三键是**整体右移**，不是被压缩：尺寸 28、间距 6 一个字没动
@@ -1276,17 +1309,17 @@ mod tests {
         );
     }
 
-    /// **G1 组**：× 命中区 `16*s` **刻意低于** `HIT_MIN = 28*s` 这件事必须显式写死。
+    /// **G1 组**：× 命中区 `14*s` **刻意低于** `HIT_MIN = 28*s` 这件事必须显式写死。
     ///
     /// 既有 `rects_do_not_overlap_and_hits_meet_minimum` 的 ≥HIT_MIN 循环里
     /// **没有** `hit_dismiss`（它是唯一不达标的命中区），如果不写这条断言，
     /// 这个例外就是「被悄悄跳过」而不是「被明确豁免」——后人把 × 加进循环、
-    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏净距与 +14px 宽度预算。
+    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏净距与 +12px 宽度预算。
     #[test]
     fn dismiss_hit_is_deliberately_smaller_than_hit_min() {
         assert!(
             limits::DISMISS_HIT < limits::HIT_MIN,
-            "DISMISS_HIT（{}）必须小于 HIT_MIN（{}）：调大到 28 会挤掉 8*s 净距",
+            "DISMISS_HIT（{}）必须小于 HIT_MIN（{}）：调大到 28 会挤掉 2*s 净距",
             limits::DISMISS_HIT,
             limits::HIT_MIN
         );
@@ -1295,15 +1328,15 @@ mod tests {
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
             assert!(
                 (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001,
-                "scale={scale}: hit_dismiss.w = {}，应恰为 16*s = {}",
+                "scale={scale}: hit_dismiss.w = {}，应恰为 14*s = {}",
                 l.hit_dismiss.w,
                 limits::DISMISS_HIT * scale
             );
             assert!(
-                (l.hit_dismiss.w - 16.0 * scale).abs() < 0.001,
-                "scale={scale}: hit_dismiss.w = {}，应恰为写死的 16*s = {}",
+                (l.hit_dismiss.w - 14.0 * scale).abs() < 0.001,
+                "scale={scale}: hit_dismiss.w = {}，应恰为写死的 14*s = {}",
                 l.hit_dismiss.w,
-                16.0 * scale
+                14.0 * scale
             );
             // 其余可点击命中区必须 ≥ HIT_MIN（防止有人"为了对称"把它们也缩小）
             for (name, r) in [
@@ -1333,22 +1366,25 @@ mod tests {
 
     /// **A 组**：× 的 8 个常量必须逐个等于**当前**需求表里的字面量。
     ///
-    /// 需求表（v1.5.3，用户验收反馈「× 左侧的按键和内容可以右移」）：
-    /// 字形 8 / 命中 16 / **净距 2（本轮唯一改动的量）** / 笔画 1.0 /
-    /// 字形不透明度 0xFF / 悬停底 0x14 / 按下底 0x22 / 圆角 4。
+    /// 需求表（v1.5.4，用户验收反馈「× 的不透明度和"下一首"一致、大小改为 6px、
+    /// 图标与 × 间距 12px 不变」）：
+    /// 字形 **6** / 命中 **14** / 净距 2（不变）/ 笔画 **1.2** /
+    /// 字形不透明度 0xFF（不变，但与按钮同源写法）/ 悬停底 0x14 / 按下底 0x22 / 圆角 4。
     ///
-    /// 这条是整组几何断言的「根」：先证明根没动，底下写死的 16/2/4 才有意义。
+    /// 这条是整组几何断言的「根」：先证明根没动，底下写死的 14/2/4 才有意义。
     ///
-    /// 改名史：v1.5.1 `..._match_v151_spec`（净距 8）→ v1.5.3 `..._match_v153_spec`（净距 2）。
+    /// 改名史：v1.5.1 `..._match_v151_spec`（净距 8）→ v1.5.3 `..._match_v153_spec`（净距 2）
+    /// → v1.5.4 `..._match_v154_spec`（字形 6 / 命中 14 / 笔画 1.2）。
     #[test]
-    fn dismiss_constants_match_v153_spec() {
+    fn dismiss_constants_match_v154_spec() {
         let close = |a: f32, b: f32| (a - b).abs() < 0.001;
-        assert!(close(limits::DISMISS_ICON, 8.0), "字形应为 8，实为 {}", limits::DISMISS_ICON);
-        assert!(close(limits::DISMISS_HIT, 16.0), "命中区应为 16，实为 {}", limits::DISMISS_HIT);
-        // 本轮唯一改动的量：净距 8 → 2（用户显式授权「只要按键之间不冲突即可」）
+        // 本轮两个改动的尺寸量：字形 8 → 6、命中 16 → 14
+        assert!(close(limits::DISMISS_ICON, 6.0), "字形应为 6，实为 {}", limits::DISMISS_ICON);
+        assert!(close(limits::DISMISS_HIT, 14.0), "命中区应为 14，实为 {}", limits::DISMISS_HIT);
+        // 净距与右距本轮不动（12px 墨迹缝、8px 右对称都靠它们 + 居中余量 4 维持）
         assert!(
             close(limits::DISMISS_GAP, 2.0),
-            "净距应为 2（v1.5.2 是 8），实为 {}",
+            "净距应为 2（v1.5.3 的成果，本轮不动），实为 {}",
             limits::DISMISS_GAP
         );
         // 净距必须**严格为正**：0 就是热区相贴，误触防线彻底消失
@@ -1357,7 +1393,7 @@ mod tests {
             "净距必须为正，实为 {}",
             limits::DISMISS_GAP
         );
-        // 三键与右距本轮一个都没动
+        // 三键本轮一个都没动
         assert!(close(limits::BTN_HIT, 28.0), "BTN_HIT 应为 28，实为 {}", limits::BTN_HIT);
         assert!(close(limits::BTN_GAP, 6.0), "BTN_GAP 应为 6，实为 {}", limits::BTN_GAP);
         assert!(
@@ -1365,12 +1401,13 @@ mod tests {
             "右边距应为 4（v1.5.2 的成果，本轮不动），实为 {}",
             limits::DISMISS_RIGHT_MARGIN
         );
-        assert!(close(limits::DISMISS_LINE, 1.0), "笔画应为 1.0，实为 {}", limits::DISMISS_LINE);
-        assert_eq!(limits::DISMISS_ALPHA, 0xFF, "字形应为满不透明 0xFF");
+        // 笔画 1.0 → 1.2（本轮第三个改动量：让墨色浓度追上三键）
+        assert!(close(limits::DISMISS_LINE, 1.2), "笔画应为 1.2，实为 {}", limits::DISMISS_LINE);
+        assert_eq!(limits::DISMISS_ALPHA, 0xFF, "字形应为满不透明 0xFF（与三键 enabled 同值）");
         assert_eq!(limits::DISMISS_BG_HOVER, 0x14, "悬停底应为 0x14");
         assert_eq!(limits::DISMISS_BG_PRESSED, 0x22, "按下底应比悬停深一档 0x22");
         assert!(close(limits::DISMISS_BG_RADIUS, 4.0), "圆角应为 4");
-        // 语义前提：底色必须比字形淡得多，否则 8px 叉会长在一块实心块里
+        // 语义前提：底色必须比字形淡得多，否则 6px 叉会长在一块实心块里
         assert!(
             (limits::DISMISS_BG_HOVER as u32) * 4 < limits::DISMISS_ALPHA as u32,
             "悬停底 0x14 必须远淡于字形 0xFF"
@@ -1381,7 +1418,48 @@ mod tests {
         );
     }
 
-    /// **B 组（补）**：2 形态 × 4 缩放 × 4 方位下，命中 16*s / 字形 8*s /
+    /// **v1.5.4 新增**：× 的**墨色浓度**必须与三键可比 —— 这是用户
+    /// 「× 的不透明度改为和按钮"下一首"一致」这句反馈的**可执行表达**。
+    ///
+    /// 实情：alpha 本来就一样（`draw_dismiss` 与 `draw_buttons` 的 enabled 都是
+    /// `theme.text @ 0xFF`）。用户看到的「淡」来自**笔画细**：三键是 2.2px 实心条，
+    /// × 是 1.0px 斜线，抗锯齿后每行覆盖率只有一半。
+    ///
+    /// 所以这条把「浓度」定义成 `笔画 / 字形` 的比值，并给出两条下限：
+    /// 1. `DISMISS_LINE >= 1.1` —— 6px 字形下的**最小可辨认**线宽（再细，
+    ///    抗锯齿把两行像素都摊成 50% 灰，看上去就是「比按钮淡」）；
+    /// 2. `DISMISS_LINE / DISMISS_ICON >= 0.18` —— **相对浓度**下限，
+    ///    防止有人为了「更细更秀气」把线改回 1.0（1.0/6 ≈ 0.167 会红）。
+    ///
+    /// 为什么不能只写死 `== 1.2`：那是 A 组的事（常量表锁死）。这条锁的是
+    /// **意图**——将来若字形再变（例如 8），线宽也得跟着变，而不是一起漂移后
+    /// 又变回「看起来发灰」。两条一起才既锁当下、又锁语义。
+    #[test]
+    fn dismiss_ink_density_matches_buttons() {
+        assert!(
+            limits::DISMISS_LINE >= 1.1,
+            "笔画 = {}，6px 字形下必须 ≥ 1.1，否则抗锯齿后覆盖率只有一半、看上去比三键淡",
+            limits::DISMISS_LINE
+        );
+        let density = limits::DISMISS_LINE / limits::DISMISS_ICON;
+        assert!(
+            density >= 0.18,
+            "笔画/字形 = {density}（{} / {}），必须 ≥ 0.18：低于它「×」会重新发灰，\
+             与三键的墨色浓度不再一致",
+            limits::DISMISS_LINE,
+            limits::DISMISS_ICON
+        );
+        // 与三键的横向对照：三键实心条 2.2px，× 的实际墨量 = 笔画 × √2（45° 斜线）
+        // ≈ 1.70px/行。写进断言消息方便评审直接看比例。
+        assert!(
+            limits::DISMISS_LINE * std::f32::consts::SQRT_2 >= 1.5,
+            "× 每行水平墨量 = {}×√2 = {}，必须 ≥ 1.5px（三键实心条是 2.2px）",
+            limits::DISMISS_LINE,
+            limits::DISMISS_LINE * std::f32::consts::SQRT_2
+        );
+    }
+
+    /// **B 组（补）**：2 形态 × 4 缩放 × 4 方位下，命中 14*s / 字形 6*s /
     /// 净距**恰为** 2*s —— 全部用字面量，不用常量推导。
     ///
     /// 既有 `dismiss_geometry_invariants_matrix` 也已改成等号判净距，但边长仍取自
@@ -1401,18 +1479,18 @@ mod tests {
                     let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
                     let tag = format!("{form:?}/{scale}/{edge:?}");
 
-                    // 命中区 16*s，字形 8*s（字面量）
+                    // 命中区 14*s，字形 6*s（字面量）
                     assert!(
-                        (l.hit_dismiss.w - 16.0 * scale).abs() < 0.001
-                            && (l.hit_dismiss.h - 16.0 * scale).abs() < 0.001,
-                        "{tag}: 命中区 = {}×{}，应恰为 16*{scale}",
+                        (l.hit_dismiss.w - 14.0 * scale).abs() < 0.001
+                            && (l.hit_dismiss.h - 14.0 * scale).abs() < 0.001,
+                        "{tag}: 命中区 = {}×{}，应恰为 14*{scale}",
                         l.hit_dismiss.w,
                         l.hit_dismiss.h
                     );
                     assert!(
-                        (l.dismiss.w - 8.0 * scale).abs() < 0.001
-                            && (l.dismiss.h - 8.0 * scale).abs() < 0.001,
-                        "{tag}: 字形 = {}×{}，应恰为 8*{scale}",
+                        (l.dismiss.w - 6.0 * scale).abs() < 0.001
+                            && (l.dismiss.h - 6.0 * scale).abs() < 0.001,
+                        "{tag}: 字形 = {}×{}，应恰为 6*{scale}",
                         l.dismiss.w,
                         l.dismiss.h
                     );
@@ -1424,7 +1502,7 @@ mod tests {
                         "{tag}: × 与 next 净距 = {gap}，应恰为 2*{scale}"
                     );
 
-                    // 字形四边余量各 4*s（字面量：(16 − 8) / 2）
+                    // 字形四边余量各 4*s（字面量：(14 − 6) / 2）
                     for (name, m) in [
                         ("左", l.dismiss.x - l.hit_dismiss.x),
                         ("上", l.dismiss.y - l.hit_dismiss.y),
@@ -1441,49 +1519,64 @@ mod tests {
         }
     }
 
-    /// **B 组（补）**：字形右缘到「下一首」命中区右缘的实际距离 = 14*s。
+    /// **B 组（补）**：字形右缘到「下一首」命中区右缘的实际距离 = 12*s。
     ///
-    /// = 净距 2*s + 字形左余量 4*s + 字形宽 8*s 的组合结果。
+    /// = 净距 2*s + 字形左余量 4*s + 字形宽 6*s 的组合结果。
     /// 单看三条断言各自都能被"两个量一起动"糊过去，合成一个数才是用户
-    /// 真正看到的那段空白（v1.5.2 这里是 20*s）。
+    /// 真正看到的那段空白（v1.5.2 是 20*s、v1.5.3 是 14*s）。
     ///
-    /// 改名史：v1.5.2 `..._is_twenty_px` → v1.5.3 `..._is_fourteen_px`。
+    /// 改名史：v1.5.2 `..._is_twenty_px` → v1.5.3 `..._is_fourteen_px`
+    /// → v1.5.4 `..._is_twelve_px`。
     #[test]
-    fn dismiss_glyph_clearance_from_next_is_fourteen_px() {
+    fn dismiss_glyph_clearance_from_next_is_twelve_px() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
             let clearance = l.dismiss.right() - l.hit_next.right();
             assert!(
-                (clearance - 14.0 * scale).abs() < 0.001,
-                "scale={scale}: 字形右缘 − next 命中区右缘 = {clearance}，应恰为 14*{scale}"
+                (clearance - 12.0 * scale).abs() < 0.001,
+                "scale={scale}: 字形右缘 − next 命中区右缘 = {clearance}，应恰为 12*{scale}"
             );
         }
     }
 
-    /// **v1.5.3 验收本质**：热区净距恰 `2*s`，且「下一首」到 × 的那段空白恰等于
-    /// `14*s` / `12*s`（两个口径都锁，见下）。
+    /// **v1.5.4 验收本质**：热区净距恰 `2*s`，且用户真正看到的那两条缝都恰 `12*s`。
     ///
-    /// 用户这一轮的原话是「× 左侧的按键和内容可以右移，充分利用空白空间，
-    /// 只要按键之间不冲突即可」。这句话有两个判据，缺一不可：
+    /// 用户这一轮的原话是「× 的不透明度和"下一首"一致，大小改为 6px，"下一首"的
+    /// 图标和 × 间距 12px 不变，但是由于 × 变小了，左侧内容应该会整体右移」。
+    /// 这句话有三个判据，缺一不可：
     ///
     /// 1. **「不冲突」** = 两个命中区仍严格不相交 → `hit_dismiss.x −
-    ///    hit_next.right()` 恰为 `DISMISS_GAP*s`（本轮 2*s，v1.5.2 是 8*s）。
-    /// 2. **「那段空白变短了」** = 用户真正**看到**的缝，而不是热区之间的缝。
+    ///    hit_next.right()` 恰为 `DISMISS_GAP*s`（本轮仍是 2*s）。
+    /// 2. **「间距 12px 不变」** = 用户真正**看到**的缝，而不是热区之间的缝。
     ///    热区比图形大，所以视觉缝有两个口径，两个都写死：
-    ///    * `dismiss.right() − hit_next.right() = 14*s`（v1.5.2 是 20*s）
-    ///      = 净距 2 + 字形左余量 4 + 字形宽 8 —— 「命中区边缘 → × 笔画右端」；
-    ///    * `dismiss.x − 图标右缘 = 12*s`（v1.5.2 是 18*s）
+    ///    * `dismiss.right() − hit_next.right() = 12*s`
+    ///      = 净距 2 + 字形左余量 4 + **字形宽 6**
+    ///      —— 「命中区边缘 → × 笔画右端」；
+    ///    * `dismiss.x − 图标右缘 = 12*s`
     ///      = 图标在 28 热区内的右侧余量 6 + 净距 2 + 字形左余量 4
     ///      —— **这才是「下一首」箭头到 × 笔画之间那条肉眼可见的白缝**。
+    /// 3. **「× 变小了」** = 字形恰 6*s（热区不能跟着缩到 12，否则口径 B 会变 10）。
+    ///
+    /// ## v1.5.4 的巧合（值得写下来，否则后人会以为是笔误）
+    ///
+    /// v1.5.3（字形 8 / 命中 16）时口径 A = 14、口径 B = 12，两者差 **2**。
+    /// 本轮字形 8→6、命中 16→14 之后，A 与 B **都等于 12**：
+    /// `A − B = DISMISS_ICON − (BTN_HIT − BTN_ICON)/2 = 6 − 6 = 0`。
+    /// 也就是说「A == B」本身就是一条**强断言**（左边三项是 × 的尺寸，
+    /// 右边两项是三键的尺寸，任何一边漂移都会破），所以对账式从
+    /// v1.5.3 的「差值 = 2」改成「两者相等」。
     ///
     /// 只锁热区（判据 1）不够：把 `DISMISS_ICON` / `BTN_ICON` 一起缩小同样能让
-    /// 净距保持 2，视觉缝却会变宽 —— 而用户抱怨的正是视觉缝。
+    /// 净距保持 2，视觉缝却会变宽 —— 而用户验收的正是视觉缝。
     ///
     /// 4 档 scale × 2 形态全跑：任何一处漏乘 `s`，或者谁把净距改回 8、
     /// 把图标/字形尺寸挪一下，都会先在这里红。
+    ///
+    /// 改名史：v1.5.3 `dismiss_gap_is_two_and_glyph_gap_is_fourteen`
+    /// → v1.5.4 `dismiss_gap_is_two_and_ink_gap_is_twelve`。
     #[test]
-    fn dismiss_gap_is_two_and_glyph_gap_is_fourteen() {
+    fn dismiss_gap_is_two_and_ink_gap_is_twelve() {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale).round() as i32;
@@ -1494,7 +1587,7 @@ mod tests {
                 let hit_gap = l.hit_dismiss.x - l.hit_next.right();
                 assert!(
                     (hit_gap - 2.0 * scale).abs() < 0.001,
-                    "{tag}: 热区净距 = {hit_gap}，应恰为 2*{scale}（v1.5.2 是 8*{scale}）"
+                    "{tag}: 热区净距 = {hit_gap}，应恰为 2*{scale}"
                 );
                 assert!(
                     hit_gap > 0.0,
@@ -1506,11 +1599,12 @@ mod tests {
                     limits::DISMISS_GAP
                 );
 
-                // ② 视觉缝口径 A：命中区右缘 → × 笔画右端，恰 14*s（= 2 + 4 + 8）
+                // ② 视觉缝口径 A：命中区右缘 → × 笔画右端，恰 12*s（= 2 + 4 + 6）
                 let glyph_right_gap = l.dismiss.right() - l.hit_next.right();
                 assert!(
-                    (glyph_right_gap - 14.0 * scale).abs() < 0.001,
-                    "{tag}: × 笔画右端 − next 命中区右缘 = {glyph_right_gap}，应恰为 14*{scale}"
+                    (glyph_right_gap - 12.0 * scale).abs() < 0.001,
+                    "{tag}: × 笔画右端 − next 命中区右缘 = {glyph_right_gap}，应恰为 12*{scale}\
+                     （= 净距 2 + 左余量 4 + 字形 6；v1.5.3 是 14*{scale}）"
                 );
 
                 // ② 视觉缝口径 B：**「下一首」图标右缘 → × 笔画左缘**，恰 12*s
@@ -1531,60 +1625,77 @@ mod tests {
                 let ink_gap = l.dismiss.x - next_icon_right;
                 assert!(
                     (ink_gap - 12.0 * scale).abs() < 0.001,
-                    "{tag}: 「下一首」图标右缘 → × 笔画左缘 = {ink_gap}，应恰为 12*{scale}（= 6+2+4）；\
-                     v1.5.2 是 18*{scale}（= 6+8+4）"
+                    "{tag}: 「下一首」图标右缘 → × 笔画左缘 = {ink_gap}，应恰为 12*{scale}\
+                     （= 6+2+4）；这是用户要求「间距 12px 不变」的直接判据"
                 );
-
-                // 两个视觉口径必须自洽：14*s − 12*s = 字形宽 8*s − 图标右侧余量 6*s + ...
-                // 直接用差值与元素尺寸对账（漏乘 s 或改尺寸会立刻对不上）
+                // 拆开写死三项，防止"两个量一起动"糊过去
                 assert!(
-                    ((glyph_right_gap - ink_gap) - (limits::DISMISS_ICON * scale
-                        - (limits::BTN_HIT - limits::BTN_ICON) * 0.5 * scale))
+                    ((limits::BTN_HIT - limits::BTN_ICON) * 0.5
+                        + limits::DISMISS_GAP
+                        + (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5
+                        - 12.0)
                         .abs()
                         < 0.001,
-                    "{tag}: 14*s 与 12*s 两个口径对不上（差值 {}）",
+                    "{tag}: 6(图标右余量) + {}(净距) + {}(字形左余量) 必须 = 12",
+                    limits::DISMISS_GAP,
+                    (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5
+                );
+
+                // 两个视觉口径的自洽：v1.5.4 起 A − B = DISMISS_ICON − (BTN_HIT−BTN_ICON)/2
+                // = 6 − 6 = 0，所以两者的对账式是「相等」——这比 v1.5.3 的「差 2」更强。
+                assert!(
+                    ((glyph_right_gap - ink_gap)
+                        - (limits::DISMISS_ICON * scale
+                            - (limits::BTN_HIT - limits::BTN_ICON) * 0.5 * scale))
+                        .abs()
+                        < 0.001,
+                    "{tag}: 12*s 与 12*s 两个口径对不上（差值 {}，应为 DISMISS_ICON − (BTN_HIT−BTN_ICON)/2）",
+                    glyph_right_gap - ink_gap
+                );
+                assert!(
+                    (glyph_right_gap - ink_gap).abs() < 0.001,
+                    "{tag}: v1.5.4 两个口径必须**相等**（都 12*s），实测 A−B = {}",
                     glyph_right_gap - ink_gap
                 );
 
-                // 三键与前序版本对齐：是三键右移，不是 × 右移
+                // ③ 三键与前序版本对齐：是三键右移，不是 × 右移；字形恰 6*s
                 assert!(
                     (l.dismiss.w - limits::DISMISS_ICON * scale).abs() < 0.001
-                        && (l.dismiss.w - 8.0 * scale).abs() < 0.001,
-                    "{tag}: × 字形必须仍是 8*{scale}"
+                        && (l.dismiss.w - 6.0 * scale).abs() < 0.001,
+                    "{tag}: × 字形必须仍是 6*{scale}（v1.5.3 是 8*{scale}）"
                 );
             }
         }
     }
 
-    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +14*s**。
+    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +12*s**。
     ///
     /// v1.4.4 的基线宽度 362/452/543/724 是字面量（= trunc(362*s) 的排版结果），
-    /// 所以「把净距偷偷改回 8」（+20）或「把右边距改回 CONTENT_PAD 8」（+24）
+    /// 所以「把净距偷偷改回 8」（+18）或「把右边距改回 CONTENT_PAD 8」（+16）
     /// 都会同时打破 `want` 与实测两条。
     ///
-    /// v1.5.3 实测真值（= trunc(fixed 176*s + info 200*s)）：
-    /// 376 / 470 / 564 / 752。
+    /// v1.5.4 实测真值（= trunc(fixed 174*s + info 200*s)）：
+    /// 374 / 467 / 561 / 748。
     ///
     /// 公式那条用 ±0.51 而不是 `assert_eq!`：`compute_full` 最后一步是
-    /// `(fixed + info_w) as i32` **截断**，而 v1.4.4 的基线 452 本身是 452.5
-    /// 截断来的，于是 scale=1.25 时 `452 + 17.5 = 469.5` 与实测 470 差 0.5。
-    /// 这不是放宽——精确真值由下面的 `assert_eq!` 字面量表锁死。
+    /// `(fixed + info_w) as i32` **截断**。精确真值由下面的 `assert_eq!` 字面量表锁死。
     ///
-    /// 改名史：v1.5.2 `..._is_20px_at_all_scales` → v1.5.3 `..._is_14px_at_all_scales`。
+    /// 改名史：v1.5.2 `..._is_20px_at_all_scales` → v1.5.3 `..._is_14px_at_all_scales`
+    /// → v1.5.4 `..._is_12px_at_all_scales`。
     #[test]
-    fn dismiss_width_delta_is_14px_at_all_scales() {
+    fn dismiss_width_delta_is_12px_at_all_scales() {
         for (scale, width_v144, width_now) in [
-            (1.0f32, 362.0f32, 376.0f32),
-            (1.25, 452.0, 470.0),
-            (1.5, 543.0, 564.0),
-            (2.0, 724.0, 752.0),
+            (1.0f32, 362.0f32, 374.0f32),
+            (1.25, 452.0, 467.0),
+            (1.5, 543.0, 561.0),
+            (2.0, 724.0, 748.0),
         ] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 14.0 * scale;
+            let want = width_v144 + 12.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
-                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 14*{scale} = {want}",
+                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 12*{scale} = {want}",
                 l.width
             );
             // 字面量真值表（不依赖上面那条公式的推导顺序）
@@ -1593,10 +1704,10 @@ mod tests {
                 "scale={scale}: width = {}，应为写死的 {width_now}",
                 l.width
             );
-            // fixed_width 同源：固定件 = 162*s + 14*s = 176*s
+            // fixed_width 同源：固定件 = 162*s + 12*s = 174*s
             assert!(
-                (l.fixed_width() - (162.0 + 14.0) * scale).abs() < 0.001,
-                "scale={scale}: fixed_width = {}，应为 176*{scale}",
+                (l.fixed_width() - (162.0 + 12.0) * scale).abs() < 0.001,
+                "scale={scale}: fixed_width = {}，应为 174*{scale}",
                 l.fixed_width()
             );
         }
@@ -1611,6 +1722,9 @@ mod tests {
     ///
     /// 4 档 scale × 2 形态全跑：任何一处漏乘 s、或者谁把右边距改回 `CONTENT_PAD`
     /// 而没同步收窄，都会先在这里红。
+    ///
+    /// v1.5.4（字形 8 → 6、命中 16 → 14）：居中余量仍是 `(14 − 6) / 2 = 4`，
+    /// 所以「4 + 4 = 8 = CONTENT_PAD」这条对称**一个字没变** —— 下面的断言原样通过。
     #[test]
     fn dismiss_glyph_right_edge_is_symmetric_with_left_pad() {
         // 常量层：右边距必须是 4（4 + 字形居中余量 4 = 8 = CONTENT_PAD）
@@ -1618,6 +1732,13 @@ mod tests {
             (limits::DISMISS_RIGHT_MARGIN - 4.0).abs() < 0.001,
             "DISMISS_RIGHT_MARGIN 应为 4，实为 {}",
             limits::DISMISS_RIGHT_MARGIN
+        );
+        // 居中余量本身也写死：v1.5.4 起 (14 − 6) / 2 = 4
+        assert!(
+            ((limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5 - 4.0).abs() < 0.001,
+            "字形居中余量 = ({} − {}) / 2，应为 4",
+            limits::DISMISS_HIT,
+            limits::DISMISS_ICON
         );
         assert!(
             (limits::DISMISS_RIGHT_MARGIN + (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5
@@ -1729,13 +1850,20 @@ mod tests {
         }
     }
 
-    /// **C 组（补）**：圆角 4*s 在 4 档缩放下都**严格小于**底色短边的一半（8*s）。
+    /// **C 组（补）**：圆角 4*s 在 4 档缩放下都**严格小于**底色短边的一半（7*s）。
     ///
     /// 风险点：D2D 对 `radius > 短边/2` 的圆角矩形会退化成胶囊/异常形状。
-    /// 16px 方块配 4px 圆角时比值是 2:1 的安全余量；但若有人把
-    /// `DISMISS_BG_RADIUS` 调大（或把底色缩小），这里会先红。
-    /// painter 侧的 `.min(短边*0.5)` 兜底见 `src/render/painter.rs:469`（代码走查，
-    /// 有 D2D 上下文才能测，单测跑不到）。
+    /// v1.5.4 起底色短边是 14*s（v1.5.3 是 16*s），4:7 仍有一倍以上余量；
+    /// 但若有人把 `DISMISS_BG_RADIUS` 调大（或把底色缩小），这里会先红。
+    /// painter 侧的 `.min(短边*0.5)` 兜底见 `src/render/painter.rs`（代码走查，
+    /// 有 D2D 上下文才能测、单测跑不到）。
+    ///
+    /// v1.5.4 顺带调整：v1.5.3 有一条「圆角 ≤ 短边 1/4」的观感断言，源码是
+    /// `r <= short * 0.25`，16px 方块下 4 ≤ 4 刚好成立。底色缩到 14 之后
+    /// 4 > 14×0.25 = 3.5，这条**不再是当前设计的真值**（圆角故意保持 4 不变，
+    /// 因为它在 14px 方块上仍像「任务栏图标悬停块」，而缩到 3.5 会引入小数
+    /// 像素圆角、反而不干净）。所以判据改成 `r ≤ short * 0.30`（4/14 ≈ 0.286），
+    /// 语义仍是「不许把方块画成圆形」，只是把阈值对齐到 v1.5.4 的实际设计。
     #[test]
     fn dismiss_bg_radius_is_safely_under_half_short_side() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
@@ -1745,8 +1873,8 @@ mod tests {
             let short = bg.w.min(bg.h);
             let r = limits::DISMISS_BG_RADIUS * scale;
             assert!(
-                (short - 16.0 * scale).abs() < 0.001,
-                "scale={scale}: 底色短边 = {short}，应恰为 16*{scale}"
+                (short - 14.0 * scale).abs() < 0.001,
+                "scale={scale}: 底色短边 = {short}，应恰为 14*{scale}（v1.5.3 是 16*{scale}）"
             );
             assert!(
                 (r - 4.0 * scale).abs() < 0.001,
@@ -1757,11 +1885,11 @@ mod tests {
                 "scale={scale}: 圆角 {r} 必须严格小于短边一半（{}），否则画成胶囊",
                 short * 0.5
             );
-            // 观感：圆角不超过短边的 1/4（4/16），超过就偏圆
+            // 观感：圆角不超过短边的 30%（4/14 ≈ 28.6%），超过就偏圆
             assert!(
-                r <= short * 0.25 + 0.001,
-                "scale={scale}: 圆角 {r} 超过短边 1/4（{}），16px 方块会显圆",
-                short * 0.25
+                r <= short * 0.30 + 0.001,
+                "scale={scale}: 圆角 {r} 超过短边 30%（{}），14px 方块会显圆",
+                short * 0.30
             );
         }
     }

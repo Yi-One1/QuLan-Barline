@@ -430,9 +430,13 @@ fn fill_triangle(
 /// 也没有禁用态（任何播放状态都可收起）；硬塞进去会让那个循环多出两处
 /// `if target == Dismiss` 的分叉，反而更难读。
 ///
-/// ## 视觉规格（v1.5.1：缩小 + 换一种悬停表达）
+/// ## 视觉规格（v1.5.1：缩小 + 换一种悬停表达；v1.5.4：字形 6px + 笔画加粗）
 ///
 /// - 字形常态就是 `0xFF` 满不透明（用户选 100%，且 8px 小字形再半透明会发虚）；
+///   v1.5.4 用户再次要求「× 的不透明度与"下一首"一致」—— 查证结果是**本来就同值**，
+///   所以这里**直接写字面量 `0xFF`**（与 `draw_buttons` 的 enabled 同源），
+///   让「两个值可能漂移」在代码层面也不可能发生。用户看到的「淡」是**笔画太细**
+///   造成的覆盖率损失，由 `limits::DISMISS_LINE = 1.2` 解决；
 /// - **因此不能再靠"变亮"做悬停反馈**——已经满不透明就没有余量。改为在
 ///   `hit_dismiss` 那一格里铺一层**极淡圆角底**：悬停 `theme.text @ 0x14`（≈8%）、
 ///   按下 `0x22`（≈13%），圆角 `4 * scale`。这是 Win11 任务栏图标悬停的常规做法：
@@ -475,7 +479,15 @@ fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Res
     }
 
     // ---- 2. 字形：常态即满不透明（不再有 0xCC → 0xFF 的变亮）----
-    let brush = frame.brush(Rgba::from_rgb(theme.text, limits::DISMISS_ALPHA))?;
+    //
+    // v1.5.4（用户反馈「× 的不透明度还是改为和按钮"下一首"一致」）：
+    // `draw_buttons` 的 enabled 态是 `Rgba::from_rgb(theme.text, 0xFF)`，这里
+    // **写成同一个字面量** 0xFF（不用 `limits::DISMISS_ALPHA`），好处是任何一方
+    // 想改 alpha 都必须同时改两处、评审一眼可见 —— 「两个常量各自漂移」这种
+    // 隐患在代码层面就不存在了。`limits::DISMISS_ALPHA` 保留为语义占位并恒等于它。
+    // 用户之所以觉得 × 更淡，真正原因是笔画宽度（见 `limits::DISMISS_LINE`
+    // 与下面的 `fill_cross`），alpha 一个 bit 都不差。
+    let brush = frame.brush(Rgba::from_rgb(theme.text, 0xFF))?;
 
     // 按下：整体下沉 1px（与三键同一口径：`1.0 * scale`）
     let sink = if pressed { 1.0 * s } else { 0.0 };
@@ -499,6 +511,25 @@ fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Res
 /// 45° 斜线的垂直粗细 `lw` 对应 `run = lw * √2`。
 /// 两端各留 `run / 2` 的内缩，笔画不会顶出 `side × side` 的字形框。
 /// 行间多画 0.6px 消除抗锯齿接缝（同 [`fill_triangle`]）。
+///
+/// ## 当前参数的实际几何（v1.5.4：`side = 6*s`、`lw = 1.2*s`，100% DPI）
+///
+/// - `rows = round(6) = 6` 行，`step = 1.0`；
+/// - `run = 1.2 × √2 ≈ 1.697px`（每行水平墨量，三键的实心条是 2.2px - 见
+///   `limits::DISMISS_LINE` 的注释：这就是「墨色浓度对齐」的来源）；
+/// - `inset = run / 2 ≈ 0.849`，`span = 6 − 2×0.849 ≈ 4.303`；
+/// - 第 i 行（0-based）两条斜线的水平间距 = `side − 2·inset − 2·t·span`：
+///   | i | t      | 间距 (px) | 与 run(1.70) 比 |
+///   |---|--------|-----------|-----------------|
+///   | 0 | 0.0833 | 3.59      | 分离            |
+///   | 1 | 0.2500 | 2.15      | 分离            |
+///   | 2 | 0.4167 | 0.72      | **重叠**（交叉点）|
+///   | 3 | 0.5833 | 0.72      | **重叠**（交叉点）|
+///   | 4 | 0.7500 | 2.15      | 分离            |
+///   | 5 | 0.9167 | 3.59      | 分离            |
+///   中间 2 行（占总高 1/3）合并成一段，正是「×」的交叉；再粗（≥1.6）会让
+///   4 行都并起来、变成实心团，「叉」的形态消失 —— 所以 1.2 是上限附近的取值，
+///   下限由 `dismiss_ink_density_matches_buttons` 把守。
 fn fill_cross(
     rt: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
