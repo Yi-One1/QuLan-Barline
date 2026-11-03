@@ -775,4 +775,35 @@ mod tests {
         );
         assert_ne!(i.pressed, Some(HitTarget::Dismiss));
     }
+
+    /// **D1 组补充（A12）**：拖动进度条期间**悬停高亮必须清空**——× 在三键/进度条
+    /// 的拖动死区里，不允许留一个"亮着但点不动"的壳子。
+    #[test]
+    fn seeking_clears_hover_target() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+        i.on_move(&l, cx, cy);
+        assert_eq!(i.hover_target, Some(HitTarget::Dismiss));
+
+        // ① 按下进度条进入 Seeking → 立刻清空
+        let py = l.hit_progress.y + l.hit_progress.h * 0.5;
+        i.on_down(&l, 40.0, py);
+        assert!(i.is_seeking());
+        assert_eq!(i.hover_target, None, "进入拖动必须清掉悬停高亮");
+
+        // ② 拖动过程中扫过 × 的位置也不许重新点亮
+        let out = i.on_move(&l, cx, cy);
+        assert!(
+            out.iter().all(|x| matches!(x, WidgetInput::SeekPreview(_))),
+            "拖动中的 mousemove 只能产生 SeekPreview：{out:?}"
+        );
+        assert_eq!(i.hover_target, None, "拖动中 × 是死区，不得高亮");
+
+        // ③ 松手退出拖动后恢复正常（悬停重新生效）
+        i.on_up(&l, cx, cy);
+        assert!(!i.is_seeking());
+        i.on_move(&l, cx, cy);
+        assert_eq!(i.hover_target, Some(HitTarget::Dismiss));
+    }
 }
