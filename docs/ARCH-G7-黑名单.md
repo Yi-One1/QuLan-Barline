@@ -378,6 +378,24 @@ fn identity(cache, process_name, aumid) -> Identity {
 > 只要末段与该 exe 名主干相同就仍然命中。它**不是**落盘的替代品——落盘解决的是"重启后"，
 > 主干比较解决的是"从未枚举过"（§11.4）。
 
+**3.2.1 匹配规则的唯一表述**（手输撞上歧义时只看这一处）
+
+> **规则一句话**：手输的键（进 `blacklist` 之前）与判定的键（`identity()` 的输出）
+> **都必须先过 `normalize_entry()`，再按"去 `.exe` 的主干"比较**。
+> 两边同一套归一化 + 同一套主干比较 = 用户抄下来的值与判定值永远可比。
+
+**某条黑名单"稳不稳"的判据表**（工程师自测、用户答疑都用这张，别看别处）：
+
+| 应用类型 | 不靠缓存也能命中？ | 依据 |
+| --- | --- | --- |
+| 在 `player_map` 表内（22 条：网易云 / QQ / Spotify / 汽水 / 酷狗 / 酷我 / foobar2000 / PotPlayer / 音乐(UWP) / **电影和电视** / Edge / Chrome / Firefox / Brave / VLC / AIMP / Groove） | ✅ **不依赖缓存** | ② 级静态表直接给真实 exe 名；`microsoft.zunevideo → video.ui.exe` 就是这类（`player_map.rs:149-155`），所以"电影和电视"重启后照样拦得住 |
+| 表外 win32 应用，AUMID 就是 exe 名或含 exe 名（`Foo.exe`、`NeteaseCloudMusic!App`） | ✅ **不依赖缓存** | ③ 级 AUMID 末段 → 主干与真实 exe 名相同（"绝大多数 win32 播放器"属这类） |
+| 表外 + 打包应用（`Publisher.App_hash!AppId`），且**曾枚举过一次** | ✅ 命中，**依赖缓存** | ① 级缓存（落盘，重启后仍在）——**这就是落盘的价值** |
+| 表外 + 打包应用，且**从未枚举过** | ⚠️ **不保证** | 只有 AUMID 末段恰好等于用户输入的主干才命中；添加时给 `toast.blacklist.unverified` |
+
+> 用途：**一眼判断"我这条黑名单到底稳不稳"**。前两行覆盖绝大多数情况（"主干比较"为什么值得写死的原因）；
+> 第三行是落盘的收益；第四行是 U1=B 唯一承认的残留，且**添加时就提示**，不是事后静默失败。
+
 **容量与淘汰（`APP_NAME_CACHE_MAX = 64`，落盘）**
 
 | 项 | 取值 | 理由 |
@@ -1492,7 +1510,7 @@ fn blacklist_keys_are_bilingual_and_non_empty() {
 | 项 | 内容 |
 | --- | --- |
 | **涉及文件** | ① `src/media/smtc.rs`（`tests` 补：忽略态不发布 / 不读 props / 播控被丢弃 / **反查超预算即降级** 四条纯逻辑等价测试）<br>② `src/media/blacklist.rs`（补齐边界测试）<br>③ `src/settings/bridge.rs`（`apply_blacklist` 全枚举覆盖 + `KeyRecognition` 两档）<br>④ `src/config/mod.rs`（`media` 缺失 / 双表归一化接线的 roundtrip 测试） |
-| **具体改动** | 1) 逐条把 PRD 修订版的 8 条验收映射成"可执行检查"：每条写清"看哪行日志 / 看哪个文件 / 看哪个 UI 元素"。<br>2) **U1=B 的三条专有走查（必须单独跑，别混在别的条目里）**：<br>　**W1 反查真的拿到了真实名**：找一个 `player_map` 表外的应用（Store 包 / UWP 最典型）开播 → 打开黑名单分区 → 该行 `process` **不是** AUMID 末段、`resolved=true`、`source` 是 `aumid` 之外的值（`cache`）；同时 `config.json` **没有**新增任何映射（`grep AUMID` 仍为 0）。<br>　**W2 缓存跨重启有效**（落盘的核心验收，别省）：W1 之后**重启程序** → **不打开设置页**直接播放该应用 → 日志里该会话的身份是**真实进程名**（`source=cache`），且小组件按黑名单把它拦住（证明①级走了落盘的缓存，没等枚举）；<br>　**W2b 手改 json 不炸**：把 `config.json` 的 `app_names` 改成 `{"":"x","A!B":"CloudMusic","C!D":"a*b.exe"}` 并塞 70 条假键 → 重启 → 程序正常起、黑名单仍生效、`app_names` 被裁到 64 条且只剩 `{"a!b":"cloudmusic.exe"}` 这类合法项（对应 R10/R12）。<br>　**W3 失败不静默**：手动输入一个本机从未出现过的名字（如 `zzz-test.exe`）→ toast 出现「已加入。这个进程名还没在这台机器上出现过…」；再手动输入 `cloudmusic.exe` → **没有**这条提示（`Verified`）。<br>3) 跑 `check` / `clippy`（**0 警告**是硬要求）/ `test`，把测试数从 390 涨上去（预计 **+40~55 条**）。<br>4) 真机清单交给主理人（工程师不启动 exe，`progress.md` §2.1 铁律 3）。 |
+| **具体改动** | 1) 逐条把 PRD 修订版的 8 条验收映射成"可执行检查"：每条写清"看哪行日志 / 看哪个文件 / 看哪个 UI 元素"。<br>2) **U1=B 的三条专有走查（必须单独跑，别混在别的条目里）**：<br>　**W1 反查真的拿到了真实名**：找一个 `player_map` 表外的应用（Store 包 / UWP 最典型）开播 → 打开黑名单分区 → 该行 `process` **不是** AUMID 末段、`resolved=true`、`source` 是 `aumid` 之外的值（`cache`）；**并且 `config.json` 的 `media.app_names` 里出现了这条 `aumid → 真实进程名` 映射**（落盘验收点）。<br>　**W2 缓存跨重启有效**（落盘的核心验收，别省）：W1 之后**重启程序** → **不打开配置页**直接播放该应用 → 日志里该会话的身份是**真实进程名**（`source=cache`），且小组件按黑名单把它拦住（证明①级走了落盘的缓存，没等枚举）；<br>　**W2b 手改 json 不炸**：把 `config.json` 的 `app_names` 改成 `{"":"x","A!B":"CloudMusic","C!D":"a*b.exe"}` 并塞 70 条假键 → 重启 → 程序正常起、黑名单仍生效、`app_names` 被裁到 64 条且只剩 `{"a!b":"cloudmusic.exe"}` 这类合法项（对应 R10/R12）。<br>　**W3 失败不静默**：手动输入一个本机从未出现过的名字（如 `zzz-test.exe`）→ toast 出现「已加入。这个进程名还没在这台机器上出现过…」；再手动输入 `cloudmusic.exe` → **没有**这条提示（`Verified`）。<br>3) 跑 `check` / `clippy`（**0 警告**是硬要求）/ `test`，把测试数从 390 涨上去（预计 **+40~55 条**）。<br>4) 真机清单交给主理人（工程师不启动 exe，`progress.md` §2.1 铁律 3）。 |
 | **验收口径** | `check`/`clippy`/`test` 全绿、clippy 0 警告；测试数只增不减；**W1/W2/W3 三条走查结论写进交付说明**；`cargo` 之外的产物（`target/`）不入库。 |
 | **规模** | **S+**（多了 W1~W3 三条专有走查 + 反查预算测试） |
 | **前置依赖** | T01~T04 |
