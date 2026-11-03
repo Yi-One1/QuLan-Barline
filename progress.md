@@ -12,7 +12,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | 项 | 值 |
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
-| 仓库 | `E:\APP\WorkBuddy\工作空间\曲栏Barline` · 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
+| 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
 | 当前版本 | **v1.4.4**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
 | 质量 | 测试 **390**（389 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1066 KB |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
