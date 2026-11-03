@@ -227,8 +227,9 @@ impl WidgetLayout {
     /// 内容自然宽度（不含宽度钳位，含歌词最小宽），用于日志与调试。
     ///
     /// v1.5.2：左侧仍只有一份 `CONTENT_PAD`（右边距改由
-    /// [`limits::DISMISS_RIGHT_MARGIN`] 承担），× 那一列 = 右边距 4 + 命中 16 +
-    /// 净距 8 = 28，故固定件从 v1.5.1 的 186 收到 182（= v1.4.4 的 162 + 20）。
+    /// [`limits::DISMISS_RIGHT_MARGIN`] 承担）。
+    /// v1.5.3：× 那一列 = 右边距 4 + 命中 16 + 净距 **2** = 22（v1.5.2 是 28），
+    /// 故固定件从 182 收到 176（= v1.4.4 的 162 + 14）。
     /// 这里必须与 [`compute_full`] 的 `fixed` 严格同源，否则日志里的调试宽度会
     /// 与真实窗口对不上。
     pub fn fixed_width(&self) -> f32 {
@@ -333,8 +334,14 @@ pub fn compute_full(
     // v1.5.1：命中区 24 → 16，这列缩到 16 + 8 = 24*s，窗口总宽增量随之变成 +24*s。
     // v1.5.2（用户反馈「右侧留空太多」）：右边距不再复用 `CONTENT_PAD`，
     // 改由 `DISMISS_RIGHT_MARGIN = 4` 承担 —— 4 + 字形居中余量 4 = 字形右缘
-    // 距窗口右缘 8px，与左侧 `CONTENT_PAD` 完全对称。这列因此 = 4 + 16 + 8 = 28*s，
-    // 固定件从 186 收到 182（`pad` 只加一次，就是左边距），窗口窄 4px。
+    // 距窗口右缘 8px，与左侧 `CONTENT_PAD` 完全对称。这列因此 = 4 + 16 + 8 = 28*s。
+    // v1.5.3（用户反馈「× 左侧的按键和内容可以右移」）：`DISMISS_GAP` 8 → 2，
+    // 这列收到 4 + 16 + 2 = **22*s**，固定件 182 → **176**（= v1.4.4 的 162 + 14）。
+    //
+    // 两种场景表现不同，这正是用户要的「右移」，不是「变窄」：
+    //   * 窗口被 `WIDGET_MIN_W` 钳住时（无文本 / 极短文本）：窗口宽度不变，
+    //     三键整体右移 6px，吃掉原来信息区里那块空白；
+    //   * 正常有文本时：窗口窄 6px，三键**绝对位置不动**，右边界左收 6px。
     let dismiss_col = (limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP) * s;
     let fixed = pad + cover_side + gap_ct + gap_tb + btn_group + dismiss_col;
     let width = (((fixed + info_w) as i32).max((limits::WIDGET_MIN_W * s).round() as i32)).max(1);
@@ -352,7 +359,7 @@ pub fn compute_full(
     // 封面 32×32（×scale），在主行内垂直居中
     let cover = RectF::new(pad, ((mh - cover_side) * 0.5).max(0.0), cover_side, cover_side);
 
-    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（右边距 4 + 命中 16 + 净距 8）
+    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（右边距 4 + 命中 16 + 净距 2）
     let btn_y = ((mh - btn) * 0.5).max(0.0);
     let btn_next = RectF::new(w - dismiss_col - btn, btn_y, btn, btn);
     let btn_toggle = RectF::new(btn_next.x - bgap - btn, btn_y, btn, btn);
@@ -417,11 +424,11 @@ pub fn compute_full(
         .min((main_bottom - 2.0).max(0.0));
     let hit_progress = RectF::new(0.0, prog_hit_top, w, (main_bottom - prog_hit_top).max(2.0));
 
-    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8；v1.5.2 右边距收到 4）----
+    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8；v1.5.2 右距收到 4；v1.5.3 净距收到 2）----
     // 命中区贴右上角：右缘 = 客户区右缘 − DISMISS_RIGHT_MARGIN，y 从 0 开始
     // （纵向占满 DISMISS_HIT*s）。右缘距窗口只有 4（而不是 CONTENT_PAD 的 8），
     // 加上字形在热区内的 4px 居中余量，字形右缘正好落在「窗口右缘 − 8」，
-    // 与左侧 CONTENT_PAD 对称 —— 这是 v1.5.2 的验收本质。
+    // 与左侧 CONTENT_PAD 对称 —— 那是 v1.5.2 的验收本质，v1.5.3 一个字没动。
     // 纵向不居中是有意的——「右上角」是用户对位置的描述，贴角比居中更像常驻角标，
     // 而且条带高度（48@100%）远大于 16，居中/贴角的点击差异可以忽略。
     let dismiss_hit = limits::DISMISS_HIT * s;
@@ -499,18 +506,18 @@ mod tests {
 
     #[test]
     fn lyric_form_widens_info_area_to_min_160() {
-        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 182 + 信息区 160 = 342
-        // （固定件 182 = v1.4.4 的 162 + 20：v1.5.2 的 ×「右距 4 + 命中 16 + 净距 8」）
+        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 176 + 信息区 160 = 336
+        // （固定件 176 = v1.4.4 的 162 + 14：v1.5.3 的 ×「右距 4 + 命中 16 + 净距 2」）
         let off = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         let on = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
         assert_eq!(off.width, 200);
-        assert_eq!(on.width, 342);
-        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 182 + 200 = 382；
-        // 文本自然宽顶到信息区上限 340：宽 = 182 + 340 = 522
+        assert_eq!(on.width, 336);
+        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 176 + 200 = 376；
+        // 文本自然宽顶到信息区上限 340：宽 = 176 + 340 = 516
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0);
-        assert_eq!(mid.width, 182 + 200);
+        assert_eq!(mid.width, 176 + 200);
         let wide = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(wide.width, 182 + 340);
+        assert_eq!(wide.width, 176 + 340);
     }
 
     #[test]
@@ -546,13 +553,13 @@ mod tests {
         assert_eq!(TaskbarEdge::from_appbar_edge(99), TaskbarEdge::Bottom);
     }
 
-    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 182+340）。
+    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 176+340）。
     #[test]
     fn width_clamps_between_min_and_max() {
         let short = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0);
         assert_eq!(short.width, 200);
         let long = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(long.width, 182 + 340);
+        assert_eq!(long.width, 176 + 340);
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0);
         assert!(mid.width > 200 && mid.width < 340, "mid.width = {}", mid.width);
     }
@@ -625,6 +632,7 @@ mod tests {
 
                 // v1.5.0（G3）：× 命中区贴右上角（v1.5.2 起距右缘只有
                 // DISMISS_RIGHT_MARGIN），且与 next 命中区留 DISMISS_GAP 净距
+                // （v1.5.3：8 → 2，仍严格不相交）
                 assert!(
                     (l.hit_dismiss.right()
                         - (l.width as f32 - limits::DISMISS_RIGHT_MARGIN * scale))
@@ -634,8 +642,9 @@ mod tests {
                     l.hit_dismiss.right()
                 );
                 assert!(
-                    l.hit_dismiss.x - l.hit_next.right() >= limits::DISMISS_GAP * scale - 0.01,
-                    "{form:?}@{scale} × 与 next 净距 = {} < {}（误触防线被破）",
+                    (l.hit_dismiss.x - l.hit_next.right() - limits::DISMISS_GAP * scale).abs()
+                        < 0.001,
+                    "{form:?}@{scale} × 与 next 净距 = {} ≠ {}（误触防线被破）",
                     l.hit_dismiss.x - l.hit_next.right(),
                     limits::DISMISS_GAP * scale
                 );
@@ -645,8 +654,8 @@ mod tests {
                 // 就是「被悄悄跳过」：
                 //   - 命中区恰为 16*s（不是"差不多"）；
                 //   - 低于 HIT_MIN 的理由写在 `limits::DISMISS_HIT` 的注释里
-                //     （× 独占右上角、与 next 有 8*s 净距，误触靠"不相邻"而不是放大热区；
-                //     放大反而更容易压到 next 并吃掉 +20*s 的宽度预算）。
+                //     （× 独占右上角、与 next 有 DISMISS_GAP 净距，误触靠"不相邻"而不是放大热区；
+                //     放大反而更容易压到 next 并吃掉 +14*s 的宽度预算）。
                 assert!(
                     (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001
                         && (l.hit_dismiss.h - limits::DISMISS_HIT * scale).abs() < 0.001,
@@ -822,28 +831,35 @@ mod tests {
     }
 
     // ------------------------------------------------- v1.5.0（G3）右上角关闭 ×
-    // v1.5.1：字形 16 → 8、命中 24 → 16、笔画 1.6 → 1.0（用户反馈「× 太大」），
-    // 净距 DISMISS_GAP 保持 8。
+    // v1.5.1：字形 16 → 8、命中 24 → 16、笔画 1.6 → 1.0（用户反馈「× 太大」）。
     // v1.5.2：右边距从 CONTENT_PAD(8) 收到 DISMISS_RIGHT_MARGIN(4)，让字形右缘
-    // 距窗口右缘 = 8（= 左侧 CONTENT_PAD），宽度增量因此从 +24 变成 +20。
+    // 距窗口右缘 = 8（= 左侧 CONTENT_PAD），宽度增量从 +24 变成 +20。
+    // v1.5.3：净距 DISMISS_GAP 8 → 2（用户反馈「× 左侧的按键和内容可以右移」），
+    // 宽度增量 +20 → +14；三键尺寸/间距一个字没动，整组右移。
     // 下面所有断言仍**写死真值**，不放宽成区间。
 
-    /// 宽度：× 的「右距 4 + 命中 16 + 净距 8」让窗口**必须**比 v1.4.4 宽 20*s。
+    /// 宽度：× 的「右距 4 + 命中 16 + 净距 2」让窗口**必须**比 v1.4.4 宽 14*s。
     ///
     /// 这里把 v1.4.4 的绝对宽度（362 / 452）**写死**而不是从公式推——这样任何人
-    /// 想「优化掉」那 20px（例如偷偷把 × 叠到 next 上、或把净距 8 吃掉）都会
+    /// 想「优化掉」那 14px（例如偷偷把 × 叠到 next 上、或把净距 2 也吃掉）都会
     /// 立刻被这条断言拦住。
     ///
-    /// 改名史：v1.5.0 `..._adds_32_...` → v1.5.1 `..._adds_24_...` → v1.5.2 `..._adds_20_...`。
+    /// 容差 0.51 而不是 0：`compute_full` 最后一步是 `(fixed + info_w) as i32`
+    /// **截断**，scale=1.25 时 fixed = 176*1.25 = 220、info_w = 250 都是整点，
+    /// 但 v1.4.4 基线 452 本身是 452.5 截断来的，于是 452 + 17.5 与实测 470
+    /// 差 0.5。这不是放宽，是把截断误差算进来——精确值写在下面两条 `assert_eq!`。
+    ///
+    /// 改名史：v1.5.0 `..._adds_32_...` → v1.5.1 `..._adds_24_...`
+    /// → v1.5.2 `..._adds_20_...` → v1.5.3 `..._adds_14_...`。
     #[test]
-    fn dismiss_column_adds_20_logical_px_to_width() {
+    fn dismiss_column_adds_14_logical_px_to_width() {
         for (scale, width_v144) in [(1.0f32, 362.0f32), (1.25, 452.0)] {
             let bar = (48.0 * scale) as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 20.0 * scale;
+            let want = width_v144 + 14.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
-                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 20*{scale} = {want}",
+                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 14*{scale} = {want}",
                 l.width
             );
         }
@@ -867,20 +883,29 @@ mod tests {
         }
     }
 
-    /// 误触防线：× 命中区与「下一首」命中区**水平净距 ≥ 8*s**（绝不重叠）。
+    /// 误触防线：× 命中区与「下一首」命中区**水平净距恰为 2*s**（绝不重叠）。
+    ///
+    /// v1.5.3：净距从 8 收到 2（用户授权「只要按键之间不冲突即可」）。
+    /// 这里用**等号**而不是 `≥`：布局里净距与按钮右缘是同一个减法，
+    /// 任何「顺手多让一点 / 多占一点」的改动都必须先在这里红。
     #[test]
-    fn dismiss_hit_keeps_8px_clear_of_next_hit() {
+    fn dismiss_hit_keeps_2px_clear_of_next_hit() {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale) as i32;
                 let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
                 let gap = l.hit_dismiss.x - l.hit_next.right();
                 assert!(
-                    gap >= limits::DISMISS_GAP * scale - 0.5,
-                    "{form:?}@{scale}: × 与 next 净距 = {gap} < {}",
+                    (gap - limits::DISMISS_GAP * scale).abs() < 0.001,
+                    "{form:?}@{scale}: × 与 next 净距 = {gap}，应恰为 DISMISS_GAP*{scale} = {}",
                     limits::DISMISS_GAP * scale
                 );
-                // 视觉上三键也整体左移（btn_next 右缘同样让出整列）
+                // 写死真值：2*s（v1.5.2 是 8*s）
+                assert!(
+                    (gap - 2.0 * scale).abs() < 0.001,
+                    "{form:?}@{scale}: × 与 next 净距 = {gap}，应恰为 2*{scale}"
+                );
+                // 视觉上三键也整体右移（btn_next 右缘同样让出整列）
                 assert!(l.btn_next.right() < l.hit_dismiss.x);
             }
         }
@@ -987,10 +1012,10 @@ mod tests {
                     overlap_w <= 0.0 || overlap_h <= 0.0,
                     "{tag}: 底色与 hit_next 重叠 {overlap_w}×{overlap_h}"
                 );
-                // 3) 净距仍是 DISMISS_GAP（底色不占用那 8*s）
+                // 3) 净距仍是 DISMISS_GAP（底色不占用那 2*s，v1.5.3）
                 assert!(
-                    bg.x - l.hit_next.right() >= limits::DISMISS_GAP * scale - 0.001,
-                    "{tag}: 底色左缘与 next 净距 = {} < {}",
+                    (bg.x - l.hit_next.right() - limits::DISMISS_GAP * scale).abs() < 0.001,
+                    "{tag}: 底色左缘与 next 净距 = {}，应恰为 {}",
                     bg.x - l.hit_next.right(),
                     limits::DISMISS_GAP * scale
                 );
@@ -1017,14 +1042,14 @@ mod tests {
         }
     }
 
-    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+20*s）。
+    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+14*s）。
     #[test]
     fn fixed_width_matches_computed_width() {
         // 162（v1.4.4 固定件，含**左右两份** CONTENT_PAD 8+8）
         // − 8（右侧那份 pad 被 DISMISS_RIGHT_MARGIN 取代）
-        // + 4（右距）+ 16（命中）+ 8（净距）= 182
+        // + 4（右距）+ 16（命中）+ 2（净距，v1.5.3）= 176
         let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, 0.0);
-        assert!((l.fixed_width() - 182.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
+        assert!((l.fixed_width() - 176.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
         // 换算出每一项，把「三个常量一起漂移」的等价改动也拦住
         assert!(
             (l.fixed_width() - (162.0 - 8.0 + limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP))
@@ -1035,10 +1060,10 @@ mod tests {
             limits::DISMISS_HIT,
             limits::DISMISS_GAP
         );
-        // 字面量版本（不经过常量，锁死 182 这个数本身）
+        // 字面量版本（不经过常量，锁死 176 这个数本身）
         assert!(
-            (l.fixed_width() - (162.0 - 8.0 + 4.0 + 16.0 + 8.0)).abs() < 0.001,
-            "固定件必须 = 154 + 4 + 16 + 8 = 182"
+            (l.fixed_width() - (162.0 - 8.0 + 4.0 + 16.0 + 2.0)).abs() < 0.001,
+            "固定件必须 = 154 + 4 + 16 + 2 = 176"
         );
     }
 
@@ -1055,7 +1080,8 @@ mod tests {
     /// 1. `height == bar_thickness`（不变量，× 不许改变高度）；
     /// 2. × 命中区贴右边缘（`right = width − DISMISS_RIGHT_MARGIN`，v1.5.2）、
     ///    `y = 0`、边长 `16*s`；
-    /// 3. 与「下一首」命中区水平净距 ≥ `8*s`（用户明确要求的误触防线）；
+    /// 3. 与「下一首」命中区水平净距**恰为** `DISMISS_GAP*s`（v1.5.3 = 2*s，
+    ///    仍严格不相交）；
     /// 4. 与「进度条」命中区**不重叠**——进度条命中区是**整宽**，最容易被忽略；
     /// 5. 完全落在窗口内（`x ≥ 0`、`right ≤ width`、`bottom ≤ height`）。
     #[test]
@@ -1097,11 +1123,11 @@ mod tests {
                         l.hit_dismiss.h
                     );
 
-                    // 3) 与 next 的水平净距（误触防线）
+                    // 3) 与 next 的水平净距（误触防线；v1.5.3：恰为 2*s，不是 ≥）
                     let gap = l.hit_dismiss.x - l.hit_next.right();
                     assert!(
-                        gap >= limits::DISMISS_GAP * scale - 0.001,
-                        "{tag}: × 与 next 净距 = {gap} < {}",
+                        (gap - limits::DISMISS_GAP * scale).abs() < 0.001,
+                        "{tag}: × 与 next 净距 = {gap}，应恰为 {}",
                         limits::DISMISS_GAP * scale
                     );
 
@@ -1154,24 +1180,29 @@ mod tests {
     }
 
     /// **B6 组**：最小窗宽场景——`compute(Compact, 1.0, 48)`，无文本、宽度被
-    /// `WIDGET_MIN_W = 200` 钳住（固定件 182 + 信息区 0 被吃掉 18px）。
+    /// `WIDGET_MIN_W = 200` 钳住（固定件 176 + 信息区 0 被吃掉 24px）。
     ///
-    /// 这是 × 最可能出问题的角落：窗口只剩 200px，× 与 next 的净距**刚好等于**
-    /// 8（零余量）。任何一处微调（右边距/按钮宽/净距）都会先在这里破防，
+    /// 这是 × 最可能出问题的角落：窗口只剩 200px，净距压到 2 之后**余量极小**。
+    /// 任何一处微调（右边距/按钮宽/净距）都会先在这里破防，
     /// 所以必须把实际数值写进断言消息，失败时一眼能看出被谁挤掉了。
     ///
-    /// v1.5.2 的真值（width = 200 固定）：
+    /// v1.5.3 的真值（width = 200 固定）：
     /// - `hit_dismiss = (180, 0, 16, 16)`，`right = 196 = 200 − DISMISS_RIGHT_MARGIN 4`
-    /// - `btn_next.x = 144 = 200 − dismiss_col 28 − btn 28`，`hit_next.right() = 172`
-    /// - 净距 = 180 − 172 = **8**
-    /// - 字形右缘 = 196 − 4（居中余量）= 192 → 距窗口右缘 **8** = 左侧 CONTENT_PAD
+    ///   —— **与 v1.5.2 完全相同**：× 的位置一个字没动
+    /// - `btn_next.x = 150 = 200 − dismiss_col 22 − btn 28`（v1.5.2 是 144 → **右移 6px**）
+    /// - `hit_next.right() = 178`（v1.5.2 是 172）
+    /// - 净距 = 180 − 178 = **2**
+    /// - 字形右缘 = 196 − 4（居中余量）= 192 → 距窗口右缘 **8** = 左侧 CONTENT_PAD（不变）
+    ///
+    /// 这一段就是用户 v1.5.3 要的「右移」：窗口被下限钳住时宽度**不变**，
+    /// 三键整体右移 6px，吃掉原来信息区里那块空白（三键本身没被压缩）。
     #[test]
     fn dismiss_fits_in_minimum_width_window() {
         let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         assert_eq!(l.width, 200, "无文本时窗口宽度应被 WIDGET_MIN_W 钳住");
         assert!(
-            (l.fixed_width() - 182.0).abs() < 0.001,
-            "固定件 = {}，应为 182（v1.4.4 的 162 + 右距 4 + 16 命中 + 8 净距）",
+            (l.fixed_width() - 176.0).abs() < 0.001,
+            "固定件 = {}，应为 176（v1.4.4 的 162 + 右距 4 + 16 命中 + 2 净距）",
             l.fixed_width()
         );
 
@@ -1194,23 +1225,23 @@ mod tests {
         );
         assert!(l.hit_dismiss.x >= 0.0 && l.hit_dismiss.right() <= l.width as f32);
 
-        // 三键的真实落点（写死）：next.x = 144、命中区右缘 = 172
+        // 三键的真实落点（写死）：next.x = 150、命中区右缘 = 178
         assert!(
-            (l.btn_next.x - 144.0).abs() < 0.001,
-            "btn_next.x = {}，应为 144（200 − dismiss_col 28 − btn 28）",
+            (l.btn_next.x - 150.0).abs() < 0.001,
+            "btn_next.x = {}，应为 150（200 − dismiss_col 22 − btn 28）",
             l.btn_next.x
         );
         assert!(
-            (l.hit_next.right() - 172.0).abs() < 0.001,
-            "hit_next.right = {}，应为 172",
+            (l.hit_next.right() - 178.0).abs() < 0.001,
+            "hit_next.right = {}，应为 178",
             l.hit_next.right()
         );
 
-        // 零余量：净距恰好 8（不是 "≥8" 的宽松判定，锁死数值）
+        // 净距恰好 2（不是 "≥2" 的宽松判定，锁死数值）
         let gap = l.hit_dismiss.x - l.hit_next.right();
         assert!(
-            (gap - 8.0).abs() < 0.001,
-            "最小窗宽下 × 与 next 净距 = {gap}，应恰为 DISMISS_GAP = 8（next.right = {}）",
+            (gap - 2.0).abs() < 0.001,
+            "最小窗宽下 × 与 next 净距 = {gap}，应恰为 DISMISS_GAP = 2（next.right = {}）",
             l.hit_next.right()
         );
 
@@ -1226,6 +1257,23 @@ mod tests {
             "最小窗宽下「上一首」命中区被挤出左边界：x = {}",
             l.hit_prev.x
         );
+
+        // v1.5.3 的「右移」实证：v1.5.2 的 next.x = 144，现在 150（吃掉 6px 空白）
+        assert!(
+            (l.btn_next.x - (144.0 + 6.0)).abs() < 0.001,
+            "btn_next.x = {} 应为 v1.5.2 的 144 + 6",
+            l.btn_next.x
+        );
+        // 三键是**整体右移**，不是被压缩：尺寸 28、间距 6 一个字没动
+        assert!(
+            (l.btn_prev.w - 28.0).abs() < 0.001 && (l.btn_next.w - 28.0).abs() < 0.001,
+            "三键宽度必须仍是 28（右移而非压缩）"
+        );
+        assert!(
+            (l.btn_toggle.x - (l.btn_prev.right() + 6.0)).abs() < 0.001
+                && (l.btn_next.x - (l.btn_toggle.right() + 6.0)).abs() < 0.001,
+            "BTN_GAP 必须仍是 6"
+        );
     }
 
     /// **G1 组**：× 命中区 `16*s` **刻意低于** `HIT_MIN = 28*s` 这件事必须显式写死。
@@ -1233,7 +1281,7 @@ mod tests {
     /// 既有 `rects_do_not_overlap_and_hits_meet_minimum` 的 ≥HIT_MIN 循环里
     /// **没有** `hit_dismiss`（它是唯一不达标的命中区），如果不写这条断言，
     /// 这个例外就是「被悄悄跳过」而不是「被明确豁免」——后人把 × 加进循环、
-    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏 8px 净距与 +20px 宽度预算。
+    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏净距与 +14px 宽度预算。
     #[test]
     fn dismiss_hit_is_deliberately_smaller_than_hit_min() {
         assert!(
@@ -1283,23 +1331,39 @@ mod tests {
     // 一大批断言会照旧通过、而用户验收要的 8px 已经没了。
     // 下面这组把 v1.5.1 的**字面量真值**单独锁死。
 
-    /// **A 组**：v1.5.1 的 8 个 × 常量必须逐个等于需求表里的字面量。
+    /// **A 组**：× 的 8 个常量必须逐个等于**当前**需求表里的字面量。
     ///
-    /// 需求表（用户验收反馈「× 太大太显眼」）：
-    /// 字形 8 / 命中 16 / **净距 8（必须未变）** / 笔画 1.0 /
+    /// 需求表（v1.5.3，用户验收反馈「× 左侧的按键和内容可以右移」）：
+    /// 字形 8 / 命中 16 / **净距 2（本轮唯一改动的量）** / 笔画 1.0 /
     /// 字形不透明度 0xFF / 悬停底 0x14 / 按下底 0x22 / 圆角 4。
     ///
-    /// 这条是整组几何断言的「根」：先证明根没动，底下写死的 16/8/4 才有意义。
+    /// 这条是整组几何断言的「根」：先证明根没动，底下写死的 16/2/4 才有意义。
+    ///
+    /// 改名史：v1.5.1 `..._match_v151_spec`（净距 8）→ v1.5.3 `..._match_v153_spec`（净距 2）。
     #[test]
-    fn dismiss_constants_match_v151_spec() {
+    fn dismiss_constants_match_v153_spec() {
         let close = |a: f32, b: f32| (a - b).abs() < 0.001;
         assert!(close(limits::DISMISS_ICON, 8.0), "字形应为 8，实为 {}", limits::DISMISS_ICON);
         assert!(close(limits::DISMISS_HIT, 16.0), "命中区应为 16，实为 {}", limits::DISMISS_HIT);
-        // 本轮**唯一必须保持不变**的量：缩字号不许顺手缩误触防线
+        // 本轮唯一改动的量：净距 8 → 2（用户显式授权「只要按键之间不冲突即可」）
         assert!(
-            close(limits::DISMISS_GAP, 8.0),
-            "净距必须保持 8（不随字号缩），实为 {}",
+            close(limits::DISMISS_GAP, 2.0),
+            "净距应为 2（v1.5.2 是 8），实为 {}",
             limits::DISMISS_GAP
+        );
+        // 净距必须**严格为正**：0 就是热区相贴，误触防线彻底消失
+        assert!(
+            limits::DISMISS_GAP > 0.0,
+            "净距必须为正，实为 {}",
+            limits::DISMISS_GAP
+        );
+        // 三键与右距本轮一个都没动
+        assert!(close(limits::BTN_HIT, 28.0), "BTN_HIT 应为 28，实为 {}", limits::BTN_HIT);
+        assert!(close(limits::BTN_GAP, 6.0), "BTN_GAP 应为 6，实为 {}", limits::BTN_GAP);
+        assert!(
+            close(limits::DISMISS_RIGHT_MARGIN, 4.0),
+            "右边距应为 4（v1.5.2 的成果，本轮不动），实为 {}",
+            limits::DISMISS_RIGHT_MARGIN
         );
         assert!(close(limits::DISMISS_LINE, 1.0), "笔画应为 1.0，实为 {}", limits::DISMISS_LINE);
         assert_eq!(limits::DISMISS_ALPHA, 0xFF, "字形应为满不透明 0xFF");
@@ -1318,10 +1382,10 @@ mod tests {
     }
 
     /// **B 组（补）**：2 形态 × 4 缩放 × 4 方位下，命中 16*s / 字形 8*s /
-    /// 净距**恰为** 8*s —— 全部用字面量，不用常量推导。
+    /// 净距**恰为** 2*s —— 全部用字面量，不用常量推导。
     ///
-    /// 既有 `dismiss_geometry_invariants_matrix` 只用 `≥ 8*s` 判净距，且边长
-    /// 取自常量；这里把「恰好」与「字面量」两条都补上。净距用等号而不是 ≥：
+    /// 既有 `dismiss_geometry_invariants_matrix` 也已改成等号判净距，但边长仍取自
+    /// 常量；这里把「字面量」这一层补上。净距用等号而不是 ≥：
     /// 布局里 net gap 与按钮右缘是同一个减法，任何"多让一点"的改动都该被发现。
     #[test]
     fn dismiss_literal_geometry_matrix() {
@@ -1353,11 +1417,11 @@ mod tests {
                         l.dismiss.h
                     );
 
-                    // 净距**恰为** 8*s（不是 ≥）
+                    // 净距**恰为** 2*s（不是 ≥）
                     let gap = l.hit_dismiss.x - l.hit_next.right();
                     assert!(
-                        (gap - 8.0 * scale).abs() < 0.001,
-                        "{tag}: × 与 next 净距 = {gap}，应恰为 8*{scale}"
+                        (gap - 2.0 * scale).abs() < 0.001,
+                        "{tag}: × 与 next 净距 = {gap}，应恰为 2*{scale}"
                     );
 
                     // 字形四边余量各 4*s（字面量：(16 − 8) / 2）
@@ -1377,48 +1441,150 @@ mod tests {
         }
     }
 
-    /// **B 组（补）**：字形到「下一首」的实际空白 = 20*s。
+    /// **B 组（补）**：字形右缘到「下一首」命中区右缘的实际距离 = 14*s。
     ///
-    /// = 净距 8*s + 字形右余量 4*s + 命中区右半 8*s 的组合结果。
+    /// = 净距 2*s + 字形左余量 4*s + 字形宽 8*s 的组合结果。
     /// 单看三条断言各自都能被"两个量一起动"糊过去，合成一个数才是用户
-    /// 真正看到的那段空白。
+    /// 真正看到的那段空白（v1.5.2 这里是 20*s）。
+    ///
+    /// 改名史：v1.5.2 `..._is_twenty_px` → v1.5.3 `..._is_fourteen_px`。
     #[test]
-    fn dismiss_glyph_clearance_from_next_is_twenty_px() {
+    fn dismiss_glyph_clearance_from_next_is_fourteen_px() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
             let clearance = l.dismiss.right() - l.hit_next.right();
             assert!(
-                (clearance - 20.0 * scale).abs() < 0.001,
-                "scale={scale}: 字形右缘 ← → next 右缘 = {clearance}，应恰为 20*{scale}"
+                (clearance - 14.0 * scale).abs() < 0.001,
+                "scale={scale}: 字形右缘 − next 命中区右缘 = {clearance}，应恰为 14*{scale}"
             );
         }
     }
 
-    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +20*s**。
+    /// **v1.5.3 验收本质**：热区净距恰 `2*s`，且「下一首」到 × 的那段空白恰等于
+    /// `14*s` / `12*s`（两个口径都锁，见下）。
     ///
-    /// 既有 `dismiss_column_adds_20_logical_px_to_width` 只跑 1.0 / 1.25。
-    /// 这里把 1.5 / 2.0 也写成真值表；v1.4.4 的基线宽度 362/452/543/724 是
-    /// 字面量（= trunc(362*s)），所以「把右边距偷偷改回 CONTENT_PAD 8」（+24）
-    /// 会同时打破 `want` 与实测两条。
+    /// 用户这一轮的原话是「× 左侧的按键和内容可以右移，充分利用空白空间，
+    /// 只要按键之间不冲突即可」。这句话有两个判据，缺一不可：
     ///
-    /// v1.5.2 实测真值（= trunc((362 + 20*s) 的排版结果)）：
-    /// 382 / 477 / 573 / 764。
+    /// 1. **「不冲突」** = 两个命中区仍严格不相交 → `hit_dismiss.x −
+    ///    hit_next.right()` 恰为 `DISMISS_GAP*s`（本轮 2*s，v1.5.2 是 8*s）。
+    /// 2. **「那段空白变短了」** = 用户真正**看到**的缝，而不是热区之间的缝。
+    ///    热区比图形大，所以视觉缝有两个口径，两个都写死：
+    ///    * `dismiss.right() − hit_next.right() = 14*s`（v1.5.2 是 20*s）
+    ///      = 净距 2 + 字形左余量 4 + 字形宽 8 —— 「命中区边缘 → × 笔画右端」；
+    ///    * `dismiss.x − 图标右缘 = 12*s`（v1.5.2 是 18*s）
+    ///      = 图标在 28 热区内的右侧余量 6 + 净距 2 + 字形左余量 4
+    ///      —— **这才是「下一首」箭头到 × 笔画之间那条肉眼可见的白缝**。
+    ///
+    /// 只锁热区（判据 1）不够：把 `DISMISS_ICON` / `BTN_ICON` 一起缩小同样能让
+    /// 净距保持 2，视觉缝却会变宽 —— 而用户抱怨的正是视觉缝。
+    ///
+    /// 4 档 scale × 2 形态全跑：任何一处漏乘 `s`，或者谁把净距改回 8、
+    /// 把图标/字形尺寸挪一下，都会先在这里红。
     #[test]
-    fn dismiss_width_delta_is_20px_at_all_scales() {
+    fn dismiss_gap_is_two_and_glyph_gap_is_fourteen() {
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                let bar = (48.0 * scale).round() as i32;
+                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let tag = format!("{form:?}@{scale}");
+
+                // ① 「不冲突」：热区净距恰 2*s（绝不重叠，也绝不多让）
+                let hit_gap = l.hit_dismiss.x - l.hit_next.right();
+                assert!(
+                    (hit_gap - 2.0 * scale).abs() < 0.001,
+                    "{tag}: 热区净距 = {hit_gap}，应恰为 2*{scale}（v1.5.2 是 8*{scale}）"
+                );
+                assert!(
+                    hit_gap > 0.0,
+                    "{tag}: 热区净距 = {hit_gap}，必须严格为正（0 就是热区相贴）"
+                );
+                assert!(
+                    (hit_gap - limits::DISMISS_GAP * scale).abs() < 0.001,
+                    "{tag}: 热区净距 = {hit_gap}，常量 DISMISS_GAP 也必须仍是 {}",
+                    limits::DISMISS_GAP
+                );
+
+                // ② 视觉缝口径 A：命中区右缘 → × 笔画右端，恰 14*s（= 2 + 4 + 8）
+                let glyph_right_gap = l.dismiss.right() - l.hit_next.right();
+                assert!(
+                    (glyph_right_gap - 14.0 * scale).abs() < 0.001,
+                    "{tag}: × 笔画右端 − next 命中区右缘 = {glyph_right_gap}，应恰为 14*{scale}"
+                );
+
+                // ② 视觉缝口径 B：**「下一首」图标右缘 → × 笔画左缘**，恰 12*s
+                //    （= 图标右侧余量 6 + 净距 2 + 字形左余量 4）
+                //    图标与字形都是「在各自热区里居中」，所以这两个余量必须由
+                //    BTN_HIT/BTN_ICON、DISMISS_HIT/DISMISS_ICON 直接推出来，
+                //    这里按 painter 的真实画法（`rect.center()` 居中）算。
+                let next_icon_right =
+                    l.btn_next.center().0 + limits::BTN_ICON * 0.5 * scale;
+                assert!(
+                    (next_icon_right - (l.btn_next.x + (limits::BTN_HIT - limits::BTN_ICON)
+                        * 0.5 * scale
+                        + limits::BTN_ICON * scale))
+                        .abs()
+                        < 0.001,
+                    "{tag}: 图标右缘推算自相矛盾"
+                );
+                let ink_gap = l.dismiss.x - next_icon_right;
+                assert!(
+                    (ink_gap - 12.0 * scale).abs() < 0.001,
+                    "{tag}: 「下一首」图标右缘 → × 笔画左缘 = {ink_gap}，应恰为 12*{scale}（= 6+2+4）；\
+                     v1.5.2 是 18*{scale}（= 6+8+4）"
+                );
+
+                // 两个视觉口径必须自洽：14*s − 12*s = 字形宽 8*s − 图标右侧余量 6*s + ...
+                // 直接用差值与元素尺寸对账（漏乘 s 或改尺寸会立刻对不上）
+                assert!(
+                    ((glyph_right_gap - ink_gap) - (limits::DISMISS_ICON * scale
+                        - (limits::BTN_HIT - limits::BTN_ICON) * 0.5 * scale))
+                        .abs()
+                        < 0.001,
+                    "{tag}: 14*s 与 12*s 两个口径对不上（差值 {}）",
+                    glyph_right_gap - ink_gap
+                );
+
+                // 三键与前序版本对齐：是三键右移，不是 × 右移
+                assert!(
+                    (l.dismiss.w - limits::DISMISS_ICON * scale).abs() < 0.001
+                        && (l.dismiss.w - 8.0 * scale).abs() < 0.001,
+                    "{tag}: × 字形必须仍是 8*{scale}"
+                );
+            }
+        }
+    }
+
+    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +14*s**。
+    ///
+    /// v1.4.4 的基线宽度 362/452/543/724 是字面量（= trunc(362*s) 的排版结果），
+    /// 所以「把净距偷偷改回 8」（+20）或「把右边距改回 CONTENT_PAD 8」（+24）
+    /// 都会同时打破 `want` 与实测两条。
+    ///
+    /// v1.5.3 实测真值（= trunc(fixed 176*s + info 200*s)）：
+    /// 376 / 470 / 564 / 752。
+    ///
+    /// 公式那条用 ±0.51 而不是 `assert_eq!`：`compute_full` 最后一步是
+    /// `(fixed + info_w) as i32` **截断**，而 v1.4.4 的基线 452 本身是 452.5
+    /// 截断来的，于是 scale=1.25 时 `452 + 17.5 = 469.5` 与实测 470 差 0.5。
+    /// 这不是放宽——精确真值由下面的 `assert_eq!` 字面量表锁死。
+    ///
+    /// 改名史：v1.5.2 `..._is_20px_at_all_scales` → v1.5.3 `..._is_14px_at_all_scales`。
+    #[test]
+    fn dismiss_width_delta_is_14px_at_all_scales() {
         for (scale, width_v144, width_now) in [
-            (1.0f32, 362.0f32, 382.0f32),
-            (1.25, 452.0, 477.0),
-            (1.5, 543.0, 573.0),
-            (2.0, 724.0, 764.0),
+            (1.0f32, 362.0f32, 376.0f32),
+            (1.25, 452.0, 470.0),
+            (1.5, 543.0, 564.0),
+            (2.0, 724.0, 752.0),
         ] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 20.0 * scale;
-            // 等号（不是 ±0.51 区间）：四个基线都是整数，+20*s 后仍是整数
-            assert_eq!(
-                l.width as f32, want,
-                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 20*{scale} = {want}",
+            let want = width_v144 + 14.0 * scale;
+            assert!(
+                (l.width as f32 - want).abs() < 0.51,
+                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 14*{scale} = {want}",
                 l.width
             );
             // 字面量真值表（不依赖上面那条公式的推导顺序）
@@ -1427,10 +1593,10 @@ mod tests {
                 "scale={scale}: width = {}，应为写死的 {width_now}",
                 l.width
             );
-            // fixed_width 同源：固定件 = 162*s + 20*s
+            // fixed_width 同源：固定件 = 162*s + 14*s = 176*s
             assert!(
-                (l.fixed_width() - (162.0 + 20.0) * scale).abs() < 0.001,
-                "scale={scale}: fixed_width = {}，应为 182*{scale}",
+                (l.fixed_width() - (162.0 + 14.0) * scale).abs() < 0.001,
+                "scale={scale}: fixed_width = {}，应为 176*{scale}",
                 l.fixed_width()
             );
         }
@@ -1501,7 +1667,7 @@ mod tests {
     /// 这正是我们要的：视觉层的自由度必须显式宣告，不能悄悄发生。
     ///
     /// 顺带在 2 形态 × 4 缩放 × 4 方位上验：
-    /// 底色非空、不出窗口、与 `hit_next` 净距**恰为** 8*s。
+    /// 底色非空、不出窗口、与 `hit_next` 净距**恰为** `DISMISS_GAP*s`（v1.5.3 = 2*s）。
     #[test]
     fn dismiss_bg_rect_equals_hit_dismiss_matrix() {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
@@ -1538,10 +1704,16 @@ mod tests {
                     // 2) 非空（painter 里 `is_empty()` 守卫的反面前提）
                     assert!(!bg.is_empty(), "{tag}: 底色不得为空矩形（否则悬停无反馈）");
 
-                    // 3) 与 next 净距恰为 8*s + 不出窗口
+                    // 3) 与 next 净距恰为 DISMISS_GAP*s（v1.5.3 = 2*s）+ 不出窗口
                     assert!(
-                        (bg.x - l.hit_next.right() - 8.0 * scale).abs() < 0.001,
-                        "{tag}: 底色左缘与 next 净距 = {}，应恰为 8*{scale}",
+                        (bg.x - l.hit_next.right() - limits::DISMISS_GAP * scale).abs() < 0.001,
+                        "{tag}: 底色左缘与 next 净距 = {}，应恰为 {}",
+                        bg.x - l.hit_next.right(),
+                        limits::DISMISS_GAP * scale
+                    );
+                    assert!(
+                        (bg.x - l.hit_next.right() - 2.0 * scale).abs() < 0.001,
+                        "{tag}: 底色左缘与 next 净距 = {}，应恰为写死的 2*{scale}",
                         bg.x - l.hit_next.right()
                     );
                     assert!(
