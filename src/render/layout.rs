@@ -226,18 +226,19 @@ impl WidgetLayout {
 
     /// 内容自然宽度（不含宽度钳位，含歌词最小宽），用于日志与调试。
     ///
-    /// v1.5.1：右上角常驻的 ×（命中 16 + 净距 8）让固定件宽度 +24
-    /// （v1.5.0 是 24 + 8 = +32）。
+    /// v1.5.2：左侧仍只有一份 `CONTENT_PAD`（右边距改由
+    /// [`limits::DISMISS_RIGHT_MARGIN`] 承担），× 那一列 = 右边距 4 + 命中 16 +
+    /// 净距 8 = 28，故固定件从 v1.5.1 的 186 收到 182（= v1.4.4 的 162 + 20）。
     /// 这里必须与 [`compute_full`] 的 `fixed` 严格同源，否则日志里的调试宽度会
-    /// 比真实窗口窄 24px。
+    /// 与真实窗口对不上。
     pub fn fixed_width(&self) -> f32 {
         let s = self.effective_scale();
-        limits::CONTENT_PAD * s * 2.0
+        limits::CONTENT_PAD * s
             + limits::COVER_SIDE * s
             + limits::COVER_TEXT_GAP * s
             + limits::TEXT_BTN_GAP * s
             + (limits::BTN_HIT * 3.0 + limits::BTN_GAP * 2.0) * s
-            + (limits::DISMISS_HIT + limits::DISMISS_GAP) * s
+            + (limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP) * s
             + self.form.lyric_w() * s
     }
 
@@ -324,14 +325,18 @@ pub fn compute_full(
         .round()
         .clamp(0.0, (limits::WIDGET_MAX_W * s).round());
 
-    // 总宽 = 固定件(边距+封面+间距+三键+关闭×) + 信息区宽，整体下限 200*s
+    // 总宽 = 固定件(左边距+封面+间距+三键+关闭×列) + 信息区宽，整体下限 200*s
     //
     // v1.5.0（G3）：右上角常驻 × 独占「右边缘的固定列」——命中 24 + 净距 8 = 32*s，
     // 播放三键因此整体左移，窗口总宽相应 +32*s（信息区宽度不变，用户看到的是
     // 「三键左移、右侧多出一个 ×」而不是「文字被挤窄」）。
     // v1.5.1：命中区 24 → 16，这列缩到 16 + 8 = 24*s，窗口总宽增量随之变成 +24*s。
-    let dismiss_col = (limits::DISMISS_HIT + limits::DISMISS_GAP) * s;
-    let fixed = pad * 2.0 + cover_side + gap_ct + gap_tb + btn_group + dismiss_col;
+    // v1.5.2（用户反馈「右侧留空太多」）：右边距不再复用 `CONTENT_PAD`，
+    // 改由 `DISMISS_RIGHT_MARGIN = 4` 承担 —— 4 + 字形居中余量 4 = 字形右缘
+    // 距窗口右缘 8px，与左侧 `CONTENT_PAD` 完全对称。这列因此 = 4 + 16 + 8 = 28*s，
+    // 固定件从 186 收到 182（`pad` 只加一次，就是左边距），窗口窄 4px。
+    let dismiss_col = (limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP) * s;
+    let fixed = pad + cover_side + gap_ct + gap_tb + btn_group + dismiss_col;
     let width = (((fixed + info_w) as i32).max((limits::WIDGET_MIN_W * s).round() as i32)).max(1);
 
     // v1.1：高度恒为任务栏条带厚度，主行与客户区完全重合。
@@ -347,9 +352,9 @@ pub fn compute_full(
     // 封面 32×32（×scale），在主行内垂直居中
     let cover = RectF::new(pad, ((mh - cover_side) * 0.5).max(0.0), cover_side, cover_side);
 
-    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（命中 16 + 净距 8）
+    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（右边距 4 + 命中 16 + 净距 8）
     let btn_y = ((mh - btn) * 0.5).max(0.0);
-    let btn_next = RectF::new(w - pad - dismiss_col - btn, btn_y, btn, btn);
+    let btn_next = RectF::new(w - dismiss_col - btn, btn_y, btn, btn);
     let btn_toggle = RectF::new(btn_next.x - bgap - btn, btn_y, btn, btn);
     let btn_prev = RectF::new(btn_toggle.x - bgap - btn, btn_y, btn, btn);
 
@@ -412,12 +417,20 @@ pub fn compute_full(
         .min((main_bottom - 2.0).max(0.0));
     let hit_progress = RectF::new(0.0, prog_hit_top, w, (main_bottom - prog_hit_top).max(2.0));
 
-    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8）----
-    // 命中区贴右上角：右缘 = 客户区右缘 − pad，y 从 0 开始（纵向占满 DISMISS_HIT*s）。
+    // ---- 右上角关闭 ×（v1.5.0 / G3；v1.5.1 缩到 16/8；v1.5.2 右边距收到 4）----
+    // 命中区贴右上角：右缘 = 客户区右缘 − DISMISS_RIGHT_MARGIN，y 从 0 开始
+    // （纵向占满 DISMISS_HIT*s）。右缘距窗口只有 4（而不是 CONTENT_PAD 的 8），
+    // 加上字形在热区内的 4px 居中余量，字形右缘正好落在「窗口右缘 − 8」，
+    // 与左侧 CONTENT_PAD 对称 —— 这是 v1.5.2 的验收本质。
     // 纵向不居中是有意的——「右上角」是用户对位置的描述，贴角比居中更像常驻角标，
     // 而且条带高度（48@100%）远大于 16，居中/贴角的点击差异可以忽略。
     let dismiss_hit = limits::DISMISS_HIT * s;
-    let hit_dismiss = RectF::new(w - pad - dismiss_hit, 0.0, dismiss_hit, dismiss_hit);
+    let hit_dismiss = RectF::new(
+        w - limits::DISMISS_RIGHT_MARGIN * s - dismiss_hit,
+        0.0,
+        dismiss_hit,
+        dismiss_hit,
+    );
     // 字形在命中区内**居中**：8 字形 / 16 命中 → 每边 4px 余量（v1.5.1）。
     let icon = limits::DISMISS_ICON * s;
     let dismiss = RectF::new(
@@ -486,18 +499,18 @@ mod tests {
 
     #[test]
     fn lyric_form_widens_info_area_to_min_160() {
-        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 186 + 信息区 160 = 346
-        // （固定件 186 = v1.4.4 的 162 + 24：v1.5.1 的 × 命中 16 + 净距 8）
+        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 182 + 信息区 160 = 342
+        // （固定件 182 = v1.4.4 的 162 + 20：v1.5.2 的 ×「右距 4 + 命中 16 + 净距 8」）
         let off = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         let on = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
         assert_eq!(off.width, 200);
-        assert_eq!(on.width, 346);
-        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 186 + 200 = 386；
-        // 文本自然宽顶到信息区上限 340：宽 = 186 + 340 = 526
+        assert_eq!(on.width, 342);
+        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 182 + 200 = 382；
+        // 文本自然宽顶到信息区上限 340：宽 = 182 + 340 = 522
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0);
-        assert_eq!(mid.width, 186 + 200);
+        assert_eq!(mid.width, 182 + 200);
         let wide = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(wide.width, 186 + 340);
+        assert_eq!(wide.width, 182 + 340);
     }
 
     #[test]
@@ -533,13 +546,13 @@ mod tests {
         assert_eq!(TaskbarEdge::from_appbar_edge(99), TaskbarEdge::Bottom);
     }
 
-    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 186+340）。
+    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 182+340）。
     #[test]
     fn width_clamps_between_min_and_max() {
         let short = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0);
         assert_eq!(short.width, 200);
         let long = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(long.width, 186 + 340);
+        assert_eq!(long.width, 182 + 340);
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0);
         assert!(mid.width > 200 && mid.width < 340, "mid.width = {}", mid.width);
     }
@@ -610,11 +623,14 @@ mod tests {
                 assert!(l.hit_next.right() <= l.width as f32 + 0.01);
                 assert!(l.hit_progress.bottom() <= l.main_row.bottom() + 0.01);
 
-                // v1.5.0（G3）：× 命中区贴右上角，且与 next 命中区留 DISMISS_GAP 净距
+                // v1.5.0（G3）：× 命中区贴右上角（v1.5.2 起距右缘只有
+                // DISMISS_RIGHT_MARGIN），且与 next 命中区留 DISMISS_GAP 净距
                 assert!(
-                    (l.hit_dismiss.right() - (l.width as f32 - limits::CONTENT_PAD * scale)).abs()
+                    (l.hit_dismiss.right()
+                        - (l.width as f32 - limits::DISMISS_RIGHT_MARGIN * scale))
+                        .abs()
                         < 0.01,
-                    "{form:?}@{scale} hit_dismiss.right = {} 应贴 pad 内侧",
+                    "{form:?}@{scale} hit_dismiss.right = {} 应距右缘 DISMISS_RIGHT_MARGIN",
                     l.hit_dismiss.right()
                 );
                 assert!(
@@ -630,7 +646,7 @@ mod tests {
                 //   - 命中区恰为 16*s（不是"差不多"）；
                 //   - 低于 HIT_MIN 的理由写在 `limits::DISMISS_HIT` 的注释里
                 //     （× 独占右上角、与 next 有 8*s 净距，误触靠"不相邻"而不是放大热区；
-                //     放大反而更容易压到 next 并吃掉 +24*s 的宽度预算）。
+                //     放大反而更容易压到 next 并吃掉 +20*s 的宽度预算）。
                 assert!(
                     (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001
                         && (l.hit_dismiss.h - limits::DISMISS_HIT * scale).abs() < 0.001,
@@ -807,43 +823,47 @@ mod tests {
 
     // ------------------------------------------------- v1.5.0（G3）右上角关闭 ×
     // v1.5.1：字形 16 → 8、命中 24 → 16、笔画 1.6 → 1.0（用户反馈「× 太大」），
-    // 净距 DISMISS_GAP 保持 8。下面所有断言仍**写死真值**，不放宽成区间。
+    // 净距 DISMISS_GAP 保持 8。
+    // v1.5.2：右边距从 CONTENT_PAD(8) 收到 DISMISS_RIGHT_MARGIN(4)，让字形右缘
+    // 距窗口右缘 = 8（= 左侧 CONTENT_PAD），宽度增量因此从 +24 变成 +20。
+    // 下面所有断言仍**写死真值**，不放宽成区间。
 
-    /// 宽度：× 的「16 命中 + 8 净距」让窗口**必须**比 v1.4.4 宽 24*s。
+    /// 宽度：× 的「右距 4 + 命中 16 + 净距 8」让窗口**必须**比 v1.4.4 宽 20*s。
     ///
     /// 这里把 v1.4.4 的绝对宽度（362 / 452）**写死**而不是从公式推——这样任何人
-    /// 想「优化掉」那 24px（例如偷偷把 × 叠到 next 上、或把净距 8 吃掉）都会
+    /// 想「优化掉」那 20px（例如偷偷把 × 叠到 next 上、或把净距 8 吃掉）都会
     /// 立刻被这条断言拦住。
     ///
-    /// v1.5.1 改名：`..._adds_32_...` → `..._adds_24_...`（24 命中 + 8 净距 → 16 + 8）。
+    /// 改名史：v1.5.0 `..._adds_32_...` → v1.5.1 `..._adds_24_...` → v1.5.2 `..._adds_20_...`。
     #[test]
-    fn dismiss_column_adds_24_logical_px_to_width() {
+    fn dismiss_column_adds_20_logical_px_to_width() {
         for (scale, width_v144) in [(1.0f32, 362.0f32), (1.25, 452.0)] {
             let bar = (48.0 * scale) as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 24.0 * scale;
+            let want = width_v144 + 20.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
-                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 24*{scale} = {want}",
+                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 20*{scale} = {want}",
                 l.width
             );
         }
     }
 
-    /// × 的命中区：贴右上角（right = w − pad、y = 0），边长 16*s。
+    /// × 的命中区：贴右上角（right = w − DISMISS_RIGHT_MARGIN、y = 0），边长 16*s。
     #[test]
     fn dismiss_hit_sits_in_top_right_corner() {
         for scale in [1.0f32, 1.25, 1.5] {
             let bar = (48.0 * scale) as i32;
             let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
-            let pad = limits::CONTENT_PAD * scale;
+            let margin = limits::DISMISS_RIGHT_MARGIN * scale;
             let side = limits::DISMISS_HIT * scale;
             assert!((side - 16.0 * scale).abs() < 0.001, "DISMISS_HIT 应已缩到 16");
-            assert!((l.hit_dismiss.right() - (l.width as f32 - pad)).abs() < 0.001);
+            assert!((margin - 4.0 * scale).abs() < 0.001, "DISMISS_RIGHT_MARGIN 应为 4");
+            assert!((l.hit_dismiss.right() - (l.width as f32 - margin)).abs() < 0.001);
             assert!(l.hit_dismiss.y.abs() < 0.001, "× 必须从客户区顶部开始");
             assert!((l.hit_dismiss.w - side).abs() < 0.001, "hit.w = {}", l.hit_dismiss.w);
             assert!((l.hit_dismiss.h - side).abs() < 0.001, "hit.h = {}", l.hit_dismiss.h);
-            assert!((l.hit_dismiss.x - (l.width as f32 - pad - side)).abs() < 0.001);
+            assert!((l.hit_dismiss.x - (l.width as f32 - margin - side)).abs() < 0.001);
         }
     }
 
@@ -997,16 +1017,28 @@ mod tests {
         }
     }
 
-    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+24*s）。
+    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+20*s）。
     #[test]
     fn fixed_width_matches_computed_width() {
-        // 162（v1.4.4 固定件）+ 24（16 命中 + 8 净距）= 186
+        // 162（v1.4.4 固定件，含**左右两份** CONTENT_PAD 8+8）
+        // − 8（右侧那份 pad 被 DISMISS_RIGHT_MARGIN 取代）
+        // + 4（右距）+ 16（命中）+ 8（净距）= 182
         let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, 0.0);
-        assert!((l.fixed_width() - 186.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
-        // 换算出 16 + 8，把「两个常量一起缩成 12+12 之类」的等价改动也拦住
+        assert!((l.fixed_width() - 182.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
+        // 换算出每一项，把「三个常量一起漂移」的等价改动也拦住
         assert!(
-            (l.fixed_width() - (162.0 + 16.0 + 8.0)).abs() < 0.001,
-            "固定件必须 = 162 + DISMISS_HIT 16 + DISMISS_GAP 8"
+            (l.fixed_width() - (162.0 - 8.0 + limits::DISMISS_RIGHT_MARGIN + limits::DISMISS_HIT + limits::DISMISS_GAP))
+                .abs()
+                < 0.001,
+            "固定件必须 = 162 − 右侧 pad 8 + 右距 {} + 命中 {} + 净距 {}",
+            limits::DISMISS_RIGHT_MARGIN,
+            limits::DISMISS_HIT,
+            limits::DISMISS_GAP
+        );
+        // 字面量版本（不经过常量，锁死 182 这个数本身）
+        assert!(
+            (l.fixed_width() - (162.0 - 8.0 + 4.0 + 16.0 + 8.0)).abs() < 0.001,
+            "固定件必须 = 154 + 4 + 16 + 8 = 182"
         );
     }
 
@@ -1021,7 +1053,8 @@ mod tests {
     ///
     /// 五条断言对应最容易回归的五件事：
     /// 1. `height == bar_thickness`（不变量，× 不许改变高度）；
-    /// 2. × 命中区贴右边缘（`right = width − pad`）、`y = 0`、边长 `16*s`（v1.5.1）；
+    /// 2. × 命中区贴右边缘（`right = width − DISMISS_RIGHT_MARGIN`，v1.5.2）、
+    ///    `y = 0`、边长 `16*s`；
     /// 3. 与「下一首」命中区水平净距 ≥ `8*s`（用户明确要求的误触防线）；
     /// 4. 与「进度条」命中区**不重叠**——进度条命中区是**整宽**，最容易被忽略；
     /// 5. 完全落在窗口内（`x ≥ 0`、`right ≤ width`、`bottom ≤ height`）。
@@ -1037,19 +1070,19 @@ mod tests {
                 ] {
                     let bar = (48.0 * scale).round() as i32;
                     let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
-                    let pad = limits::CONTENT_PAD * scale;
+                    let margin = limits::DISMISS_RIGHT_MARGIN * scale;
                     let side = limits::DISMISS_HIT * scale;
                     let tag = format!("{form:?}/{scale}/{edge:?}");
 
                     // 1) 高度不变量
                     assert_eq!(l.height, bar, "{tag}: 高度必须恒等于条带厚度");
 
-                    // 2) 贴右上角 + 边长
+                    // 2) 贴右上角 + 边长（v1.5.2：距右缘 DISMISS_RIGHT_MARGIN，不是 CONTENT_PAD）
                     assert!(
-                        (l.hit_dismiss.right() - (l.width as f32 - pad)).abs() < 0.001,
-                        "{tag}: hit_dismiss.right = {} 应贴 pad 内侧（{}）",
+                        (l.hit_dismiss.right() - (l.width as f32 - margin)).abs() < 0.001,
+                        "{tag}: hit_dismiss.right = {} 应距右缘 DISMISS_RIGHT_MARGIN 内侧（{}）",
                         l.hit_dismiss.right(),
-                        l.width as f32 - pad
+                        l.width as f32 - margin
                     );
                     assert!(
                         l.hit_dismiss.y.abs() < 0.001,
@@ -1121,35 +1154,36 @@ mod tests {
     }
 
     /// **B6 组**：最小窗宽场景——`compute(Compact, 1.0, 48)`，无文本、宽度被
-    /// `WIDGET_MIN_W = 200` 钳住（固定件 186 + 信息区 0 被吃掉 14px）。
+    /// `WIDGET_MIN_W = 200` 钳住（固定件 182 + 信息区 0 被吃掉 18px）。
     ///
     /// 这是 × 最可能出问题的角落：窗口只剩 200px，× 与 next 的净距**刚好等于**
-    /// 8（零余量）。任何一处微调（pad/按钮宽/净距）都会先在这里破防，
+    /// 8（零余量）。任何一处微调（右边距/按钮宽/净距）都会先在这里破防，
     /// 所以必须把实际数值写进断言消息，失败时一眼能看出被谁挤掉了。
     ///
-    /// v1.5.1 的真值（width = 200 固定）：
-    /// - `hit_dismiss = (176, 0, 16, 16)`，`right = 192 = 200 − pad 8`
-    /// - `btn_next.x = 140 = 200 − pad 8 − dismiss_col 24 − btn 28`，`hit_next.right() = 168`
-    /// - 净距 = 176 − 168 = **8**
+    /// v1.5.2 的真值（width = 200 固定）：
+    /// - `hit_dismiss = (180, 0, 16, 16)`，`right = 196 = 200 − DISMISS_RIGHT_MARGIN 4`
+    /// - `btn_next.x = 144 = 200 − dismiss_col 28 − btn 28`，`hit_next.right() = 172`
+    /// - 净距 = 180 − 172 = **8**
+    /// - 字形右缘 = 196 − 4（居中余量）= 192 → 距窗口右缘 **8** = 左侧 CONTENT_PAD
     #[test]
     fn dismiss_fits_in_minimum_width_window() {
         let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         assert_eq!(l.width, 200, "无文本时窗口宽度应被 WIDGET_MIN_W 钳住");
         assert!(
-            (l.fixed_width() - 186.0).abs() < 0.001,
-            "固定件 = {}，应为 186（v1.4.4 的 162 + 16 命中 + 8 净距）",
+            (l.fixed_width() - 182.0).abs() < 0.001,
+            "固定件 = {}，应为 182（v1.4.4 的 162 + 右距 4 + 16 命中 + 8 净距）",
             l.fixed_width()
         );
 
-        // 实际数值：hit_dismiss = (176, 0, 16, 16)
+        // 实际数值：hit_dismiss = (180, 0, 16, 16)
         assert!(
-            (l.hit_dismiss.x - 176.0).abs() < 0.001,
-            "hit_dismiss.x = {}，应为 176（200 − pad 8 − 16）",
+            (l.hit_dismiss.x - 180.0).abs() < 0.001,
+            "hit_dismiss.x = {}，应为 180（200 − 右距 4 − 16）",
             l.hit_dismiss.x
         );
         assert!(
-            (l.hit_dismiss.right() - 192.0).abs() < 0.001,
-            "hit_dismiss.right = {}，应为 192（200 − pad 8）",
+            (l.hit_dismiss.right() - 196.0).abs() < 0.001,
+            "hit_dismiss.right = {}，应为 196（200 − 右距 4）",
             l.hit_dismiss.right()
         );
         assert!(
@@ -1160,15 +1194,15 @@ mod tests {
         );
         assert!(l.hit_dismiss.x >= 0.0 && l.hit_dismiss.right() <= l.width as f32);
 
-        // 三键的真实落点（写死）：next.x = 140、命中区右缘 = 168
+        // 三键的真实落点（写死）：next.x = 144、命中区右缘 = 172
         assert!(
-            (l.btn_next.x - 140.0).abs() < 0.001,
-            "btn_next.x = {}，应为 140（200 − pad 8 − dismiss_col 24 − btn 28）",
+            (l.btn_next.x - 144.0).abs() < 0.001,
+            "btn_next.x = {}，应为 144（200 − dismiss_col 28 − btn 28）",
             l.btn_next.x
         );
         assert!(
-            (l.hit_next.right() - 168.0).abs() < 0.001,
-            "hit_next.right = {}，应为 168",
+            (l.hit_next.right() - 172.0).abs() < 0.001,
+            "hit_next.right = {}，应为 172",
             l.hit_next.right()
         );
 
@@ -1199,7 +1233,7 @@ mod tests {
     /// 既有 `rects_do_not_overlap_and_hits_meet_minimum` 的 ≥HIT_MIN 循环里
     /// **没有** `hit_dismiss`（它是唯一不达标的命中区），如果不写这条断言，
     /// 这个例外就是「被悄悄跳过」而不是「被明确豁免」——后人把 × 加进循环、
-    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏 8px 净距与 +24px 宽度预算。
+    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏 8px 净距与 +20px 宽度预算。
     #[test]
     fn dismiss_hit_is_deliberately_smaller_than_hit_min() {
         assert!(
@@ -1361,35 +1395,101 @@ mod tests {
         }
     }
 
-    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +24*s**。
+    /// **B 组（补）**：窗口宽度增量在 4 档缩放下都**恰为 +20*s**。
     ///
-    /// 既有 `dismiss_column_adds_24_logical_px_to_width` 只跑 1.0 / 1.25。
+    /// 既有 `dismiss_column_adds_20_logical_px_to_width` 只跑 1.0 / 1.25。
     /// 这里把 1.5 / 2.0 也写成真值表；v1.4.4 的基线宽度 362/452/543/724 是
-    /// 字面量（= trunc(362*s)），所以「把命中区偷偷改回 24」会同时打破
-    /// `want` 与实测两条。
+    /// 字面量（= trunc(362*s)），所以「把右边距偷偷改回 CONTENT_PAD 8」（+24）
+    /// 会同时打破 `want` 与实测两条。
+    ///
+    /// v1.5.2 实测真值（= trunc((362 + 20*s) 的排版结果)）：
+    /// 382 / 477 / 573 / 764。
     #[test]
-    fn dismiss_width_delta_is_24px_at_all_scales() {
-        for (scale, width_v144) in [
-            (1.0f32, 362.0f32),
-            (1.25, 452.0),
-            (1.5, 543.0),
-            (2.0, 724.0),
+    fn dismiss_width_delta_is_20px_at_all_scales() {
+        for (scale, width_v144, width_now) in [
+            (1.0f32, 362.0f32, 382.0f32),
+            (1.25, 452.0, 477.0),
+            (1.5, 543.0, 573.0),
+            (2.0, 724.0, 764.0),
         ] {
             let bar = (48.0 * scale).round() as i32;
             let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
-            let want = width_v144 + 24.0 * scale;
-            // 等号（不是 ±0.51 区间）：四个基线都是整数，+24*s 后仍是整数
+            let want = width_v144 + 20.0 * scale;
+            // 等号（不是 ±0.51 区间）：四个基线都是整数，+20*s 后仍是整数
             assert_eq!(
                 l.width as f32, want,
-                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 24*{scale} = {want}",
+                "scale={scale}: width = {}，应为 v1.4.4 的 {width_v144} + 20*{scale} = {want}",
                 l.width
             );
-            // fixed_width 同源：固定件 = 162*s + 24*s
+            // 字面量真值表（不依赖上面那条公式的推导顺序）
+            assert_eq!(
+                l.width as f32, width_now,
+                "scale={scale}: width = {}，应为写死的 {width_now}",
+                l.width
+            );
+            // fixed_width 同源：固定件 = 162*s + 20*s
             assert!(
-                (l.fixed_width() - (162.0 + 24.0) * scale).abs() < 0.001,
-                "scale={scale}: fixed_width = {}，应为 186*{scale}",
+                (l.fixed_width() - (162.0 + 20.0) * scale).abs() < 0.001,
+                "scale={scale}: fixed_width = {}，应为 182*{scale}",
                 l.fixed_width()
             );
+        }
+    }
+
+    /// **v1.5.2 验收本质**：字形右缘到窗口右缘的空白 == 左侧 `CONTENT_PAD`。
+    ///
+    /// 用户反馈的原话是「右侧空间留多了」——判据不是「右边距等于某个数」，
+    /// 而是**左右对称**。所以这条断言用「左边距」（封面左缘 = `CONTENT_PAD*s`）
+    /// 直接与「字形右缘到右边界」比较，并额外写死 8*s 的字面量：
+    /// v1.5.1 这里是 12（右边距 8 + 字形居中余量 4），v1.5.2 收到 8。
+    ///
+    /// 4 档 scale × 2 形态全跑：任何一处漏乘 s、或者谁把右边距改回 `CONTENT_PAD`
+    /// 而没同步收窄，都会先在这里红。
+    #[test]
+    fn dismiss_glyph_right_edge_is_symmetric_with_left_pad() {
+        // 常量层：右边距必须是 4（4 + 字形居中余量 4 = 8 = CONTENT_PAD）
+        assert!(
+            (limits::DISMISS_RIGHT_MARGIN - 4.0).abs() < 0.001,
+            "DISMISS_RIGHT_MARGIN 应为 4，实为 {}",
+            limits::DISMISS_RIGHT_MARGIN
+        );
+        assert!(
+            (limits::DISMISS_RIGHT_MARGIN + (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5
+                - limits::CONTENT_PAD)
+                .abs()
+                < 0.001,
+            "右边距 + 字形居中余量 必须恰等于 CONTENT_PAD"
+        );
+
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                let bar = (48.0 * scale).round() as i32;
+                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let tag = format!("{form:?}@{scale}");
+
+                // 右侧：字形右缘 → 窗口右缘
+                let glyph_right_gap = l.width as f32 - l.dismiss.right();
+                // 左侧：封面左缘 = CONTENT_PAD*s（同一份 pad）
+                let left_gap = l.cover.x;
+
+                assert!(
+                    (left_gap - limits::CONTENT_PAD * scale).abs() < 0.001,
+                    "{tag}: 左边距 = {left_gap}，应恰为 CONTENT_PAD*{scale}"
+                );
+                assert!(
+                    (glyph_right_gap - left_gap).abs() < 0.001,
+                    "{tag}: 左右不对称 —— 字形右缘距窗口 {glyph_right_gap}，左边距 {left_gap}"
+                );
+                // 写死真值：两侧都恰为 8*s（v1.5.1 右侧是 12*s）
+                assert!(
+                    (glyph_right_gap - 8.0 * scale).abs() < 0.001,
+                    "{tag}: 字形右缘距窗口 = {glyph_right_gap}，应恰为 8*{scale}"
+                );
+                assert!(
+                    l.dismiss.right() <= l.width as f32,
+                    "{tag}: 字形越出窗口右缘"
+                );
+            }
         }
     }
 
