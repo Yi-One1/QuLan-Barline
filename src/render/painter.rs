@@ -9,7 +9,7 @@
 //! 5. 封面（真实位图 or 渐变占位 + 音符）
 //! 6. 歌名 / 歌手（读 WidgetLayout 里缓存的截断结果）
 //! 7. 三个按钮（含 disabled / pressed 态）
-//! 7.5 右上角关闭 ×（v1.5.0 / G3；悬停变亮 / 按下下沉 1px）
+//! 7.5 右上角关闭 ×（v1.5.0 / G3；v1.5.1 悬停淡底 / 按下加深并下沉 1px）
 //! 8. 进度条（静止 2px / 悬停 4px / 拖动时显示气泡）
 //! 9. 歌词占位（M3 换成真歌词与扫光）
 //! 10. HUD 浮层
@@ -430,10 +430,15 @@ fn fill_triangle(
 /// 也没有禁用态（任何播放状态都可收起）；硬塞进去会让那个循环多出两处
 /// `if target == Dismiss` 的分叉，反而更难读。
 ///
-/// ## 视觉规格（G3 只做**最小反馈**）
+/// ## 视觉规格（v1.5.1：缩小 + 换一种悬停表达）
 ///
-/// - 常态 alpha `0xCC`、悬停 `0xFF`（变亮）；
-/// - 按下整体下沉 `1 * scale`（与三键同一套手感）；
+/// - 字形常态就是 `0xFF` 满不透明（用户选 100%，且 8px 小字形再半透明会发虚）；
+/// - **因此不能再靠"变亮"做悬停反馈**——已经满不透明就没有余量。改为在
+///   `hit_dismiss` 那一格里铺一层**极淡圆角底**：悬停 `theme.text @ 0x14`（≈8%）、
+///   按下 `0x22`（≈13%），圆角 `4 * scale`。这是 Win11 任务栏图标悬停的常规做法：
+///   **不是**描边、**不是**光晕、**不**向外扩（底矩形取自 `dismiss_bg_rect()`，
+///   语义上恒等于 `hit_dismiss`，几何契约由 `layout::tests` 锁住）；
+/// - 按下除了加深底色，字形整体下沉 `1 * scale`（与三键同一套手感）；
 /// - 完整的光晕 / 缩放留 G4 —— 布局里的 `dismiss` / `hit_dismiss` 与
 ///   `hover_target` / `pressed` 字段已经建好，G4 直接复用，不再改数据流。
 fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
@@ -444,15 +449,36 @@ fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Res
     }
 
     let hovering = state.hover_target == Some(HitTarget::Dismiss);
-    let alpha = if hovering { 0xFF } else { 0xCC };
-    let brush = frame.brush(Rgba::from_rgb(theme.text, alpha))?;
+    let pressed = state.pressed == Some(HitTarget::Dismiss);
+
+    // ---- 1. 悬停 / 按下的极淡圆角底（v1.5.1）----
+    // 只在 `hit_dismiss` 那一格里画：底矩形 = `dismiss_bg_rect()`，绝不外扩，
+    // 因此天然与 `hit_next` 保持 DISMISS_GAP 的净距。
+    let bg_alpha = if pressed {
+        limits::DISMISS_BG_PRESSED
+    } else if hovering {
+        limits::DISMISS_BG_HOVER
+    } else {
+        0
+    };
+    if bg_alpha > 0 {
+        let bg = layout.dismiss_bg_rect();
+        if !bg.is_empty() {
+            // 圆角钳到短边一半：D2D 对 radius > 半边长 的圆角矩形会画成胶囊/异常。
+            let radius = (limits::DISMISS_BG_RADIUS * s).min(bg.w.min(bg.h) * 0.5);
+            let bg_brush = frame.brush(Rgba::from_rgb(theme.text, bg_alpha))?;
+            // SAFETY: 栈上圆角矩形；坐标全部有限；brush 由本帧持有。
+            unsafe {
+                rt.FillRoundedRectangle(&rounded(bg.x, bg.y, bg.w, bg.h, radius), &bg_brush);
+            }
+        }
+    }
+
+    // ---- 2. 字形：常态即满不透明（不再有 0xCC → 0xFF 的变亮）----
+    let brush = frame.brush(Rgba::from_rgb(theme.text, limits::DISMISS_ALPHA))?;
 
     // 按下：整体下沉 1px（与三键同一口径：`1.0 * scale`）
-    let sink = if state.pressed == Some(HitTarget::Dismiss) {
-        1.0 * s
-    } else {
-        0.0
-    };
+    let sink = if pressed { 1.0 * s } else { 0.0 };
 
     let side = glyph.w.min(glyph.h);
     fill_cross(

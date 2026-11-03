@@ -326,4 +326,77 @@ mod tests {
             "净距 ({x},{y}) 必须是死区，不得命中 Next 或 Dismiss"
         );
     }
+
+    // ================================================ QA（v1.5.1 缩小复验）补充断言
+
+    /// **D 组（补）**：命中区**真的缩小了** —— v1.5.0 的 24×24 里、v1.5.1 的
+    /// 16×16 外的那些点，现在必须是死区。
+    ///
+    /// 为什么需要从 `hit_test` 侧再验一次：布局层断言只证明"矩形是 16"，
+    /// 而 `hit_test` 里除了 `hit_dismiss` 还 OR 了 `dismiss`（字形），
+    /// 且外层还可能是 `expanded_to` 之类被后人加上。这条用例从**用户实际
+    /// 点击的入口**确认热区缩了，且缩掉的区域不会回落到 Next（误触更糟）。
+    #[test]
+    fn dismiss_shrunk_area_is_dead_zone_after_v151() {
+        let l = layout();
+        // 前提：v1.5.0 的 24 热区是 (168, 0, 24, 24)，v1.5.1 是 (176, 0, 16, 16)
+        assert!((l.hit_dismiss.x - 176.0).abs() < 0.001, "v1.5.1 热区 x 应为 176");
+        assert!((l.hit_dismiss.w - 16.0).abs() < 0.001, "v1.5.1 热区边长应为 16");
+
+        for (x, y) in [
+            (170.0, 12.0), // 旧热区内、新热区左侧
+            (184.0, 20.0), // 旧热区内、新热区下方
+            (175.5, 8.0),  // 新热区左边界外 0.5px
+        ] {
+            assert_ne!(
+                hit_test(&l, x, y, false),
+                HitTarget::Dismiss,
+                "({x},{y}) 落在 v1.5.0 旧热区但已出 v1.5.1 新热区，不得命中 Dismiss"
+            );
+            assert_ne!(
+                hit_test(&l, x, y, false),
+                HitTarget::Next,
+                "({x},{y}) 是缩小腾出来的区域，绝不能回落成 Next（误触更糟）"
+            );
+        }
+
+        // 热区中心仍然必须是 Dismiss（16px 热区缩小后中心点必须好点）
+        let (cx, cy) = l.hit_dismiss.center();
+        assert_eq!(hit_test(&l, cx, cy, false), HitTarget::Dismiss);
+        assert_eq!(hit_test(&l, 184.0, 8.0, false), HitTarget::Dismiss, "中心右 8px 仍在内");
+    }
+
+    /// **D 组（补）**：2 形态 × 4 缩放 × 4 方位 —— 热区中心恒为 `Dismiss`，
+    /// 且 `seeking` 期间恒为 `None`。
+    ///
+    /// 既有的 `dismiss_hit_centre_returns_dismiss` / `dismiss_is_dead_while_seeking`
+    /// 只在 100% / Bottom 上跑。缩放后热区中心是 `16*s/2 = 8*s`，若有人把
+    /// 竖向偏移写成固定 8px（而不是随 s），1.25+ 上中心点就会落到热区外。
+    #[test]
+    fn dismiss_centre_and_dead_state_matrix() {
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                for edge in [
+                    TaskbarEdge::Bottom,
+                    TaskbarEdge::Top,
+                    TaskbarEdge::Left,
+                    TaskbarEdge::Right,
+                ] {
+                    let bar = (48.0 * scale).round() as i32;
+                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let (cx, cy) = l.hit_dismiss.center();
+                    assert_eq!(
+                        hit_test(&l, cx, cy, false),
+                        HitTarget::Dismiss,
+                        "{form:?}@{scale}/{edge:?}: 热区中心 ({cx},{cy}) 必须命中 Dismiss"
+                    );
+                    assert_eq!(
+                        hit_test(&l, cx, cy, true),
+                        HitTarget::None,
+                        "{form:?}@{scale}/{edge:?}: 拖动期间 × 必须失活"
+                    );
+                }
+            }
+        }
+    }
 }

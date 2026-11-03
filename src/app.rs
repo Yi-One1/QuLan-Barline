@@ -100,7 +100,8 @@ pub struct AppState {
     pub lyric_scroll_offset: f32,
     /// 当前按下的按钮（M2 新增：画按下态）
     pub pressed: Option<HitTarget>,
-    /// 当前指针悬停的目标（v1.5.0 / G3：关闭 × 悬停变亮；G4 的光晕 / 缩放复用）
+    /// 当前指针悬停的目标（v1.5.0 / G3：关闭 × 悬停淡底；v1.5.1 起底色取代"变亮"；
+    /// G4 的光晕 / 缩放复用）
     ///
     /// 与 [`AppState::pressed`] 走**同一条通道**：由 `Interaction` 维护，
     /// `sync_interaction` 每帧拷进来，painter 只读。`None` = 指针不在任何控件上。
@@ -2189,7 +2190,8 @@ impl App {
         hover_key(st.hover).hash(&mut h);
         ((st.hover_alpha.clamp(0.0, 1.0) * 32.0) as u32).hash(&mut h);
         st.pressed.map(target_key).hash(&mut h);
-        // v1.5.0：× 的悬停变亮必须进指纹，否则「悬停 ×」那一帧会被去重吞掉
+        // v1.5.0：× 的悬停反馈必须进指纹，否则「悬停 ×」那一帧会被去重吞掉
+        // （v1.5.1 起这个反馈是极淡圆角底而不是变亮，结论不变）
         st.hover_target.map(target_key).hash(&mut h);
 
         // ---- 播放态 ----
