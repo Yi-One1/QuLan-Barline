@@ -100,8 +100,20 @@ pub struct AppState {
     pub lyric_scroll_offset: f32,
     /// 当前按下的按钮（M2 新增：画按下态）
     pub pressed: Option<HitTarget>,
+    /// 当前指针悬停的目标（v1.5.0 / G3：关闭 × 悬停变亮；G4 的光晕 / 缩放复用）
+    ///
+    /// 与 [`AppState::pressed`] 走**同一条通道**：由 `Interaction` 维护，
+    /// `sync_interaction` 每帧拷进来，painter 只读。`None` = 指针不在任何控件上。
+    pub hover_target: Option<HitTarget>,
     /// 用户是否隐藏（PRD 机器 B 门控 1）
     pub user_hidden: bool,
+    /// **本次运行**内被右上角 × 收起（v1.5.0 / G3）
+    ///
+    /// 与 [`general.widget_hidden`](crate::config::GeneralConfig::widget_hidden) 的区别：
+    /// 那个是**持久化**的用户设置（托盘「显示小组件」勾选项），这个是**运行期**标记。
+    /// 点 × 只置它，**绝不写配置**——用户要的语义是「这次收起来，下次启动照常显示」。
+    /// 有效隐藏态 = `widget_hidden || dismissed`（见 [`App::sync_visibility`]）。
+    pub dismissed: bool,
     /// 任务栏自动隐藏且已收起（门控 2）
     pub taskbar_collapsed: bool,
     /// 最终可见性
@@ -764,7 +776,11 @@ impl App {
             crate::log_info!("托盘回调：右键抬起，弹菜单");
             // v1.3.1：勾选态 = 「小组件正在显示」。换算只能经过 tray::toggle_checked，
             // 历史 bug 就是这里把 `widget_hidden` 直接当勾选态传进去（勾选态反了）。
-            let widget_visible = crate::ui::tray::toggle_checked(self.config.general.widget_hidden);
+            // v1.5.0（G3）：传**有效隐藏态**（配置 ∨ 本次运行的 × 收起），
+            // 否则点了 × 收起后托盘里仍然是打钩的，用户会以为没生效。
+            let widget_visible = crate::ui::tray::toggle_checked(
+                self.config.general.widget_hidden || self.state.dismissed,
+            );
             let cmd = self
                 .tray
                 .as_ref()
@@ -1195,19 +1211,7 @@ impl App {
                     self.on_second_instance();
                     Vec::new()
                 }
-                TrayCommand::ToggleWidget => {
-                    self.config.general.widget_hidden = !self.config.general.widget_hidden;
-                    crate::log_info!(
-                        "托盘：小组件{}",
-                        if self.config.general.widget_hidden {
-                            "隐藏"
-                        } else {
-                            "显示"
-                        }
-                    );
-                    self.sync_visibility();
-                    vec![Effect::SaveConfig(Box::new(self.config.clone()))]
-                }
+                TrayCommand::ToggleWidget => self.toggle_widget_visible(),
                 TrayCommand::Quit => {
                     crate::log_info!("托盘：退出");
                     vec![Effect::Quit]
@@ -1712,9 +1716,8 @@ impl App {
             A::Next => self.reduce_input(WidgetInput::ClickNext),
             A::ToggleLyrics => self.reduce_input(WidgetInput::ToggleLyricsFromMenu),
             A::ToggleWidget => {
-                self.config.general.widget_hidden = !self.config.general.widget_hidden;
-                self.sync_visibility();
-                vec![Effect::SaveConfig(Box::new(self.config.clone()))]
+                crate::log_info!("热键：显隐小组件");
+                self.toggle_widget_visible()
             }
             A::Mute => {
                 // 静音走 WASAPI：SMTC 的 Mute 只有部分播放器实现
@@ -1755,6 +1758,15 @@ impl App {
                 let activation = media::launch::activate_player(&self.state.playing.session);
                 crate::log_info!("点击封面 → 激活结果={}", activation.as_str());
                 Vec::new()
+            }
+            WidgetInput::ClickDismiss => {
+                // v1.5.0（G3）：右上角 × = 隐藏到托盘，**仅本次运行生效**。
+                // 关键：只置运行期标记，**不碰配置、不产生 SaveConfig**——
+                // 「下次启动照常显示」全靠这一点（写盘了就变成永久隐藏）。
+                self.state.dismissed = true;
+                self.sync_visibility();
+                crate::log_info!("× 关闭：隐藏到托盘（仅本次运行）");
+                vec![Effect::Redraw]
             }
             WidgetInput::SeekBegin => {
                 self.state.seek_preview_ms = self.state.playing.position_now();
@@ -2133,6 +2145,7 @@ impl App {
                 HitTarget::Toggle => 3,
                 HitTarget::Next => 4,
                 HitTarget::Progress => 5,
+                HitTarget::Dismiss => 6,
             }
         }
 
@@ -2176,6 +2189,8 @@ impl App {
         hover_key(st.hover).hash(&mut h);
         ((st.hover_alpha.clamp(0.0, 1.0) * 32.0) as u32).hash(&mut h);
         st.pressed.map(target_key).hash(&mut h);
+        // v1.5.0：× 的悬停变亮必须进指纹，否则「悬停 ×」那一帧会被去重吞掉
+        st.hover_target.map(target_key).hash(&mut h);
 
         // ---- 播放态 ----
         st.playing.track_id.hash(&mut h);
@@ -2219,10 +2234,37 @@ impl App {
         h.finish()
     }
 
+    /// 显示 / 隐藏小组件（**托盘菜单「显示小组件」与 `Ctrl+Alt+H` 共用这一份**）。
+    ///
+    /// v1.5.0（G3）起隐藏有**两个**来源：
+    /// - `config.general.widget_hidden` —— 持久化的用户设置（托盘勾选项）；
+    /// - `state.dismissed` —— 本次运行点了右上角 ×，**只活在内存里**。
+    ///
+    /// 判定必须按**有效隐藏态**（两者取或）来做，否则「点了 × 收起后按热键」会把
+    /// 已经显示的窗口又"隐藏"一次（看到的是没反应）。语义：
+    /// - 当前**隐藏** → 显示：两者一起清（`dismissed` 必须清，否则清完配置仍不可见）；
+    /// - 当前**显示** → 隐藏：只写配置（保持既有「托盘隐藏会被记住」的行为，
+    ///   与 × 的「仅本次运行」区分开）。
+    fn toggle_widget_visible(&mut self) -> Vec<Effect> {
+        let hidden = self.config.general.widget_hidden || self.state.dismissed;
+        if hidden {
+            self.config.general.widget_hidden = false;
+            self.state.dismissed = false;
+            crate::log_info!("小组件：显示（配置隐藏与 × 收起一并复位）");
+        } else {
+            self.config.general.widget_hidden = true;
+            crate::log_info!("小组件：隐藏（写入配置，下次启动仍隐藏）");
+        }
+        self.sync_visibility();
+        vec![Effect::SaveConfig(Box::new(self.config.clone()))]
+    }
+
     /// 可见性同步（PRD 5.2 三道门控，M2 起真的生效）。
     fn sync_visibility(&mut self) {
         self.state.taskbar_collapsed = self.geometry.map(|g| g.collapsed).unwrap_or(false);
-        self.state.user_hidden = self.config.general.widget_hidden;
+        // v1.5.0（G3）：有效隐藏态 = 「配置里隐藏」∨「本次运行点了 ×」。
+        // `dismissed` 只在内存里，从不写盘 —— 这就是「重启后照常显示」。
+        self.state.user_hidden = self.config.general.widget_hidden || self.state.dismissed;
         self.state.visible = self.state.compute_visible();
         let vis = self.state.visible;
         if let Some(h) = self.widget.as_mut() {
@@ -2322,6 +2364,7 @@ impl App {
         self.state.hover = self.interact.hover;
         self.state.hover_alpha = self.interact.hover_alpha;
         self.state.pressed = self.interact.pressed;
+        self.state.hover_target = self.interact.hover_target;
         self.state.volume_hud_left_ms = self.interact.hud_left_ms;
 
         // 16ms 动画定时器：只在真的需要推进时存在（悬停淡入淡出 / 歌词高度过渡）
@@ -2401,8 +2444,14 @@ impl App {
 
     /// 把一批语义化输入送进 reduce，并在结束后同步交互态 + 重绘一次。
     fn dispatch(&mut self, inputs: Vec<WidgetInput>) {
+        // v1.5.0（G3）：悬停目标变化本身不产生 `WidgetInput`，但它改变像素
+        // （× 的悬停变亮）——所以在这里对比一次，变化就补一帧重绘。
+        let prev_hover_target = self.state.hover_target;
         if inputs.is_empty() {
             self.sync_interaction();
+            if self.state.hover_target != prev_hover_target {
+                self.redraw();
+            }
             return;
         }
         let mut needs_redraw = false;
@@ -2417,7 +2466,7 @@ impl App {
             }
         }
         self.sync_interaction();
-        if needs_redraw {
+        if needs_redraw || self.state.hover_target != prev_hover_target {
             self.redraw();
         }
     }
@@ -2806,6 +2855,77 @@ mod tests {
     fn progress_fraction_is_zero_without_duration() {
         let s = AppState::default();
         assert_eq!(s.progress_fraction(), 0.0);
+    }
+
+    // ================================================ QA（G3 独立验证）补充断言
+    //
+    // `sync_visibility` / `toggle_widget_visible` / `reduce_input(ClickDismiss)`
+    // 都是 `App` 的方法（依赖 HWND、托盘、渲染器），无法在单测里构造。
+    // 这里只覆盖它们**依赖的纯数据前提**，方法体的行为用代码走查 + file:line
+    // 证据在 QA 报告里说明（见 E 组）。
+
+    /// **E4 组**：`dismissed` 是**运行期**标记，默认必须为 `false`。
+    ///
+    /// 「重启后照常显示」完全依赖这一点：`dismissed` 不落盘、也没有任何从配置
+    /// 恢复它的路径，所以下次启动 `user_hidden` 只由 `config.general.widget_hidden`
+    /// 决定。若有人给它加上 `serde`/持久化，这条断言会先失败。
+    #[test]
+    fn dismissed_defaults_to_false() {
+        let s = AppState::default();
+        assert!(!s.dismissed, "× 收起是运行期状态，重启后不得残留");
+        assert!(!s.user_hidden);
+        assert!(!s.visible);
+    }
+
+    /// **E 组**：有效隐藏态真值表（2×2），与 `sync_visibility` 的公式同源。
+    ///
+    /// 依据 `src/app.rs:2267`：
+    /// `user_hidden = config.general.widget_hidden || state.dismissed`
+    /// 因此：
+    /// - `(false, false)` → 可见（常规状态）；
+    /// - `(false, true)`  → **隐藏**（刚点了 ×，配置仍是「显示」）；
+    /// - `(true,  false)` → 隐藏（托盘里持久化的隐藏）；
+    /// - `(true,  true)`  → 隐藏。
+    ///
+    /// 关键是第 2 行：它保证「点 × 之后按热键 / 勾托盘」走的是
+    /// `toggle_widget_visible` 的「当前隐藏 → 显示」分支（`src/app.rs:2249-2253`
+    /// 同时清 `widget_hidden` 与 `dismissed`），不会出现"按了没反应"。
+    #[test]
+    fn effective_hidden_truth_table() {
+        for widget_hidden in [false, true] {
+            for dismissed in [false, true] {
+                let mut s = AppState::default();
+                s.playing.state = PlaybackState::Playing;
+                s.dismissed = dismissed;
+                // 与 `sync_visibility` 完全同一公式
+                s.user_hidden = widget_hidden || dismissed;
+
+                let hidden = widget_hidden || dismissed;
+                assert_eq!(
+                    s.compute_visible(),
+                    !hidden,
+                    "widget_hidden={widget_hidden} dismissed={dismissed} → \
+                     user_hidden={} 时可见性应为 {}",
+                    s.user_hidden,
+                    !hidden
+                );
+            }
+        }
+
+        // 单独点名第 2 行（本轮最可能出错的组合）：配置说"显示"、但点了 ×
+        //
+        // 注意：`AppState` 不持有 `Config`，所以这里只能验证"有效隐藏态已生效"，
+        // 「× 不写配置」这一半靠走查 `reduce_input(ClickDismiss)` 的返回 effect 确认
+        // （`src/app.rs:1762-1770`：只置 `dismissed` + `sync_visibility`，
+        // 返回 `vec![Effect::Redraw]`，**没有** `Effect::SaveConfig`）。
+        let mut s = AppState::default();
+        s.playing.state = PlaybackState::Playing;
+        s.dismissed = true;
+        s.user_hidden = s.dismissed;
+        assert!(
+            !s.compute_visible(),
+            "点 × 收起（配置仍为 widget_hidden=false）后必须不可见"
+        );
     }
 }
 

@@ -52,6 +52,12 @@ pub struct Interaction {
     pub hover_alpha: f32,
     /// 当前按下的按钮（用于画按下态）
     pub pressed: Option<HitTarget>,
+    /// 当前指针悬停在哪个目标上（v1.5.0 / G3：关闭 × 的悬停变亮要用）。
+    ///
+    /// 只有**变化**时才置位（见 [`Interaction::on_move`]），painter 每帧只读。
+    /// 后续 G4 的光晕 / 缩放也复用这个字段，所以它是「悬停目标」的**唯一**出处，
+    /// 不要再开第二份状态。
+    pub hover_target: Option<HitTarget>,
     down: Option<DownState>,
     pending: Option<PendingClick>,
     seeking: bool,
@@ -77,6 +83,7 @@ impl Interaction {
             hover: HoverState::Idle,
             hover_alpha: 0.0,
             pressed: None,
+            hover_target: None,
             down: None,
             pending: None,
             seeking: false,
@@ -92,6 +99,7 @@ impl Interaction {
         self.hover = HoverState::Idle;
         self.hover_alpha = 0.0;
         self.pressed = None;
+        self.hover_target = None;
         self.down = None;
         self.pending = None;
         self.seeking = false;
@@ -135,11 +143,30 @@ impl Interaction {
         }
 
         if self.seeking {
+            // 拖动期间 × 与三键一律是死区（`hit_test` 已屏蔽），悬停高亮必须
+            // 一起清掉——否则指针从 × 上滑过再按下进度条，× 会留着一个亮着的
+            // 壳子（看起来像"还能点"，但点不动）。QA-G3 第 3 条。
+            if self.hover_target.take().is_some() {
+                self.animating = true;
+            }
             let frac = seek_fraction(layout, x);
             out.push(WidgetInput::SeekPreview(frac));
+        } else {
+            // v1.5.0（G3）：维护「当前悬停目标」（关闭 × 的悬停变亮用，G4 复用）。
+            // **只在变化时**置 `animating`——否则每帧移动都强制刷一帧，
+            // 「空闲 CPU ≈ 0」这条约束就废了。
+            let target = hit_test(layout, x, y, false);
+            let next = if target == HitTarget::None {
+                None
+            } else {
+                Some(target)
+            };
+            if self.hover_target != next {
+                self.hover_target = next;
+                self.animating = true;
+            }
         }
 
-        let _ = y;
         out
     }
 
@@ -148,6 +175,11 @@ impl Interaction {
         // 拖动中指针跑出窗口不结束拖动（有 SetCapture，事件仍归我们）
         if self.seeking {
             return Vec::new();
+        }
+        // 悬停目标随指针离开一起清（× 不该保持亮着）
+        let had_target = self.hover_target.take().is_some();
+        if had_target {
+            self.animating = true;
         }
         if self.hover == HoverState::Idle {
             return Vec::new();
@@ -187,11 +219,13 @@ impl Interaction {
             self.seeking = true;
             self.hover = HoverState::Seeking;
             self.pressed = None;
+            // 进入拖动 = 进入死区，悬停高亮一并清（与 `on_move` 的 seeking 分支同口径）
+            self.hover_target = None;
             let frac = seek_fraction(layout, x);
             return (vec![WidgetInput::SeekBegin, WidgetInput::SeekPreview(frac)], true);
         }
 
-        self.pressed = if target.is_button() || target == HitTarget::Cover {
+        self.pressed = if target.is_pressable() || target == HitTarget::Cover {
             Some(target)
         } else {
             None
@@ -228,12 +262,23 @@ impl Interaction {
             return (vec![], true);
         }
 
-        // ② 只有按钮与封面产生点击
+        // ② 关闭 ×：**立即派发**，不进 250ms 双击判定
+        //
+        // 双击保护的目的是「双击 = 零动作」（防止用户误把双击当成两个单击）。
+        // × 不需要保护：① 它没有"双击语义"，② 收起小组件是不可逆的显式动作，
+        // 延迟 250ms 只会让人觉得"点了没反应"。何况真实的双击第二下会落在
+        // 已经隐藏的窗口之外，压根收不到。
+        if d.target == HitTarget::Dismiss {
+            crate::log_debug!("单击确认：Dismiss（立即派发，不进双击队列）");
+            return (vec![WidgetInput::ClickDismiss], true);
+        }
+
+        // ③ 只有按钮与封面产生点击
         if !(d.target.is_button() || d.target == HitTarget::Cover) {
             return (vec![], true);
         }
 
-        // ③ 排队等 250ms 判定（双击保护）
+        // ④ 排队等 250ms 判定（双击保护）
         self.pending = Some(PendingClick {
             target: d.target,
             at: Instant::now(),
@@ -532,5 +577,202 @@ mod tests {
         assert!(!i.is_seeking());
         assert!(!i.has_pending_click());
         assert!(!i.animating());
+    }
+
+    // ------------------------------------------------- v1.5.0（G3）右上角关闭 ×
+
+    /// 悬停目标：移到 × 上置 `Some(Dismiss)`，移出清空。
+    #[test]
+    fn hover_target_tracks_dismiss() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_move(&l, cx, cy);
+        assert_eq!(i.hover_target, Some(HitTarget::Dismiss));
+
+        // 移到空白区（左上角，不在封面内）
+        i.on_move(&l, 2.0, 2.0);
+        assert_eq!(i.hover_target, None, "移出后必须清空悬停目标");
+
+        // 移到「下一首」上仍然是具体目标（不是只给 Dismiss 服务）
+        let (nx, ny) = l.btn_next.center();
+        i.on_move(&l, nx, ny);
+        assert_eq!(i.hover_target, Some(HitTarget::Next));
+
+        // 指针离开窗口 → 清空
+        i.on_move(&l, cx, cy);
+        i.on_leave();
+        assert_eq!(i.hover_target, None);
+    }
+
+    /// 悬停目标只在**变化**时置 animating（不能每帧强制重绘）。
+    #[test]
+    fn hover_target_change_only_animates_on_change() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+        i.on_move(&l, cx, cy);
+        // 手动把 animating 关掉，模拟「悬停淡入已结束」
+        i.animating = false;
+        i.on_move(&l, cx + 1.0, cy + 1.0);
+        assert!(!i.animating(), "同一目标内移动不得触发重绘");
+        i.on_move(&l, 2.0, 2.0);
+        assert!(i.animating(), "目标变化必须触发一帧");
+    }
+
+    /// 在 × 上 down + up（未移动）→ **立即**返回 `ClickDismiss`，不进双击队列。
+    #[test]
+    fn dismiss_click_fires_immediately_without_double_click_queue() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_down(&l, cx, cy);
+        assert_eq!(i.pressed, Some(HitTarget::Dismiss), "按下 × 必须进按下态");
+
+        let (inputs, release) = i.on_up(&l, cx, cy);
+        assert_eq!(inputs, vec![WidgetInput::ClickDismiss]);
+        assert!(release, "与 SetCapture 配对，必须释放捕获");
+        assert!(
+            !i.has_pending_click(),
+            "× 不进 250ms 双击队列（否则手感延迟 250ms）"
+        );
+        assert!(!i.take_click_timer_wanted(), "不得启动单击判定定时器");
+        assert!(i.on_click_timer().is_empty(), "没有待判定单击可派发");
+    }
+
+    /// 从 × 拖到别处再松手 → **不**产生 `ClickDismiss`（沿用既有取消逻辑）。
+    #[test]
+    fn dragging_off_dismiss_cancels_the_click() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_down(&l, cx, cy);
+        // 拖到「上一首」上（远超 SEEK_DRAG_PX）
+        let (px, py) = l.btn_prev.center();
+        i.on_move(&l, px, py);
+        let (inputs, _) = i.on_up(&l, px, py);
+        assert!(inputs.is_empty(), "拖走再松手不能收起小组件：{inputs:?}");
+        assert_eq!(i.pressed, None);
+
+        // 移动距离不足但目标未变的情形仍算点击（见上一条），这里补一条
+        // 「原地小幅抖动」也必须是点击（不要过度敏感）
+        i.on_down(&l, cx, cy);
+        let (inputs, _) = i.on_up(&l, cx + 1.0, cy + 1.0);
+        assert_eq!(inputs, vec![WidgetInput::ClickDismiss]);
+    }
+
+    // ================================================ QA（G3 独立验证）补充断言
+
+    /// **D2 组**：双击 × —— 每次 up 都要派发 `ClickDismiss`，且不得产生任何按钮目标。
+    ///
+    /// × 刻意**不进** 250ms 双击队列（`on_up` 里对 `Dismiss` 提前 return），
+    /// 所以第二次 `on_down` 不会命中「250ms 内同一元素第二下 → 取消单击」的分支。
+    /// 这条用例锁死该语义：如果将来有人把 Dismiss 混进双击保护，第一次点击会
+    /// 变成「等了 250ms 才生效」，第二次点击会被吞掉 —— 两处都会失败。
+    #[test]
+    fn double_click_on_dismiss_fires_twice() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_down(&l, cx, cy);
+        let (first, _) = i.on_up(&l, cx, cy);
+        assert_eq!(first, vec![WidgetInput::ClickDismiss], "第一次点击必须立即派发");
+        assert!(!i.has_pending_click(), "× 不得进双击队列");
+
+        // 250ms 内的第二下（真实场景第二下已落在已隐藏的窗口之外，这里验状态机本身）
+        i.on_down(&l, cx, cy);
+        assert_eq!(i.pressed, Some(HitTarget::Dismiss), "第二下同样要进按下态");
+        let (second, _) = i.on_up(&l, cx, cy);
+        assert_eq!(second, vec![WidgetInput::ClickDismiss], "第二次点击同样必须派发");
+        assert!(!i.has_pending_click(), "× 永远不进双击队列");
+        assert!(i.on_click_timer().is_empty(), "不得派发任何播控 / 封面动作");
+    }
+
+    /// **D3 组**：按下 × 后捕获丢失（Alt+Tab / 被别的窗口抢走）→ 复位且**不**收起。
+    ///
+    /// `on_capture_lost` 只在 seeking 时返回 `SeekCancel`；对 Dismiss 必须返回空，
+    /// 否则用户切个窗口小组件就没了。之后的 `on_up` 也不能"补发"。
+    #[test]
+    fn capture_loss_after_dismiss_down_produces_nothing() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_down(&l, cx, cy);
+        assert_eq!(i.pressed, Some(HitTarget::Dismiss));
+
+        let out = i.on_capture_lost();
+        assert!(out.is_empty(), "捕获丢失不得收起小组件：{out:?}");
+        assert_eq!(i.pressed, None, "捕获丢失后不得保留按下态（会画成一直按着）");
+        assert!(!i.has_pending_click());
+
+        // down 已被清空 → 后续 up 直接走「没有按下现场」分支
+        let (inputs, _) = i.on_up(&l, cx, cy);
+        assert!(inputs.is_empty(), "捕获丢失后的 up 不得再派发：{inputs:?}");
+    }
+
+    /// **D4 组**：在 × 上按下、拖到「下一首」上松手 → **不产生** `ClickDismiss`。
+    ///
+    /// × 与 next 只隔 8*s，是"手指抖一下就到"的最近邻居——这条是本轮误触防线的
+    /// 最后一道（前两道是净距与 seeking 屏蔽）。既有的
+    /// `dragging_off_dismiss_cancels_the_click` 只测了拖到 prev，这里点名 next。
+    #[test]
+    fn dragging_from_dismiss_to_next_cancels_the_click() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (dx, dy) = l.hit_dismiss.center();
+        let (nx, ny) = l.btn_next.center();
+
+        i.on_down(&l, dx, dy);
+        let (inputs, _) = i.on_up(&l, nx, ny);
+        assert!(
+            inputs.is_empty(),
+            "从 × 拖到 next 松手不得收起小组件，也不得触发下一首：{inputs:?}"
+        );
+        assert_eq!(i.pressed, None);
+        assert!(!i.has_pending_click());
+
+        // 中途经过 next 的 mousemove 也不得产生任何动作。
+        // 先用一次 on_move 建立 Hover 态——否则第一次移动会合法地带一个
+        // `HoverEnter`（"指针刚进窗口"），那是正确行为，不属于本用例要抓的"动作"。
+        let _ = i.on_move(&l, dx, dy);
+        i.on_down(&l, dx, dy);
+        for x in [nx, l.btn_next.x + 2.0] {
+            assert!(
+                i.on_move(&l, x, ny).is_empty(),
+                "× 拖动过程中的 mousemove 不得产生输入"
+            );
+        }
+        let (inputs, _) = i.on_up(&l, nx, ny);
+        assert!(inputs.is_empty(), "再次确认：{inputs:?}");
+    }
+
+    /// **D1 组补充**：× 的按下反馈必须存在（`pressed` 用于画下沉 1px），
+    /// 而**拖动进度条**期间 × 连按下态都不能有（seeking 优先）。
+    #[test]
+    fn dismiss_pressed_state_and_seeking_precedence() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (cx, cy) = l.hit_dismiss.center();
+
+        i.on_down(&l, cx, cy);
+        assert_eq!(i.pressed, Some(HitTarget::Dismiss), "× 必须有按下反馈");
+        i.on_up(&l, cx, cy);
+        assert_eq!(i.pressed, None);
+
+        // 先在进度条上按下进入 seeking，再去 × 上按下：不得产生任何 Dismiss 动作
+        let py = l.hit_progress.y + l.hit_progress.h * 0.5;
+        i.on_down(&l, 40.0, py);
+        assert!(i.is_seeking());
+        let (inputs, _) = i.on_down(&l, cx, cy);
+        assert!(
+            inputs.iter().all(|x| matches!(x, WidgetInput::SeekPreview(_))),
+            "拖动期间按到 × 也只能产生 SeekPreview：{inputs:?}"
+        );
+        assert_ne!(i.pressed, Some(HitTarget::Dismiss));
     }
 }

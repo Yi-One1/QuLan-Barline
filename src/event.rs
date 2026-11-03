@@ -158,6 +158,8 @@ pub enum WidgetInput {
     ClickPrev,
     ClickNext,
     ClickCover,
+    /// 右上角关闭 ×（v1.5.0 / G3）：隐藏到托盘，**仅本次运行**生效（不写配置）
+    ClickDismiss,
     SeekBegin,
     /// 0.0..=1.0
     SeekPreview(f32),

@@ -9,6 +9,7 @@
 //! 5. 封面（真实位图 or 渐变占位 + 音符）
 //! 6. 歌名 / 歌手（读 WidgetLayout 里缓存的截断结果）
 //! 7. 三个按钮（含 disabled / pressed 态）
+//! 7.5 右上角关闭 ×（v1.5.0 / G3；悬停变亮 / 按下下沉 1px）
 //! 8. 进度条（静止 2px / 悬停 4px / 拖动时显示气泡）
 //! 9. 歌词占位（M3 换成真歌词与扫光）
 //! 10. HUD 浮层
@@ -128,6 +129,11 @@ pub fn paint(
 
         // ---- 5. 按钮 ----
         draw_buttons(&rt, frame, ctx)?;
+
+        // ---- 5.5 右上角关闭 ×（v1.5.0 / G3）----
+        // 必须在按钮之后、进度条之前：进度条贴在条带底部、整宽，画在它后面
+        // 就会被压住（× 在右上角，实际不重叠，但顺序上先画更安全）。
+        draw_dismiss(&rt, frame, ctx)?;
 
         // ---- 6. 进度条 / 音量 HUD ----
         draw_progress(&rt, frame, ctx)?;
@@ -410,6 +416,90 @@ fn fill_triangle(
         // SAFETY: 栈上矩形；坐标全部有限。
         unsafe {
             rt.FillRectangle(&d2d_rect(xx, y + i as f32 * step, ww, step + 0.6), brush);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ 关闭 ×（v1.5.0 / G3）
+
+/// 右上角常驻的关闭 ×（点击 = 隐藏到托盘，仅本次运行）。
+///
+/// ## 为什么单独一个函数而不是塞进 `draw_buttons`
+///
+/// `draw_buttons` 的循环吃「媒体播控三键 + 启用/禁用态」，× 既不属于播控、
+/// 也没有禁用态（任何播放状态都可收起）；硬塞进去会让那个循环多出两处
+/// `if target == Dismiss` 的分叉，反而更难读。
+///
+/// ## 视觉规格（G3 只做**最小反馈**）
+///
+/// - 常态 alpha `0xCC`、悬停 `0xFF`（变亮）；
+/// - 按下整体下沉 `1 * scale`（与三键同一套手感）；
+/// - 完整的光晕 / 缩放留 G4 —— 布局里的 `dismiss` / `hit_dismiss` 与
+///   `hover_target` / `pressed` 字段已经建好，G4 直接复用，不再改数据流。
+fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
+    let (layout, state, theme, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.scale);
+    let glyph = layout.dismiss;
+    if glyph.is_empty() {
+        return Ok(());
+    }
+
+    let hovering = state.hover_target == Some(HitTarget::Dismiss);
+    let alpha = if hovering { 0xFF } else { 0xCC };
+    let brush = frame.brush(Rgba::from_rgb(theme.text, alpha))?;
+
+    // 按下：整体下沉 1px（与三键同一口径：`1.0 * scale`）
+    let sink = if state.pressed == Some(HitTarget::Dismiss) {
+        1.0 * s
+    } else {
+        0.0
+    };
+
+    let side = glyph.w.min(glyph.h);
+    fill_cross(
+        rt,
+        &brush,
+        glyph.x,
+        glyph.y + sink,
+        side,
+        limits::DISMISS_LINE * s,
+    );
+    Ok(())
+}
+
+/// 用**逐行矩形**填一个 45° 的 ×（避免依赖 `ID2D1PathGeometry` / 变换矩阵，
+/// 与 [`fill_triangle`] 保持同一种"纯 `FillRectangle`"实现风格）。
+///
+/// 每一行画两个短横条：`run` 是笔画在**水平方向**的截面宽度，
+/// 45° 斜线的垂直粗细 `lw` 对应 `run = lw * √2`。
+/// 两端各留 `run / 2` 的内缩，笔画不会顶出 `side × side` 的字形框。
+/// 行间多画 0.6px 消除抗锯齿接缝（同 [`fill_triangle`]）。
+fn fill_cross(
+    rt: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    x: f32,
+    y: f32,
+    side: f32,
+    line_width: f32,
+) {
+    let side = side.max(1.0);
+    let rows = side.round().max(1.0) as i32;
+    let step = side / rows as f32;
+    let run = (line_width.max(0.4) * std::f32::consts::SQRT_2).min(side * 0.5);
+    let inset = run * 0.5;
+    let span = (side - 2.0 * inset).max(0.0);
+
+    for i in 0..rows {
+        // 行中心相对字形框的归一化位置 0..1
+        let t = (i as f32 + 0.5) / rows as f32;
+        let yy = y + i as f32 * step;
+        // 左上→右下：中心从 inset 走到 side-inset
+        let cx1 = x + inset + t * span;
+        // 右上→左下：镜像
+        let cx2 = x + side - inset - t * span;
+        // SAFETY: 栈上矩形；坐标全部有限；brush 由本帧持有。
+        unsafe {
+            rt.FillRectangle(&d2d_rect(cx1 - run * 0.5, yy, run, step + 0.6), brush);
+            rt.FillRectangle(&d2d_rect(cx2 - run * 0.5, yy, run, step + 0.6), brush);
         }
     }
 }

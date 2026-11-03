@@ -185,6 +185,10 @@ pub struct WidgetLayout {
     pub hit_next: RectF,
     pub hit_progress: RectF,
     pub hit_cover: RectF,
+    /// 右上角关闭 × 的**字形**矩形（边长 [`limits::DISMISS_ICON`] * scale，居中于命中区）
+    pub dismiss: RectF,
+    /// 右上角关闭 × 的**命中**矩形（边长 [`limits::DISMISS_HIT`] * scale，贴右边缘、y 从 0）
+    pub hit_dismiss: RectF,
 
     // ---- 文本缓存（M1 报告 §5.9：截断结果缓存进布局，避免每帧建 TextLayout）----
     /// 已截断的歌名（含省略号）
@@ -221,6 +225,10 @@ impl WidgetLayout {
     }
 
     /// 内容自然宽度（不含宽度钳位，含歌词最小宽），用于日志与调试。
+    ///
+    /// v1.5.0：右下角多了一个常驻的 ×（命中 24 + 净距 8），固定件宽度随之 +32。
+    /// 这里必须与 [`compute_full`] 的 `fixed` 严格同源，否则日志里的调试宽度会
+    /// 比真实窗口窄 32px。
     pub fn fixed_width(&self) -> f32 {
         let s = self.effective_scale();
         limits::CONTENT_PAD * s * 2.0
@@ -228,6 +236,7 @@ impl WidgetLayout {
             + limits::COVER_TEXT_GAP * s
             + limits::TEXT_BTN_GAP * s
             + (limits::BTN_HIT * 3.0 + limits::BTN_GAP * 2.0) * s
+            + (limits::DISMISS_HIT + limits::DISMISS_GAP) * s
             + self.form.lyric_w() * s
     }
 }
@@ -301,8 +310,13 @@ pub fn compute_full(
         .round()
         .clamp(0.0, (limits::WIDGET_MAX_W * s).round());
 
-    // 总宽 = 固定件(边距+封面+间距+三键) + 信息区宽，整体下限 200*s
-    let fixed = pad * 2.0 + cover_side + gap_ct + gap_tb + btn_group;
+    // 总宽 = 固定件(边距+封面+间距+三键+关闭×) + 信息区宽，整体下限 200*s
+    //
+    // v1.5.0（G3）：右上角常驻 × 独占「右边缘的固定列」——命中 24 + 净距 8 = 32*s，
+    // 播放三键因此整体左移，窗口总宽相应 +32*s（信息区宽度不变，用户看到的是
+    // 「三键左移、右侧多出一个 ×」而不是「文字被挤窄」）。
+    let dismiss_col = (limits::DISMISS_HIT + limits::DISMISS_GAP) * s;
+    let fixed = pad * 2.0 + cover_side + gap_ct + gap_tb + btn_group + dismiss_col;
     let width = (((fixed + info_w) as i32).max((limits::WIDGET_MIN_W * s).round() as i32)).max(1);
 
     // v1.1：高度恒为任务栏条带厚度，主行与客户区完全重合。
@@ -318,9 +332,9 @@ pub fn compute_full(
     // 封面 32×32（×scale），在主行内垂直居中
     let cover = RectF::new(pad, ((mh - cover_side) * 0.5).max(0.0), cover_side, cover_side);
 
-    // 按钮组：右对齐
+    // 按钮组：右对齐，但**右边缘让出关闭 × 的整列**（命中 24 + 净距 8）
     let btn_y = ((mh - btn) * 0.5).max(0.0);
-    let btn_next = RectF::new(w - pad - btn, btn_y, btn, btn);
+    let btn_next = RectF::new(w - pad - dismiss_col - btn, btn_y, btn, btn);
     let btn_toggle = RectF::new(btn_next.x - bgap - btn, btn_y, btn, btn);
     let btn_prev = RectF::new(btn_toggle.x - bgap - btn, btn_y, btn, btn);
 
@@ -383,6 +397,21 @@ pub fn compute_full(
         .min((main_bottom - 2.0).max(0.0));
     let hit_progress = RectF::new(0.0, prog_hit_top, w, (main_bottom - prog_hit_top).max(2.0));
 
+    // ---- 右上角关闭 ×（v1.5.0 / G3）----
+    // 命中区贴右上角：右缘 = 客户区右缘 − pad，y 从 0 开始（纵向占满 24*s）。
+    // 纵向不居中是有意的——「右上角」是用户对位置的描述，贴角比居中更像常驻角标，
+    // 而且条带高度（48@100%）远大于 24，居中/贴角的点击差异可以忽略。
+    let dismiss_hit = limits::DISMISS_HIT * s;
+    let hit_dismiss = RectF::new(w - pad - dismiss_hit, 0.0, dismiss_hit, dismiss_hit);
+    // 字形在命中区内**居中**：16 字形 / 24 命中 → 每边 4px 余量。
+    let icon = limits::DISMISS_ICON * s;
+    let dismiss = RectF::new(
+        hit_dismiss.x + (dismiss_hit - icon) * 0.5,
+        hit_dismiss.y + (dismiss_hit - icon) * 0.5,
+        icon,
+        icon,
+    );
+
     WidgetLayout {
         form,
         edge,
@@ -403,6 +432,8 @@ pub fn compute_full(
         hit_next: btn_next.expanded_to(hit_min),
         hit_progress,
         hit_cover,
+        dismiss,
+        hit_dismiss,
         title_text: String::new(),
         artist_text: String::new(),
         text_key: 0,
@@ -440,17 +471,17 @@ mod tests {
 
     #[test]
     fn lyric_form_widens_info_area_to_min_160() {
-        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 162 + 信息区 160 = 322
+        // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 194 + 信息区 160 = 354
         let off = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         let on = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
         assert_eq!(off.width, 200);
-        assert_eq!(on.width, 322);
-        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 162 + 200 = 362；
-        // 文本自然宽顶到信息区上限 340：宽 = 162 + 340 = 502
+        assert_eq!(on.width, 354);
+        // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 194 + 200 = 394；
+        // 文本自然宽顶到信息区上限 340：宽 = 194 + 340 = 534
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0);
-        assert_eq!(mid.width, 162 + 200);
+        assert_eq!(mid.width, 194 + 200);
         let wide = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(wide.width, 162 + 340);
+        assert_eq!(wide.width, 194 + 340);
     }
 
     #[test]
@@ -486,13 +517,13 @@ mod tests {
         assert_eq!(TaskbarEdge::from_appbar_edge(99), TaskbarEdge::Bottom);
     }
 
-    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 162+340）。
+    /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 194+340）。
     #[test]
     fn width_clamps_between_min_and_max() {
         let short = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0);
         assert_eq!(short.width, 200);
         let long = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0);
-        assert_eq!(long.width, 162 + 340);
+        assert_eq!(long.width, 194 + 340);
         let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0);
         assert!(mid.width > 200 && mid.width < 340, "mid.width = {}", mid.width);
     }
@@ -562,6 +593,37 @@ mod tests {
                 // 命中区不出窗口
                 assert!(l.hit_next.right() <= l.width as f32 + 0.01);
                 assert!(l.hit_progress.bottom() <= l.main_row.bottom() + 0.01);
+
+                // v1.5.0（G3）：× 命中区贴右上角，且与 next 命中区留 DISMISS_GAP 净距
+                assert!(
+                    (l.hit_dismiss.right() - (l.width as f32 - limits::CONTENT_PAD * scale)).abs()
+                        < 0.01,
+                    "{form:?}@{scale} hit_dismiss.right = {} 应贴 pad 内侧",
+                    l.hit_dismiss.right()
+                );
+                assert!(
+                    l.hit_dismiss.x - l.hit_next.right() >= limits::DISMISS_GAP * scale - 0.01,
+                    "{form:?}@{scale} × 与 next 净距 = {} < {}（误触防线被破）",
+                    l.hit_dismiss.x - l.hit_next.right(),
+                    limits::DISMISS_GAP * scale
+                );
+
+                // QA 补充（G1）：`hit_dismiss` 是**唯一**刻意小于 HIT_MIN 的命中区，
+                // 所以它不在上面的 ≥HIT_MIN 循环里。这个例外必须有断言兜底，否则
+                // 就是「被悄悄跳过」：
+                //   - 命中区恰为 24*s（不是"差不多"）；
+                //   - 低于 HIT_MIN 的理由写在 `limits::DISMISS_HIT` 的注释里
+                //     （× 独占右上角、与 next 有 8*s 净距，误触靠"不相邻"而不是放大热区；
+                //     放大反而更容易压到 next 并吃掉 +32*s 的宽度预算）。
+                assert!(
+                    (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001
+                        && (l.hit_dismiss.h - limits::DISMISS_HIT * scale).abs() < 0.001,
+                    "{form:?}@{scale} hit_dismiss = {}×{}，应恰为 DISMISS_HIT*s = {}（刻意低于 HIT_MIN {}）",
+                    l.hit_dismiss.w,
+                    l.hit_dismiss.h,
+                    limits::DISMISS_HIT * scale,
+                    limits::HIT_MIN * scale
+                );
             }
         }
     }
@@ -725,5 +787,297 @@ mod tests {
         let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
         assert!(l.lyric_cur.is_empty());
         assert_eq!(l.width, 200);
+    }
+
+    // ------------------------------------------------- v1.5.0（G3）右上角关闭 ×
+
+    /// 宽度：× 的「24 命中 + 8 净距」让窗口**必须**比 v1.4.4 宽 32*s。
+    ///
+    /// 这里把 v1.4.4 的绝对宽度（362 / 452）**写死**而不是从公式推——这样任何人
+    /// 想「优化掉」那 32px（例如偷偷把 × 叠到 next 上、或缩回 16 热区）都会立刻
+    /// 被这条断言拦住。
+    #[test]
+    fn dismiss_column_adds_32_logical_px_to_width() {
+        for (scale, width_v144) in [(1.0f32, 362.0f32), (1.25, 452.0)] {
+            let bar = (48.0 * scale) as i32;
+            let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
+            let want = width_v144 + 32.0 * scale;
+            assert!(
+                (l.width as f32 - want).abs() < 0.51,
+                "scale={scale}: width = {} 应为 v1.4.4 的 {width_v144} + 32*{scale} = {want}",
+                l.width
+            );
+        }
+    }
+
+    /// × 的命中区：贴右上角（right = w − pad、y = 0），边长 24*s。
+    #[test]
+    fn dismiss_hit_sits_in_top_right_corner() {
+        for scale in [1.0f32, 1.25, 1.5] {
+            let bar = (48.0 * scale) as i32;
+            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let pad = limits::CONTENT_PAD * scale;
+            let side = limits::DISMISS_HIT * scale;
+            assert!((l.hit_dismiss.right() - (l.width as f32 - pad)).abs() < 0.001);
+            assert!(l.hit_dismiss.y.abs() < 0.001, "× 必须从客户区顶部开始");
+            assert!((l.hit_dismiss.w - side).abs() < 0.001, "hit.w = {}", l.hit_dismiss.w);
+            assert!((l.hit_dismiss.h - side).abs() < 0.001, "hit.h = {}", l.hit_dismiss.h);
+            assert!((l.hit_dismiss.x - (l.width as f32 - pad - side)).abs() < 0.001);
+        }
+    }
+
+    /// 误触防线：× 命中区与「下一首」命中区**水平净距 ≥ 8*s**（绝不重叠）。
+    #[test]
+    fn dismiss_hit_keeps_8px_clear_of_next_hit() {
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                let bar = (48.0 * scale) as i32;
+                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let gap = l.hit_dismiss.x - l.hit_next.right();
+                assert!(
+                    gap >= limits::DISMISS_GAP * scale - 0.5,
+                    "{form:?}@{scale}: × 与 next 净距 = {gap} < {}",
+                    limits::DISMISS_GAP * scale
+                );
+                // 视觉上三键也整体左移（btn_next 右缘同样让出整列）
+                assert!(l.btn_next.right() < l.hit_dismiss.x);
+            }
+        }
+    }
+
+    /// 字形在命中区内居中：每边余量 = (24 − 16) / 2 * s = 4*s。
+    #[test]
+    fn dismiss_glyph_is_centred_in_hit() {
+        let s = 1.0f32;
+        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, s, 48);
+        let margin = (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5 * s;
+        assert!((l.dismiss.x - (l.hit_dismiss.x + margin)).abs() < 0.001);
+        assert!((l.dismiss.y - (l.hit_dismiss.y + margin)).abs() < 0.001);
+        assert!((l.dismiss.w - limits::DISMISS_ICON * s).abs() < 0.001);
+        assert!((l.dismiss.h - limits::DISMISS_ICON * s).abs() < 0.001);
+        let (hx, hy) = l.hit_dismiss.center();
+        let (cx, cy) = l.dismiss.center();
+        assert!((hx - cx).abs() < 0.001 && (hy - cy).abs() < 0.001, "字形必须居中");
+    }
+
+    /// 回归：加了 × 之后高度**仍恒等于条带厚度**（不变量不许破）。
+    #[test]
+    fn dismiss_does_not_change_height() {
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for bar in [40i32, 48, 60, 72] {
+                let l = compute(TaskbarEdge::Bottom, form, 1.0, bar);
+                assert_eq!(l.height, bar, "{form:?}@{bar}");
+            }
+        }
+    }
+
+    /// `fixed_width()` 必须与 `compute_full` 的固定件同源（+32*s）。
+    #[test]
+    fn fixed_width_matches_computed_width() {
+        // 162（v1.4.4 固定件）+ 32（24 命中 + 8 净距）= 194
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, 0.0);
+        assert!((l.fixed_width() - 194.0).abs() < 0.001, "fixed_width = {}", l.fixed_width());
+    }
+
+    // ================================================ QA（G3 独立验证）补充断言
+    //
+    // 下面几条是 QA 侧新增的「跨维度」断言，理由：既有用例里 × 的几何只在
+    // `TaskbarEdge::Bottom` 上验证过，而左右任务栏走的是旋转渲染路径
+    // （`TaskbarEdge::is_vertical`），布局仍按水平语义算——一旦有人给左右方位
+    // 加特判，只有全矩阵断言能拦住。
+
+    /// **B 组**：几何不变量跨「2 形态 × 4 缩放 × 4 方位」全矩阵。
+    ///
+    /// 五条断言对应最容易回归的五件事：
+    /// 1. `height == bar_thickness`（不变量，× 不许改变高度）；
+    /// 2. × 命中区贴右边缘（`right = width − pad`）、`y = 0`、边长 `24*s`；
+    /// 3. 与「下一首」命中区水平净距 ≥ `8*s`（用户明确要求的误触防线）；
+    /// 4. 与「进度条」命中区**不重叠**——进度条命中区是**整宽**，最容易被忽略；
+    /// 5. 完全落在窗口内（`x ≥ 0`、`right ≤ width`、`bottom ≤ height`）。
+    #[test]
+    fn dismiss_geometry_invariants_matrix() {
+        for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                for edge in [
+                    TaskbarEdge::Bottom,
+                    TaskbarEdge::Top,
+                    TaskbarEdge::Left,
+                    TaskbarEdge::Right,
+                ] {
+                    let bar = (48.0 * scale).round() as i32;
+                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let pad = limits::CONTENT_PAD * scale;
+                    let side = limits::DISMISS_HIT * scale;
+                    let tag = format!("{form:?}/{scale}/{edge:?}");
+
+                    // 1) 高度不变量
+                    assert_eq!(l.height, bar, "{tag}: 高度必须恒等于条带厚度");
+
+                    // 2) 贴右上角 + 边长
+                    assert!(
+                        (l.hit_dismiss.right() - (l.width as f32 - pad)).abs() < 0.001,
+                        "{tag}: hit_dismiss.right = {} 应贴 pad 内侧（{}）",
+                        l.hit_dismiss.right(),
+                        l.width as f32 - pad
+                    );
+                    assert!(
+                        l.hit_dismiss.y.abs() < 0.001,
+                        "{tag}: hit_dismiss.y = {} 应从客户区顶部开始",
+                        l.hit_dismiss.y
+                    );
+                    assert!(
+                        (l.hit_dismiss.w - side).abs() < 0.001
+                            && (l.hit_dismiss.h - side).abs() < 0.001,
+                        "{tag}: hit_dismiss 边长 = {}×{}，应为 {side}",
+                        l.hit_dismiss.w,
+                        l.hit_dismiss.h
+                    );
+
+                    // 3) 与 next 的水平净距（误触防线）
+                    let gap = l.hit_dismiss.x - l.hit_next.right();
+                    assert!(
+                        gap >= limits::DISMISS_GAP * scale - 0.001,
+                        "{tag}: × 与 next 净距 = {gap} < {}",
+                        limits::DISMISS_GAP * scale
+                    );
+
+                    // 4) 与进度条命中区不重叠（进度条命中区横跨整宽）
+                    let overlap_w = l.hit_dismiss.right().min(l.hit_progress.right())
+                        - l.hit_dismiss.x.max(l.hit_progress.x);
+                    let overlap_h = l.hit_dismiss.bottom().min(l.hit_progress.bottom())
+                        - l.hit_dismiss.y.max(l.hit_progress.y);
+                    assert!(
+                        overlap_w <= 0.0 || overlap_h <= 0.0,
+                        "{tag}: × 命中区与进度条命中区重叠 {overlap_w}×{overlap_h}\
+                         （dismiss {}/{}，progress {}/{}）",
+                        l.hit_dismiss.y,
+                        l.hit_dismiss.bottom(),
+                        l.hit_progress.y,
+                        l.hit_progress.bottom()
+                    );
+
+                    // 5) 不出窗口
+                    assert!(l.hit_dismiss.x >= 0.0, "{tag}: hit_dismiss.x = {} < 0", l.hit_dismiss.x);
+                    assert!(
+                        l.hit_dismiss.right() <= l.width as f32 + 0.001,
+                        "{tag}: hit_dismiss.right = {} > width {}",
+                        l.hit_dismiss.right(),
+                        l.width
+                    );
+                    assert!(
+                        l.hit_dismiss.bottom() <= l.height as f32 + 0.001,
+                        "{tag}: hit_dismiss.bottom = {} > height {}",
+                        l.hit_dismiss.bottom(),
+                        l.height
+                    );
+
+                    // 字形 16*s 且居中于命中区
+                    assert!(
+                        (l.dismiss.w - limits::DISMISS_ICON * scale).abs() < 0.001,
+                        "{tag}: 字形边长 = {}，应为 {}",
+                        l.dismiss.w,
+                        limits::DISMISS_ICON * scale
+                    );
+                    let (hx, hy) = l.hit_dismiss.center();
+                    let (gx, gy) = l.dismiss.center();
+                    assert!(
+                        (hx - gx).abs() < 0.001 && (hy - gy).abs() < 0.001,
+                        "{tag}: 字形中心 ({gx},{gy}) 必须与命中区中心 ({hx},{hy}) 重合"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **B6 组**：最小窗宽场景——`compute(Compact, 1.0, 48)`，无文本、宽度被
+    /// `WIDGET_MIN_W = 200` 钳住（固定件 194 + 信息区 0 被吃掉 6px）。
+    ///
+    /// 这是 × 最可能出问题的角落：窗口只剩 200px，× 与 next 的净距**刚好等于**
+    /// 8（零余量）。任何一处微调（pad/按钮宽/净距）都会先在这里破防，
+    /// 所以必须把实际数值写进断言消息，失败时一眼能看出被谁挤掉了。
+    #[test]
+    fn dismiss_fits_in_minimum_width_window() {
+        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        assert_eq!(l.width, 200, "无文本时窗口宽度应被 WIDGET_MIN_W 钳住");
+        assert!(
+            (l.fixed_width() - 194.0).abs() < 0.001,
+            "固定件 = {}，应为 194（v1.4.4 的 162 + 24 命中 + 8 净距）",
+            l.fixed_width()
+        );
+
+        // 实际数值：hit_dismiss = (168, 0, 24, 24)
+        assert!(
+            (l.hit_dismiss.x - 168.0).abs() < 0.001,
+            "hit_dismiss.x = {}，应为 168（200 − pad 8 − 24）",
+            l.hit_dismiss.x
+        );
+        assert!(
+            (l.hit_dismiss.right() - 192.0).abs() < 0.001,
+            "hit_dismiss.right = {}，应为 192（200 − pad 8）",
+            l.hit_dismiss.right()
+        );
+        assert!(l.hit_dismiss.x >= 0.0 && l.hit_dismiss.right() <= l.width as f32);
+
+        // 零余量：净距恰好 8（不是 "≥8" 的宽松判定，锁死数值）
+        let gap = l.hit_dismiss.x - l.hit_next.right();
+        assert!(
+            (gap - 8.0).abs() < 0.001,
+            "最小窗宽下 × 与 next 净距 = {gap}，应恰为 DISMISS_GAP = 8（next.right = {}）",
+            l.hit_next.right()
+        );
+
+        // 三键仍完整落在窗口内（没有因为让出 × 的整列而被挤出左边界）
+        assert!(l.btn_next.right() < l.hit_dismiss.x);
+        assert!(
+            l.btn_prev.x >= 0.0,
+            "最小窗宽下「上一首」被挤出左边界：x = {}",
+            l.btn_prev.x
+        );
+        assert!(
+            l.hit_prev.x >= 0.0,
+            "最小窗宽下「上一首」命中区被挤出左边界：x = {}",
+            l.hit_prev.x
+        );
+    }
+
+    /// **G1 组**：× 命中区 `24*s` **刻意低于** `HIT_MIN = 28*s` 这件事必须显式写死。
+    ///
+    /// 既有 `rects_do_not_overlap_and_hits_meet_minimum` 的 ≥HIT_MIN 循环里
+    /// **没有** `hit_dismiss`（它是唯一不达标的命中区），如果不写这条断言，
+    /// 这个例外就是「被悄悄跳过」而不是「被明确豁免」——后人把 × 加进循环、
+    /// 或把 `DISMISS_HIT` 调大到 28，都会静默破坏 8px 净距与 +32px 宽度预算。
+    #[test]
+    fn dismiss_hit_is_deliberately_smaller_than_hit_min() {
+        assert!(
+            limits::DISMISS_HIT < limits::HIT_MIN,
+            "DISMISS_HIT（{}）必须小于 HIT_MIN（{}）：调大到 28 会挤掉 8*s 净距",
+            limits::DISMISS_HIT,
+            limits::HIT_MIN
+        );
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let bar = (48.0 * scale).round() as i32;
+            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            assert!(
+                (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001,
+                "scale={scale}: hit_dismiss.w = {}，应恰为 24*s = {}",
+                l.hit_dismiss.w,
+                limits::DISMISS_HIT * scale
+            );
+            // 其余可点击命中区必须 ≥ HIT_MIN（防止有人"为了对称"把它们也缩小）
+            for (name, r) in [
+                ("hit_prev", l.hit_prev),
+                ("hit_toggle", l.hit_toggle),
+                ("hit_next", l.hit_next),
+                ("hit_cover", l.hit_cover),
+            ] {
+                assert!(
+                    r.w >= limits::HIT_MIN * scale - 0.01 && r.h >= limits::HIT_MIN * scale - 0.01,
+                    "scale={scale}: {name} = {}×{} < {}",
+                    r.w,
+                    r.h,
+                    limits::HIT_MIN * scale
+                );
+            }
+        }
     }
 }
