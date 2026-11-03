@@ -1,0 +1,129 @@
+%% G7 媒体会话黑名单（v1.8.0）— 类图（ARCH v1.3 / U1=B，缓存落盘 config.media.app_names）
+%% 来源：docs/ARCH-G7-黑名单.md §3.4
+classDiagram
+    class Config {
+        +u32 version
+        +AppearanceConfig appearance
+        +LyricsConfig lyrics
+        +VolumeConfig volume
+        +HotkeyConfig hotkeys
+        +GeneralConfig general
+        +WindowStateConfig window
+        +StorageConfig storage
+        +MediaConfig media
+        +load() Config
+        +save() Result
+    }
+
+    class MediaConfig {
+        +Vec~String~ blacklist
+        +BTreeMap~String,String~ app_names
+    }
+
+    class MediaIndex {
+        -Mutex~Vec~String~~ blacklist
+        -Mutex~BTreeMap~String,String~~ app_names
+        +new(cfg) Arc~MediaIndex~
+        +set(cfg)
+        +identity(process_name, aumid) Identity
+        +matches(process_name, aumid) bool
+        +blacklist_snapshot() Vec~String~
+        +blacklist_len() usize
+        +learn(learned)
+        +knows_process(key) bool
+    }
+
+    class Identity {
+        +String key
+        +IdentitySource source
+    }
+
+    class IdentitySource {
+        <<enumeration>>
+        Cache
+        Table
+        AumidSegment
+        None
+    }
+
+    class NormError {
+        <<enumeration>>
+        Empty
+        InvalidChar
+        TooLong
+    }
+
+    class PollState {
+        -Option~NowPlaying~ last
+        -SessionParts parts
+        -Cadence cadence
+        -Arc~MediaIndex~ index
+        -Option~IgnoredSessionInfo~ last_ignored
+        -Option~(String, Instant)~ last_hit
+        -Instant last_ignore_probe
+        +schedule(now, dirty) tuple
+        +tick(mgr, sink, now, plan)
+        +ignored_now() bool
+        +tick_ignored(mgr, sink, now, plan, forced)
+    }
+
+    class MediaAppEntry {
+        +String process
+        +String display_name
+        +bool playable
+        +bool resolved
+        +String source
+    }
+
+    class IgnoredSessionInfo {
+        +String process_name
+        +String aumid
+        +String app_name
+    }
+
+    class Cadence {
+        -Option~Instant~ last_playback
+        -Option~Instant~ last_timeline
+        -Option~Instant~ last_props
+        +plan(now, forced) Plan
+        +consume(now, plan)
+    }
+
+    class App {
+        -Arc~MediaIndex~ index
+        -Option~IgnoredSessionInfo~ ignored
+        +reduce(evt) Vec~Effect~
+        +ignore_menu_item() IgnoreMenuItem
+        +reduce_blacklist_set(path, value) Vec~Effect~
+        +reduce_media_apps(snap) Vec~Effect~
+    }
+
+    class BlacklistOutcome {
+        <<enumeration>>
+        Added(KeyRecognition)
+        Duplicate
+        Invalid(NormError)
+        Full
+        Removed
+        NotFound
+        Cleared
+        BadPath
+    }
+
+    class KeyRecognition {
+        <<enumeration>>
+        Verified
+        Unverified
+    }
+
+    Config *-- MediaConfig
+    MediaConfig ..> MediaIndex : 启动时注入（同源内存副本）
+    MediaIndex *-- Identity
+    Identity --> IdentitySource
+    App --> MediaIndex : 写（SaveConfig 时 set / 枚举时 learn）
+    PollState --> MediaIndex : 读（每轮 identity+matches，纯内存）
+    PollState *-- IgnoredSessionInfo : last_ignored
+    PollState *-- Cadence
+    App ..> BlacklistOutcome : toast 分流
+    BlacklistOutcome --> KeyRecognition
+    MediaIndex ..> MediaAppEntry : 枚举结果填充（learned 随事件回传落盘）

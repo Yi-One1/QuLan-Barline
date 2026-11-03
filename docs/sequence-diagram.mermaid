@@ -1,0 +1,110 @@
+%% G7 媒体会话黑名单（v1.8.0）— 时序图（ARCH v1.3 / U1=B，缓存落盘）
+%% 图 1 来源：docs/ARCH-G7-黑名单.md §4.6（过滤 / 播控拦截 / 解绑恢复）
+%% 图 2 来源：docs/ARCH-G7-黑名单.md §5.8（枚举 + 真实名反查 + 缓存写回）
+
+%% ==================== 图 1：过滤 / 播控拦截 / 解绑恢复 ====================
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant T as 托盘 (T0)
+    participant A as App::reduce (T0)
+    participant X as MediaIndex (共享)
+    participant M as media thread (T1)
+    participant W as 小组件 (T0)
+
+    Note over M: 正常态：每 500ms/1s/2s 分层读取
+    M-->>A: AppEvent::NowPlaying(网易云)
+    A->>W: Relayout → 显示
+
+    U->>T: 右键 → 拉黑当前应用（网易云音乐）
+    T->>A: TrayCommand::ToggleIgnoreCurrent
+    A->>A: config.media.blacklist.push("cloudmusic.exe")
+    A->>X: set(&config.media)
+    Note right of A: 先同步共享索引（媒体线程立即看到）
+    A->>A: ignored = Some(网易云)；playing = default()
+    A->>W: Relayout → NoSession → 隐藏
+    A->>A: Effects: SaveConfig（同步写盘）+ push state
+
+    Note over M: 下一轮 tick：ignored_now() == true
+    M->>M: tick_ignored()：不发 NowPlaying、不读时间线/属性/封面
+    M-->>A: AppEvent::SessionCleared（进入忽略，一次性）
+    M-->>A: AppEvent::IgnoredSession(Some(网易云))
+    Note over M: 命中日志 1 条 INFO，同进程名 60s 内不再打
+
+    U->>W: 按 Ctrl+Alt+P（热键仍可用）
+    A->>M: Effect::Media(PlayPause)
+    M->>M: execute() → ignored_now() → 丢弃（log_debug）
+    Note over M: 不产生任何 TryTogglePlayPauseAsync，日志无 smtc.controls
+
+    U->>T: 右键 → 恢复当前应用（网易云音乐）
+    T->>A: TrayCommand::ToggleIgnoreCurrent
+    A->>X: set(&config.media)   Note right of A: 名单已空
+    A->>A: ignored = None
+    Note over M: 下一轮 ignored_now() == false → 走正常 tick()
+    M-->>A: AppEvent::NowPlaying(网易云)
+    Note right of M: last==None，必然重发
+    M-->>A: AppEvent::IgnoredSession(None)
+    A->>W: Relayout → 显示（≤500ms）
+
+%% ==================== 图 2：枚举 + 真实名反查 + 缓存写回 ====================
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant JS as 设置页 JS
+    participant WV as WebView2 回调 (T0)
+    participant A as App::reduce (T0)
+    participant M as media thread (T1)
+    participant B as player_map
+    participant X as MediaIndex (共享)
+    participant W as WASAPI (T1)
+
+    U->>JS: 点导航「黑名单」
+    JS->>JS: detectedLoaded == false ?
+    JS->>WV: post({type:"action", payload:"blacklistEnumerate"})
+    WV->>A: AppEvent::SettingsMessage
+    A->>A: run_settings_action → media.send(EnumerateApps)
+    A-->>JS: （无 UI 阻塞，页面继续响应）
+    A->>M: MediaCommand::EnumerateApps
+
+    rect rgb(238,244,255)
+    Note over M: ① collect（1+N 次跨进程）
+    M->>M: mgr.GetSessions()
+    loop 每个会话 N=0..3
+        M->>M: session.SourceAppUserModelId()
+        M->>B: resolve(aumid)
+    end
+    end
+
+    rect rgb(255,246,238)
+    Note over M,W: ② reverse（仅表未命中的条目；deadline 120ms / ≤16 次）
+    M->>X: identity(process, aumid) 取①级缓存
+    alt 表与缓存都未命中
+        M->>W: CoCreateInstance + GetDefaultAudioEndpoint + Activate
+        loop 前 32 个音频会话（pid 去重，≤16 个进程查镜像名）
+            M->>W: GetProcessId + process_image_name(pid)
+            Note right of W: 唯一可能慢的调用<br/>调用前查 deadline
+        end
+        M->>M: session_matches(image, aumid) → 真实进程名
+    end
+    end
+
+    Note over M: ③ finish：identity() 三级回退 → process / resolved / source
+    M->>X: learn(learned)   Note right of X: 先写内存副本，本轮 tick 立即生效
+    M-->>A: AppEvent::MediaApps({apps, at_ms, learned, over_budget})
+    A->>A: merge_learned(&mut config.media.app_names, learned)
+    A->>X: set(&config.media)   Note right of A: 必须在 merge 之后（§5.6 顺序陷阱）
+    A->>A: Effect::SaveConfig → 落盘（仅 changed 时）
+    A-->>JS: push_transient({type:"mediaApps", ...})
+    JS->>JS: 过滤已在黑名单的条目 → 渲染列表 + datalist
+    JS->>JS: resolved=false 的行加软提示（"进程名可能不是真实文件名"）
+
+    U->>JS: 点某行「加入」
+    JS->>A: set("media.blacklist_add", "cloudmusic.exe")
+    A->>A: apply_blacklist → Added(Verified)
+    A-->>JS: toast::blacklist.added + state（全量回推）
+    JS->>JS: render() 重画 → 该行因在 blacklist 里而被过滤掉（列表立即少一行）
+
+    U->>JS: 手输一个从未出现过的名字
+    JS->>A: set("media.blacklist_add", "someplayer.exe")
+    A->>A: apply_blacklist → Added(Unverified)
+    A-->>JS: toast::blacklist.unverified（"已添加，但未能验证该进程名…"）
