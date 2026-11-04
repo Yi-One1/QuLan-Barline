@@ -26,7 +26,7 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - **歌词链（v1.4.0）**：内存→磁盘→本地→负缓存→**在线并发**（lrclib+网易云抢答，8s 硬截止）；换歌抢占（独立线程 + TrackId 代次守卫）；重试最多 1 次/3s、超时不重试；缓存键 `cache_title_key` 摘平台后缀与首尾装饰但**版本标记不摘**；`MIN_PICK_SCORE=60`、时长差 >10s 淘汰。
 - **SMTC 轮询（v1.4.2/1.4.3，卡顿的根）**：**禁止全量轮询**（14 次/秒会拖卡网易云）；分层 500/1000/2000ms + 网易云 (0,0)×3 退避 5s；**主通道=事件**（MediaPropertiesChanged 等三事件→置脏位→60ms 下限 forced；回调只许置 AtomicBool）。
 - **位置锚点 `position_at`**（歌词同步命门）：读了时间线→读取时刻；没读但切歌→检测时刻；其余沿用上一份。绝不许用陈旧 `timeline_at`（网易云恒报 (0,0)）。
-- **G3.5-A 全屏遮挡（v1.5.6）**：曲栏是 top-level popup（**非任务栏子窗口**），全屏盖不住的根因是 `WS_EX_TOPMOST` + 每秒 `ensure_on_top()`。纯通知型 appbar（只 `ABM_NEW/ABM_REMOVE`、**不发 `ABM_QUERYPOS/SETPOS`、不占工作区**）注册在 **widget 主窗口**（`TaskbarCreated` 是广播，`HWND_MESSAGE` 收不到）；`ABM_REMOVE` 必须在 `host.destroy()` 之前。`ABN_FULLSCREENAPP` 事件驱动 → `HWND_BOTTOM`（**禁用 `HWND_NOTOPMOST`**）→ 退出 `HWND_TOPMOST`。**永不 `SW_HIDE`**：`frozen` 只降 Z 序 + 静止降载，`compute_visible()` 不含 frozen；`z_demoted` 双份状态幂等、只在 `SetWindowPos` 成功后翻转；退出须**先清 `frozen/z_demoted` 逻辑门控再恢复 Z 序**。1s 心跳只作兜底对账。`occlusion_want(AppbarOpen) = !(fs && !same_monitor(fg,wm))`（信任事件、仅明确异屏还原）。
+- **G3.5-A 全屏遮挡（v1.5.6）**：曲栏是 top-level popup（**非任务栏子窗口**），全屏盖不住的根因是 `WS_EX_TOPMOST` + 每秒 `ensure_on_top()`。纯通知型 appbar（只 `ABM_NEW/ABM_REMOVE`、**不发 `ABM_QUERYPOS/SETPOS`、不占工作区**）注册在 **widget 主窗口**（`TaskbarCreated` 是广播，`HWND_MESSAGE` 收不到）；`ABM_REMOVE` 必须在 `host.destroy()` 之前。`ABN_FULLSCREENAPP` 事件驱动 → `HWND_BOTTOM`（**禁用 `HWND_NOTOPMOST`**）→ 退出 `HWND_TOPMOST`。**永不 `SW_HIDE`**：`frozen` 只降 Z 序 + 静止降载，`compute_visible()` 不含 frozen；`z_demoted` 双份状态幂等、只在 `SetWindowPos` 成功后翻转；退出须**先清 `frozen/z_demoted` 逻辑门控再恢复 Z 序**。1s 心跳只作兜底对账。`occlusion_want(AppbarOpen) = !(fs && !same_monitor(fg,wm))`（信任事件、仅明确异屏还原）。**坑：`||` 短路使 `fs=false` 时 monitor 完全不参与判定 → 「monitor 全 0 不冻结」安全方向在事件路径被放宽，只有 `fs=true` 路径 100% 保住；v1.5.7 应对 `fg/wm == RECT::default()` 回退 `frozen_decision`**。
 - 热键：`HOTKEYS_VERSION=2`，默认 `Ctrl+Alt+P/←/→/L/M/H`。单实例 `Local\Barline.SingleInstance.v1`。
 - 性能埋点（仍在）：`perf::Span`，默认 50ms / `smtc.*` 8ms 才记 `[perf]`；统计行每 60s 一条。
 
@@ -50,5 +50,5 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - 待办 A：会话音量（禁用中，入口 `media/wasapi.rs::session_simple_volume`）。
 - 待办 D：汽水音乐托盘态激活（搁置：外部 ShowWindow 让 CEF 输入挂起）。
 - 小尾巴：`hotkeys.reset1` 死词条；`SettingsService::is_open()` 零调用；`event.rs:201` "300ms 去抖"注释失实（实为同步写盘）；「冲突一键换组」未做。
-- **v1.5.6 观察项**：R2 退出抖动（`AppbarClose` 后 1s 心跳可能补冻，可加 1–2s 纯函数抑制，只抑制 Timer）；R1 新分支 `AppbarOpen × fs=false` 误冻 ≤1s 可自愈、窗口不 hide。真机验收看日志 `trigger=appbar|timer`：F11 进入应立刻出现 `trigger=appbar` 的「进入」行。
+- **v1.5.6 观察项（QA 最终报告，均不阻塞出包）**：① R2 退出抖动（`AppbarClose` 后 1s 心跳可能补冻，可加 1–2s 纯函数抑制，只抑制 Timer）；② R1 新分支 `AppbarOpen × fs=false` 会**完整冻结含降载** ≤1s、可自愈、窗口不 hide，且 monitor 全 0 安全方向在该路径被放宽；③ 迟到/重复的 TRUE 广播可立即补冻；④ `ensure_on_top()` 与 `set_z_demoted(false)` 各发一次 `HWND_TOPMOST`（冗余无害，别删）。**v1.5.7 首选加固**：`AppbarOpen` 遇 `fg/wm == RECT::default()` 回退 `frozen_decision`。真机验收看日志 `trigger=appbar|timer`：F11 进入应立刻出现 `trigger=appbar` 的「进入」行。
 - **下一组 G4**（悬停反馈，v1.6.0，含 × 悬停底色与全窗 hover 不同源的遗留）→ G5 歌词落盘（`歌词目录/Barline/歌手 - 歌名.lrc`，已存在跳过，行级 LRC）→ G6 清理（死码+未引用资源，删前列清单）→ G7 黑名单（v1.8.0，PRD/ARCH 已入库）。
