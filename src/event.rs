@@ -250,6 +250,10 @@ pub struct LyricRequest {
     pub online_enabled: bool,
     /// 在线歌词落盘开关（v1.7.0）。歌词线程看不到 Config，开关随请求带过去。
     pub write_back: bool,
+    /// 歌词查询顺序（v1.8.0）：`true` = 本地文件优先，`false` = 磁盘缓存优先。
+    /// 与 `write_back` 同款——歌词线程看不到 Config，开关必须随请求带过去；
+    /// 每首歌重建一次请求（`app.rs` 的 `lyric_request`）→ 改动即时生效、无需重启。
+    pub local_first: bool,
     /// 是否为重试
     pub retry: bool,
 }

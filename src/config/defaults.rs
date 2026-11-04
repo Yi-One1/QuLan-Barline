@@ -24,6 +24,12 @@ pub mod limits {
     /// 歌词落盘「本次运行内已处理」集合的容量上限（v1.7.0）。
     /// 满了直接 clear：真正的幂等由 `writeback` 的 `create_new` 保证，这个集合只省 syscall。
     pub const WRITE_BACK_DEDUP_CAP: usize = 64;
+    /// 设置页「歌词磁盘缓存」占用统计的单次扫描条目上限（v1.8.0）。
+    ///
+    /// 只数**顶层文件**，到达上限立即早停并把 `truncated` 置真（页面显示 `5000+`）。
+    /// 存在理由：用户可能把数据目录指到一个几万文件的目录，统计发生在 UI 线程上，
+    /// 不封顶就会把设置页卡住（PRD v1.8.0 A5.6）。
+    pub const CACHE_STATS_MAX_ENTRIES: usize = 5000;
     /// 小组件宽度范围（100% DPI 逻辑像素）
     pub const WIDGET_MIN_W: f32 = 200.0;
     pub const WIDGET_MAX_W: f32 = 340.0;
@@ -427,6 +433,8 @@ impl Default for LyricsConfig {
             local_dirs: Vec::new(),
             // v1.7.0：在线歌词落盘（只新建不覆盖），默认开
             write_back: true,
+            // v1.8.0：查询顺序默认「磁盘缓存优先」= 与 v1.7.0 行为逐字节一致
+            local_first: false,
         }
     }
 }

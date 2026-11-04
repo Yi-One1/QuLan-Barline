@@ -71,6 +71,26 @@ pub fn toast_json(level: &str, text: &str) -> String {
     json!({ "type": "toast", "payload": { "level": level, "text": text } }).to_string()
 }
 
+/// 组装 `cacheStats` 消息（v1.8.0 / R2）：设置页「歌词磁盘缓存」卡片的占用统计。
+///
+/// **刻意不进 `state`**：`state_json` 是纯函数且是热路径（每次 `set` 之后都推一次），
+/// 往里塞 `read_dir` 等于用户拨滑条时扫目录（A5.3 明令禁止）；而且统计是「一次点查的
+/// 结果」，没有「窗口重建后重推」的语义——重推它会让扫描次数飘。所以走独立消息类型。
+///
+/// `dir` 由 Rust 组装下发 → JS **不拼路径**（A4.3）。
+pub fn cache_stats_json(st: &crate::lyric::cache::Stats) -> String {
+    json!({
+        "type": "cacheStats",
+        "payload": {
+            "dir": st.dir.to_string_lossy(),
+            "files": st.files,
+            "bytes": st.bytes,
+            "truncated": st.truncated,
+        }
+    })
+    .to_string()
+}
+
 /// 应用一条 `set`。返回 `true` 表示配置真的变了。
 ///
 /// 白名单之外的路径一律拒绝（返回 `false` 并记警告）。
@@ -138,6 +158,13 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
         "lyrics.write_back" => {
             let Some(v) = value.as_bool() else { return false };
             cfg.lyrics.write_back = v;
+            true
+        }
+        // v1.8.0：歌词查询顺序（false = 磁盘缓存优先，保持 v1.7.0 现状；
+        // true = 本地歌词文件优先）。只认 JSON 布尔——"yes" / 1 / null 一律拒绝。
+        "lyrics.local_first" => {
+            let Some(v) = value.as_bool() else { return false };
+            cfg.lyrics.local_first = v;
             true
         }
         "lyrics.local_dirs_add" => {
@@ -400,6 +427,55 @@ mod tests {
         // 类型不对 → 拒绝，且不改配置
         assert!(!apply_set(&mut c, "lyrics.write_back", &json!("yes")));
         assert!(c.lyrics.write_back);
+    }
+
+    /// v1.8.0：`lyrics.local_first` 必须在白名单里（显式 match，不加就被 `_`
+    /// 分支静默拒绝 → 开关永远无效且不报错），且**只接受 `as_bool()`**。
+    #[test]
+    fn apply_set_lyrics_local_first() {
+        let mut c = Config::default();
+        assert!(!c.lyrics.local_first, "默认 = 磁盘缓存优先");
+        assert!(apply_set(&mut c, "lyrics.local_first", &json!(true)));
+        assert!(c.lyrics.local_first);
+        assert!(apply_set(&mut c, "lyrics.local_first", &json!(false)));
+        assert!(!c.lyrics.local_first);
+        // 类型不对 → 拒绝，且**配置不变**（A3.4）
+        assert!(apply_set(&mut c, "lyrics.local_first", &json!(true)));
+        for bad in [json!("yes"), json!("true"), json!(1), json!(0), json!(null)] {
+            assert!(
+                !apply_set(&mut c, "lyrics.local_first", &bad),
+                "{bad} 不是 JSON 布尔，必须拒绝"
+            );
+            assert!(c.lyrics.local_first, "被拒绝的写入不许改动配置：{bad}");
+        }
+    }
+
+    /// v1.8.0 / R2：`cacheStats` 消息的形状（PRD `:104` 已定，不增字段）。
+    #[test]
+    fn cache_stats_json_shape() {
+        let st = crate::lyric::cache::Stats {
+            dir: std::path::PathBuf::from("E:\\数据目录\\lyrics-cache"),
+            files: 93,
+            bytes: 421_888,
+            truncated: false,
+        };
+        let s = cache_stats_json(&st);
+        let v: Value = serde_json::from_str(&s).expect("cacheStats 不是合法 JSON");
+        assert_eq!(v["type"], "cacheStats");
+        assert_eq!(v["payload"]["dir"], "E:\\数据目录\\lyrics-cache");
+        assert_eq!(v["payload"]["files"], 93);
+        assert_eq!(v["payload"]["bytes"], 421_888);
+        assert_eq!(v["payload"]["truncated"], false);
+        assert!(v["payload"]["files"].is_u64(), "files 必须是数字，不是字符串");
+        assert!(v["payload"]["bytes"].is_u64(), "bytes 必须是数字");
+
+        // 截断态
+        let more = crate::lyric::cache::Stats {
+            truncated: true,
+            ..st
+        };
+        let v: Value = serde_json::from_str(&cache_stats_json(&more)).expect("合法 JSON");
+        assert_eq!(v["payload"]["truncated"], true);
     }
 
     /// v1.2.2：「界面缩放」整项删除，白名单必须同时关掉这个口子——

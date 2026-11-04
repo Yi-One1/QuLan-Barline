@@ -244,7 +244,7 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
     <!-- ==================== 歌词 ==================== -->
     <section id="group-lyrics">
       <h1 data-i18n="nav.lyrics">歌词</h1>
-      <p class="sub" data-i18n="lyrics.sub">本地 .lrc 优先，其次 lrclib.net 在线歌词。</p>
+      <p class="sub" data-i18n="lyrics.sub">优先使用已缓存的歌词，其次本地 .lrc 与在线歌词；顺序可在下方切换。</p>
       <div class="card">
         <div class="row">
           <div><div class="label" data-i18n="lyrics.enabled">显示歌词</div>
@@ -267,9 +267,14 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-online"><span class="track"></span><span class="knob"></span></label></div>
         </div>
         <div class="row" data-dep="lyrics">
-          <div><div class="label" data-i18n="lyrics.writeback">在线歌词保存到本地</div>
-            <div class="desc" data-i18n="lyrics.writeback.desc">在线命中的歌词会保存到「本地歌词目录」的第一个目录下的 Barline 子文件夹，文件名与曲目对应。只新建，不覆盖已有文件。已存在的歌词缓存（30 天）优先于本地文件，因此手工修改 .lrc 需要等缓存过期或清理缓存后才会生效。</div></div>
+          <div><div class="label" data-i18n="lyrics.writeback">歌词保存到本地</div>
+            <div class="desc" data-i18n="lyrics.writeback.desc">只要拿到歌词时它不在本地歌词目录里（在线查到、内存或磁盘缓存命中），就会保存一份到「本地歌词目录」第一个目录下的 Barline 子文件夹，文件名是「歌名 - 歌手.lrc」。只新建，绝不覆盖已有文件（手工改过的 .lrc 安全）。查询顺序为「磁盘缓存优先」时，手工改 .lrc 需等缓存过期或清理缓存才生效；切到「本地歌词文件优先」可立即生效。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-writeback"><span class="track"></span><span class="knob"></span></label></div>
+        </div>
+        <div class="row" data-dep="lyrics">
+          <div><div class="label" data-i18n="lyrics.local_first">本地歌词文件优先</div>
+            <div class="desc" data-i18n="lyrics.local_first.desc">「关」（默认）：优先用磁盘缓存，重启也命中、最省事，但手工改的 .lrc 最长 30 天不生效，要等缓存过期或清理缓存。「开」：每次切歌先扫描本地歌词目录，再读内存缓存——手工改的 .lrc 立刻生效，正在播放的这一首也生效；代价是每次切歌多一次目录遍历（目录越大越慢）。</div></div>
+          <div class="right"><label class="switch"><input type="checkbox" id="lyrics-local-first"><span class="track"></span><span class="knob"></span></label></div>
         </div>
       </div>
       <div class="card" id="lyrics-dirs-card" data-dep="lyrics">
@@ -278,6 +283,21 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
         <div class="row" style="margin-top:8px">
           <div class="desc" data-i18n="lyrics.dirs.desc">扫描这些目录里的 .lrc 文件（含子目录）。</div>
           <button class="btn" id="dir-add" data-i18n="lyrics.dirs.add">添加</button>
+        </div>
+      </div>
+      <!-- v1.8.0 / R2：歌词磁盘缓存（只读卡片；路径与占用都由 Rust 下发，JS 不拼路径） -->
+      <div class="card" id="lyrics-cache-card" data-dep="lyrics">
+        <h2 data-i18n="lyrics.cache">歌词磁盘缓存</h2>
+        <div class="row">
+          <div><div class="label" data-i18n="lyrics.cache.path">缓存位置</div>
+            <div class="desc link" id="lyrics-cache-dir" title="">—</div></div>
+          <div class="right"><button class="btn" id="lyrics-cache-open" data-i18n="lyrics.cache.open.hint">点击打开文件夹</button></div>
+        </div>
+        <div class="row">
+          <!-- ⚠ #lyrics-cache-usage 刻意**不带** data-i18n：render() 会把所有
+               [data-i18n] 元素重写成 t(key)，带上去就会把动态占用文本打回模板串 -->
+          <div><div class="label" id="lyrics-cache-usage">—</div>
+            <div class="desc" data-i18n="lyrics.cache.desc">命中的歌词按歌曲缓存在这里，命中就不再联网。单条 30 天过期，总量超过 5 MB 时自动删最旧的。这个文件夹可以安全删除——删掉后下次播放会重新查找并缓存；配置文件与已经保存到本地歌词目录的 .lrc 都不受影响。</div></div>
         </div>
       </div>
     </section>
@@ -403,14 +423,19 @@ const I18N = {
     "appearance.bg.translucent": "半透明", "appearance.bg.transparent": "透明",
     "appearance.monitor": "显示显示器", "appearance.monitor.desc": "多显示器时小组件贴在哪块屏的任务栏上。",
     "appearance.monitor.primary": "主显示器",
-    "lyrics.sub": "本地 .lrc 优先，其次 lrclib.net 在线歌词。",
+    "lyrics.sub": "优先使用已缓存的歌词，其次本地 .lrc 与在线歌词；顺序可在下方切换。",
     "lyrics.enabled": "显示歌词", "lyrics.enabled.desc": "关闭后小组件不再显示歌词行，只保留歌名、歌手与播放控制。",
     "lyrics.sweep": "逐字扫光", "lyrics.sweep.desc": "卡拉OK 效果；关闭后整行同色。",
     "lyrics.scroll": "长歌词滚动", "lyrics.scroll.desc": "歌词超宽时按演唱进度匀速滚动，唱完前提前滚到尾；关闭后行首截断。",
     "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。",
     "storage.browse": "更改", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时依次向 lrclib.net、网易云音乐查询。",
-    "lyrics.writeback": "在线歌词保存到本地", "lyrics.writeback.desc": "在线命中的歌词会保存到「本地歌词目录」的第一个目录下的 Barline 子文件夹，文件名与曲目对应。只新建，不覆盖已有文件。已存在的歌词缓存（30 天）优先于本地文件，因此手工修改 .lrc 需要等缓存过期或清理缓存后才会生效。",
+    "lyrics.writeback": "歌词保存到本地", "lyrics.writeback.desc": "只要拿到歌词时它不在本地歌词目录里（在线查到、内存或磁盘缓存命中），就会保存一份到「本地歌词目录」第一个目录下的 Barline 子文件夹，文件名是「歌名 - 歌手.lrc」。只新建，绝不覆盖已有文件（手工改过的 .lrc 安全）。查询顺序为「磁盘缓存优先」时，手工改 .lrc 需等缓存过期或清理缓存才生效；切到「本地歌词文件优先」可立即生效。",
+    "lyrics.local_first": "本地歌词文件优先", "lyrics.local_first.desc": "「关」（默认）：优先用磁盘缓存，重启也命中、最省事，但手工改的 .lrc 最长 30 天不生效，要等缓存过期或清理缓存。「开」：每次切歌先扫描本地歌词目录，再读内存缓存——手工改的 .lrc 立刻生效，正在播放的这一首也生效；代价是每次切歌多一次目录遍历（目录越大越慢）。",
+    "lyrics.cache": "歌词磁盘缓存", "lyrics.cache.path": "缓存位置", "lyrics.cache.open.hint": "点击打开文件夹",
+    "lyrics.cache.usage": "{files} 个文件 · {size}", "lyrics.cache.usage.more": "{files}+ 个文件 · {size}",
+    "lyrics.cache.scanning": "统计中…",
+    "lyrics.cache.desc": "命中的歌词按歌曲缓存在这里，命中就不再联网。单条 30 天过期，总量超过 5 MB 时自动删最旧的。这个文件夹可以安全删除——删掉后下次播放会重新查找并缓存；配置文件与已经保存到本地歌词目录的 .lrc 都不受影响。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
     "volume.wheel": "滚轮调节", "volume.wheel.desc": "仅指针悬停在小组件上时生效。",
@@ -448,14 +473,19 @@ const I18N = {
     "appearance.bg.translucent": "Translucent", "appearance.bg.transparent": "Transparent",
     "appearance.monitor": "Monitor", "appearance.monitor.desc": "Which taskbar the widget attaches to.",
     "appearance.monitor.primary": "Primary",
-    "lyrics.sub": "Local .lrc first, then lrclib.net.",
+    "lyrics.sub": "Cached lyrics first, then local .lrc files and online sources; the order is adjustable below.",
     "lyrics.enabled": "Show lyrics", "lyrics.enabled.desc": "Turning this off hides the lyric line; title, artist and playback controls stay.",
     "lyrics.sweep": "Karaoke sweep", "lyrics.sweep.desc": "Per-character highlight. Off = uniform color.",
     "lyrics.scroll": "Scroll long lines", "lyrics.scroll.desc": "Scroll overflowing lyrics in step with singing, finishing just before the line ends. Off = cut at the right edge.",
     "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put). Click the path to open it.",
     "storage.browse": "Change", "storage.reset": "Reset", "storage.pending": "applies after restart",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Queries lrclib.net, then NetEase Cloud Music, when no local file exists.",
-    "lyrics.writeback": "Save online lyrics locally", "lyrics.writeback.desc": "Online matches are saved into a Barline subfolder of the first local lyric folder, named after the track. New files only — existing files are never overwritten. The 30-day lyric cache takes precedence over local files, so manual edits to a .lrc only take effect after the cache expires or is cleared.",
+    "lyrics.writeback": "Save lyrics locally", "lyrics.writeback.desc": "Whenever lyrics are obtained and are not already in your local lyric folders (fetched online, or from the memory/disk cache), a copy is saved into the Barline subfolder of the first local lyric folder, named \"Title - Artist.lrc\". New files only — existing files are never overwritten (your manual edits are safe). With disk-cache-first order, manual .lrc edits apply only after the cache expires or is cleared; switch to local-first to apply them immediately.",
+    "lyrics.local_first": "Prefer local lyric files", "lyrics.local_first.desc": "Off (default): disk cache first — fastest and survives restarts, but manual .lrc edits only take effect after the 30-day cache expires or is cleared. On: scan local lyric folders before the memory cache on every track change, so manual .lrc edits apply immediately — including the track currently playing — at the cost of one extra folder scan per track.",
+    "lyrics.cache": "Lyric disk cache", "lyrics.cache.path": "Cache folder", "lyrics.cache.open.hint": "Click to open the folder",
+    "lyrics.cache.usage": "{files} files · {size}", "lyrics.cache.usage.more": "{files}+ files · {size}",
+    "lyrics.cache.scanning": "Counting…",
+    "lyrics.cache.desc": "Matched lyrics are cached here per track, so a hit needs no network. Entries expire after 30 days, and the oldest are pruned beyond 5 MB. This folder is safe to delete — the next play simply looks up and caches again; your config and the .lrc files saved into your local lyric folder are unaffected.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
@@ -486,6 +516,12 @@ const I18N = {
 let state = null;
 let lang = "zh";
 let recording = null;   // 正在录制的动作名
+/* v1.8.0 / R2：歌词磁盘缓存的统计结果 {dir, files, bytes, truncated}。
+   JS 侧唯一真相；render() 只做格式化、**不重扫**（重扫由 requestCacheStats 触发）。
+   刻意不挂在 `state` 上：state 是「配方的全量快照」，每次 set 都回推；
+   统计是「一次点查的结果」，混进去会让扫描次数飘（PRD A5.3 / A5.5）。 */
+let cacheStats = null;
+let firstState = true;  // 第一次收到 state：若初始就落在歌词分区则统计一次
 
 const ACTIONS = ["play_pause", "prev", "next", "toggle_lyrics", "mute", "toggle_widget"];
 const VK_NAMES = {
@@ -515,6 +551,44 @@ function toast(text) {
   el._timer = setTimeout(() => el.classList.remove("show"), 1400);
 }
 
+/* ---------------- 歌词磁盘缓存占用（v1.8.0 / R2） ----------------
+   三条铁律：
+   1. 只格式化、零 IO —— 扫描只发生在 Rust 的 `lyricsCacheStats` 动作里；
+   2. 动态文本写进**不带 data-i18n** 的元素（见 #lyrics-cache-usage），
+      否则 render() 的 [data-i18n] 循环会把它打回 "{files} 个文件 · {size}" 模板串；
+   3. 这里**不许**出现任何定时器（轮询）—— 没有自动刷新，只有用户进分区时那一次。 */
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+function renderCacheStats() {
+  const dirEl = document.getElementById("lyrics-cache-dir");
+  const useEl = document.getElementById("lyrics-cache-usage");
+  if (!dirEl || !useEl) return;
+  if (!cacheStats) {
+    // 还没统计回来：目录留占位（路径由 Rust 下发，JS 不拼），占用显示「统计中…」
+    dirEl.textContent = dirEl.textContent || "—";
+    useEl.textContent = t("lyrics.cache.scanning");
+    return;
+  }
+  dirEl.textContent = cacheStats.dir;
+  dirEl.title = cacheStats.dir;
+  const key = cacheStats.truncated ? "lyrics.cache.usage.more" : "lyrics.cache.usage";
+  useEl.textContent = t(key)
+    .replace("{files}", String(cacheStats.files))
+    .replace("{size}", fmtSize(cacheStats.bytes));
+}
+
+/* 请求一次统计：先回「统计中…」，再发动作。重推时直接覆盖（幂等）。 */
+function requestCacheStats() {
+  cacheStats = null;
+  renderCacheStats();
+  post({ type: "action", payload: "lyricsCacheStats" });
+}
+
 /* ---------------- 导航 ---------------- */
 document.querySelectorAll("nav button").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -522,6 +596,11 @@ document.querySelectorAll("nav button").forEach((btn) => {
     document.querySelectorAll("section").forEach((s) => s.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById(btn.dataset.group).classList.add("active");
+    // v1.8.0 / R2：进入歌词分区时统计一次缓存占用（覆盖「首次进入」与
+    // 「切走再切回」两种情形；分区内的开关改动**不**重扫）
+    if (btn.dataset.group === "group-lyrics") requestCacheStats();
+    // 用户已经开始导航 → 首次 state 不再需要「初始分区」判定（避免重复扫一次）
+    firstState = false;
   });
 });
 
@@ -574,8 +653,11 @@ function render() {
   document.getElementById("lyrics-scroll").checked = c.lyrics.scroll;
   document.getElementById("lyrics-online").checked = c.lyrics.online_enabled;
   document.getElementById("lyrics-writeback").checked = c.lyrics.write_back;
+  document.getElementById("lyrics-local-first").checked = c.lyrics.local_first;
   renderDirs(c.lyrics.local_dirs);
   syncLyricsDeps();   // v1.1.22：目录列表刚重建，置灰态要重新贴一遍
+  // v1.8.0：语言切换也会走到这里 —— 只重排文字，**不重新统计**（缓存占用来自 cacheStats 变量）
+  renderCacheStats();
 
   // 音量
   document.getElementById("wheel-enabled").checked = c.volume.wheel_enabled;
@@ -651,7 +733,7 @@ function syncLyricsDeps() {
     el.classList.toggle("dimmed", !on);
   });
 
-  ["lyrics-sweep", "lyrics-scroll", "lyrics-online", "lyrics-writeback"].forEach((id) => {
+  ["lyrics-sweep", "lyrics-scroll", "lyrics-online", "lyrics-writeback", "lyrics-local-first"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = !on;
   });
@@ -786,6 +868,7 @@ bind("lyrics-sweep", "lyrics.karaoke_sweep", "bool");
 bind("lyrics-scroll", "lyrics.scroll", "bool");
 bind("lyrics-online", "lyrics.online_enabled", "bool");
 bind("lyrics-writeback", "lyrics.write_back", "bool");
+bind("lyrics-local-first", "lyrics.local_first", "bool");
 // v1.1.22：主开关一动就立刻刷新置灰态，不等 Rust 回推 state（回推后 render() 还会再刷一次）
 document.getElementById("lyrics-enabled").addEventListener("change", syncLyricsDeps);
 bind("wheel-enabled", "volume.wheel_enabled", "bool");
@@ -809,6 +892,9 @@ document.getElementById("storage-browse").addEventListener("click", () => post({
 document.getElementById("storage-reset").addEventListener("click", () => post({ type: "action", payload: "resetStorageDir" }));
 document.getElementById("open-lrclib").addEventListener("click", () => post({ type: "action", payload: "openLrclib" }));
 document.getElementById("open-netease").addEventListener("click", () => post({ type: "action", payload: "openNetease" }));
+// v1.8.0 / R2：打开歌词缓存目录（路径点击与按钮同一个动作）
+document.getElementById("lyrics-cache-dir").addEventListener("click", () => post({ type: "action", payload: "openLyricsCacheDir" }));
+document.getElementById("lyrics-cache-open").addEventListener("click", () => post({ type: "action", payload: "openLyricsCacheDir" }));
 
 /* ---------------- 消息接收 ---------------- */
 if (window.chrome && chrome.webview) {
@@ -818,6 +904,16 @@ if (window.chrome && chrome.webview) {
     if (msg.type === "state") {
       state = msg.payload;
       render();
+      // 设置页打开时若初始就落在歌词分区 → 统计一次（默认落在外观分区，正常零扫描）
+      if (firstState) {
+        firstState = false;
+        const active = document.querySelector("nav button.active");
+        if (active && active.dataset.group === "group-lyrics") requestCacheStats();
+      }
+    } else if (msg.type === "cacheStats") {
+      // 重推直接覆盖（幂等）；这里**不**再发请求，避免自激
+      cacheStats = msg.payload;
+      renderCacheStats();
     } else if (msg.type === "toast") {
       toast(msg.payload.text);
     }

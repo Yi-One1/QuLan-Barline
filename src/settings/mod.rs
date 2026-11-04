@@ -223,6 +223,21 @@ impl SettingsService {
         }
     }
 
+    /// 推一条**一次性**消息给页面（v1.8.0 / R2）：只发出去，**不碰 `last_state`**。
+    ///
+    /// 为什么不能复用 [`Self::push`]：`push` 会把 `last_state` 覆写成刚推的内容。
+    /// 拿它推 `cacheStats`，下一次窗口重建时 [`Self::push_last`] 补推的就是
+    /// `cacheStats` 而不是 `state` → 页面收不到配置，**所有控件空白**。
+    /// 而且这个缺陷只在「关掉设置窗口再打开」时复现（开着窗测永远全绿）。
+    ///
+    /// 语义上也有区别：`state` 是「配方的全量快照」，必须缓存重推；
+    /// `cacheStats` 是「一次点查的结果」，重推会让扫描次数飘（A5 的数次会飘）。
+    pub fn post(&mut self, json: &str) {
+        if let Some(wv) = self.slot.borrow().as_ref() {
+            wv.post(json);
+        }
+    }
+
     /// 把最近一次状态重推（WebView2 就绪时用）。
     pub fn push_last(&self) {
         if let (Some(json), Some(wv)) = (self.last_state.as_ref(), self.slot.borrow().as_ref()) {

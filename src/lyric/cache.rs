@@ -182,14 +182,94 @@ impl DiskLyrics {
 
 // ---------------------------------------------------------------- 缓存本体
 
+/// 一条**缓存命中**（v1.8.0）：歌词本体 + 来源标识。
+///
+/// `source` 是写这条缓存时的 provider 名（`"local"` / `"lrclib"` / `"netease"` / `"test"`），
+/// 也兼容 v1.7.0 之前没有该字段的老缓存文件（`#[serde(default)]` → 空串）。
+/// 判定规矩只有一条：`source == "local"` 表示「歌词来自用户自己的 .lrc」，
+/// 落盘必须跳过（`service::maybe_write_back` 的早退）；其余一律落盘。
+pub struct Hit {
+    pub lyrics: Arc<Lyrics>,
+    pub source: String,
+}
+
+/// 内存条目：歌词本体 + 来源。
+///
+/// 为什么内存也要记 `source`：`service` 落盘前要判「来源是不是本地文件」
+/// （A6.6：缓存来源为 local 的命中不得再写一份到 `Barline/`）。
+/// 只把 source 留在磁盘 `DiskLyrics` 里是不够的——内存命中那条路径读不到磁盘格式。
+struct Entry {
+    lyrics: Arc<Lyrics>,
+    source: String,
+}
+
 /// 三层缓存。
 pub struct Cache {
     dir: PathBuf,
     /// 内存 LRU 的顺序表（头部最新）
     order: VecDeque<String>,
-    map: HashMap<String, Arc<Lyrics>>,
+    map: HashMap<String, Entry>,
     /// 内存里这些歌词的大致字节数（用于按预算淘汰）
     mem_bytes: usize,
+}
+
+/// 歌词磁盘缓存的**唯一路径出处**（v1.8.0）。
+///
+/// 歌词线程建缓存（`service::run`）与设置页统计（`app::run_settings_action`）
+/// 都从这里取，路径不可能漂移（PRD A4.3 的机械保证）。
+pub fn dir() -> PathBuf {
+    crate::platform::data_dir().join("lyrics-cache")
+}
+
+/// 磁盘占用统计结果（v1.8.0 / R2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stats {
+    /// 缓存目录（与 [`dir`] 同源）
+    pub dir: PathBuf,
+    /// 顶层文件数（`<hex>.json` 与 `miss-<hex>.json` 都算，与 `sweep` 口径一致）
+    pub files: u64,
+    /// 顶层文件总字节
+    pub bytes: u64,
+    /// 是否因达到 `cap` 而早停（页面显示 `N+`）
+    pub truncated: bool,
+}
+
+/// 统计当前缓存目录的占用（`limits::CACHE_STATS_MAX_ENTRIES` 封顶）。
+///
+/// 只读顶层、不递归、**不建目录**：目录不存在就是 `(0, 0, false)`（PRD A4.4）。
+pub fn stats() -> Stats {
+    let d = dir();
+    let (files, bytes, truncated) = collect_stats(&d, limits::CACHE_STATS_MAX_ENTRIES);
+    Stats {
+        dir: d,
+        files,
+        bytes,
+        truncated,
+    }
+}
+
+/// [`stats`] 的可测内核：`cap` 可注入，单测不用真造 5007 个文件。
+fn collect_stats(dir: &Path, cap: usize) -> (u64, u64, bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0, false);
+    };
+    let mut files: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut truncated = false;
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if files as usize >= cap {
+            // 还有一个文件没数 → 已达上限，早停
+            truncated = true;
+            break;
+        }
+        files += 1;
+        bytes += meta.len();
+    }
+    (files, bytes, truncated)
 }
 
 impl Cache {
@@ -207,8 +287,11 @@ impl Cache {
     }
 
     /// 只查内存。
-    pub fn get_mem(&mut self, key: &str) -> Option<Arc<Lyrics>> {
-        let hit = self.map.get(key).cloned();
+    pub fn get_mem(&mut self, key: &str) -> Option<Hit> {
+        let hit = self.map.get(key).map(|e| Hit {
+            lyrics: Arc::clone(&e.lyrics),
+            source: e.source.clone(),
+        });
         if hit.is_some() {
             self.touch(key);
         }
@@ -216,7 +299,11 @@ impl Cache {
     }
 
     /// 查磁盘（命中会回填内存）。
-    pub fn get_disk(&mut self, key: &str) -> Option<Arc<Lyrics>> {
+    ///
+    /// **回填必须把 `disk.source` 一起带进 `Entry`**（v1.8.0 / A6.6 的命门）：
+    /// 漏了这一步，第一次（磁盘命中）落盘正常、第二次（内存命中）source 变空串
+    /// → 被判「非本地」→ 又落盘一次。
+    pub fn get_disk(&mut self, key: &str) -> Option<Hit> {
         let path = self.positive_path(key);
         let text = std::fs::read_to_string(&path).ok()?;
         let disk: DiskLyrics = serde_json::from_str(&text).ok()?;
@@ -224,14 +311,27 @@ impl Cache {
             let _ = std::fs::remove_file(&path);
             return None;
         }
+        let source = disk.source.clone();
         let lyrics = Arc::new(disk.into_lyrics());
-        self.insert_mem(key, lyrics.clone());
-        Some(lyrics)
+        self.insert_mem(
+            key,
+            Entry {
+                lyrics: Arc::clone(&lyrics),
+                source: source.clone(),
+            },
+        );
+        Some(Hit { lyrics, source })
     }
 
-    /// 写入内存 + 磁盘。`source` 只用于诊断。
+    /// 写入内存 + 磁盘。`source` = provider 名（`"local"` = 用户自己的 .lrc）。
     pub fn put(&mut self, key: &str, lyrics: &Lyrics, source: &str) {
-        self.insert_mem(key, Arc::new(lyrics.clone()));
+        self.insert_mem(
+            key,
+            Entry {
+                lyrics: Arc::new(lyrics.clone()),
+                source: source.to_string(),
+            },
+        );
         let now = now_secs();
         let disk = DiskLyrics::from_lyrics(key, lyrics, source, now);
         let Ok(json) = serde_json::to_string(&disk) else {
@@ -317,11 +417,12 @@ impl Cache {
 
     // ---- 内部 ----
 
-    fn insert_mem(&mut self, key: &str, lyrics: Arc<Lyrics>) {
-        if let Some(old) = self.map.insert(key.to_string(), lyrics.clone()) {
-            self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&old));
+    fn insert_mem(&mut self, key: &str, entry: Entry) {
+        let bytes = approx_bytes(&entry.lyrics);
+        if let Some(old) = self.map.insert(key.to_string(), entry) {
+            self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&old.lyrics));
         }
-        self.mem_bytes += approx_bytes(&lyrics);
+        self.mem_bytes += bytes;
         self.touch(key);
         // 两条淘汰条件：条数上限（架构 §7.6）与字节预算（QA 要求 512 KB）
         while self.order.len() > limits::LYRIC_LRU_CAP || self.mem_bytes > MEM_BUDGET_BYTES {
@@ -332,8 +433,8 @@ impl Cache {
             let Some(old) = self.order.pop_back() else {
                 break;
             };
-            if let Some(l) = self.map.remove(&old) {
-                self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&l));
+            if let Some(e) = self.map.remove(&old) {
+                self.mem_bytes = self.mem_bytes.saturating_sub(approx_bytes(&e.lyrics));
             }
         }
     }
@@ -488,7 +589,8 @@ mod tests {
         c.put("k1", &l, "test");
         // 换一个实例，只走磁盘
         let mut c2 = Cache::new(c.dir.clone());
-        let got = c2.get_disk("k1").expect("磁盘未命中");
+        // v1.8.0：`get_disk` 返回 `Option<Hit>`（歌词 + 来源），测试只关心歌词本体
+        let got = c2.get_disk("k1").expect("磁盘未命中").lyrics;
         assert_eq!(got.lines.len(), 2);
         assert_eq!(got.lines[0].words.len(), 2);
         assert_eq!(got.lines[0].words[1].text, "好");
@@ -496,6 +598,113 @@ mod tests {
         assert_eq!(got.offset_ms, -100);
         assert_eq!(got.title, "t");
         let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    // ------------------------------------------------ v1.8.0：来源透传（C1–C3）
+
+    /// C1：内存命中必须带出写入时的 `source`。
+    #[test]
+    fn get_mem_returns_source() {
+        let mut c = tmp_cache("src_mem");
+        c.put("k", &sample(), "lrclib");
+        let hit = c.get_mem("k").expect("内存应命中");
+        assert_eq!(hit.source, "lrclib", "内存条目必须记住来源");
+        assert_eq!(hit.lyrics.lines.len(), 2);
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    /// C2：**A6.6 的命门**——磁盘命中带出来源，且回填内存时**不许丢** source。
+    ///
+    /// 漏掉回填这一步的症状：第一次播放（磁盘命中）落盘正常，第二次播放
+    /// （内存命中）source 变空串 → 被判「非本地」→ 又落盘一次。
+    #[test]
+    fn get_disk_returns_source_and_backfill_keeps_it() {
+        let mut c = tmp_cache("src_disk");
+        c.put("k", &sample(), "lrclib");
+        // 换实例 = 模拟重启（内存 LRU 清空，磁盘保留）
+        let mut c2 = Cache::new(c.dir.clone());
+        let disk_hit = c2.get_disk("k").expect("磁盘应命中");
+        assert_eq!(disk_hit.source, "lrclib", "磁盘命中必须带出 source");
+        // 紧接着走内存（get_disk 已回填）——source 必须还在
+        let mem_hit = c2.get_mem("k").expect("回填后内存应命中");
+        assert_eq!(
+            mem_hit.source, "lrclib",
+            "磁盘回填内存时必须把 source 一起带进 Entry，否则二次播放会重复落盘"
+        );
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    /// C3：v1.7.0 之前的老缓存文件没有 `source` 字段 → 空串，不 panic。
+    #[test]
+    fn legacy_disk_file_without_source_is_empty() {
+        let mut c = tmp_cache("src_legacy");
+        let path = c.positive_path("legacy");
+        let json = r#"{"key":"legacy","saved_at":4102444800,"lines":[{"s":0,"e":1000,"t":"老歌词"}]}"#;
+        write_atomic(&path, json.as_bytes());
+        let hit = c.get_disk("legacy").expect("老格式必须仍可读");
+        assert_eq!(hit.source, "", "缺 source 字段按空串（= 未知来源 → 照常落盘）");
+        assert_eq!(hit.lyrics.lines[0].text, "老歌词");
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    // ------------------------------------------------ v1.8.0：占用统计（C4–C5）
+
+    /// C4：只数**顶层文件**（子目录不计、不递归）；目录不存在 → `(0,0,false)`。
+    #[test]
+    fn stats_counts_top_level_only() {
+        let dir = std::env::temp_dir().join("barline_cache_stats_top");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        std::fs::write(dir.join("a.json"), b"12345").expect("写 a");
+        std::fs::write(dir.join("b.json"), b"123").expect("写 b");
+        std::fs::write(dir.join("c.json"), b"1").expect("写 c");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("建子目录");
+        std::fs::write(sub.join("d.json"), b"999999").expect("写 d");
+
+        let (files, bytes, truncated) = collect_stats(&dir, 5000);
+        assert_eq!(files, 3, "子目录里的文件不许计入");
+        assert_eq!(bytes, 5 + 3 + 1, "字节只算顶层三个文件");
+        assert!(!truncated);
+
+        // 目录不存在：不报错、不建目录
+        let missing = std::env::temp_dir().join("barline_cache_stats_missing_α");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(collect_stats(&missing, 5000), (0, 0, false));
+        assert!(!missing.exists(), "统计不许顺手把目录造出来");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C5：达到上限立即早停并把 `truncated` 置真（用小 cap 测，别真造 5007 个文件）。
+    #[test]
+    fn stats_truncates_at_cap() {
+        let dir = std::env::temp_dir().join("barline_cache_stats_cap");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        for i in 0..7 {
+            std::fs::write(dir.join(format!("{i:016x}.json")), b"12").expect("写文件");
+        }
+        let (files, _, truncated) = collect_stats(&dir, 3);
+        assert_eq!(files, 3, "达到 cap 必须停在 cap");
+        assert!(truncated, "还有没数到的文件 → truncated 必须为 true");
+
+        // 恰好等于 cap 且没有更多文件 → 不算被截断
+        let (files, bytes, truncated) = collect_stats(&dir, 7);
+        assert_eq!((files, bytes, truncated), (7, 14, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `stats()` 的路径必须与 [`dir`] 同源（PRD A4.3：路径与占用不可能漂移）。
+    #[test]
+    fn stats_dir_matches_cache_dir() {
+        let st = stats();
+        assert_eq!(st.dir, dir());
+        assert!(
+            st.dir.ends_with("lyrics-cache"),
+            "缓存目录名固定为 lyrics-cache，实际 {}",
+            st.dir.display()
+        );
     }
 
     #[test]

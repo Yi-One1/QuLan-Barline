@@ -111,6 +111,14 @@ pub struct LyricsConfig {
     /// 在线歌词落盘（v1.7.0）：命中在线歌词后保存到第一个本地歌词目录的 Barline 子目录。
     /// 只新建、绝不覆盖已有文件。默认开。
     pub write_back: bool,
+    /// 歌词查询顺序（v1.8.0）：
+    /// - `false`（默认）= 磁盘缓存优先 → `内存 → 磁盘缓存 → 本地 → 负缓存 → 在线`
+    ///   （= v1.7.0 现状：省时优先，重启也命中）；
+    /// - `true` = 本地歌词文件优先 → `本地 → 内存 → 磁盘缓存 → 负缓存 → 在线`
+    ///   （手改 `.lrc` **立刻**生效，含正在播放的那一首；代价是每次切歌多一次目录遍历）。
+    ///
+    /// 缺省走容器级 `#[serde(default)]` 兜底 → 旧 `config.json` 删掉该行落到 `false`。
+    pub local_first: bool,
 }
 
 /// 音量。
@@ -380,6 +388,33 @@ mod tests {
             back.lyrics.write_back,
             "旧配置缺省 write_back 必须为 true（默认开）"
         );
+    }
+
+    /// **v1.8.0 / A1.1 向后兼容**：旧配置里没有 `lyrics.local_first` 字段 →
+    /// 反序列化不报错且落到 `false`（= 磁盘缓存优先 = 与 v1.7.0 行为一致）。
+    ///
+    /// 兜底机制与 `write_back` 同款：`LyricsConfig` 容器上的 `#[serde(default)]`
+    /// 让 serde 用 `LyricsConfig::default()` 逐字段补齐缺失字段。
+    #[test]
+    fn legacy_config_without_local_first_defaults_false() {
+        let mut cfg = Config::default();
+        cfg.lyrics.local_first = true; // 故意写非默认值再删掉字段，验证走 serde default
+        let mut json = serde_json::to_value(&cfg).expect("序列化不应失败");
+        json["lyrics"]
+            .as_object_mut()
+            .expect("lyrics 必须是对象")
+            .remove("local_first");
+        let back: Config = serde_json::from_value(json).expect("缺 local_first 字段不应报错");
+        assert!(
+            !back.lyrics.local_first,
+            "旧配置缺省 local_first 必须为 false（默认 = 磁盘缓存优先）"
+        );
+
+        // 更极端：整段 lyrics 都没有 → 仍然落到默认值，不 panic
+        let only_version: Config = serde_json::from_slice(br#"{"version":1}"#)
+            .expect("只有 version 的旧配置必须仍能加载");
+        assert!(!only_version.lyrics.local_first);
+        assert!(only_version.lyrics.write_back, "同容器的其它默认值不受影响");
     }
 
     /// **v1.2.2 旧配置兼容（删除 `ui_scale` 后最重要的回归保障）**：

@@ -1438,6 +1438,8 @@ impl App {
             local_dirs: self.config.lyrics.local_dirs.clone(),
             online_enabled: self.config.lyrics.online_enabled,
             write_back: self.config.lyrics.write_back,
+            // v1.8.0：查询顺序随请求带上（每首歌重建一次请求 → 改动即时生效、无需重启）
+            local_first: self.config.lyrics.local_first,
             retry,
         }
     }
@@ -1746,6 +1748,45 @@ impl App {
                     );
                 }
                 crate::log_info!("设置页：打开数据目录 {}", dir.display());
+            }
+            // v1.8.0 / R2：统计歌词磁盘缓存的路径与占用。
+            //
+            // **只在这里扫一次**（PRD A5.5）：不建目录、不递归、不改任何文件，
+            // 上限 `limits::CACHE_STATS_MAX_ENTRIES`。页面只在「切到歌词分区」时
+            // 发这个动作，`render()` 与 `state` 回推都不重扫。
+            "lyricsCacheStats" => {
+                let st = crate::lyric::cache::stats();
+                crate::log_info!(
+                    "设置页：统计歌词缓存 {} → {} 个文件 / {} 字节{}",
+                    st.dir.display(),
+                    st.files,
+                    st.bytes,
+                    if st.truncated {
+                        "（已达上限，早停）"
+                    } else {
+                        ""
+                    }
+                );
+                // 必须走 post（不碰 last_state），否则窗口重建后补推的是统计而非 state
+                self.settings
+                    .post(&crate::settings::bridge::cache_stats_json(&st));
+            }
+            // v1.8.0 / R2：打开歌词缓存目录（与歌词线程同源，来自 `cache::dir()`）
+            "openLyricsCacheDir" => {
+                let dir = crate::lyric::cache::dir();
+                let w = to_wide(&dir.to_string_lossy());
+                // SAFETY: w 以 NUL 结尾且在本调用期间存活（与 openLogDir 同款）
+                unsafe {
+                    windows::Win32::UI::Shell::ShellExecuteW(
+                        None,
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(w.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+                crate::log_info!("设置页：打开歌词缓存目录 {}", dir.display());
             }
             // v1.1.5 问题 3 / v1.1.7：选数据目录 → 弹窗问「迁移？删除原文件？」
             // → 选项记进配置，重启后由 storage::init_from_config 执行

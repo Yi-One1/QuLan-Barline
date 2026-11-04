@@ -175,6 +175,63 @@ mod tests {
         }
     }
 
+    /// 契约回归（v1.8.0 / R2）：歌词磁盘缓存卡片的三条纪律。
+    ///
+    /// ① **JS 不拼路径**：页面里不许出现 `"lyrics-cache"` 这个**完整字符串字面量**
+    ///    （元素 id 是 `lyrics-cache-dir` 之类，语义是 DOM 锚点，不是路径片段）；
+    /// ② **动态占用文本不许带 `data-i18n`**：否则 `render()` 会把它打回
+    ///    `{files} 个文件 · {size}` 模板串；
+    /// ③ **零轮询**：统计只在用户进入歌词分区时那一次，页面里除 toast 之外
+    ///    不许有任何超时 / 间隔定时器。
+    #[test]
+    fn lyrics_cache_card_follows_r2_contract() {
+        assert!(
+            !INDEX_HTML.contains("\"lyrics-cache\""),
+            "页面里出现了 \"lyrics-cache\" 字面量：路径必须由 Rust 下发，JS 不拼"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"lyrics-cache-dir\""),
+            "缺缓存路径锚点"
+        );
+        assert!(
+            INDEX_HTML.contains("id=\"lyrics-cache-usage\""),
+            "缺缓存占用锚点"
+        );
+        // ② 两个锚点都必须是「无 data-i18n」的纯 JS 填充元素
+        for anchor in ["lyrics-cache-dir", "lyrics-cache-usage"] {
+            let at = INDEX_HTML
+                .find(&format!("id=\"{anchor}\""))
+                .unwrap_or_else(|| panic!("找不到 #{anchor}"));
+            // 往前取到同一个标签的开始，检查这段属性里没有 data-i18n
+            let tag_start = INDEX_HTML[..at].rfind('<').unwrap_or(0);
+            let tag = &INDEX_HTML[tag_start..at];
+            assert!(
+                !tag.contains("data-i18n"),
+                "#{anchor} 的标签带了 data-i18n，动态文本会被 render() 打回模板串：{tag}"
+            );
+        }
+        // ③ 统计相关代码零定时器（`toast` 的自动隐藏与本特性无关）
+        assert_eq!(
+            INDEX_HTML.matches("setInterval").count(),
+            0,
+            "页面里不许有 setInterval"
+        );
+        assert_eq!(
+            INDEX_HTML.matches("setTimeout").count(),
+            1,
+            "只允许 toast 的那一处 setTimeout"
+        );
+        // 统计动作名必须与 Rust 侧一致（`run_settings_action` 的分支字面量）
+        assert!(
+            INDEX_HTML.contains("\"lyricsCacheStats\""),
+            "缺少 lyricsCacheStats 动作"
+        );
+        assert!(
+            INDEX_HTML.contains("\"openLyricsCacheDir\""),
+            "缺少 openLyricsCacheDir 动作"
+        );
+    }
+
     /// 契约回归（v1.1.22）：「显示歌词」的描述必须与真实渲染行为一致。
     ///
     /// 关闭后走 `WidgetForm::Compact`——窗口高度恒为任务栏条带厚度，只是不画歌词行，
