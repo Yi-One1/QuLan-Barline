@@ -49,7 +49,7 @@ use crate::taskbar::host::TaskbarHost;
 use crate::ui::hit::HitTarget;
 use crate::ui::interaction::Interaction;
 use crate::ui::menu::{self, MenuCommand};
-use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_CLICK, TIMER_LYRIC};
+use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_CLICK, TIMER_LYRIC, TIMER_RESUME};
 
 /// 交互修饰态（PRD 机器 C）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -153,6 +153,17 @@ pub struct AppState {
     /// 与 [`App::widget_monitor`] 比较即可知道「全屏的那块屏是不是小组件所在的那块」：
     /// 副屏全屏视频不该让主屏的字色自适应停摆。拿不到时全 0。
     pub foreground_monitor: RECT,
+    /// **全屏冻结**（v1.5.5 / G3.5）：同屏的前台窗口全屏时，整个小组件静止。
+    ///
+    /// 由 1s 心跳 [`App::sync_fullscreen_freeze`] 根据 `foreground_info()` 翻转。
+    /// `true` 期间：窗口隐藏、动画 / 歌词定时器停摆且不许再挂、媒体线程暂停
+    /// 分层轮询、`redraw` / `ensure_on_top` / `request_backdrop` 全部跳过。
+    /// 只保留 `TIMER_GEOM`（1s）里的 `foreground_info()` 作为发现「退出全屏」的途径。
+    pub frozen: bool,
+    /// **解冻等待期**（v1.5.5 / G3.5）：已退出全屏、媒体线程已恢复，但还没收到
+    /// 解冻后第一份 `NowPlaying`。窗口仍隐藏，等 `reduce` 把隐藏窗口刷成最新内容
+    /// 再显示，避免用户看到冻结前的旧帧；400ms 一次性兜底定时器到点也强制结束。
+    pub resume_pending: bool,
 }
 
 impl AppState {
@@ -162,6 +173,12 @@ impl AppState {
             return false;
         }
         if self.taskbar_collapsed {
+            return false;
+        }
+        // v1.5.5 / G3.5：冻结放在「用户主动隐藏 / 任务栏收起」之后、「无会话」之前。
+        // 前两者是明确的长期状态，冻结是临时状态；放在 NoSession 之前才能保证
+        // `frozen == true` 时恒为 false，且解冻后由真实会话态无缝接管。
+        if self.frozen {
             return false;
         }
         if self.playing.state == PlaybackState::NoSession {
@@ -335,6 +352,20 @@ pub const LYRIC_FADE_SECS: f32 = 0.150;
 pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
 /// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
 pub const LYRIC_SLIDE_PX: f32 = 6.0;
+
+/// 解冻兜底超时（毫秒，v1.5.5 / G3.5）。**一次性**定时器，挂在消息窗上。
+///
+/// 为什么是 400ms：
+/// - **下界 200ms**：媒体线程解冻后第一轮全量读要跨进程访问 SMTC，正常 1~3ms、
+///   慢调用阈值 8ms，200ms 足够覆盖一次异常慢的读取并让 `NowPlaying` 回到 UI；
+///   再短就会在状态到达前提前显示旧帧；
+/// - **上界 1000ms**：`TIMER_GEOM` 心跳就是 1s，用户退出全屏后最多再等一个
+///   心跳周期就必须看见小组件，不能更慢（也不许为此把心跳调快，见禁改清单）；
+/// - 400ms 落在中间：即使媒体线程异常 / 当前无会话（永远不会有 `NowPlaying`），
+///   也不会出现「小组件再也不显示」。
+///
+/// 它不新增任何轮询频率：只 `SetTimer` 一次，触发或被 `finish_resume` 取消后即结束。
+pub const RESUME_FALLBACK_MS: u32 = 400;
 
 impl WidthAnim {
     /// 当前时刻的插值宽度（ease-out cubic：收合时先快后慢，观感更自然）。
@@ -558,14 +589,35 @@ impl App {
         self.sync_lyric_timer();
     }
 
-    /// 1 秒定时器：几何兜底探测 + 乐观更新对账。
-    pub fn on_timer(&mut self) {
+    /// 消息窗的 `WM_TIMER`：`TIMER_GEOM`（1000ms）走几何心跳，
+    /// `TIMER_RESUME`（一次性 400ms）走解冻兜底（v1.5.5 / G3.5）。
+    pub fn on_timer(&mut self, id: usize) {
+        // 解冻兜底：无论媒体线程有没有回状态，到点都结束 resume_pending。
+        // 若第一份 `NowPlaying` 已先到，`finish_resume` 的守卫保证不会重复显示。
+        if id == TIMER_RESUME {
+            self.kill_msg_timer(TIMER_RESUME);
+            if self.state.resume_pending {
+                self.finish_resume("兜底 400ms");
+            }
+            return;
+        }
+
         self.tick_optimistic();
         // G2 诊断：截图态探测要碰**前台进程**（OpenProcess + 查询镜像名），
         // 它有被安全软件挂钩拖慢的可能，单独计时。
+        // v1.5.5：冻结态下 `sync_capture_freeze` 只跑纯本地的 `foreground_info()`，
+        // 这正是「发现退出全屏」的唯一途径（1s 一次，不新增频率、不调快）。
         {
             let _sp = crate::platform::perf::Span::new("tick.capture");
             self.sync_capture_freeze();
+        }
+
+        // ---- v1.5.5 / G3.5：全屏冻结 ----
+        // 冻结期间这一 tick 只做上面那一次 `foreground_info()`（纯本地、微秒级）。
+        // 任务栏几何探测（FindWindow / 托盘遍历 / SHAppBarMessage）、ensure_on_top
+        // （SetWindowPos）、静止态背景采样、任何重绘全部跳过。
+        if self.state.frozen {
+            return;
         }
 
         // ---- 截图态：冻结「跟屏幕变」的两件事（v1.2.0 / G5 问题 2）----
@@ -695,6 +747,18 @@ impl App {
             }
         }
 
+        // v1.5.5（G3.5）：全屏冻结判定与心跳共用**同一次** `foreground_info()`，
+        // 零新增跨进程调用。必须放在下面「截图态状态没变就提前 return」之前——
+        // 冻结与否不依赖截图态是否翻转。
+        self.sync_fullscreen_freeze(&info);
+
+        // 冻结期间连截图态探测（OpenProcess + 查进程镜像名，跨进程）也跳过：
+        // 这一 tick 只允许留下纯本地的 `foreground_info()`，它是发现「退出全屏」
+        // 的唯一途径。解冻后的下一个 tick 会照常重新判定截图态。
+        if self.state.frozen {
+            return;
+        }
+
         let now = self.detect_capture_with(&info);
         if now == self.capture_frozen {
             return;
@@ -706,6 +770,94 @@ impl App {
             crate::log_info!("退出截图态：恢复刷新，立即补一次背景采样");
             self.request_backdrop();
         }
+    }
+
+    /// 全屏冻结的**进入 / 退出**（v1.5.5 / G3.5）。
+    ///
+    /// 每秒一次，与心跳共用 [`crate::platform::capture::foreground_info`] 的结果。
+    /// 判据是纯函数 [`frozen_decision`]：前台全屏 **且** 那块屏就是小组件所在屏。
+    /// 只在状态真的翻转时执行动作——冻结期间不重复隐藏、不重复发命令。
+    fn sync_fullscreen_freeze(&mut self, info: &crate::platform::capture::ForegroundInfo) {
+        let want = frozen_decision(info.fullscreen, info.monitor, self.widget_monitor);
+        if want == self.state.frozen {
+            return;
+        }
+        if want {
+            self.enter_fullscreen_freeze(info);
+        } else {
+            self.exit_fullscreen_freeze();
+        }
+    }
+
+    /// 进入冻结（false→true，只执行一次）。
+    fn enter_fullscreen_freeze(&mut self, info: &crate::platform::capture::ForegroundInfo) {
+        // 1) 立刻隐藏（不绕 sync_visibility：那边会按门控重算，没必要）
+        if let Some(h) = self.widget.as_mut() {
+            h.set_visible(false);
+        }
+        // 2) 停掉两个会持续唤醒 UI 的定时器。`start_widget_timer` 里另有 frozen
+        //    守卫，冻结期间谁都别想再把它们挂回来。
+        self.kill_widget_timer(TIMER_ANIM);
+        self.kill_widget_timer(TIMER_LYRIC);
+        self.last_lyric_key = None;
+        // 3) 媒体线程完全停下：只 send，绝不等待媒体线程（不 join / 不 SendMessage）
+        self.send_media(MediaCommand::SetPaused(true));
+        // 4) 置位：compute_visible / redraw / request_backdrop / ensure_on_top /
+        //    on_timer 全靠它跳过；state.visible 与实际隐藏保持一致。
+        self.state.frozen = true;
+        self.state.visible = false;
+        let w = info.monitor.right - info.monitor.left;
+        let h = info.monitor.bottom - info.monitor.top;
+        crate::log_info!("进入全屏冻结：{w}×{h} 媒体轮询暂停、渲染停止");
+    }
+
+    /// 退出冻结（true→false，只执行一次）。
+    ///
+    /// 顺序是「不闪旧内容」的关键：**先不显示**，等 `reduce` 收到解冻后第一份
+    /// `NowPlaying`（或 400ms 兜底）把隐藏窗口刷成最新内容，再 `set_visible(true)`。
+    fn exit_fullscreen_freeze(&mut self) {
+        // 1) 恢复媒体线程：SetPaused(false) 让第一轮立即全量读；
+        //    Refresh 再兜一次「强制重读」。两者共用命令通道，只 send 不 join。
+        self.state.frozen = false;
+        self.send_media(MediaCommand::SetPaused(false));
+        self.send_media(MediaCommand::Refresh);
+        // 2) 置等待标志；sync_visibility 会因此保持隐藏（见其中的 resume 门控）
+        self.state.resume_pending = true;
+        self.sync_visibility();
+        // 3) 一次性兜底定时器（消息窗；不是新的轮询频率）
+        self.start_msg_timer(TIMER_RESUME, RESUME_FALLBACK_MS);
+        crate::log_info!("退出全屏 → 解冻（{}ms 后恢复显示）", RESUME_FALLBACK_MS);
+    }
+
+    /// 结束解冻等待期：先把隐藏窗口刷成最新内容，再显示。
+    ///
+    /// `source` 只进日志（`"NowPlaying"` / `"兜底 400ms"`），便于确认走的是
+    /// 「状态先到」还是「超时兜底」。
+    fn finish_resume(&mut self, source: &str) {
+        if !self.state.resume_pending {
+            return;
+        }
+        // 1) 窗口仍隐藏时刷新内容：`relayout_with` 内部顺序是 apply_geometry →
+        //    `redraw()` → `sync_visibility()`；此时 resume_pending 仍为 true，
+        //    sync_visibility 保持隐藏，绝不会提前露出旧帧。
+        //    （`redraw` 对隐藏的 layered window 有效：UpdateLayeredWindow 只是提交位图。）
+        self.relayout_with(RectChangeReason::Unknown);
+        // 2) 内容已画好 → 显示。几何不可用时 relayout 已隐藏窗口，不强行显示，
+        //    等下次几何就绪自然恢复；其余可见性门控（user_hidden / NoSession 等）照旧。
+        let host = if self.geometry.is_some() && self.state.compute_visible() {
+            self.widget.as_mut()
+        } else {
+            None
+        };
+        if let Some(h) = host {
+            h.set_visible(true);
+        }
+        // 3) 清标志 + 停兜底定时器 + 让 state.visible / 歌词定时器回到常规门控
+        self.state.resume_pending = false;
+        self.kill_msg_timer(TIMER_RESUME);
+        self.sync_visibility();
+        self.sync_lyric_timer();
+        crate::log_info!("解冻完成（{source}），恢复显示");
     }
 
     /// 前景窗口是不是已知的截图工具（用**已经取好**的前台信息，不重复查询）。
@@ -1140,7 +1292,14 @@ impl App {
                     self.interact.reset();
                     self.sync_interaction();
                 }
-                let mut effects = vec![Effect::Relayout];
+                // v1.5.5 / G3.5：解冻后的第一份 NowPlaying 不直接 Relayout——
+                // 交给 apply 走 `finish_resume`（先刷隐藏窗口的内容，再显示），
+                // 否则用户退出全屏瞬间会看到冻结前的旧帧。
+                let mut effects = if self.state.resume_pending {
+                    vec![Effect::ResumeFromFreeze]
+                } else {
+                    vec![Effect::Relayout]
+                };
                 if track_changed {
                     // 换歌 → 立刻发歌词请求（旧歌词由 `LyricLoading` 覆盖，不残留）
                     effects.push(Effect::Lyric(self.lyric_request(false)));
@@ -1876,6 +2035,9 @@ impl App {
             match effect {
                 Effect::Relayout => self.relayout_with(RectChangeReason::Resize),
                 Effect::Redraw => self.redraw(),
+                // v1.5.5 / G3.5：解冻后第一份 NowPlaying 已写进 state，
+                // 此时才刷新隐藏窗口并恢复显示（不闪旧内容）。
+                Effect::ResumeFromFreeze => self.finish_resume("NowPlaying"),
                 Effect::SetVisible(v) => {
                     if let Some(h) = self.widget.as_mut() {
                         h.set_visible(v);
@@ -2076,6 +2238,12 @@ impl App {
 
     /// 只重绘（布局不变）。
     pub fn redraw(&mut self) {
+        // v1.5.5 / G3.5：冻结期间任何绘制都跳过——窗口已隐藏，也没有内容变化。
+        // 解冻等待期（resume_pending）frozen 已是 false，这里的 redraw 照常生效，
+        // 由 finish_resume 在隐藏状态下先把内容刷成最新。
+        if self.state.frozen {
+            return;
+        }
         if self.geometry.is_none() {
             return;
         }
@@ -2267,7 +2435,10 @@ impl App {
         // v1.5.0（G3）：有效隐藏态 = 「配置里隐藏」∨「本次运行点了 ×」。
         // `dismissed` 只在内存里，从不写盘 —— 这就是「重启后照常显示」。
         self.state.user_hidden = self.config.general.widget_hidden || self.state.dismissed;
-        self.state.visible = self.state.compute_visible();
+        // v1.5.5 / G3.5：解冻等待第一份 `NowPlaying` 期间，即使门控算出「该显示」
+        // 也必须保持隐藏——先让隐藏窗口刷成最新内容，再由 `finish_resume` 显示。
+        // 否则 `LyricReady` / `ConfigChanged` 等事件顺路调到这里就会露出旧帧。
+        self.state.visible = self.state.compute_visible() && !self.state.resume_pending;
         let vis = self.state.visible;
         if let Some(h) = self.widget.as_mut() {
             h.set_visible(vis);
@@ -2289,6 +2460,11 @@ impl App {
     /// **所有采样入口都走这里**（悬停进入 / 换壁纸 / 几何变化 / 退出截图态 / 配置变更），
     /// 所以「上次采样时刻」只需在这里刷新一处（v1.4.4 / G2-B1 的心跳节流依赖它）。
     fn request_backdrop(&mut self) {
+        // v1.5.5（G3.5）：全屏冻结期间不抓屏——窗口已隐藏，读桌面毫无意义，
+        // BitBlt 还正是「后台占用」的大头。退出冻结后由 relayout 自然补采。
+        if self.state.frozen {
+            return;
+        }
         // v1.2.0（G5 问题 2）：截图态**不抓屏**。截图工具的置顶遮罩会把整屏压暗 /
         // 打上十字线，抓到的是被污染的像素 → 亮度突变 → 文字色可能翻一下。
         // 退出截图态时由 `sync_capture_freeze` 立刻补一次，不会漏采样。
@@ -2388,6 +2564,12 @@ impl App {
     }
 
     fn start_widget_timer(&mut self, id: usize, ms: u32) {
+        // v1.5.5 / G3.5：冻结期间 ANIM / LYRIC 一律不许再挂起（0 唤醒）。
+        // 单点守卫而不是改每个调用点：`sync_interaction` / `sync_lyric_timer` /
+        // `animate_lyric_width` / `on_wake` 全都从这里过。
+        if self.state.frozen && (id == TIMER_ANIM || id == TIMER_LYRIC) {
+            return;
+        }
         let Some(h) = self.widget.as_ref() else {
             return;
         };
@@ -2413,6 +2595,26 @@ impl App {
             TIMER_ANIM => self.anim_timer_on = false,
             TIMER_LYRIC => self.lyric_timer_on = false,
             _ => {}
+        }
+    }
+
+    /// 在**消息窗**上挂一次性定时器（v1.5.5 / G3.5 解冻兜底）。
+    ///
+    /// 消息窗是 `HWND_MESSAGE`，进程期常驻；`TIMER_GEOM`（1s）也在它上面，
+    /// 两者 id 不冲突。同 id 重复 `SetTimer` 只是重置周期，不会叠加。
+    fn start_msg_timer(&self, id: usize, ms: u32) {
+        // SAFETY: msg_hwnd 由 bootstrap 创建且进程期有效。
+        unsafe {
+            let _ = SetTimer(Some(self.msg_hwnd), id, ms, None);
+        }
+    }
+
+    /// 结束消息窗上的一次性定时器（幂等；WM_TIMER 已入队也无害，
+    /// `on_timer` 里的 `resume_pending` 守卫会把它变成 no-op）。
+    fn kill_msg_timer(&self, id: usize) {
+        // SAFETY: 与 start_msg_timer 配对。
+        unsafe {
+            let _ = KillTimer(Some(self.msg_hwnd), id);
         }
     }
 
@@ -2599,6 +2801,12 @@ impl App {
 
     /// 重新把小组件窗口放到 topmost 带的最前面（`SWP_NOACTIVATE`，不改焦点）。
     fn ensure_on_top(&mut self) {
+        // v1.5.5 / G3.5：冻结期间绝不 `raise()`——这正是「小组件盖在全屏窗口上方」
+        // 的根因（本轮需求的原始动机）。on_timer 已提前 return，这里再兜一层，
+        // 保证 TaskbarCreated 等其它入口也不会把它抬上去。
+        if self.state.frozen {
+            return;
+        }
         // v1.2.0 诊断：置顶轮询顺便对账「窗口实际矩形 vs target_rect」。
         // 正常情况下两者恒等（`relayout` 用 `apply_geometry` 写、`redraw` 用
         // `present` 的 pptdst 再写一次，用的都是同一个 target_rect）。一旦不等，
@@ -2750,6 +2958,18 @@ fn same_monitor(a: RECT, b: RECT) -> bool {
 /// 与别的显示器上的全屏毫无关系。
 fn should_skip_idle_backdrop(fullscreen: bool, fg_monitor: RECT, widget_monitor: RECT) -> bool {
     fullscreen && same_monitor(fg_monitor, widget_monitor)
+}
+
+/// 是否进入「全屏冻结」（v1.5.5 / G3.5）——**纯函数**，可单测。
+///
+/// 判据与 [`should_skip_idle_backdrop`] **完全同源**（直接复用，不复制逻辑）：
+/// 前台窗口全屏 **且** 全屏的那块屏就是小组件所在的屏。于是「同屏全屏」这一个
+/// 事实同时驱动两件事：v1.4.4 的静止态心跳跳过、v1.5.5 的整个小组件冻结。
+///
+/// 安全方向：副屏全屏、任一显示器矩形取不到（全 0）时都判 `false`（不冻结），
+/// 与 v1.4.4 多显示器补丁一致——宁可多跑一次心跳，也不能让主屏小组件被误冻。
+fn frozen_decision(foreground_fullscreen: bool, fg_monitor: RECT, widget_monitor: RECT) -> bool {
+    should_skip_idle_backdrop(foreground_fullscreen, fg_monitor, widget_monitor)
 }
 
 /// 从 `LPARAM` 里取客户区坐标（`GET_X_LPARAM` / `GET_Y_LPARAM` 的等价实现）。
@@ -3255,5 +3475,332 @@ mod marquee_tests {
             idle_backdrop_due(ms, skip),
             "拿不到小组件所在屏时必须继续采样（安全方向）"
         );
+    }
+
+    // ---------------------------------------------- v1.5.5 / G3.5：全屏冻结
+
+    /// 两个新标记默认必须是 `false`：启动时不该莫名其妙处于冻结 / 解冻等待态。
+    #[test]
+    fn freeze_flags_default_to_false() {
+        let s = AppState::default();
+        assert!(!s.frozen);
+        assert!(!s.resume_pending);
+    }
+
+    /// **冻结判定真值表**：`(foreground_fullscreen, same_monitor,
+    /// taskbar_collapsed, user_hidden)` 共 16 格，逐格断言 `frozen` 与
+    /// `compute_visible()`。同时点名两条安全方向：副屏全屏、monitor 全 0。
+    #[test]
+    fn frozen_decision_matrix() {
+        for fullscreen in [false, true] {
+            for same in [false, true] {
+                for collapsed in [false, true] {
+                    for hidden in [false, true] {
+                        let fg_mon = if same { mon_primary() } else { mon_secondary() };
+                        let frozen = frozen_decision(fullscreen, fg_mon, mon_primary());
+                        assert_eq!(
+                            frozen,
+                            fullscreen && same,
+                            "fullscreen={fullscreen} same={same} → frozen 应为 {}",
+                            fullscreen && same
+                        );
+
+                        let mut s = AppState::default();
+                        s.playing.state = PlaybackState::Playing; // 有会话
+                        s.user_hidden = hidden;
+                        s.taskbar_collapsed = collapsed;
+                        s.frozen = frozen;
+                        let want_visible = !hidden && !collapsed && !frozen;
+                        assert_eq!(
+                            s.compute_visible(),
+                            want_visible,
+                            "fullscreen={fullscreen} same={same} collapsed={collapsed} \
+                             hidden={hidden} frozen={frozen}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 点名 1：同屏全屏才冻结
+        assert!(frozen_decision(true, mon_primary(), mon_primary()));
+        assert!(!frozen_decision(false, mon_primary(), mon_primary()));
+        // 点名 2：**副屏全屏不得冻结主屏**（v1.4.4 多显示器补丁口径）
+        assert!(!frozen_decision(true, mon_secondary(), mon_primary()));
+        // 点名 3：任一 monitor 全 0 → 不冻结（安全方向）
+        assert!(!frozen_decision(true, RECT::default(), mon_primary()));
+        assert!(!frozen_decision(true, mon_primary(), RECT::default()));
+        assert!(!frozen_decision(true, RECT::default(), RECT::default()));
+    }
+
+    /// `frozen == true` 时 `compute_visible()` **恒** false：不管会话态、
+    /// 用户隐藏、任务栏收起怎么组合，也不管是不是刚解冻结。
+    #[test]
+    fn compute_visible_is_false_whenever_frozen() {
+        for hidden in [false, true] {
+            for collapsed in [false, true] {
+                for state in [
+                    PlaybackState::NoSession,
+                    PlaybackState::Paused,
+                    PlaybackState::Playing,
+                ] {
+                    let mut s = AppState::default();
+                    s.playing.state = state;
+                    s.user_hidden = hidden;
+                    s.taskbar_collapsed = collapsed;
+                    s.frozen = true;
+                    assert!(
+                        !s.compute_visible(),
+                        "frozen 时必须恒不可见：hidden={hidden} collapsed={collapsed} state={state:?}"
+                    );
+                }
+            }
+        }
+        // 回归：没冻结时既有真值表不许被改坏（不放宽任何既有断言）
+        let mut s = AppState::default();
+        s.playing.state = PlaybackState::Playing;
+        assert!(s.compute_visible());
+        s.frozen = true;
+        assert!(!s.compute_visible());
+    }
+
+    /// 冻结判定与 v1.4.4 心跳跳过判据**同源**（不许两套逻辑漂移）。
+    #[test]
+    fn frozen_decision_shares_backdrop_skip_criterion() {
+        for fullscreen in [false, true] {
+            for fg in [mon_primary(), mon_secondary(), RECT::default()] {
+                for widget in [mon_primary(), mon_secondary(), RECT::default()] {
+                    assert_eq!(
+                        frozen_decision(fullscreen, fg, widget),
+                        should_skip_idle_backdrop(fullscreen, fg, widget),
+                        "fg={fg:?} widget={widget:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 解冻兜底 400ms：
+    /// - **≥200ms**：给媒体线程一次解冻后的全量读（跨进程 SMTC 正常 1~3ms，
+    ///   异常慢也不该被提前显示旧帧）留出余量；
+    /// - **≤1000ms**：`TIMER_GEOM_MS` 就是 1s，退出全屏后最多再等一个心跳周期
+    ///   必须看见小组件，且**不许**为此把 1s 心跳调快（禁改清单）；
+    /// - 400ms 取中，媒体线程异常 / 无会话（永远没有 NowPlaying）时也不会永远隐藏。
+    #[test]
+    fn resume_fallback_timeout_is_within_bounds() {
+        assert!(
+            RESUME_FALLBACK_MS >= 200,
+            "太短会在第一份 NowPlaying 到达前露出冻结前的旧帧"
+        );
+        assert!(
+            RESUME_FALLBACK_MS <= 1000,
+            "不得超过 1s 几何心跳周期，也不许为此新增更快的轮询"
+        );
+        assert_eq!(RESUME_FALLBACK_MS, 400);
+        assert_eq!(TIMER_RESUME, 6, "消息窗定时器 id 不得与既有 id 冲突");
+        assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000, "1s 心跳是本轮上限，不许调快");
+    }
+}
+
+// ============================================================================
+// QA 独立回归验证（Edward / G3.5 v1.5.5）
+// 只新增测试代码；不复用工程师的 mon_primary / mon_secondary helper，
+// 全部数据独立构造，期望值独立推导，避免「测试和实现错到一起去」。
+// ============================================================================
+#[cfg(test)]
+mod qa_g35_regression {
+    use super::*;
+
+    /// QA 自造的显示器矩形：主屏（含 0 字段但非全 0）、副屏、差 1px、
+    /// 左屏（含 0 字段）、取不到（全 0）。
+    fn qa_rects() -> Vec<(&'static str, RECT)> {
+        vec![
+            ("primary", RECT { left: 0, top: 0, right: 1920, bottom: 1080 }),
+            ("secondary", RECT { left: 1920, top: 0, right: 3840, bottom: 1080 }),
+            ("primary_1px_off", RECT { left: 0, top: 0, right: 1921, bottom: 1080 }),
+            ("left_monitor", RECT { left: -1920, top: 0, right: 0, bottom: 1080 }),
+            ("unknown_zero", RECT::default()),
+        ]
+    }
+
+    /// 独立期望：全屏 + 两块矩形严格相等 + 都不是全 0，才冻结。
+    fn qa_expected(fullscreen: bool, fg: RECT, widget: RECT) -> bool {
+        let unknown = fg == RECT::default() || widget == RECT::default();
+        fullscreen && !unknown && fg == widget
+    }
+
+    /// B1 + B2：2 × 5 × 5 = 50 格真值表，逐格对照独立期望；
+    /// 并逐格确认 frozen_decision 与 should_skip_idle_backdrop 同值（防判据漂移）。
+    #[test]
+    fn qa_frozen_decision_full_truth_table_and_no_criterion_drift() {
+        let rects = qa_rects();
+        let mut cells = 0;
+        for fullscreen in [false, true] {
+            for (fname, fg) in &rects {
+                for (wname, widget) in &rects {
+                    let want = qa_expected(fullscreen, *fg, *widget);
+                    let got = frozen_decision(fullscreen, *fg, *widget);
+                    assert_eq!(
+                        got,
+                        want,
+                        "fullscreen={fullscreen} fg={fname}({fg:?}) widget={wname}({widget:?})"
+                    );
+                    assert_eq!(
+                        got,
+                        should_skip_idle_backdrop(fullscreen, *fg, *widget),
+                        "判据漂移：fullscreen={fullscreen} fg={fname} widget={wname}"
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 50);
+    }
+
+    /// B1 点名：同屏才冻结、副屏不冻结主屏、任一侧取不到一律不冻结（安全方向）。
+    #[test]
+    fn qa_safety_direction_never_freezes_on_unknown_or_secondary_monitor() {
+        let p = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let s = RECT { left: 1920, top: 0, right: 3840, bottom: 1080 };
+        let z = RECT::default();
+        assert!(frozen_decision(true, p, p), "同屏全屏必须冻结");
+        assert!(!frozen_decision(true, s, p), "副屏全屏不得冻结主屏");
+        assert!(!frozen_decision(true, p, s), "主屏全屏不得冻结副屏");
+        assert!(!frozen_decision(true, z, p), "fg monitor 取不到 → 不冻结");
+        assert!(!frozen_decision(true, p, z), "widget monitor 取不到 → 不冻结");
+        assert!(!frozen_decision(true, z, z), "两边都取不到 ≠ 同屏");
+        assert!(!frozen_decision(false, p, p), "没全屏一律不冻结");
+        // 含 0 字段但不是全 0 的合法显示器仍应能判同屏（别把主屏误当「取不到」）
+        let left = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+        assert!(frozen_decision(true, left, left), "含 0 字段的合法矩形仍算同屏");
+    }
+
+    /// B3：compute_visible 门控全组合（2 × 2 × 2 × 3 = 24 格）。
+    /// 工程师的矩阵只设 Playing，这里补上 NoSession × frozen 等组合，
+    /// 钉死「frozen 恒 false」以及 user_hidden / taskbar_collapsed / NoSession 的优先级。
+    #[test]
+    fn qa_compute_visible_gate_order_full_matrix() {
+        let states = [
+            PlaybackState::NoSession,
+            PlaybackState::Paused,
+            PlaybackState::Playing,
+        ];
+        let mut cells = 0;
+        for user_hidden in [false, true] {
+            for collapsed in [false, true] {
+                for frozen in [false, true] {
+                    for state in states {
+                        let mut st = AppState::default();
+                        st.user_hidden = user_hidden;
+                        st.taskbar_collapsed = collapsed;
+                        st.frozen = frozen;
+                        st.playing.state = state;
+                        let want = !user_hidden
+                            && !collapsed
+                            && !frozen
+                            && state != PlaybackState::NoSession;
+                        assert_eq!(
+                            st.compute_visible(),
+                            want,
+                            "hidden={user_hidden} collapsed={collapsed} frozen={frozen} state={state:?}"
+                        );
+                        if frozen {
+                            assert!(!st.compute_visible(), "frozen 时必须恒不可见");
+                        }
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 24);
+    }
+
+    /// E2/E6：resume_pending **不**参与 compute_visible()——
+    /// 隐藏是靠 sync_visibility() 里的 `&& !resume_pending`；
+    /// 正因为如此，finish_resume 第 847 行的 compute_visible() 门控才能独立生效。
+    #[test]
+    fn qa_resume_pending_is_not_part_of_compute_visible_gate() {
+        let mut st = AppState::default();
+        st.playing.state = PlaybackState::Playing;
+        for hidden in [false, true] {
+            for collapsed in [false, true] {
+                st.user_hidden = hidden;
+                st.taskbar_collapsed = collapsed;
+                let base = st.compute_visible();
+                st.resume_pending = true;
+                assert_eq!(
+                    st.compute_visible(),
+                    base,
+                    "resume_pending 不得改变门控结论；保持隐藏靠 sync_visibility 的 && !resume_pending"
+                );
+                st.resume_pending = false;
+            }
+        }
+    }
+
+    /// E6：钉死 finish_resume 的显示门控 `geometry.is_some() && compute_visible()`。
+    /// 冻结期 Ctrl+Alt+H 主动隐藏 / 任务栏收起 / 无会话 / 几何不可用时，
+    /// 400ms 兜底都不得强行把窗口露出来。
+    #[test]
+    fn qa_finish_resume_show_gate_blocks_user_hidden_and_no_session() {
+        fn gate(geometry_present: bool, st: &AppState) -> bool {
+            geometry_present && st.compute_visible()
+        }
+
+        let mut st = AppState::default();
+        st.playing.state = PlaybackState::Playing;
+        assert!(gate(true, &st), "基线：几何就绪 + 有会话 + 未隐藏 → 允许显示");
+
+        st.user_hidden = true; // Ctrl+Alt+H / × 主动隐藏
+        assert!(!gate(true, &st), "用户主动隐藏时兜底不得显示");
+        st.user_hidden = false;
+
+        st.taskbar_collapsed = true;
+        assert!(!gate(true, &st), "任务栏收起时不得显示");
+        st.taskbar_collapsed = false;
+
+        st.playing.state = PlaybackState::NoSession;
+        assert!(!gate(true, &st), "无会话时不得显示");
+        st.playing.state = PlaybackState::Playing;
+
+        assert!(!gate(false, &st), "几何不可用时不得显示");
+    }
+
+    /// D4/E4：5 个定时器 id 互异且值未变；1s 心跳、40ms 歌词周期、400ms 兜底未被改。
+    #[test]
+    fn qa_timer_ids_and_periods_are_unchanged() {
+        let ids = [
+            ("GEOM", widget_wnd::TIMER_GEOM),
+            ("ANIM", widget_wnd::TIMER_ANIM),
+            ("CLICK", widget_wnd::TIMER_CLICK),
+            ("LYRIC", widget_wnd::TIMER_LYRIC),
+            ("RESUME", widget_wnd::TIMER_RESUME),
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(ids[i].1, ids[j].1, "{} 与 {} 定时器 id 冲突", ids[i].0, ids[j].0);
+            }
+        }
+        assert_eq!(widget_wnd::TIMER_GEOM, 1);
+        assert_eq!(widget_wnd::TIMER_ANIM, 2);
+        assert_eq!(widget_wnd::TIMER_CLICK, 3);
+        assert_eq!(widget_wnd::TIMER_LYRIC, 5);
+        assert_eq!(widget_wnd::TIMER_RESUME, 6);
+        assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000, "1s 心跳不许调快");
+        assert_eq!(widget_wnd::TIMER_LYRIC_MS, 40, "歌词定时器周期不许被改");
+        assert_eq!(RESUME_FALLBACK_MS, 400);
+        assert!(RESUME_FALLBACK_MS >= 200 && RESUME_FALLBACK_MS <= 1_000);
+    }
+
+    /// 两个新标记默认 false 且互不联动（防止某处顺手把另一个也置位）。
+    #[test]
+    fn qa_freeze_flags_default_false_and_independent() {
+        let mut st = AppState::default();
+        assert!(!st.frozen);
+        assert!(!st.resume_pending);
+        st.frozen = true;
+        assert!(!st.resume_pending, "置 frozen 不得暗改 resume_pending");
+        st.resume_pending = true;
+        assert!(st.frozen, "置 resume_pending 不得暗改 frozen");
     }
 }

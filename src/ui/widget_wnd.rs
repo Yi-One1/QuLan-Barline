@@ -59,6 +59,13 @@ pub const TIMER_LYRIC: usize = 5;
 /// 平均停留 250–350ms，扫光边界每帧只移动 ~1px；25fps 已经完全看不出台阶，
 /// 而 60fps 会让「播放中空闲 CPU」逼近 PRD P0-14 的 0.5% 红线。
 pub const TIMER_LYRIC_MS: u32 = 40;
+/// 解冻兜底定时器 ID（v1.5.5 / G3.5）：挂在**消息窗**上的一次性定时器。
+///
+/// 退出全屏后置 `resume_pending`，等第一份 `NowPlaying` 把隐藏窗口刷成最新内容
+/// 再显示；万一媒体线程异常 / 当前无会话（永远不会来 `NowPlaying`），
+/// [`crate::app::RESUME_FALLBACK_MS`] 到点由它兜底，不会「再也不显示」。
+/// 它是一次性的，不是新的轮询频率；`TIMER_GEOM` 仍是唯一常驻的 1s 心跳。
+pub const TIMER_RESUME: usize = 6;
 
 /// 全局的「小组件窗口句柄」与「App 指针」——`WH_MOUSE_LL` 钩子回调需要它们。
 ///
@@ -344,8 +351,10 @@ unsafe extern "system" fn msg_proc(
         WM_TIMER => {
             let app = app_ptr(hwnd);
             if !app.is_null() {
+                // v1.5.5 / G3.5：消息窗上现在有两个定时器——常驻的 TIMER_GEOM
+                // 与一次性的 TIMER_RESUME，必须把 id 传下去区分。
                 // SAFETY: 同上。
-                unsafe { (*app).on_timer() };
+                unsafe { (*app).on_timer(wparam.0) };
             }
             LRESULT(0)
         }

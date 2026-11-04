@@ -462,6 +462,25 @@ impl PollState {
         now.saturating_duration_since(self.last_tick) >= Duration::from_millis(FORCED_FLOOR_MS)
     }
 
+    /// v1.5.5 / G3.5：**解冻后的第一轮必须是全量读**。
+    ///
+    /// 不许等 500 / 1000 / 2000ms 的常规节奏，也不许被
+    /// [`FORCED_FLOOR_MS`]（60ms）挡住。做法是三管齐下，全部只改状态、不改常量：
+    /// 1. `Cadence::default()` → 三层 `last_*` 全为 `None`，[`due`] 恒真；
+    /// 2. `last_tick` 回拨一个下限 → `forced_due` 立即成立；
+    /// 3. 置脏位 → 主循环的 `schedule` 拿到 `dirty_set = true`。
+    ///
+    /// 于是无论本轮是「收到 `Refresh`」还是「50ms 超时」，`schedule` 都返回
+    /// `(Plan::full(), true)`；UI 连发 `SetPaused(false) + Refresh` 也只会有
+    /// **一次**全量读（两者都只置状态，由本轮末尾统一的 `tick` 执行）。
+    fn reset_for_resume(&mut self, now: Instant) {
+        self.cadence = Cadence::default();
+        self.last_tick = now
+            .checked_sub(Duration::from_millis(FORCED_FLOOR_MS))
+            .unwrap_or(now);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
     /// **主循环每轮（50ms）的调度**：统计落地 + forced 判定 + 分层计划。
     ///
     /// 与 COM 无关的部分集中在这里，`run` 只负责收发——这样「统计确实每轮都刷」
@@ -681,6 +700,37 @@ fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> (T, u128) {
 
 // ---------------------------------------------------------------- 线程主体
 
+/// 一次「等命令」的结果（v1.5.5 / G3.5：抽成纯通道语义，便于单测）。
+///
+/// `Timeout` 只在**非冻结**态出现（50ms 轮询节拍）；paused 态是阻塞 `recv()`，
+/// 永远不会产生 Timeout——这正是「0 唤醒」的含义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvOutcome {
+    Command(MediaCommand),
+    Timeout,
+    Disconnected,
+}
+
+/// 取一条命令：冻结（paused）时**阻塞** `recv()`，非冻结时 50ms `recv_timeout()`。
+///
+/// 这条分叉是 G3.5 的核心：冻结期间媒体线程完全不醒来、不发任何跨进程调用，
+/// 唯一的唤醒来源是命令通道——`Quit`（退出）、播控命令（热键切歌）、
+/// `SetPaused(false)`（解冻）。`Quit` 因此在 paused 态天然可投递，不会死锁。
+fn recv_command(rx: &Receiver<MediaCommand>, paused: bool) -> RecvOutcome {
+    if paused {
+        match rx.recv() {
+            Ok(cmd) => RecvOutcome::Command(cmd),
+            Err(_) => RecvOutcome::Disconnected,
+        }
+    } else {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(cmd) => RecvOutcome::Command(cmd),
+            Err(RecvTimeoutError::Timeout) => RecvOutcome::Timeout,
+            Err(RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+        }
+    }
+}
+
 /// 媒体线程主函数。**整个函数体都在 MTA 上运行**，因此可以随意 `join()`。
 pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
     let _com = ComApartment::mta();
@@ -700,12 +750,40 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
     let mut state = PollState::new(dirty.clone());
     let _handlers = subscribe(&mgr, &dirty, &sink);
 
+    // v1.5.5 / G3.5：全屏冻结时整个轮询停摆，只留命令通道（阻塞 recv）。
+    // 分层间隔 500 / 1000 / 2000ms 与 FORCED_FLOOR_MS 一律不动，只整体跳过。
+    let mut paused = false;
     loop {
-        match cmd_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(MediaCommand::Quit) => break,
-            Ok(cmd) => execute(cmd, &mgr, &sink, &mut state),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
+        match recv_command(&cmd_rx, paused) {
+            RecvOutcome::Command(MediaCommand::Quit) => break,
+            RecvOutcome::Command(MediaCommand::SetPaused(true)) => {
+                if !paused {
+                    crate::log_info!("媒体线程：全屏冻结，暂停分层轮询（仅等待命令）");
+                }
+                paused = true;
+                // 冻结期间完全跳过 schedule / tick
+                continue;
+            }
+            RecvOutcome::Command(MediaCommand::SetPaused(false)) => {
+                paused = false;
+                // 解冻后第一轮必须全量读：三层节奏时间戳归零 + 置脏位 +
+                // 让 forced 的 60ms 下限立即成立（见 `PollState::reset_for_resume`）。
+                state.reset_for_resume(Instant::now());
+                crate::log_info!("媒体线程：解冻，恢复分层轮询（第一轮全量读）");
+                continue;
+            }
+            RecvOutcome::Command(cmd) => {
+                // 播控命令在冻结期间照常执行（用户在全屏游戏里按热键切歌）。
+                // 只有「轮询」被暂停，命令通路不冻结；执行完立即回到阻塞 recv。
+                execute(cmd, &mgr, &sink, &mut state);
+                if paused {
+                    continue;
+                }
+            }
+            RecvOutcome::Timeout => {
+                // 非冻结态：50ms 到点，进入本轮分层轮询
+            }
+            RecvOutcome::Disconnected => {
                 crate::log_warn!("命令通道已断开，媒体线程退出");
                 break;
             }
@@ -953,14 +1031,20 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
     match cmd {
         MediaCommand::Quit => return,
         MediaCommand::Refresh => {
-            // 强制重读一次并广播（乐观更新超时后的对账）——三组全读
-            state.tick(mgr, sink, Instant::now(), Plan::full());
+            // 强制重读一次（乐观更新回滚校验 / v1.5.5 解冻）。
+            // 不在 `execute` 里直接 `tick`，而是置「立即全量读」状态，交给本轮
+            // 末尾的 `schedule` 统一执行：解冻时 UI 连发 `SetPaused(false) + Refresh`
+            // 也只会读一次；冻结期间收到它则自然推迟到解冻后（0 跨进程调用）。
+            state.reset_for_resume(Instant::now());
             return;
         }
         MediaCommand::Mute => {
             crate::log_debug!("Mute 由 WASAPI 通道实现（T16），当前忽略");
             return;
         }
+        // `SetPaused` 由 `run` 在命令入口截获，绝不该走到这里；
+        // 显式列出是防御未来有人在别处调用 `execute`。
+        MediaCommand::SetPaused(_) => return,
         _ => {}
     }
 
@@ -970,6 +1054,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         MediaCommand::Prev => MediaCommandKind::Prev,
         MediaCommand::Seek(_) => MediaCommandKind::Seek,
         MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
+        MediaCommand::SetPaused(_) => return,
     };
 
     let session = match mgr.GetCurrentSession() {
@@ -998,6 +1083,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
                 .join()
         }),
         MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
+        MediaCommand::SetPaused(_) => return,
     };
 
     match result {
@@ -1406,5 +1492,228 @@ mod tests {
         assert_eq!(st.stats.playback, 0, "主循环必须每轮落地统计（flush_if_due）");
         assert_eq!(st.stats.timeline, 0);
         assert_eq!(st.stats.props, 0);
+    }
+
+    // ------------------------------------------- v1.5.5 / G3.5：全屏冻结（paused）
+
+    /// paused 态用阻塞 `recv()`：通道开着、命令还没到时必须一直等，而不是
+    /// 每 50ms 醒一次。**同时证明 `Quit` 在 paused 语义下仍可投递**（退出不死锁）。
+    #[test]
+    fn paused_recv_waits_for_command_and_quit_is_deliverable() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            tx.send(MediaCommand::SetPaused(true)).unwrap();
+            tx.send(MediaCommand::Quit).unwrap();
+        });
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Command(MediaCommand::SetPaused(true)),
+            "paused 必须阻塞到命令到达，不许返回 Timeout"
+        );
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Command(MediaCommand::Quit),
+            "Quit 必须能在 paused 态收到，否则 shutdown 会挂住"
+        );
+        sender.join().unwrap();
+    }
+
+    /// 非 paused 用 `recv_timeout`：空闲时返回 Timeout，主循环据此推进分层轮询。
+    #[test]
+    fn running_recv_uses_timeout_when_idle() {
+        // `_tx` 必须活着，否则会直接 Disconnected
+        let (_tx, rx) = std::sync::mpsc::channel::<MediaCommand>();
+        assert_eq!(recv_command(&rx, false), RecvOutcome::Timeout);
+    }
+
+    /// paused 态**不可能**产生 Timeout（0 唤醒）；通道断开则两种态都判 Disconnected。
+    #[test]
+    fn paused_recv_never_times_out_and_detects_disconnect() {
+        let (tx, rx) = std::sync::mpsc::channel::<MediaCommand>();
+        drop(tx);
+        assert_eq!(recv_command(&rx, true), RecvOutcome::Disconnected);
+        assert_eq!(recv_command(&rx, false), RecvOutcome::Disconnected);
+    }
+
+    /// 解冻命令序列 `SetPaused(false) + Refresh` 按 FIFO 到达，paused 的 recv 接得住。
+    #[test]
+    fn resume_command_sequence_is_delivered_in_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(MediaCommand::SetPaused(true)).unwrap();
+        tx.send(MediaCommand::SetPaused(false)).unwrap();
+        tx.send(MediaCommand::Refresh).unwrap();
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Command(MediaCommand::SetPaused(true))
+        );
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Command(MediaCommand::SetPaused(false))
+        );
+        assert_eq!(
+            recv_command(&rx, false),
+            RecvOutcome::Command(MediaCommand::Refresh)
+        );
+    }
+
+    /// **解冻后第一轮就是全量读**的证据：冻结前三层都刚读过（常规节奏整轮跳过），
+    /// `reset_for_resume` 之后第一次 `schedule` 必须 `forced` + `Plan::full()`。
+    #[test]
+    fn resume_forces_full_read_on_first_schedule() {
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+        let t0 = st.last_tick;
+        st.cadence.note_playback(t0, PlaybackState::Playing);
+        st.cadence.note_timeline(t0, 1_000, 180_000);
+        st.cadence.note_props(t0);
+        assert!(
+            !st.cadence.plan(t0, false).any(),
+            "前置：三层都刚读过，常规节奏这一轮一组都不该读"
+        );
+
+        st.reset_for_resume(t0);
+        assert!(st.dirty.load(Ordering::Relaxed), "脏位必须置上");
+        let (plan, forced) = st.schedule(t0, st.dirty.load(Ordering::Relaxed));
+        assert!(forced, "解冻第一轮必须绕过 60ms 下限成为 forced");
+        assert_eq!(
+            plan,
+            Plan::full(),
+            "解冻第一轮必须三组全读，不许等 500/1000/2000ms"
+        );
+    }
+}
+
+// ============================================================================
+// QA 独立回归验证（Edward / G3.5 v1.5.5）—— 只新增测试代码。
+// ============================================================================
+#[cfg(test)]
+mod qa_g35_regression {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    /// C1/C2：paused 必须是**阻塞 recv()**，不是 50ms 轮询。
+    /// 工程师的用例只 sleep 30ms（< 50ms）——即使实现错用 recv_timeout(50ms)，
+    /// 命令也已经到达，recv_timeout 会立刻返回 Ok，测试照样通过，**无法证伪**。
+    /// 这里故意让命令 150ms 后才到：若实现仍是 50ms 超时，第一次必然返回 Timeout。
+    #[test]
+    fn qa_paused_recv_is_truly_blocking_not_50ms_polling() {
+        let (tx, rx) = channel::<MediaCommand>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            tx.send(MediaCommand::PlayPause).unwrap();
+            tx.send(MediaCommand::Quit).unwrap();
+        });
+
+        let t0 = Instant::now();
+        let first = recv_command(&rx, true);
+        let elapsed = t0.elapsed();
+        assert_eq!(
+            first,
+            RecvOutcome::Command(MediaCommand::PlayPause),
+            "paused 期间不得产生 Timeout / 50ms 唤醒；实际拿到 {first:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "阻塞仅 {elapsed:?}，说明存在 50ms 级唤醒，不是阻塞 recv()"
+        );
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Command(MediaCommand::Quit),
+            "Quit 在 paused 下必须可投递，否则 shutdown 死锁"
+        );
+        sender.join().unwrap();
+    }
+
+    /// C3：paused 下所有播控命令（含 Refresh / SetPaused / Quit）原样送达，
+    /// 不产生 Timeout；通道断开后 paused 也必须识别 Disconnected。
+    #[test]
+    fn qa_all_commands_are_deliverable_while_paused_without_timeout() {
+        let seq = [
+            MediaCommand::PlayPause,
+            MediaCommand::Next,
+            MediaCommand::Prev,
+            MediaCommand::Seek(42_000),
+            MediaCommand::Mute,
+            MediaCommand::Refresh,
+            MediaCommand::SetPaused(true),
+            MediaCommand::SetPaused(false),
+            MediaCommand::Quit,
+        ];
+        let (tx, rx) = channel::<MediaCommand>();
+        for cmd in seq {
+            tx.send(cmd).unwrap();
+        }
+        drop(tx); // 队列读空后应得到 Disconnected，而不是 Timeout
+
+        for cmd in seq {
+            assert_eq!(
+                recv_command(&rx, true),
+                RecvOutcome::Command(cmd),
+                "paused 下命令 {cmd:?} 必须原样送达"
+            );
+        }
+        assert_eq!(
+            recv_command(&rx, true),
+            RecvOutcome::Disconnected,
+            "通道断开在 paused 下也必须被识别（run() 据此退出）"
+        );
+    }
+
+    /// 非冻结态仍走 50ms recv_timeout：空闲返回 Timeout，且不许被改快。
+    #[test]
+    fn qa_running_recv_keeps_50ms_cadence() {
+        let (_tx, rx) = channel::<MediaCommand>();
+        let t0 = Instant::now();
+        assert_eq!(recv_command(&rx, false), RecvOutcome::Timeout);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "非冻结态 50ms 节拍被改快：{elapsed:?}"
+        );
+    }
+
+    /// C4：解冻后第一轮在任意时刻都必须是 (Plan::full(), true)；
+    /// 连续两个解冻信号（SetPaused(false) + Refresh 都只置状态）只产生一次全量读。
+    #[test]
+    fn qa_reset_for_resume_forces_full_read_at_any_now_and_is_idempotent() {
+        for step_ms in [0u64, 1, 60, 137, 2_000] {
+            let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+            let base = st.last_tick;
+            // 前置：三层都「刚读过」，常规节奏这一轮一组都不该读
+            st.cadence.note_playback(base, PlaybackState::Playing);
+            st.cadence.note_timeline(base, 1_000, 180_000);
+            st.cadence.note_props(base);
+            assert!(!st.cadence.plan(base, false).any(), "前置：常规节奏整轮跳过");
+
+            let now = base + Duration::from_millis(step_ms);
+            st.reset_for_resume(now);
+            st.reset_for_resume(now); // 模拟 UI 连发 SetPaused(false) + Refresh
+
+            assert!(st.dirty.load(Ordering::Relaxed), "脏位必须置上");
+            assert!(st.cadence.last_playback.is_none(), "三层节奏必须归零");
+            assert!(st.cadence.last_timeline.is_none(), "三层节奏必须归零");
+            assert!(st.cadence.last_props.is_none(), "三层节奏必须归零");
+
+            let (plan, forced) = st.schedule(now, st.dirty.load(Ordering::Relaxed));
+            assert!(forced, "step={step_ms}ms 解冻第一轮必须绕过 60ms 下限");
+            assert_eq!(plan, Plan::full(), "step={step_ms}ms 解冻第一轮必须三组全读");
+
+            // 消费脏位后同一轮内不会再出现第二次 forced 全量读
+            st.dirty.store(false, Ordering::Relaxed);
+            let (_, forced_again) = st.schedule(now, st.dirty.load(Ordering::Relaxed));
+            assert!(!forced_again, "两个解冻信号只该产生一次全量读");
+        }
+    }
+
+    /// C6：分层间隔与 60ms 下限一个都没被改（只在 paused 时整体跳过）。
+    #[test]
+    fn qa_polling_intervals_and_forced_floor_are_unchanged() {
+        assert_eq!(limits::MEDIA_POLL_MS, 500);
+        assert_eq!(limits::MEDIA_POLL_MID_MS, 1_000);
+        assert_eq!(limits::MEDIA_POLL_SLOW_MS, 2_000);
+        assert_eq!(limits::MEDIA_POLL_TIMELINE_BACKOFF_MS, 5_000);
+        assert_eq!(limits::MEDIA_POLL_ZERO_STREAK, 3);
+        assert_eq!(FORCED_FLOOR_MS, 60);
+        assert_eq!(limits::BACKDROP_IDLE_MS, 3_000);
     }
 }
