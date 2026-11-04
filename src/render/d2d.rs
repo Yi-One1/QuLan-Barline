@@ -279,15 +279,6 @@ impl Targets {
         }
     }
 
-    /// 当前槽位（0 = A，1 = B），用作封面缓存的分桶键。
-    pub fn current_slot(&self) -> u8 {
-        if self.next_is_b {
-            1
-        } else {
-            0
-        }
-    }
-
     pub fn matches(&self, width: u32, height: u32, dpi: f32) -> bool {
         self.width == width && self.height == height && (self.dpi - dpi).abs() < 0.01
     }

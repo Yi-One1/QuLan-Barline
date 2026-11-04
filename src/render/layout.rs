@@ -259,38 +259,17 @@ impl WidgetLayout {
     }
 }
 
-/// 计算布局（不带文本自然宽度，等价于「文本宽 0」→ 宽度取下限）。
-///
-/// 保留这个 4 参数签名是为了让既有单测与调用点零改动；
-/// 正式路径用 [`compute_ex`]。
-pub fn compute(edge: TaskbarEdge, form: WidgetForm, scale: f32, bar_thickness: i32) -> WidgetLayout {
-    compute_ex(edge, form, scale, bar_thickness, 0.0, 0.0)
-}
-
-/// 计算布局（信息区最小宽取形态默认值：Compact→0 / Lyric→160 * scale）。
-///
-/// * `edge`        —— 任务栏方位
-/// * `form`        —— 形态（决定信息区最小宽；高度恒为条带厚度）
-/// * `scale`       —— DPI 缩放系数（96dpi → 1.0）
-/// * `bar_thickness` —— 任务栏条带厚度（物理像素）
-/// * `title_w`     —— 歌名自然宽度（物理像素，未截断）
-/// * `artist_w`    —— 歌手自然宽度（物理像素，未截断）
-pub fn compute_ex(
-    edge: TaskbarEdge,
-    form: WidgetForm,
-    scale: f32,
-    bar_thickness: i32,
-    title_w: f32,
-    artist_w: f32,
-) -> WidgetLayout {
-    compute_full(edge, form, scale, bar_thickness, title_w, artist_w, form.lyric_w())
-}
-
 /// 计算布局，并**显式指定信息区最小宽**（逻辑像素，未乘 scale）。
 ///
-/// 存在的唯一理由是歌词开关的 200ms 宽度缓动：动画期间每帧的最小宽是
-/// 插值出来的中间值，不等于任何 `WidgetForm` 的默认值。
-/// `compute_ex` 就是「最小宽 = 形态默认值」的特例。
+/// 这是**唯一**的布局入口（v1.8.1 / G6 清理）：过去另有 `compute`（4 参数）与
+/// `compute_ex`（6 参数）两个便利包装，但它们的调用点在生产代码里已经归零
+/// （`app.rs` 直接调本函数），只剩单测在用——等于给测试开了一条与线上不同的
+/// 入口。两个包装层删除后，单测显式传「文本宽 0/实测宽 + 形态默认信息区宽」，
+/// 与线上走**同一条**路径。
+///
+/// `lyric_w_logical` 之所以要显式传：歌词开关有 200ms 宽度缓动，动画期间每帧的
+/// 信息区最小宽是插值出来的中间值，不等于任何 `WidgetForm` 的默认值
+/// （`WidgetForm::lyric_w()`）。
 pub fn compute_full(
     edge: TaskbarEdge,
     form: WidgetForm,
@@ -489,15 +468,15 @@ mod tests {
 
     #[test]
     fn width_scales_with_dpi() {
-        let a = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
-        let b = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.25, 60);
+        let a = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
+        let b = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.25, 60, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(a.width, 200);
         assert_eq!(b.width, 250);
     }
 
     #[test]
     fn compact_height_equals_bar_thickness() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(l.height, 48);
     }
 
@@ -506,7 +485,7 @@ mod tests {
         // v1.1 裁决：高度恒定 = 任务栏条带厚度，歌词开/关不变
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for bar in [40i32, 48, 60] {
-                let l = compute(TaskbarEdge::Bottom, form, 1.0, bar);
+                let l = compute_full(TaskbarEdge::Bottom, form, 1.0, bar, 0.0, 0.0, form.lyric_w());
                 assert_eq!(l.height, bar, "{form:?}@{bar}");
             }
         }
@@ -516,21 +495,21 @@ mod tests {
     fn lyric_form_widens_info_area_to_min_160() {
         // 歌名+歌手自然宽 0（下限 200 生效）：关 → 200；开 → 固定件 174 + 信息区 160 = 334
         // （固定件 174 = v1.4.4 的 162 + 12：v1.5.4 的 ×「右距 4 + 命中 14 + 净距 2」）
-        let off = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
-        let on = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
+        let off = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
+        let on = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 0.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert_eq!(off.width, 200);
         assert_eq!(on.width, 334);
         // 文本自然宽 200 > 最小宽 160：信息区 = 200 → 宽 = 174 + 200 = 374；
         // 文本自然宽顶到信息区上限 340：宽 = 174 + 340 = 514
-        let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0);
+        let mid = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 200.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert_eq!(mid.width, 174 + 200);
-        let wide = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0);
+        let wide = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert_eq!(wide.width, 174 + 340);
     }
 
     #[test]
     fn cover_inside_main_row_and_vertically_centered() {
-        let l = compute(TaskbarEdge::Top, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Top, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert!(l.cover.x >= l.main_row.x);
         assert!(l.cover.right() <= l.main_row.right());
         assert!(l.cover.bottom() <= l.main_row.bottom());
@@ -540,14 +519,14 @@ mod tests {
 
     #[test]
     fn title_starts_right_of_cover() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert!(l.title.x > l.cover.right());
         assert!(l.title.right() <= l.btn_prev.x + 0.001);
     }
 
     #[test]
     fn zero_scale_falls_back_to_one() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 0.0, 40);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 0.0, 40, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(l.scale, 1.0);
         assert_eq!(l.width, 200);
     }
@@ -564,11 +543,11 @@ mod tests {
     /// 宽度自适应：极短文本取下限 200，信息区不超过 340（总宽 ≤ 174+340）。
     #[test]
     fn width_clamps_between_min_and_max() {
-        let short = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0);
+        let short = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(short.width, 200);
-        let long = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0);
+        let long = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 4000.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(long.width, 174 + 340);
-        let mid = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0);
+        let mid = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 60.0, 0.0, WidgetForm::Compact.lyric_w());
         assert!(mid.width > 200 && mid.width < 340, "mid.width = {}", mid.width);
     }
 
@@ -578,7 +557,7 @@ mod tests {
     fn rects_do_not_overlap_and_hits_meet_minimum() {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for (scale, bar) in [(1.0f32, 48i32), (1.25, 60)] {
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 let hit_min = limits::HIT_MIN * scale;
 
                 // 命中区尺寸
@@ -681,7 +660,7 @@ mod tests {
     /// 高度恒为条带厚度，歌词行压在条带内。
     #[test]
     fn bottom_edge_keeps_main_row_on_the_taskbar_strip() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 0.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert_eq!(l.height, 48);
         assert!(l.main_row.y.abs() < 0.001, "main_row.y = {}", l.main_row.y);
         assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
@@ -699,7 +678,7 @@ mod tests {
     /// 顶部任务栏：主行同样从 0 开始（歌词不向桌面方向扩展）。
     #[test]
     fn top_edge_keeps_main_row_on_the_taskbar_strip() {
-        let l = compute(TaskbarEdge::Top, WidgetForm::Lyric, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Top, WidgetForm::Lyric, 1.0, 48, 0.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert!(l.main_row.y.abs() < 0.001);
         assert!((l.main_row.bottom() - 48.0).abs() < 0.001);
         assert!((l.lyric_cur.y - (24.0 - limits::LYRIC_LIFT)).abs() < 0.001);
@@ -710,7 +689,7 @@ mod tests {
     /// 固定间隔，不再锚定到信息区右端（4145b89/v1.1.1 的大空隙根因）。
     #[test]
     fn compact_spacing_artist_follows_title() {
-        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 50.0, 40.0);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 50.0, 40.0, WidgetForm::Lyric.lyric_w());
         let gap = limits::TITLE_ARTIST_GAP;
         assert!(
             (l.artist.x - (l.title.x + l.title.w + gap)).abs() < 0.01,
@@ -728,7 +707,7 @@ mod tests {
     /// 紧凑总宽超过信息区上限 340 时才截断：歌手钳到一半，歌名占其余（歌手仍可见）。
     #[test]
     fn overflow_truncates_but_keeps_artist_visible() {
-        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 200.0);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 200.0, WidgetForm::Lyric.lyric_w());
         assert!(l.artist.w > 0.0 && l.artist.w <= 170.0 + 0.01, "artist.w = {}", l.artist.w);
         assert!(l.artist.x >= l.title.right() - 0.01);
         assert!(l.title.w < l.artist.w * 4.0, "歌名仍占主导");
@@ -740,7 +719,7 @@ mod tests {
     /// 放得下的歌名误截成「主…」（歌名"主动"+歌手"加木"的实际案例）。
     #[test]
     fn fractional_natural_width_is_not_truncated() {
-        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 60.4, 40.3);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 60.4, 40.3, WidgetForm::Lyric.lyric_w());
         assert!((l.title.w - 61.0).abs() < 0.001, "title.w = {}", l.title.w);
         assert!((l.artist.w - 41.0).abs() < 0.001, "artist.w = {}", l.artist.w);
         // 矩形宽 ≥ 实测自然宽 → 省略判定（measure ≤ max_w）必然通过
@@ -751,7 +730,7 @@ mod tests {
     /// 歌词行上移量（v1.1.2）：y = 行位 − LYRIC_LIFT，底部仍在条带内。
     #[test]
     fn lyric_row_is_lifted_toward_title_row() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 0.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert!((l.lyric_cur.y - (24.0 - limits::LYRIC_LIFT)).abs() < 0.001);
         assert!(l.lyric_cur.bottom() <= 48.0);
         assert!(l.lyric_cur.y >= l.title.y + l.title.h - limits::LYRIC_LIFT - 0.01);
@@ -761,7 +740,7 @@ mod tests {
     #[test]
     fn compact_form_has_no_vertical_offset() {
         for edge in [TaskbarEdge::Bottom, TaskbarEdge::Top] {
-            let l = compute(edge, WidgetForm::Compact, 1.0, 48);
+            let l = compute_full(edge, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
             assert!((l.main_row.y).abs() < 0.001);
             assert_eq!(l.height, 48);
             assert!((l.hit_progress.bottom() - 48.0).abs() < 0.001);
@@ -771,7 +750,7 @@ mod tests {
     /// 进度条高度切换（PRD：静止 2px，悬停 4px）。
     #[test]
     fn progress_height_toggles() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(l.progress_height(false), 2.0);
         assert_eq!(l.progress_height(true), 4.0);
         let idle = l.progress_rect(l.progress_height(false));
@@ -810,7 +789,7 @@ mod tests {
     /// v1.1.1 布局：上行 = 歌名 + 歌手（歌名右侧），下行 = 单行歌词，无下一行。
     #[test]
     fn lyric_row_sits_below_title_and_artist_row() {
-        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 120.0, 60.0);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 120.0, 60.0, WidgetForm::Lyric.lyric_w());
         // 歌手紧跟歌名右侧（v1.1.2 紧凑排列）
         assert!(l.artist.x >= l.title.right(), "歌手必须在歌名右侧");
         assert!(l.artist.w > 0.0, "有歌手名时歌手区必须有宽度");
@@ -823,7 +802,7 @@ mod tests {
     /// 歌名过长时歌手名仍可见（钳到信息区一半），且两者不重叠。
     #[test]
     fn long_title_keeps_artist_visible_on_same_row() {
-        let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 80.0);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 80.0, WidgetForm::Lyric.lyric_w());
         assert!(l.artist.w > 0.0, "歌名再长歌手区也不能被挤没了");
         assert!(l.artist.w <= l.title.w + 0.01, "歌手区不得超过歌名区（歌名主导）");
         assert!(l.artist.x >= l.title.right() - 0.01);
@@ -833,7 +812,7 @@ mod tests {
     /// 歌词关闭时歌词行完全收合。
     #[test]
     fn off_form_has_no_lyric_rect() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert!(l.lyric_cur.is_empty());
         assert_eq!(l.width, 200);
     }
@@ -867,7 +846,7 @@ mod tests {
     fn dismiss_column_adds_12_logical_px_to_width() {
         for (scale, width_v144) in [(1.0f32, 362.0f32), (1.25, 452.0)] {
             let bar = (48.0 * scale) as i32;
-            let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0, WidgetForm::Compact.lyric_w());
             let want = width_v144 + 12.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
@@ -882,7 +861,7 @@ mod tests {
     fn dismiss_hit_sits_in_top_right_corner() {
         for scale in [1.0f32, 1.25, 1.5] {
             let bar = (48.0 * scale) as i32;
-            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 0.0, 0.0, WidgetForm::Compact.lyric_w());
             let margin = limits::DISMISS_RIGHT_MARGIN * scale;
             let side = limits::DISMISS_HIT * scale;
             assert!((side - 14.0 * scale).abs() < 0.001, "DISMISS_HIT 应已缩到 14");
@@ -909,7 +888,7 @@ mod tests {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale) as i32;
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 let gap = l.hit_dismiss.x - l.hit_next.right();
                 assert!(
                     (gap - limits::DISMISS_GAP * scale).abs() < 0.001,
@@ -931,7 +910,7 @@ mod tests {
     #[test]
     fn dismiss_glyph_is_centred_in_hit() {
         let s = 1.0f32;
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, s, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, s, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         let margin = (limits::DISMISS_HIT - limits::DISMISS_ICON) * 0.5 * s;
         assert!((margin - 4.0).abs() < 0.001, "每边余量应恰为 4*s");
         assert!((l.dismiss.x - (l.hit_dismiss.x + margin)).abs() < 0.001);
@@ -964,7 +943,7 @@ mod tests {
 
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
-            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 0.0, 0.0, WidgetForm::Compact.lyric_w());
 
             // 字形边长 = 6*s，命中区 = 14*s
             assert!(
@@ -1006,7 +985,7 @@ mod tests {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale).round() as i32;
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 let bg = l.dismiss_bg_rect();
                 let hit = l.hit_dismiss;
                 let tag = format!("{form:?}@{scale}");
@@ -1059,7 +1038,7 @@ mod tests {
     fn dismiss_does_not_change_height() {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for bar in [40i32, 48, 60, 72] {
-                let l = compute(TaskbarEdge::Bottom, form, 1.0, bar);
+                let l = compute_full(TaskbarEdge::Bottom, form, 1.0, bar, 0.0, 0.0, form.lyric_w());
                 assert_eq!(l.height, bar, "{form:?}@{bar}");
             }
         }
@@ -1118,7 +1097,7 @@ mod tests {
                     TaskbarEdge::Right,
                 ] {
                     let bar = (48.0 * scale).round() as i32;
-                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let l = compute_full(edge, form, scale, bar, 120.0, 40.0, form.lyric_w());
                     let margin = limits::DISMISS_RIGHT_MARGIN * scale;
                     let side = limits::DISMISS_HIT * scale;
                     let tag = format!("{form:?}/{scale}/{edge:?}");
@@ -1202,7 +1181,7 @@ mod tests {
         }
     }
 
-    /// **B6 组**：最小窗宽场景——`compute(Compact, 1.0, 48)`，无文本、宽度被
+    /// **B6 组**：最小窗宽场景——`compute_full(Compact, 1.0, 48, 0.0, 0.0, 0.0)`，无文本、宽度被
     /// `WIDGET_MIN_W = 200` 钳住（固定件 174 + 信息区 0 被吃掉 26px）。
     ///
     /// 这是 × 最可能出问题的角落：窗口只剩 200px，净距压到 2 之后**余量极小**。
@@ -1223,7 +1202,7 @@ mod tests {
     /// 宽度**不变**，三键再右移 2px（v1.5.3 已右移 6px，累计相对 v1.5.2 右移 8px）。
     #[test]
     fn dismiss_fits_in_minimum_width_window() {
-        let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w());
         assert_eq!(l.width, 200, "无文本时窗口宽度应被 WIDGET_MIN_W 钳住");
         assert!(
             (l.fixed_width() - 174.0).abs() < 0.001,
@@ -1325,7 +1304,7 @@ mod tests {
         );
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
-            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 0.0, 0.0, WidgetForm::Compact.lyric_w());
             assert!(
                 (l.hit_dismiss.w - limits::DISMISS_HIT * scale).abs() < 0.001,
                 "scale={scale}: hit_dismiss.w = {}，应恰为 14*s = {}",
@@ -1476,7 +1455,7 @@ mod tests {
                     TaskbarEdge::Right,
                 ] {
                     let bar = (48.0 * scale).round() as i32;
-                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let l = compute_full(edge, form, scale, bar, 120.0, 40.0, form.lyric_w());
                     let tag = format!("{form:?}/{scale}/{edge:?}");
 
                     // 命中区 14*s，字形 6*s（字面量）
@@ -1531,7 +1510,7 @@ mod tests {
     fn dismiss_glyph_clearance_from_next_is_twelve_px() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
-            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 0.0, 0.0, WidgetForm::Compact.lyric_w());
             let clearance = l.dismiss.right() - l.hit_next.right();
             assert!(
                 (clearance - 12.0 * scale).abs() < 0.001,
@@ -1580,7 +1559,7 @@ mod tests {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale).round() as i32;
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 let tag = format!("{form:?}@{scale}");
 
                 // ① 「不冲突」：热区净距恰 2*s（绝不重叠，也绝不多让）
@@ -1691,7 +1670,7 @@ mod tests {
             (2.0, 724.0, 748.0),
         ] {
             let bar = (48.0 * scale).round() as i32;
-            let l = compute_ex(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 200.0, 0.0, WidgetForm::Compact.lyric_w());
             let want = width_v144 + 12.0 * scale;
             assert!(
                 (l.width as f32 - want).abs() < 0.51,
@@ -1751,7 +1730,7 @@ mod tests {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale).round() as i32;
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 let tag = format!("{form:?}@{scale}");
 
                 // 右侧：字形右缘 → 窗口右缘
@@ -1800,7 +1779,7 @@ mod tests {
                     TaskbarEdge::Right,
                 ] {
                     let bar = (48.0 * scale).round() as i32;
-                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let l = compute_full(edge, form, scale, bar, 120.0, 40.0, form.lyric_w());
                     let tag = format!("{form:?}/{scale}/{edge:?}");
                     let bg = l.dismiss_bg_rect();
                     let hit = l.hit_dismiss;
@@ -1868,7 +1847,7 @@ mod tests {
     fn dismiss_bg_radius_is_safely_under_half_short_side() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let bar = (48.0 * scale).round() as i32;
-            let l = compute(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar);
+            let l = compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, scale, bar, 0.0, 0.0, WidgetForm::Compact.lyric_w());
             let bg = l.dismiss_bg_rect();
             let short = bg.w.min(bg.h);
             let r = limits::DISMISS_BG_RADIUS * scale;

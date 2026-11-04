@@ -3,13 +3,14 @@
 //! `AppState` 是**唯一真相源**，里面没有任何 `HWND` / COM 指针，因此可单测。
 //! `App::reduce(AppEvent) -> Vec<Effect>` 是纯函数；`App::apply(Vec<Effect>)` 才碰句柄。
 //!
-//! ## M2 的处理范围
+//! ## 处理范围（v1.8.1 / G6 清理后）
 //!
-//! - 完整：`NowPlaying` / `SessionCleared` / `BackdropReady` / `CommandResult` /
-//!   `WidgetInput` 全部 15 个变体 / `TaskbarGeometry` / `TaskbarCreated` /
-//!   `DisplayChanged` / `ConfigChanged` / `Tick` / `Quit`
-//! - 预留：`Hotkey` / `TrayCommand` / `SettingsOpenRequest` / `SettingsClosed`
-//!   / `SecondInstanceLaunched`（M3/M4 落地，这里 `log_debug!` 后忽略，不 panic）
+//! `reduce()` 覆盖 `AppEvent` **全部 15 个变体**，没有兜底臂（见 `event.rs` 顶部的
+//! 说明）：新增变体时编译器会直接报「未覆盖的模式」，不会静默吞成一条 debug 日志。
+//!
+//! 「Explorer 重启 / 显示配置变化 / 第二实例」这三类过去靠事件变体驱动的路径，
+//! 现在是方法直调：`widget_wnd` 的窗口消息处理里直接调
+//! [`App::on_taskbar_created`] / [`App::on_display_changed`] / [`App::on_second_instance`]。
 //!
 //! ## 与 M1 的三处行为变化
 //!
@@ -402,10 +403,9 @@ impl App {
         crate::storage::init_from_config(&mut config);
         let lang = Lang::from_serde(config.general.language);
         crate::log_info!(
-            "启动：语言={:?} 歌词={}({:?}) 背景={:?}",
+            "启动：语言={:?} 歌词={} 背景={:?}",
             lang,
             config.lyrics.enabled,
-            config.lyrics.mode,
             config.appearance.background_mode
         );
 
@@ -1591,49 +1591,6 @@ impl App {
                 self.sync_lyric_timer();
                 vec![Effect::Redraw]
             }
-            AppEvent::LyricRetryDue { track_id } => {
-                if track_id != self.state.playing.track_id {
-                    return Vec::new();
-                }
-                vec![Effect::Lyric(self.lyric_request(true))]
-            }
-            AppEvent::TaskbarGeometry(g) => {
-                self.geometry = Some(g);
-                vec![Effect::Relayout]
-            }
-            AppEvent::TaskbarCreated => {
-                self.on_taskbar_created();
-                Vec::new()
-            }
-            AppEvent::DisplayChanged => {
-                self.on_display_changed();
-                Vec::new()
-            }
-            AppEvent::SecondInstanceLaunched => {
-                self.on_second_instance();
-                Vec::new()
-            }
-            AppEvent::ConfigChanged(cfg) => {
-                crate::log_info!("配置变更（version={}）", cfg.version);
-                self.lang = Lang::from_serde(cfg.general.language);
-                self.config = *cfg;
-                self.animate_lyric_width();
-                self.relayout_with(RectChangeReason::Resize);
-                let json = self.settings_state_json();
-                self.settings.push(&json);
-                vec![Effect::RefreshTrayMenu]
-            }
-            AppEvent::Tick => {
-                self.tick_optimistic();
-                Vec::new()
-            }
-            AppEvent::Quit => vec![Effect::Quit],
-
-            // ---- M3–M5 的接口预留：记录后忽略，绝不 panic ----
-            other => {
-                crate::log_debug!("reduce: 暂未处理的 AppEvent（M2 范围外）：{other:?}");
-                Vec::new()
-            }
         }
     }
 
@@ -2163,24 +2120,6 @@ impl App {
                 self.animate_lyric_width();
                 self.commit_config()
             }
-            WidgetInput::SetBackgroundMode(mode) => {
-                self.config.appearance.background_mode = mode;
-                // 就地同步主题（悬停底色即时切换）+ 立即重采样拿新亮度主题
-                self.state.theme.apply_bg_config(
-                    mode,
-                    self.config.appearance.idle_mode,
-                    self.config.appearance.hover_alpha,
-                    self.config.appearance.idle_alpha,
-                );
-                self.request_backdrop();
-                let mut effects = self.commit_config();
-                effects.push(Effect::Redraw);
-                effects
-            }
-            WidgetInput::ShowAbout => {
-                self.show_about();
-                Vec::new()
-            }
         }
     }
 
@@ -2242,11 +2181,6 @@ impl App {
             match effect {
                 Effect::Relayout => self.relayout_with(RectChangeReason::Resize),
                 Effect::Redraw => self.redraw(),
-                Effect::SetVisible(v) => {
-                    if let Some(h) = self.widget.as_mut() {
-                        h.set_visible(v);
-                    }
-                }
                 Effect::Media(cmd) => match self.media.as_ref() {
                     Some(m) => m.send(cmd),
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
@@ -2268,9 +2202,6 @@ impl App {
                         crate::settings::bind_app(h, self as *mut App);
                     }
                 }
-                Effect::CloseSettings => {
-                    self.settings.close();
-                }
                 Effect::RebindHotkeys => {
                     let cfg = self.config.hotkeys;
                     self.hotkeys.register_all(self.msg_hwnd, &cfg);
@@ -2289,26 +2220,11 @@ impl App {
                         crate::log_err!("保存配置失败：{e}");
                     }
                 }
-                Effect::RequestBackdrop { .. } => self.request_backdrop(),
                 Effect::Quit => {
                     crate::log_info!("收到 Quit，准备退出");
                     // SAFETY: PostQuitMessage 只投递一条 WM_QUIT，可在任意线程调用。
                     unsafe { PostQuitMessage(0) };
                 }
-                Effect::MoveWindow { x, y, w, h } => {
-                    let r = RECT {
-                        left: x,
-                        top: y,
-                        right: x + w,
-                        bottom: y + h,
-                    };
-                    if let Some(h) = self.widget.as_mut() {
-                        if let Err(e) = h.apply_geometry(r) {
-                            crate::log_warn!("应用窗口几何失败：{e}");
-                        }
-                    }
-                }
-                other => crate::log_debug!("apply: 暂未实现的 Effect（M3+ 范围外）：{other:?}"),
             }
         }
     }
@@ -3067,25 +2983,6 @@ impl App {
 
     // ---------------------------------------------------------------- 诊断
 
-    /// 诊断用：当前几何 / 布局摘要。
-    pub fn debug_summary(&self) -> String {
-        let (hits, misses, cached) = match self.renderer.as_ref() {
-            Some(r) => r.cover_stats(),
-            None => (0, 0, 0),
-        };
-        format!(
-            "layout={}×{} scale={:.3} visible={} hover={:?} alpha={:.2} theme_luma={:.3} media={} cover(h/m/c)={hits}/{misses}/{cached}",
-            self.state.layout.width,
-            self.state.layout.height,
-            self.state.layout.scale,
-            self.state.visible,
-            self.state.hover,
-            self.state.hover_alpha,
-            self.state.theme.backdrop_luma,
-            self.media.is_some()
-        )
-    }
-
     /// 事件投递器（工作线程用）。
     pub fn sink(&self) -> EventSink<AppEvent> {
         self.sink.clone()
@@ -3338,7 +3235,18 @@ mod tests {
 
     #[test]
     fn layout_rects_are_sane() {
-        let l = layout::compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48);
+        // v1.8.1（G6）：`layout::compute` / `compute_ex` 两个「只服务单测」的包装层已删除，
+        // 全仓（含测试）统一走正式路径 `compute_full`——这里显式传「文本宽 0 + 形态默认
+        // 信息区最小宽」，即原 `compute(...)` 的等价入参。
+        let l = layout::compute_full(
+            TaskbarEdge::Bottom,
+            WidgetForm::Compact,
+            1.0,
+            48,
+            0.0,
+            0.0,
+            WidgetForm::Compact.lyric_w(),
+        );
         assert_eq!(l.width, 200);
         assert_eq!(l.height, 48);
         assert!(l.title.x > l.cover.right());

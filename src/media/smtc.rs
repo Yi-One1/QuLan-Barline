@@ -1038,10 +1038,6 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
             state.reset_for_resume(Instant::now());
             return;
         }
-        MediaCommand::Mute => {
-            crate::log_debug!("Mute 由 WASAPI 通道实现（T16），当前忽略");
-            return;
-        }
         // `SetPaused` 由 `run` 在命令入口截获，绝不该走到这里；
         // 显式列出是防御未来有人在别处调用 `execute`。
         MediaCommand::SetPaused(_) => return,
@@ -1053,7 +1049,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         MediaCommand::Next => MediaCommandKind::Next,
         MediaCommand::Prev => MediaCommandKind::Prev,
         MediaCommand::Seek(_) => MediaCommandKind::Seek,
-        MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
+        MediaCommand::Refresh | MediaCommand::Quit => return,
         MediaCommand::SetPaused(_) => return,
     };
 
@@ -1082,7 +1078,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
                 .TryChangePlaybackPositionAsync(ms.saturating_mul(10_000))?
                 .join()
         }),
-        MediaCommand::Refresh | MediaCommand::Mute | MediaCommand::Quit => return,
+        MediaCommand::Refresh | MediaCommand::Quit => return,
         MediaCommand::SetPaused(_) => return,
     };
 
@@ -1633,7 +1629,6 @@ mod qa_g35_regression {
             MediaCommand::Next,
             MediaCommand::Prev,
             MediaCommand::Seek(42_000),
-            MediaCommand::Mute,
             MediaCommand::Refresh,
             MediaCommand::SetPaused(true),
             MediaCommand::SetPaused(false),

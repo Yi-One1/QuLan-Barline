@@ -206,13 +206,28 @@ embed-resource = "3.0.12"   # 编译 assets/barline.rc（图标 + VERSIONINFO + 
 
 ### 4.2 `windows` feature 清单（已核对存在性）
 
+> **v1.8.1（G6）**：本节已与 `Cargo.toml` **逐条对齐**（此前漏了 `Win32_Security` /
+> `Win32_System_Diagnostics_ToolHelp` / `Win32_Globalization` / `Foundation_Numerics`，
+> 多列了 `Win32_UI_Accessibility` / `Foundation_Collections`）。
+>
+> 摘掉的两个 feature 是**实测**结论（各自单独摘掉后 `build.ps1 -Task build` 全绿）：
+> - `Win32_UI_Accessibility`：全仓零 import（没有 `SetWinEventHook` / `WINEVENTPROC`；
+>   自动隐藏跟随走 500ms 轮询 + appbar 回调，不靠 WinEvent 钩子）；
+> - `Foundation_Collections`：全仓零 import（没有 `GetSessions()` / `IVectorView`；
+>   媒体层只用 `GetCurrentSession()`，其返回类型不要求该 feature）。
+>
+> 两者都**不是**传递依赖——若是，`webview2-com-sys` 会自行 `features = [...]` 打开，
+> 与我们是否显式声明无关。
+
 ```toml
 windows = { version = "0.62.2", features = [
   # ---- 基础 ----
   "Win32_Foundation",
+  "Win32_Security",                       # CreateMutexW 的 SECURITY_ATTRIBUTES（单实例必需）
   "Win32_System_Threading",
   "Win32_System_LibraryLoader",
   "Win32_System_SystemInformation",
+  "Win32_System_Diagnostics_ToolHelp",    # AUMID 拿不到 pid 时按进程名反查
 
   # ---- COM / WinRT ----
   "Win32_System_Com",
@@ -227,7 +242,6 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",      # RegisterHotKey / HOT_KEY_MODIFIERS
-  "Win32_UI_Accessibility",               # SetWinEventHook / WINEVENTPROC
 
   # ---- 图形 ----
   "Win32_Graphics_Gdi",                   # BitBlt / CreateDIBSection / BLENDFUNCTION
@@ -242,13 +256,14 @@ windows = { version = "0.62.2", features = [
   "Win32_Media_Audio",                    # IMMDeviceEnumerator / IAudioSessionManager2 / IAudioSessionControl2
   "Win32_Media_Audio_Endpoints",          # IAudioEndpointVolume / IAudioMeterInformation
 
-  # ---- 网络 / 注册表 ----
+  # ---- 网络 / 注册表 / 本地化 ----
   "Win32_Networking_WinHttp",
   "Win32_System_Registry",
+  "Win32_Globalization",                  # GetUserDefaultUILanguage（§14.6 系统语言探测）
 
   # ---- WinRT ----
   "Foundation",
-  "Foundation_Collections",
+  "Foundation_Numerics",                  # D2D1_ELLIPSE 的 Vector2
   "Media",
   "Media_Control",
   "Storage",
@@ -505,7 +520,7 @@ debug     = 1            # 行号级调试信息，不进 release
 | `ui/hotkey.rs` | 注册 6 组、注销、冲突检测（`RegisterHotKey` 返回 `Err` 判定） | 180 |
 | `settings/window.rs` | 宿主窗口、`WM_SIZE` → `SetBounds`、关闭即销毁 | 260 |
 | `settings/webview.rs` | 预检 → 环境 → 控制器 → 导航 → 事件挂载 | 300 |
-| `settings/bridge.rs` | `SettingsMsg` / `HostMsg` serde 定义 + 双向收发 + 校验 | 280 |
+| `settings/bridge.rs` | `Incoming`（JS→Rust）serde 定义 + `state_json()`（Rust→JS）+ 白名单校验 | 280 |
 | `settings/assets.rs` | `include_str!` 拼装 HTML、注入初始配置与语言 | 100 |
 
 **总计约 11,000 行 Rust + 约 1,200 行 HTML/CSS/JS。**
@@ -871,24 +886,10 @@ impl Lyrics {
         if idx == 0 { None } else { Some(idx - 1) }
     }
 
-    /// 当前行的扫光进度 0.0..=1.0，以及当前字下标。
-    /// 逐字：找到 start_ms <= t 的最后一个 word。
-    pub fn word_progress(&self, line_idx: usize, t: Ms) -> (f32, usize) {
-        let Some(line) = self.lines.get(line_idx) else { return (0.0, 0) };
-        if line.words.is_empty() {
-            let span = (line.end_ms - line.start_ms).max(1) as f32;
-            let p = ((t - line.start_ms) as f32 / span).clamp(0.0, 1.0);
-            return (p, 0);
-        }
-        let wi = line.words.partition_point(|w| w.start_ms <= t);
-        let cur = wi.saturating_sub(1);
-        let w = &line.words[cur];
-        let span = (w.end_ms - w.start_ms).max(1) as f32;
-        let frac = ((t - w.start_ms) as f32 / span).clamp(0.0, 1.0);
-        // 总进度 = (已完成的字数 + 当前字内进度) / 总字数
-        let total = line.words.len() as f32;
-        ((cur as f32 + frac) / total, cur)
-    }
+    // v1.8.1（G6）：这里的 `word_progress(line_idx, t) -> (f32, usize)` 已删除——
+    // 它算出来的进度**从来没有被画到屏幕上**（painter 另有一份内联实现），
+    // 只剩 2 条单测在自证。扫光位置现在统一由渲染侧的
+    // `lyric::sweep_offset(line, t) -> f32`（UTF-16 码元、连续值）给出，见 §12.3。
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1373,7 +1374,6 @@ classDiagram
         +String title
         +String artist
         +line_at(t) Option~usize~
-        +word_progress(idx, t) tuple
     }
 
     class LyricLine {
@@ -1477,9 +1477,9 @@ classDiagram
     }
 
     class SettingsWindow {
-        +open(Config)
-        +push(HostMsg)
-        +is_open() bool
+        +open(Config, json)
+        +push(json: &str)
+        +push_last()
     }
 
     AppState "1" *-- "1" NowPlaying
@@ -1506,16 +1506,24 @@ classDiagram
 
 ### 8.1 `AppEvent`（所有工作线程 → UI 线程）
 
+> **v1.8.1（G6 清理）**：本节与 §8.2 已按**代码现状**重写。原文列着一批
+> `M1 时代的接口预留`，其中 9 个 `AppEvent` 变体与 6 个 `Effect` 变体**一个发射 / 构造点
+> 都没有**（对应行为早已改成方法直调，例如 `widget_wnd` 直接调
+> `App::on_taskbar_created`）。「文档与代码不一致」比死代码更危险——下一轮会把它当成
+> 契约引用，所以本轮随代码一起收口。
+>
+> 删掉的 9 个 `AppEvent` 变体：`FallbackSession` / `LyricRetryDue` / `TaskbarGeometry` /
+> `TaskbarCreated` / `DisplayChanged` / `ConfigChanged` / `SecondInstanceLaunched` /
+> `Tick` / `Quit`（24 → **15**）。删掉后 `App::reduce()` **没有兜底臂**：新增变体会
+> 直接编译失败，逼着实现方补齐语义。
+
 ```rust
 // src/event.rs
 use std::sync::Arc;
 use crate::config::Config;
 use crate::lyric::{LyricMissReason, Lyrics};
-use crate::media::{NowPlaying, FallbackInfo};
-use crate::render::sampler::BlurBuffer;
+use crate::media::{Ms, NowPlaying, Track, TrackId};
 use crate::render::theme::Theme;
-use crate::taskbar::geometry::TaskbarGeometry;
-use crate::event::TrackId;
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -1524,34 +1532,17 @@ pub enum AppEvent {
     NowPlaying(Box<NowPlaying>),
     /// 会话全部消失
     SessionCleared,
-    /// WASAPI 兜底会话出现
-    FallbackSession(Box<FallbackInfo>),
     /// 播控命令执行结果（用于回滚乐观更新）
-    CommandResult {
-        kind: MediaCommandKind,
-        ok: bool,
-    },
+    CommandResult { kind: MediaCommandKind, ok: bool },
 
     // ---------------- 歌词（T2 → T0） ----------------
     LyricLoading { track_id: TrackId },
     LyricReady { track_id: TrackId, lyrics: Arc<Lyrics> },
     LyricMissing { track_id: TrackId, reason: LyricMissReason },
-    /// 重试计时到点，需要重新请求
-    LyricRetryDue { track_id: TrackId },
 
     // ---------------- 背景（T3 → T0） ----------------
-    BackdropReady {
-        epoch: u64,
-        theme: Theme,
-        blur: Option<Arc<BlurBuffer>>,
-    },
-
-    // ---------------- 任务栏（watcher → T0） ----------------
-    TaskbarGeometry(TaskbarGeometry),
-    /// 收到 TaskbarCreated 广播（Explorer 重启），需要重新挂载
-    TaskbarCreated,
-    /// 显示配置变化（分辨率/DPI/显示器增删）
-    DisplayChanged,
+    /// 背景采样结果（`blur` 字段 v1.1.11 随模糊背景整链删除）
+    BackdropReady { epoch: u64, theme: Theme },
 
     // ---------------- 用户输入 ----------------
     Hotkey(HotkeyAction),
@@ -1560,17 +1551,15 @@ pub enum AppEvent {
     WidgetInput(WidgetInput),
 
     // ---------------- 配置 / 设置页 ----------------
-    ConfigChanged(Box<Config>),
-    /// 设置页请求打开/关闭
+    /// 设置页请求打开 / 关闭
     SettingsOpenRequest,
     SettingsClosed,
-
-    // ---------------- 生命周期 ----------------
-    /// 第二个实例启动，要求唤起设置页
-    SecondInstanceLaunched,
-    /// 低频心跳（500ms），驱动进度外推与歌词推进的脏标记
-    Tick,
-    Quit,
+    /// WebView2 就绪（controller 已拿到）
+    SettingsWebViewReady,
+    /// WebView2 创建失败（未安装运行时等）
+    SettingsWebViewFailed(String),
+    /// 设置页 JS 发来的一条 JSON
+    SettingsMessage(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1599,6 +1588,8 @@ pub enum WidgetInput {
     ClickPrev,
     ClickNext,
     ClickCover,
+    /// 右上角 ×（v1.5.0 / G3）：隐藏到托盘，仅本次运行生效
+    ClickDismiss,
     SeekBegin,
     SeekPreview(f32),   // 0.0..=1.0
     SeekCommit(f32),
@@ -1606,9 +1597,6 @@ pub enum WidgetInput {
     Wheel { delta: i32 },
     VolumeHudExpired,
     ToggleLyricsFromMenu,
-    SetLyricMode(crate::render::layout::LyricMode),
-    SetBackgroundMode(crate::config::BackgroundMode),
-    ShowAbout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1630,21 +1618,20 @@ pub enum LyricMissReason {
     /// 播放器未上报足够元数据（无标题/无时长）
     InsufficientMetadata,
 }
-
-/// WASAPI 兜底会话信息
-#[derive(Debug, Clone)]
-pub struct FallbackInfo {
-    pub process_id: u32,
-    pub process_name: String,
-    pub display_name: String,
-    /// 该会话的 peak 值，用于判断是否真的在出声
-    pub peak: f32,
-}
 ```
 
 ### 8.2 `Effect`（UI 线程需要产生的副作用）
 
 `reduce()` 保持纯函数，返回 `Vec<Effect>` 由 `App::apply()` 执行。
+
+> **v1.8.1（G6 清理）**：删掉 6 个**零构造**的变体（`SetVisible` / `MoveWindow` /
+> `ResizeTarget` / `RequestBackdrop` / `SettingsPush` / `CloseSettings`）与从来不存在于代码里的
+> `DropBackdrop`。窗口可见性 / 几何由 `relayout_with()` 内部直接调
+> `TaskbarHost::set_visible` / `apply_geometry`；背景采样由 `request_backdrop()` 直接调；
+> 设置页关闭由 `SettingsService::close()` 直接调。`apply()` 也**没有兜底臂**。
+>
+> `SaveConfig` 的注释也一并纠正：它**不做去抖**（全仓没有 300ms 去抖实现，另一处
+> 300ms 是 `SAMPLE_THROTTLE_MS`，与落盘无关），是 **tmp + 原子 rename 的同步写盘**。
 
 ```rust
 #[derive(Debug, Clone)]
@@ -1653,27 +1640,14 @@ pub enum Effect {
     Relayout,
     /// 只重绘（布局不变）
     Redraw,
-    /// 应用窗口可见性
-    SetVisible(bool),
-    /// 把窗口移到新位置/新尺寸
-    MoveWindow { x: i32, y: i32, w: i32, h: i32 },
-    /// 重建 D2D 目标（尺寸或 DPI 变化）
-    ResizeTarget { w: i32, h: i32, dpi: u32 },
-    /// 请求背景采样
-    RequestBackdrop { epoch: u64 },
-    /// 释放模糊背景
-    DropBackdrop,
     /// 向媒体线程发命令
     Media(MediaCommand),
     /// 向歌词线程发请求
     Lyric(LyricRequest),
-    /// 保存配置（带 300ms 去抖）
+    /// 保存配置（同步写盘：tmp + 原子 rename；不做去抖）
     SaveConfig(Box<Config>),
-    /// 向设置页推送
-    SettingsPush(HostMsg),
-    /// 打开/关闭设置页
+    /// 打开设置页
     OpenSettings,
-    CloseSettings,
     /// 重新注册热键
     RebindHotkeys,
     /// 更新托盘菜单语言
@@ -1682,6 +1656,8 @@ pub enum Effect {
     Quit,
 }
 
+/// v1.8.1（G6）：`Mute` 变体删除——静音一直走 WASAPI（`App::reduce_hotkey`），
+/// SMTC 侧的 `Mute` 分支只是记一条 debug 日志后 return，从未被构造过。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCommand {
     PlayPause,
@@ -1690,7 +1666,8 @@ pub enum MediaCommand {
     Seek(Ms),
     /// 强制重新读取一次会话（用于乐观更新回滚校验）
     Refresh,
-    Mute,
+    /// 全屏冻结（v1.5.5 / G3.5）：暂停 / 恢复媒体线程的分层轮询
+    SetPaused(bool),
     Quit,
 }
 
@@ -1701,6 +1678,10 @@ pub struct LyricRequest {
     /// 已知的本地歌词目录（来自 Config）
     pub local_dirs: Vec<String>,
     pub online_enabled: bool,
+    /// 在线歌词落盘（v1.7.0）
+    pub write_back: bool,
+    /// 歌词查询顺序（v1.8.0）：true = 本地文件优先，false = 磁盘缓存优先
+    pub local_first: bool,
     /// 是否为重试
     pub retry: bool,
 }
@@ -1723,8 +1704,8 @@ sequenceDiagram
     M-->>A: AppEvent::NowPlaying(snapshot)
     A->>A: 更新 state.playing / 计算 visible
     A->>L: Effect::Lyric(request)
-    A->>S: Effect::RequestBackdrop(epoch)
-    A->>H: Effect::MoveWindow + SetVisible
+    A->>S: request_backdrop()（直调；v1.8.1 起不再是 Effect）
+    A->>H: relayout_with() → Host::apply_geometry / set_visible
     A->>A: Effect::Redraw → Renderer::render
     H->>H: UpdateLayeredWindow
 
@@ -1735,15 +1716,15 @@ sequenceDiagram
     A->>A: state.lyrics = Ready
     A->>H: Effect::Redraw
 
-    S-->>A: AppEvent::BackdropReady(theme, blur)
-    A->>A: state.theme / state.blur
+    S-->>A: AppEvent::BackdropReady{epoch, theme}
+    A->>A: state.theme
     A->>H: Effect::Redraw
 
     U->>W: WM_MOUSEMOVE 进入
     W->>W: TrackMouseEvent + 启动 120ms 淡入定时器
     W->>A: WidgetInput::HoverEnter
     A->>A: state.hover = Hover
-    A->>S: Effect::RequestBackdrop
+    A->>S: request_backdrop()（直调）
     A->>H: Effect::Redraw
 
     U->>W: WM_LBUTTONDOWN 在 ⏸
@@ -1760,7 +1741,7 @@ sequenceDiagram
     U->>W: WM_MOUSEWHEEL
     W->>A: WidgetInput::Wheel{delta}
     A->>A: hover = VolumeHud, volume_hud_left_ms = 1200
-    A->>M: Effect::Media(SetVolume 或 Mute)
+    A->>M: Effect::Media(SetPaused) / WASAPI 音量直调（无 Mute 命令）
     A->>H: Effect::Redraw（HUD 浮层）
 ```
 
@@ -1825,7 +1806,7 @@ sequenceDiagram
 | 取 manager | `GlobalSystemMediaTransportControlsSessionManager::RequestAsync() -> Result<IAsyncOperation<Manager>>` | 静态方法 |
 | **阻塞取值** | **`op.join() -> Result<Manager>`** | **不是 `.get()`**（§2.2 第 1 条） |
 | 当前会话 | `mgr.GetCurrentSession() -> Result<Session>` | 无会话时返回 `Err` |
-| 全部会话 | `mgr.GetSessions() -> Result<IVectorView<Session>>` | 需要 `Foundation_Collections` |
+| 全部会话 | `mgr.GetSessions() -> Result<IVectorView<Session>>` | 需要 `Foundation_Collections`。**本项目未使用**（只用 `GetCurrentSession()`），v1.8.1 已从 `Cargo.toml` 摘掉该 feature |
 | 会话变化事件 | `mgr.CurrentSessionChanged(TypedEventHandler::new(..)) -> Result<i64>` | **无 `Add` 前缀** |
 | 会话列表变化 | `mgr.SessionsChanged(..)` | — |
 | 媒体属性变化 | `session.MediaPropertiesChanged(..)` | 会话级 |
@@ -1879,7 +1860,7 @@ sequenceDiagram
 | 删值 | `RegDeleteValueW(hkey, w!("Barline"))` | — |
 | 热键注册 | `RegisterHotKey(Some(hwnd), id: i32, fsmodifiers: HOT_KEY_MODIFIERS, vk: u32) -> Result<()>` | `MOD_ALT=0x0001`、`MOD_CONTROL=0x0002`、`MOD_SHIFT=0x0004`、`MOD_WIN=0x0008`、`MOD_NOREPEAT=0x4000` |
 | 热键注销 | `UnregisterHotKey(Some(hwnd), id) -> Result<()>` | — |
-| 事件钩子 | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(cb), explorer_pid, 0, WINEVENT_OUTOFCONTEXT) -> HWINEVENTHOOK` | 回调签名 `WINEVENTPROC = Option<unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32)>`；`EVENT_OBJECT_LOCATIONCHANGE = 32779` 在 `Win32_UI_WindowsAndMessaging`，`SetWinEventHook` 在 `Win32_UI_Accessibility` |
+| 事件钩子 | `SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(cb), explorer_pid, 0, WINEVENT_OUTOFCONTEXT) -> HWINEVENTHOOK` | 回调签名 `WINEVENTPROC = Option<unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32)>`；`EVENT_OBJECT_LOCATIONCHANGE = 32779` 在 `Win32_UI_WindowsAndMessaging`，`SetWinEventHook` 在 `Win32_UI_Accessibility`。**本项目未使用**（自动隐藏跟随走 500ms 轮询 + appbar 回调），v1.8.1 已摘掉 `Win32_UI_Accessibility` |
 | 撤销钩子 | `UnhookWinEvent(hook)` | — |
 
 ### 9.7 封面字节读取链路（完整）
@@ -2067,16 +2048,21 @@ rt.SetTransform(&Matrix3x2::rotation(angle, cw * 0.5, ch * 0.5));
 
 ```text
 1. 启动时：taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
-   在 widget_wnd 的 WndProc 里：
-     if msg == taskbar_created_msg { evt.send(AppEvent::TaskbarCreated); }
+   在 widget_wnd 的 WndProc 里（`_ =>` 分支）：
+     if msg == taskbar_created_msg { (*app).on_taskbar_created(); }   // **直调方法，不经事件**
 
-2. 收到 TaskbarCreated：
-   a. 丢弃旧的 tray/notify 句柄（已失效）
-   b. 重新 probe() 拿新几何
-   c. SetWindowPos(HWND_TOPMOST, 新位置)   ← 必须重新置顶，
-      因为新任务栏是新建的 topmost 窗口，会盖在我们上面
-   d. 重新 SetTimer 轮询
-   e. 重新 SetWinEventHook（explorer pid 变了）
+2. `App::on_taskbar_created()` 实际做的事（v1.8.1 按代码重写）：
+   a. `widget` 为 `None` → 重新 probe() 拿新几何 + `TaskbarHost::attach` 重建窗口
+   b. 托盘图标：Explorer 重启后图标消失 → `Tray::add(lang)` 重新 `NIM_ADD`
+   c. `relayout_with(TaskbarGeometry)` → 按新几何重排
+   d. `ensure_on_top()` + `reassert_z_order()`：新任务栏是新建的 topmost 窗口，
+      会盖在我们上面，必须重新置顶
+   e. `appbar_reregister()`：Explorer 重启期间 `SHAppBarMessage` 会失败，必须重注册
+   f. `reconcile_fullscreen(Timer)`：用新几何对账一次全屏遮挡态
+
+   > 早期文档里的「丢弃旧 tray 句柄 / 重新 SetTimer 轮询 / 重新 SetWinEventHook」
+   > 三条都不存在：托盘是重新 `NIM_ADD`（不是丢弃重建）、定时器挂在消息窗上不受
+   > Explorer 重启影响、本项目从未使用 WinEvent 钩子（见 §4.2 / §9.6）。
 
 3. 若 probe() 返回 None（Explorer 还没起来）：
    启动 500ms 重试定时器，最多 60 次（30s），期间窗口隐藏。
@@ -2091,8 +2077,12 @@ rt.SetTransform(&Matrix3x2::rotation(angle, cw * 0.5, ch * 0.5));
 
 ### 10.6 自动隐藏跟随
 
-- `auto_hide == true && collapsed == true` → `Effect::SetVisible(false)`。
+- `auto_hide == true && collapsed == true` → `sync_visibility()` → `TaskbarHost::set_visible(false)`
+  （v1.8.1 起不再是 `Effect::SetVisible`：该变体零构造，已删除）。
 - `collapsed` 由 500ms 轮询 + WinEvent 双重检测。
+- **v1.8.1 盘点结论：这条没实现。** 全仓没有 `SetWinEventHook` 调用，实际只有
+  500ms 轮询 + appbar 的 `ABN_FULLSCREENAPP` / `ABN_POSCHANGED` 回调，`Win32_UI_Accessibility`
+  feature 因此一并摘除。下面两句保留为**待办需求**，不是现状描述。
 - PRD P1-09 要求"任务栏滑出时小组件同步出现（延迟 ≤ 100ms）"。500ms 轮询达不到，
   因此**自动隐藏时必须启用 WinEvent 钩子监听任务栏位置变化**（`EVENT_OBJECT_LOCATIONCHANGE`
   对 `Shell_TrayWnd` 也订阅），钩子回调延迟 < 30ms，满足 100ms。
@@ -2212,7 +2202,9 @@ AppState (只读)  →  │ 1. layout::compute(state, dpi)       │ → WidgetL
      contrast = (L1 + 0.05) / (L2 + 0.05)
      若 contrast < 4.5 → 把 text 向极端方向推（on_light 时更黑、否则更白）直到达标
      若推到纯黑/纯白仍不达标（背景正好是中灰）→ 给文字加 1px 描边（alpha 60% 的反色）
-7. 发 AppEvent::BackdropReady { theme, blur }
+7. 发 AppEvent::BackdropReady { epoch, theme }
+   // 只有 epoch + theme 两个字段：`epoch` 是几何代次，与当前不符则 App 侧直接丢弃
+   // （尺寸/位置变了，这次采样已经过期）；`blur` 字段 v1.1.11 随模糊背景整链删除。
 ```
 
 **为什么不用 `WDA_EXCLUDEFROMCAPTURE`**：`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`
@@ -2455,7 +2447,12 @@ pub fn split_units(text: &str, start_ms: Ms, end_ms: Ms) -> Vec<LyricWord> {
 上面的实现 60 行、零依赖、行为可预测。`unicode-segmentation` 会把中文按"词"切
 （需要词典），不符合"中文按字"的要求。
 
-### 12.3 当前行定位与扫光（已给在 §7.2 `Lyrics::line_at` / `word_progress`）
+### 12.3 当前行定位与扫光（已给在 §7.2 `Lyrics::line_at` / `lyric::sweep_offset`）
+
+> **v1.8.1（G6）**：`Lyrics::word_progress()`（返回 `(总进度, 当前字下标)`）已删除。
+> 实际画到屏幕上的一直是渲染侧的 `sweep_offset(line, t)`（UTF-16 码元连续值，
+> 直接喂 `HitTestTextPosition`），`word_progress` 只是它的另一份算法且无人调用。
+> 两处并存的「两份实现」与 D-6 的进度条问题同源，那份重构留给下一轮。
 
 - **二分查找**：`partition_point(|l| l.start_ms <= t)`，O(log n)。
 - **行切换**：`line_idx` 变化时触发一次"上移动画"（150ms 缓动，PRD §4.1）。
@@ -2639,6 +2636,12 @@ SettingsService::open(config)
 | `close` | `null` | 关闭设置窗口 |
 | `restart_hint` | `null` | 用户点了"需要重启才能生效"的项（本项目全部即时生效，保留占位） |
 
+> **v1.8.1 口径**：实际协议是**纯 JSON 字符串**——JS→Rust 走 `bridge::parse() → Incoming`
+> （只有 `Set { path, value }` / `Action(String)` / `Record(bool)` 三种），Rust→JS 走
+> `bridge::state_json()`（全量 `state`）+ `SettingsService::push(&str)`。
+> 早期文档里的 `HostMsg` 枚举**从未落地**（那是 M1 的占位类型，v1.8.1 已从代码删除）。
+> 下表保留为设计稿口径，字段名请以 `settings/bridge.rs` 与 `assets/ui/index.html` 为准。
+
 **Rust → JS**（`webview.PostWebMessageAsJson(&HSTRING::from(json))`）
 
 | `type` | `payload` | 说明 |
@@ -2659,6 +2662,11 @@ SettingsService::open(config)
 
 ### 13.3 快捷键录制（`add_AcceleratorKeyPressed`）
 
+> **v1.8.1 口径**：本节是 v1.0/M3 的设计稿。当前实现里按键捕获在 **JS 侧**完成，
+> Rust 只收到 `Record(start|stop)` 与 `hotkeys.<action> = {modifiers, vk}` 两条消息；
+> 冲突通过 `state_json(cfg, version, conflicts)` 的 `conflicts` 数组回推。
+> 原文里的 `HostMsg` 类型从未落地，v1.8.1 已从代码中删除。
+
 ```text
 1. JS 点"录制" → hotkey_record{phase:"start"}
 2. Rust：ui::hotkey::suspend_all()（注销全部 RegisterHotKey，PRD P1-02 要求）
@@ -2668,11 +2676,11 @@ SettingsService::open(config)
      若是修饰键本身（VK_CONTROL/SHIFT/MENU/LWIN/RWIN）→ 忽略，继续等
      否则：modifiers 从 GetKeyState 读（VK_CONTROL/VK_SHIFT/VK_MENU/VK_LWIN）
            args.SetHandled(true)     // 阻止 WebView 处理（避免输入框被写入）
-           → HostMsg::HotkeyCaptured { action, modifiers, vk, label }
+           → 回推全量 state JSON（`bridge::state_json` → `SettingsService::push`）
 4. JS 收到后显示组合键，用户点"应用" → hotkey_apply
 5. Rust：先试 RegisterHotKey 检测冲突
      Ok  → 保存到 config，UnregisterHotKey 试注册（因为稍后要全量重绑）
-     Err → HostMsg::HotkeyConflict（标红，R4：**允许保留**，用户可再点"仍然使用"）
+     Err → 冲突进 `state_json` 的 `conflicts` 数组（标红，R4：**允许保留**，用户可再点"仍然使用"）
 6. 关闭录制 / 窗口失焦 → hotkey_record{phase:"stop"} → resume_all()
 ```
 
@@ -2682,24 +2690,29 @@ SettingsService::open(config)
 
 ### 13.4 设置变更即时生效
 
+> **v1.8.1（G6 清理）按代码现状重写**。原文写的是
+> `JS set → AppEvent::ConfigChanged(new_config) → diff(old, new) → SaveConfig（300ms 去抖）`，
+> 三处都与代码不符：`AppEvent::ConfigChanged` **不存在**（零发射点，已删除）、没有
+> `diff(old, new)`、`SaveConfig` **也不做去抖**。真实路径在
+> `App::reduce_settings_message()` 的 `Incoming::Set` 分支里（见下方伪代码）。
+
 ```text
-JS set → bridge 校验 → AppEvent::ConfigChanged(new_config)
-  → App::reduce:
-      diff(old, new) 决定需要哪些 Effect：
-        appearance.*        → Relayout + Redraw + RequestBackdrop
-        lyrics.*            → Relayout + Redraw（+ 若 online_enabled 从 false→true 则重发 LyricRequest）
-        volume.*            → 无（只在滚轮时读）
-        hotkeys.*           → RebindHotkeys
-        general.autostart   → 写 HKCU Run
-        general.language    → RefreshTrayMenu + SettingsPush(init)
-        general.widget_hidden → SetVisible
-        window.*            → 无
-      → SaveConfig（300ms 去抖后写盘）
-      → SettingsPush(patch) 回推规范化后的值（例如 hover_alpha 被 clamp）
+JS set{path,value} → bridge::parse → bridge::apply_set（白名单 + 逐字段 clamp）
+  → 返回 false（非白名单 / 值非法）→ 什么都不做，只记一条 WARN
+  → 返回 true（配置已就地改好）→
+      判两个前缀：
+        hotkeys.*     → 追加 Effect::RebindHotkeys
+        appearance.*  → theme.apply_bg_config 就地同步两态背景 + request_backdrop()，
+                        并追加 Effect::Redraw（滑条拖动即时可见）
+        lyrics.enabled → animate_lyric_width()（宽度 200ms 过渡）
+      → Effect::Relayout + Effect::SaveConfig(config.clone())（**同步写盘**）
+      → settings.push(全量 state JSON) 回推规范化后的值（如 hover_alpha 被 clamp）
 ```
 
-**去抖**：拖动取色器会连续产生几十个 `set`。`SaveConfig` 用 300ms 去抖（`SetTimer`），
-但 **`ConfigChanged` 的处理（视觉更新）立即执行**——用户要即时反馈。
+**没有去抖**：每一次成功的 `set` 都立刻 `Effect::SaveConfig` → `Config::save()`
+（tmp 文件 + `fs::rename` 原子替换）。拖动滑条会连续产生几十次写盘，
+这是 v1.x 以来的**既有行为**，不是本轮引入的；要改成去抖属于行为变更，
+不在 G6（清理）范围内，已登记为下一轮候选（见 `CLEANUP-G6-清单.md` D-1）。
 
 ---
 

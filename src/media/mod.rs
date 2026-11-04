@@ -121,18 +121,6 @@ impl Rgb {
 
     /// 系统强调色兜底值（Win11 默认蓝）。
     pub const SYSTEM_ACCENT_FALLBACK: Rgb = Rgb::new(0x00, 0x78, 0xD4);
-
-    /// 解析 `#RRGGBB` / `RRGGBB`。失败返回 `None`。
-    pub fn parse_hex(s: &str) -> Option<Self> {
-        let s = s.trim().trim_start_matches('#');
-        if s.len() != 6 {
-            return None;
-        }
-        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-        Some(Rgb::new(r, g, b))
-    }
 }
 
 /// 小组件渲染所需的完整「当前播放」快照。UI 线程只读它，不再访问 COM。
@@ -270,19 +258,6 @@ mod match_tests {
         assert!(!session_matches("chrome.exe", "", ""));
         assert!(!session_matches("", "cloudmusic.exe", ""), "空进程名不匹配");
     }
-}
-
-/// WASAPI 兜底会话信息（`ARCHITECTURE.md` §8.1）。
-///
-/// 放在 media 层而不是 event 层，是因为它是「采集层的事实」，
-/// `AppEvent::FallbackSession(Box<FallbackInfo>)` 只是把它搬过线程边界。
-#[derive(Debug, Clone)]
-pub struct FallbackInfo {
-    pub process_id: u32,
-    pub process_name: String,
-    pub display_name: String,
-    /// 该会话的 peak 值，用于判断是否真的在出声
-    pub peak: f32,
 }
 
 /// 媒体线程门面：持有命令发送端与 join 句柄。

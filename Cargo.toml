@@ -1,6 +1,6 @@
 [package]
 name         = "barline"
-version      = "1.8.0"
+version      = "1.8.1"
 edition      = "2021"
 rust-version = "1.82"
 description  = "曲栏 Barline — Windows 11 任务栏媒体播控小组件"
@@ -39,7 +39,6 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_Accessibility",
 
   # ---- 图形 ----
   "Win32_Graphics_Gdi",
@@ -63,7 +62,6 @@ windows = { version = "0.62.2", features = [
   "Foundation",
   # D2D 的 D2D1_ELLIPSE / 渐变属性用 windows_numerics::Vector2，该模块在 Foundation_Numerics 下
   "Foundation_Numerics",
-  "Foundation_Collections",
   "Media",
   "Media_Control",
   "Storage",

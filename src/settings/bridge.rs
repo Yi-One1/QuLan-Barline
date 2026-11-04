@@ -167,15 +167,6 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             cfg.lyrics.local_first = v;
             true
         }
-        "lyrics.local_dirs_add" => {
-            let Some(s) = value.as_str() else { return false };
-            let s = s.trim();
-            if s.is_empty() || cfg.lyrics.local_dirs.iter().any(|d| d == s) {
-                return false;
-            }
-            cfg.lyrics.local_dirs.push(s.to_string());
-            true
-        }
         "lyrics.local_dirs_remove" => {
             let Some(s) = value.as_str() else { return false };
             let before = cfg.lyrics.local_dirs.len();
@@ -325,15 +316,6 @@ fn set_binding(
 /// 动作名（日志 / 冲突上报用）。
 pub fn action_name(a: crate::event::HotkeyAction) -> &'static str {
     a.as_str()
-}
-
-/// 语言枚举 → 页面用的字符串。
-pub fn lang_str(l: LangSerde) -> &'static str {
-    match l {
-        LangSerde::Zh => "Zh",
-        LangSerde::En => "En",
-        LangSerde::System => "System",
-    }
 }
 
 #[cfg(test)]
@@ -595,13 +577,22 @@ mod tests {
         assert!(!apply_set(&mut c, "hotkeys.prev", &json!({"modifiers": 3})));
     }
 
+    /// v1.8.1（G6）：`lyrics.local_dirs_add` 白名单分支删除——「添加目录」实际走
+    /// `addLyricsDirBrowse` 动作（`app.rs` 里直接 push），从不发这条 set。
+    /// 现在只剩「删除」这一侧，并且**必须仍然拒绝**旧页面残留的 add 请求。
     #[test]
-    fn local_dirs_add_and_remove() {
+    fn local_dirs_remove_and_add_path_is_gone() {
         let mut c = Config::default();
-        assert!(apply_set(&mut c, "lyrics.local_dirs_add", &json!("D:/lyrics")));
-        assert_eq!(c.lyrics.local_dirs, vec!["D:/lyrics".to_string()]);
-        // 重复添加不生效
-        assert!(!apply_set(&mut c, "lyrics.local_dirs_add", &json!("D:/lyrics")));
+        c.lyrics.local_dirs = vec!["D:/lyrics".to_string()];
+        assert!(
+            !apply_set(&mut c, "lyrics.local_dirs_add", &json!("E:/other")),
+            "已删除的 add 路径必须走兜底并返回 false（忽略，不报错）"
+        );
+        assert_eq!(
+            c.lyrics.local_dirs,
+            vec!["D:/lyrics".to_string()],
+            "add 请求不得改动目录列表"
+        );
         assert!(apply_set(
             &mut c,
             "lyrics.local_dirs_remove",

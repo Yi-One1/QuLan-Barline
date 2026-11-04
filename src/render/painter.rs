@@ -1326,7 +1326,7 @@ fn push_mmss(out: &mut String, ms: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::layout::{compute, TaskbarEdge, WidgetForm};
+    use crate::render::layout::{compute_full, TaskbarEdge, WidgetForm};
     use crate::render::theme::BackgroundMode;
 
     #[test]
@@ -1751,12 +1751,12 @@ mod tests {
         }
     }
 
-    /// 用 `layout::compute` 实算椭圆几何：不越出各自命中区半边、与「下一首」不重叠。
+    /// 用 `layout::compute_full` 实算椭圆几何：不越出各自命中区半边、与「下一首」不重叠。
     #[test]
     fn g4_glow_geometry_stays_inside_hit_and_clear_of_next() {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             for form in [WidgetForm::Compact, WidgetForm::Lyric] {
-                let l = compute(TaskbarEdge::Bottom, form, scale, (48.0 * scale).round() as i32);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, (48.0 * scale).round() as i32, 0.0, 0.0, form.lyric_w());
                 let s = l.effective_scale();
                 let outer_button = (limits::GLOW_RADIUS_BUTTON + limits::GLOW_GROW_BUTTON) * s;
                 let outer_dismiss = (limits::GLOW_RADIUS_DISMISS + limits::GLOW_GROW_DISMISS) * s;

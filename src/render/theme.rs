@@ -55,15 +55,6 @@ impl Rgba {
         }
     }
 
-    /// 按比例缩放 alpha（用于淡入淡出）。`t` ∈ 0..=1。
-    pub fn with_alpha_scale(self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
-        Self {
-            a: ((self.a as f32) * t).round() as u8,
-            ..self
-        }
-    }
-
     /// 打包成 `0xAARRGGBB`，作为笔刷缓存的 key。
     pub fn packed(self) -> u32 {
         ((self.a as u32) << 24)
@@ -144,8 +135,6 @@ impl Theme {
     pub const DARK_TEXT: Rgb = Rgb::new(0x0A, 0x0A, 0x0A);
     /// 浅色文字（深色壁纸）
     pub const LIGHT_TEXT: Rgb = Rgb::new(0xFA, 0xFA, 0xFA);
-    /// 次要文字的 alpha（PRD §4.1：60% 不透明度）
-    pub const DIM_ALPHA: u8 = 0x99;
 
     /// 由背景亮度 + 强调色 + 背景配置算出完整主题。
     ///
@@ -554,13 +543,6 @@ mod tests {
             let back = relative_luminance(g);
             assert!((back - l).abs() < 0.02, "luma {l} → gray → {back}");
         }
-    }
-
-    #[test]
-    fn alpha_scaling_keeps_rgb() {
-        let c = Rgba::new(1, 2, 3, 0xFF).with_alpha_scale(0.5);
-        assert_eq!((c.r, c.g, c.b), (1, 2, 3));
-        assert_eq!(c.a, 0x80);
     }
 
     /// 次要文字（歌手名）在浅/深背景下都必须 ≥ 4.5:1，且不能比 78% 更淡。

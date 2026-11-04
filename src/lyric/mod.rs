@@ -96,24 +96,6 @@ impl Lyrics {
         }
     }
 
-    /// 当前行的扫光进度 `0.0..=1.0`，以及当前字下标。
-    pub fn word_progress(&self, line_idx: usize, t: Ms) -> (f32, usize) {
-        let Some(line) = self.lines.get(line_idx) else {
-            return (0.0, 0);
-        };
-        if line.words.is_empty() {
-            let span = (line.end_ms - line.start_ms).max(1) as f32;
-            let p = ((t - line.start_ms) as f32 / span).clamp(0.0, 1.0);
-            return (p, 0);
-        }
-        let wi = line.words.partition_point(|w| w.start_ms <= t);
-        let cur = wi.saturating_sub(1);
-        let w = &line.words[cur];
-        let span = (w.end_ms - w.start_ms).max(1) as f32;
-        let frac = ((t - w.start_ms) as f32 / span).clamp(0.0, 1.0);
-        let total = line.words.len() as f32;
-        ((cur as f32 + frac) / total, cur)
-    }
 }
 
 /// 扫光边界在一行内的位置（**UTF-16 码元**，连续值）。
@@ -319,18 +301,6 @@ mod tests {
     fn empty_lyrics_have_no_line() {
         let l = Lyrics::default();
         assert_eq!(l.line_at(0), None);
-        assert_eq!(l.word_progress(0, 0), (0.0, 0));
-    }
-
-    #[test]
-    fn word_progress_without_words_uses_line_span() {
-        let l = Lyrics {
-            lines: vec![line(1000, 2000, "hello")],
-            ..Default::default()
-        };
-        let (p, idx) = l.word_progress(0, 1500);
-        assert!((p - 0.5).abs() < 1e-6);
-        assert_eq!(idx, 0);
     }
 
     #[test]

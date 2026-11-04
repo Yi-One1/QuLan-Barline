@@ -124,10 +124,10 @@ pub fn seek_fraction(layout: &WidgetLayout, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::layout::{compute, compute_ex, TaskbarEdge, WidgetForm};
+    use crate::render::layout::{compute_full, TaskbarEdge, WidgetForm};
 
     fn layout() -> WidgetLayout {
-        compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48)
+        compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w())
     }
 
     #[test]
@@ -295,7 +295,7 @@ mod tests {
         for form in [WidgetForm::Compact, WidgetForm::Lyric] {
             for scale in [1.0f32, 1.25, 1.5, 2.0] {
                 let bar = (48.0 * scale).round() as i32;
-                let l = compute_ex(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0);
+                let l = compute_full(TaskbarEdge::Bottom, form, scale, bar, 120.0, 40.0, form.lyric_w());
                 for (rect, expect, name) in [
                     (l.btn_prev, HitTarget::Prev, "prev"),
                     (l.btn_toggle, HitTarget::Toggle, "toggle"),
@@ -428,7 +428,7 @@ mod tests {
                     TaskbarEdge::Right,
                 ] {
                     let bar = (48.0 * scale).round() as i32;
-                    let l = compute_ex(edge, form, scale, bar, 120.0, 40.0);
+                    let l = compute_full(edge, form, scale, bar, 120.0, 40.0, form.lyric_w());
                     let (cx, cy) = l.hit_dismiss.center();
                     assert_eq!(
                         hit_test(&l, cx, cy, false),

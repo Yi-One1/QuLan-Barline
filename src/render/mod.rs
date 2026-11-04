@@ -232,11 +232,6 @@ impl Renderer {
             .map(|l| crate::render::text::metrics_width(&l.layout))
             .filter(|w| w.is_finite() && *w > 0.0)
     }
-
-    /// 封面缓存统计（诊断用）。
-    pub fn cover_stats(&self) -> (u64, u64, usize) {
-        (self.covers.hits, self.covers.misses, self.covers.len())
-    }
 }
 
 /// 文本缓存指纹：文本内容 + 可用宽度 + 缩放。

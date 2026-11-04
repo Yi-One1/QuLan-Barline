@@ -47,7 +47,7 @@ const MAX_PATH_UTF16: usize = 259;
 /// （比如 `_`），写出来的名字就永远命中不了（v1.7.0 已踩过的坑）。
 const ILLEGAL: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 
-/// 落盘目标：目录 + 文件名（不含扩展名的部分已带 `.lrc`，见 [`file_name_for`]）。
+/// 落盘目标：目录 + 文件名（不含扩展名的部分已带 `.lrc`，见 [`build_file_name`]）。
 pub struct Target {
     /// 目标目录（`<第一个本地歌词目录>/Barline`）
     pub dir: PathBuf,
@@ -102,15 +102,6 @@ pub fn resolve_target_dir(local_dirs: &[String]) -> Option<PathBuf> {
         return None;
     }
     Some(dir.join(SUB_DIR))
-}
-
-/// 由曲目生成落盘文件名（`<歌名 - 歌手>.lrc`）。
-///
-/// v1.8.0 / R4 改口径：主干从「`candidates()[0]`（= `歌手 - 歌名`，已小写）」
-/// 改成 [`display_stem`] 的 `歌名 - 歌手`（保留原始大小写）。
-/// 签名保持不变——既有 W3/W4/W5/W11/W12/W15 的断言因此可以零改动存活。
-pub fn file_name_for(track: &Track) -> Option<String> {
-    display_stem(track).ok().map(|s| format!("{s}.lrc"))
 }
 
 /// 落盘文件名主干：`{歌名} - {歌手}`（保留原始大小写 / 全角），无歌手时退化为 `{歌名}`。
@@ -413,8 +404,8 @@ mod tests {
         let second = locate::candidates(&t).get(1).cloned().expect("应有第二候选");
         assert_eq!(second, "晴天 - 周杰伦", "候选顺序本身不许动（查找侧红线）");
         assert_eq!(
-            file_name_for(&t).as_deref(),
-            Some("晴天 - 周杰伦.lrc"),
+            build_file_name(&t).as_deref(),
+            Ok("晴天 - 周杰伦.lrc"),
             "v1.8.0 R4：文件名主干 = 歌名 - 歌手，不是 candidates()[0]"
         );
     }
@@ -425,7 +416,7 @@ mod tests {
     #[test]
     fn w2_illegal_chars_become_spaces_not_underscores() {
         let t = track("A/B:C*D?E", "");
-        let name = file_name_for(&t).expect("应能生成文件名");
+        let name = build_file_name(&t).expect("应能生成文件名");
         assert_eq!(name, "A B C D E.lrc");
         assert!(!name.contains('_'), "非法字符必须换成空格，不能是下划线");
         assert!(name.contains(' '));
@@ -436,15 +427,15 @@ mod tests {
     /// W3：Windows 保留设备名一律拒绝；`com0` / `lpt0` 不算保留名。
     #[test]
     fn w3_reserved_device_names_are_rejected() {
-        assert_eq!(file_name_for(&track("CON", "")), None);
-        assert_eq!(file_name_for(&track("nul", "")), None);
-        assert_eq!(file_name_for(&track("com1", "")), None);
-        assert_eq!(file_name_for(&track("lpt9", "")), None);
-        assert_eq!(file_name_for(&track("aux", "")), None);
-        assert_eq!(file_name_for(&track("prn", "")), None);
+        assert_eq!(build_file_name(&track("CON", "")), Err(Skip::Reserved));
+        assert_eq!(build_file_name(&track("nul", "")), Err(Skip::Reserved));
+        assert_eq!(build_file_name(&track("com1", "")), Err(Skip::Reserved));
+        assert_eq!(build_file_name(&track("lpt9", "")), Err(Skip::Reserved));
+        assert_eq!(build_file_name(&track("aux", "")), Err(Skip::Reserved));
+        assert_eq!(build_file_name(&track("prn", "")), Err(Skip::Reserved));
         // com0 / lpt0 不是保留名
-        assert!(file_name_for(&track("com0", "")).is_some());
-        assert!(file_name_for(&track("lpt0", "")).is_some());
+        assert!(build_file_name(&track("com0", "")).is_ok());
+        assert!(build_file_name(&track("lpt0", "")).is_ok());
     }
 
     /// W4：主干长度上限 120 码元（121 拒绝、120 通过）。
@@ -453,8 +444,8 @@ mod tests {
         let ok = "a".repeat(120);
         let bad = "a".repeat(121);
         let want = format!("{ok}.lrc");
-        assert_eq!(file_name_for(&track(&ok, "")).as_deref(), Some(want.as_str()));
-        assert_eq!(file_name_for(&track(&bad, "")), None);
+        assert_eq!(build_file_name(&track(&ok, "")).as_deref(), Ok(want.as_str()));
+        assert_eq!(build_file_name(&track(&bad, "")), Err(Skip::TooLong));
     }
 
     /// W5：尾随点标题必须**落盘后能被自己搜到**（v1.7.0 出包前修正：
@@ -466,7 +457,7 @@ mod tests {
         let dirs = dirs_of(&dir);
         for title in ["abc...", "..."] {
             let t = track(title, "");
-            let name = file_name_for(&t).expect("尾随点标题必须能生成文件名");
+            let name = build_file_name(&t).expect("尾随点标题必须能生成文件名");
             assert_eq!(
                 name,
                 format!("{}.lrc", locate::candidates(&t)[0]),
@@ -638,7 +629,7 @@ mod tests {
         let t = track("测试曲目ε", "无名歌手ε");
         let sub = dir.join(SUB_DIR);
         std::fs::create_dir_all(&sub).expect("建子目录");
-        let name = file_name_for(&t).expect("应有文件名");
+        let name = build_file_name(&t).expect("应有文件名");
         let path = sub.join(&name);
         std::fs::write(&path, "USER").expect("预置用户文件");
 
@@ -656,21 +647,45 @@ mod tests {
         clean(&dir);
     }
 
-    /// W13：`local_dirs` 为空 → 跳过且**连目录都不建**。
+    /// W13：`local_dirs` 为空 → 跳过，且**目标目录一个字节都不许动**。
+    ///
+    /// **v1.8.1（G6 / D-3）修掉一条恒真断言**：原写法是
+    /// `assert!(!dir.join(SUB_DIR).exists())`，但 `save` 拿到的第二个参数是空切片，
+    /// 它根本不可能知道 `dir` 存在 —— 那条断言改坏 `save` 也永远为真。
+    /// 现在把 `dir` 预置一个**哨兵文件**，再断言「目录里仍然只有哨兵」：
+    /// 只要 `save` 在空清单路径上碰了任何目录（哪怕将来改成「兜底用临时目录」），
+    /// 条目数就会变 → 断言立刻红。
     #[test]
     fn w13_empty_local_dirs_writes_nothing_and_creates_no_dir() {
         let dir = tmp("w13");
+        let sentinel = dir.join("sentinel.txt");
+        std::fs::write(&sentinel, "KEEP").expect("预置哨兵文件");
         let out = save(&track("测试曲目ζ", "无名歌手ζ"), &[], &lyrics());
         assert!(
             matches!(out, Outcome::Skipped(Skip::NoDir)),
             "空清单必须按键 NoDir 跳过，实际 {:?}",
             describe(&out)
         );
-        assert!(!dir.join(SUB_DIR).exists(), "不该创建任何目录");
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("目录应可读").count(),
+            1,
+            "空清单下 save 不得创建任何东西（目录里应仍只有哨兵文件）"
+        );
+        assert!(!dir.join(SUB_DIR).exists(), "不该创建 Barline 子目录");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("哨兵文件必须还在"),
+            "KEEP",
+            "哨兵文件内容不许被改动"
+        );
         clean(&dir);
     }
 
-    /// W14：空歌词跳过，且不产生任何文件。
+    /// W14：空歌词跳过，且**连 `Barline/` 目录都不建**。
+    ///
+    /// **v1.8.1（G6 / D-4）拆开一条弱断言**：原写法
+    /// `match read_dir(&sub) { Ok(rd) => rd.count(), Err(_) => 0 }` 把「目录不存在」
+    /// 与「目录存在但是空的」合并成同一个 0，于是「建了个空目录」这种回归抓不到
+    /// —— 而 W13 的主张正是「这条路径连目录都不建」。现在两条分开断言。
     #[test]
     fn w14_empty_lyrics_are_skipped() {
         let dir = tmp("w14");
@@ -685,11 +700,10 @@ mod tests {
             describe(&out)
         );
         let sub = dir.join(SUB_DIR);
-        let count = match std::fs::read_dir(&sub) {
-            Ok(rd) => rd.count(),
-            Err(_) => 0,
-        };
-        assert_eq!(count, 0, "不许产生任何文件");
+        assert!(
+            !sub.exists(),
+            "空歌词不该建 Barline 目录：`save` 必须在解析目标目录之前就早退"
+        );
         clean(&dir);
     }
 
@@ -781,7 +795,7 @@ mod tests {
             Ok("A B C D E F G H I"),
             "九个非法字符都要变成空格"
         );
-        let name = file_name_for(&track("A/B:C*D?E\"F<G>H|I", "")).expect("应有文件名");
+        let name = build_file_name(&track("A/B:C*D?E\"F<G>H|I", "")).expect("应有文件名");
         assert!(!name.contains('_'), "必须是空格，不能是下划线");
         for (raw, want) in [
             ("a\u{1}b", "a b"),
@@ -919,7 +933,7 @@ mod tests {
             Ok("晴天"),
             "必须回退到 title-only 主干"
         );
-        assert_eq!(file_name_for(&t).as_deref(), Some("晴天.lrc"));
+        assert_eq!(build_file_name(&t).as_deref(), Ok("晴天.lrc"));
 
         let path = match save(&t, &dirs, &lyrics()) {
             Outcome::Written(p) => p,

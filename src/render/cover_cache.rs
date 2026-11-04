@@ -38,9 +38,6 @@ struct Entry {
 pub struct CoverCache {
     entries: Vec<Entry>,
     tick: u64,
-    /// 统计信息（日志用）
-    pub hits: u64,
-    pub misses: u64,
 }
 
 impl Default for CoverCache {
@@ -54,8 +51,6 @@ impl CoverCache {
         Self {
             entries: Vec::with_capacity(limits::COVER_CACHE_CAP),
             tick: 0,
-            hits: 0,
-            misses: 0,
         }
     }
 
@@ -85,11 +80,9 @@ impl CoverCache {
             .find(|e| e.track_id == track_id && e.slot == slot)
         {
             e.used = now;
-            self.hits += 1;
             return Some(e.bitmap.clone());
         }
 
-        self.misses += 1;
         let bitmap = create_bitmap(rt, wic, cover)?;
 
         // LRU 淘汰

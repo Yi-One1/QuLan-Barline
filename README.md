@@ -2,7 +2,7 @@
 
 **Windows 10/11 任务栏媒体播控小组件**：一条贴着托盘区左侧的内嵌任务栏条带，逐像素透明，用 Rust + Direct2D 直接绘制——不注入 Explorer、不弹独立悬浮窗。
 
-![screenshots](docs/screenshots/m4-qa-10-appearance.bmp)
+> 界面截图已归档至 git 历史（v1.8.0 及更早），如需查看可用 `git show 890c07f^:docs/screenshots/` 取回。
 
 ## 功能
 

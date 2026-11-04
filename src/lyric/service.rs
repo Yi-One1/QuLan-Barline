@@ -1124,12 +1124,16 @@ mod tests {
         let files = written_files(&dir);
         assert_eq!(files.len(), 1, "应落盘 1 个文件，实际 {files:?}");
         // v1.8.0 R4 改口径：文件名从 `candidates()[0] + .lrc`（歌手 - 歌名，已小写）
-        // 改成 `歌名 - 歌手.lrc`（保留原始大小写）。断言直接读落盘侧的唯一出处。
-        let want = writeback::file_name_for(&req.track).expect("应有落盘文件名");
-        assert_eq!(files[0], want, "文件名必须是 writeback::file_name_for 的产出");
-        assert!(
-            want.contains(" - "),
-            "v1.8.0 R4：文件名主干是「歌名 - 歌手」，实际 {want}"
+        // 改成 `歌名 - 歌手.lrc`（保留原始大小写）。
+        //
+        // v1.8.1（G6 / D-5）：断言从「等于 `writeback::file_name_for` 的产出」改成
+        // **字面量**。原写法是「两份同样的实现互相印证」——落盘侧真正用的是私有
+        // `build_file_name`，`file_name_for` 是它的一行孪生兄弟，任一份单独改另一条
+        // 都测不出「写出去的名字查找侧命中不了」。跨侧闭环由 `writeback` 的 W15 承担
+        // （落盘后立刻 `locate::find`），这里只钉死**具体文件名**这个事实。
+        assert_eq!(
+            files[0], "测试曲目α - 无名歌手α.lrc",
+            "文件名必须是「歌名 - 歌手.lrc」（保留原始大小写）"
         );
         assert!(w.wrote.contains(&query::cache_key(&req.track)));
         let _ = std::fs::remove_dir_all(&dir);

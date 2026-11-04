@@ -32,7 +32,7 @@
 //! WASAPI 的 `Activate` 是同步 COM 调用，`EnumWindows` 也是同步的。
 //! 实测整个流程 5–40ms，不会卡消息泵。
 
-use windows::core::{w, Interface, PCWSTR};
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, MAX_PATH};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
@@ -45,7 +45,7 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{
-    ApplicationActivationManager, IApplicationActivationManager, ShellExecuteW, ACTIVATEOPTIONS,
+    ApplicationActivationManager, IApplicationActivationManager, ACTIVATEOPTIONS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, IsWindowEnabled, SetActiveWindow, SetFocus,
@@ -57,7 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
     SetForegroundWindow, ShowWindow, SwitchToThisWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
-    SW_SHOWNORMAL, WS_EX_TOOLWINDOW,
+    WS_EX_TOOLWINDOW,
 };
 
 use windows::Win32::Media::Audio::{
@@ -701,31 +701,6 @@ fn activate_by_aumid(aumid: &str) -> bool {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------- URL 打开
-
-/// 用系统默认程序打开一个 URL / 协议（`ms-settings:` 也走这里）。
-pub fn open_url(url: &str) -> bool {
-    let wide = crate::platform::wide::to_wide(url);
-    // SAFETY: wide 是 NUL 结尾缓冲；ShellExecuteW 只读取它。
-    let h = unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    // ShellExecuteW 的返回值 > 32 才算成功（历史约定）
-    (h.0 as isize) > 32
-}
-/// 打开本地日志目录（设置页 / 关于页用）。
-pub fn open_log_dir() -> bool {
-    let dir = crate::platform::data_dir();
-    open_url(&dir.to_string_lossy())
 }
 
 #[cfg(test)]

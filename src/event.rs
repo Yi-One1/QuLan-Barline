@@ -6,9 +6,23 @@
 //! ```
 //! `reduce()` 是纯函数，只产出 `Vec<Effect>`；副作用由 `App::apply()` 执行。
 //!
-//! M1 阶段只有 `NowPlaying` / `SessionCleared` / `Tick` / `Quit` / `ConfigChanged` /
-//! `TaskbarGeometry` / `SecondInstanceLaunched` 会被真正处理，其余变体是
-//! M2–M5 的接口预留——`reduce()` 里统一 `log_debug!` 后忽略。
+//! ## v1.8.1（G6 清理）删掉的死变体
+//!
+//! - `AppEvent`：`Tick` / `Quit` / `ConfigChanged` / `DisplayChanged` / `TaskbarCreated` /
+//!   `TaskbarGeometry` / `SecondInstanceLaunched` / `LyricRetryDue` / `FallbackSession`
+//!   共 **9 个零发射点**的变体（24 → 15）。
+//! - `Effect`：`SetVisible` / `MoveWindow` / `ResizeTarget` / `RequestBackdrop` /
+//!   `SettingsPush` / `CloseSettings` 共 **6 个零构造**的变体。
+//!
+//! 它们此前被注释描述成「M2–M5 的接口预留」，但 M2–M5 全部已发布，预留一次都没被用上；
+//! 对应行为早已改成方法直调（例如 `widget_wnd` 直接调 `App::on_taskbar_created`、
+//! 心跳直接调 `tick_optimistic()`），变体本身只是残骸。
+//!
+//! ## 因此 `reduce` / `apply` 不再有兜底臂
+//!
+//! 删掉 `other =>` 兜底是**有意的契约**：给 `AppEvent` / `Effect` 加新变体时编译器会
+//! 立刻报「未覆盖的模式」，逼着实现方当场把语义补齐——而不是像过去那样静默落进
+//! 一条 `log_debug!`，表现为「功能不生效、日志里只有一句『暂未实现』」。
 
 #![allow(dead_code)]
 
@@ -16,10 +30,8 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::lyric::{LyricMissReason, Lyrics};
-use crate::media::{FallbackInfo, Ms, NowPlaying, Track, TrackId};
-use crate::platform::wake::EventSink;
-use crate::render::theme::{BackgroundMode, Theme};
-use crate::taskbar::geometry::TaskbarGeometry;
+use crate::media::{Ms, NowPlaying, Track, TrackId};
+use crate::render::theme::Theme;
 
 /// 工作线程 → UI 线程的事件。
 #[derive(Debug, Clone)]
@@ -29,8 +41,6 @@ pub enum AppEvent {
     NowPlaying(Box<NowPlaying>),
     /// 会话全部消失
     SessionCleared,
-    /// WASAPI 兜底会话出现
-    FallbackSession(Box<FallbackInfo>),
     /// 播控命令执行结果（用于回滚乐观更新）
     CommandResult { kind: MediaCommandKind, ok: bool },
 
@@ -46,23 +56,12 @@ pub enum AppEvent {
         track_id: TrackId,
         reason: LyricMissReason,
     },
-    /// 重试计时到点，需要重新请求
-    LyricRetryDue {
-        track_id: TrackId,
-    },
 
     // ---------------- 背景（T3 → T0） ----------------
     BackdropReady {
         epoch: u64,
         theme: Theme,
     },
-
-    // ---------------- 任务栏（watcher → T0） ----------------
-    TaskbarGeometry(TaskbarGeometry),
-    /// 收到 TaskbarCreated 广播（Explorer 重启），需要重新挂载
-    TaskbarCreated,
-    /// 显示配置变化（分辨率 / DPI / 显示器增删）
-    DisplayChanged,
 
     // ---------------- 用户输入 ----------------
     Hotkey(HotkeyAction),
@@ -71,7 +70,6 @@ pub enum AppEvent {
     WidgetInput(WidgetInput),
 
     // ---------------- 配置 / 设置页 ----------------
-    ConfigChanged(Box<Config>),
     /// 设置页请求打开 / 关闭
     SettingsOpenRequest,
     SettingsClosed,
@@ -81,13 +79,6 @@ pub enum AppEvent {
     SettingsWebViewFailed(String),
     /// 设置页 JS 发来的一条 JSON
     SettingsMessage(String),
-
-    // ---------------- 生命周期 ----------------
-    /// 第二个实例启动，要求唤起设置页
-    SecondInstanceLaunched,
-    /// 低频心跳（500ms），驱动进度外推与歌词推进的脏标记
-    Tick,
-    Quit,
 }
 
 /// 全局快捷键动作（6 组）。
@@ -168,8 +159,6 @@ pub enum WidgetInput {
     Wheel { delta: i32 },
     VolumeHudExpired,
     ToggleLyricsFromMenu,
-    SetBackgroundMode(BackgroundMode),
-    ShowAbout,
 }
 
 /// 播控命令种类（用于 `CommandResult` 回滚）。v1.1.16 起没有 Shuffle/Repeat。
@@ -188,28 +177,27 @@ pub enum Effect {
     Relayout,
     /// 只重绘（布局不变）
     Redraw,
-    /// 应用窗口可见性
-    SetVisible(bool),
-    /// 把窗口移到新位置 / 新尺寸
-    MoveWindow { x: i32, y: i32, w: i32, h: i32 },
-    /// 重建 D2D 目标（尺寸或 DPI 变化）
-    ResizeTarget { w: i32, h: i32, dpi: u32 },
-    /// 请求背景采样
-    RequestBackdrop { epoch: u64 },
     /// 向媒体线程发命令
     Media(MediaCommand),
     /// 向歌词线程发请求
     Lyric(LyricRequest),
-    /// 保存配置（带 300ms 去抖）
+    /// 保存配置（**同步**写盘：tmp + 原子 rename；**不做去抖**）
     SaveConfig(Box<Config>),
-    /// 向设置页推送
-    SettingsPush(HostMsg),
-    /// 打开 / 关闭设置页
+    /// 打开设置页
     OpenSettings,
-    CloseSettings,
     /// 重新注册热键
     RebindHotkeys,
     /// 更新托盘菜单语言
+    ///
+    /// **当前没有构造点**（v1.8.1 / G6 盘点结论）：它原先唯一的产出者是
+    /// `AppEvent::ConfigChanged` 的 reduce 臂，而该事件**零发射点**、本轮已删。
+    ///
+    /// **既有缺口，非本轮引入**：设置页改 `general.language` 后 `App::lang` 不更新、
+    /// 托盘菜单不刷新（`Lang::from_serde` 全仓只有 `bootstrap` 一处调用），
+    /// 小组件侧文案与托盘语言**需重启生效**。
+    ///
+    /// 本轮只做清理、不改行为，故保留该变体作为修复挂点（连同
+    /// `ui::tray::Tray::refresh`），缺口另行安排。
     RefreshTrayMenu,
     /// 退出进程
     Quit,
@@ -219,6 +207,9 @@ pub enum Effect {
 ///
 /// v1.1.16 起**没有** `Shuffle` / `Repeat`——SMTC 远程变更只是「请求」，
 /// 网易云/汽水等大量播放器声明能力却不响应，右键菜单两项已删除。
+///
+/// v1.8.1（G6）：`Mute` 变体删除——静音一直走 WASAPI（`app.rs` 的 `reduce_hotkey`），
+/// SMTC 侧的 `Mute` 分支只是 `log_debug!` 后 return，从未被构造过。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaCommand {
     PlayPause,
@@ -227,7 +218,6 @@ pub enum MediaCommand {
     Seek(Ms),
     /// 强制重新读取一次会话（用于乐观更新回滚校验）
     Refresh,
-    Mute,
     /// **全屏冻结**（v1.5.5 / G3.5）：暂停 / 恢复媒体线程的「分层轮询」。
     ///
     /// - `true`：线程阻塞在 `cmd_rx.recv()` 上，0 唤醒、0 跨进程调用；
@@ -257,31 +247,6 @@ pub struct LyricRequest {
     /// 是否为重试
     pub retry: bool,
 }
-
-/// Rust → 设置页的消息（`ARCHITECTURE.md` §13.2）。
-///
-/// **M1 占位**：真正的协议实现与 WebView2 桥接在 T13（M3），
-/// 届时本类型会整体搬到 `settings::bridge`，`Effect::SettingsPush` 的签名不变。
-#[derive(Debug, Clone)]
-pub enum HostMsg {
-    /// 首次全量下发（配置 + 运行时信息 + i18n 字典）
-    Init,
-    /// 单字段变更回推
-    Patch { path: String },
-    /// 轻提示
-    Toast { level: ToastLevel, text: String },
-}
-
-/// 提示级别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastLevel {
-    Info,
-    Warn,
-    Error,
-}
-
-/// 便捷别名，减少调用点的类型噪音。
-pub type Sink = EventSink<AppEvent>;
 
 #[cfg(test)]
 mod tests {

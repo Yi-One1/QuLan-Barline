@@ -37,23 +37,16 @@ pub fn detect_system_lang() -> Lang {
 }
 
 /// 词条查表。未知 key 返回 key 本身（便于发现漏配，不会 panic）。
+///
+/// v1.8.1（G6）：删掉 12 条**零调用点**的词条（`app.name` / `app.tagline` /
+/// `btn.play` / `btn.pause` / `btn.prev` / `btn.next` / `menu.separator` /
+/// `state.no_session` / `state.playing` / `state.paused` / `state.fallback` /
+/// `state.no_cover`）。它们只有 zh/en 两条定义、没有任何 `t()` 调用点；
+/// 实际活着的只有 `state.unknown_track` / `state.unknown_artist`。
 pub fn t(lang: Lang, key: &'static str) -> &'static str {
     match (lang, key) {
         // ---------------- 通用 ----------------
-        (Lang::Zh, "app.name") => "曲栏",
-        (Lang::En, "app.name") => "Barline",
-        (Lang::Zh, "app.tagline") => "曲栏 Barline",
-        (Lang::En, "app.tagline") => "Barline",
-
         // ---------------- 播放态 ----------------
-        (Lang::Zh, "state.no_session") => "无播放",
-        (Lang::En, "state.no_session") => "No playback",
-        (Lang::Zh, "state.playing") => "正在播放",
-        (Lang::En, "state.playing") => "Now playing",
-        (Lang::Zh, "state.paused") => "已暂停",
-        (Lang::En, "state.paused") => "Paused",
-        (Lang::Zh, "state.fallback") => "正在播放（兜底）",
-        (Lang::En, "state.fallback") => "Playing (fallback)",
         (Lang::Zh, "state.unknown_track") => "未知曲目",
         (Lang::En, "state.unknown_track") => "Unknown track",
         (Lang::Zh, "state.unknown_artist") => "未知艺术家",
@@ -106,22 +99,10 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         // SMTC 远程循环/随机，功能形同虚设）
         (Lang::Zh, "menu.about") => "关于",
         (Lang::En, "menu.about") => "About",
-        (Lang::Zh, "menu.separator") => "-",
-        (Lang::En, "menu.separator") => "-",
 
         // ---------------- 播控 / HUD（M2） ----------------
         (Lang::Zh, "hud.volume") => "音量",
         (Lang::En, "hud.volume") => "Volume",
-        (Lang::Zh, "state.no_cover") => "暂无封面",
-        (Lang::En, "state.no_cover") => "No cover",
-        (Lang::Zh, "btn.prev") => "上一首",
-        (Lang::En, "btn.prev") => "Previous",
-        (Lang::Zh, "btn.next") => "下一首",
-        (Lang::En, "btn.next") => "Next",
-        (Lang::Zh, "btn.play") => "播放",
-        (Lang::En, "btn.play") => "Play",
-        (Lang::Zh, "btn.pause") => "暂停",
-        (Lang::En, "btn.pause") => "Pause",
 
         (Lang::Zh, "about.title") => "关于 曲栏 Barline",
         (Lang::En, "about.title") => "About Barline",
@@ -227,8 +208,11 @@ mod tests {
         );
     }
 
-    /// 契约回归（v1.1.22 / 为 G6 铺路）：歌词来源文案必须同时提到 lrclib.net 与网易云，
-    /// 否则 G6 接入网易云兜底后还得再回来改一次文案。
+    /// 契约回归（v1.1.22 / **v1.3.0 网易云兜底接入前铺路**）：歌词来源文案必须同时
+    /// 提到 lrclib.net 与网易云，否则接入网易云兜底时还得再回来改一次文案。
+    ///
+    /// （原文写的是「为 G6 铺路」——那指的是 v1.3.0 的那轮 G6，与 v1.8.1 的
+    /// 「G6 清理专项」是两回事，容易误读，故改写字面口径。）
     #[test]
     fn about_text_credits_both_lyric_sources() {
         let zh = t(Lang::Zh, "about.text");

@@ -110,15 +110,6 @@ impl CoverageMap {
         (n / total).clamp(0.0, 1.0)
     }
 
-    /// 整体覆盖率（诊断用）。
-    pub fn overall(&self) -> f32 {
-        if self.cov.is_empty() {
-            return 0.0;
-        }
-        let sum: u32 = self.cov.iter().map(|v| *v as u32).sum();
-        let total = self.cov.len() as u32 * limits::SAMPLE_BLOCK * limits::SAMPLE_BLOCK;
-        (sum as f32 / total as f32).clamp(0.0, 1.0)
-    }
 }
 
 /// 一次采样请求。**最新覆盖槽**语义：300ms 内的多次请求只保留最后一次。
@@ -744,7 +735,6 @@ mod tests {
         assert!((m.ratio(0, 0) - 1.0).abs() < 1e-6);
         assert!((m.ratio(1, 0) - 0.0).abs() < 1e-6);
         assert!((m.ratio(0, 1) - 0.0).abs() < 1e-6);
-        assert!(m.overall() > 0.2 && m.overall() < 0.3);
     }
 
     #[test]

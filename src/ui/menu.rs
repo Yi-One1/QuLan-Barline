@@ -27,8 +27,8 @@
 //! 2. 用 `TPM_RETURNCMD` 同步取回命令号，**不用** `WM_COMMAND`——
 //!    我们的窗口没有菜单栏，走 `WM_COMMAND` 会和任务栏的消息流混在一起。
 
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow, TrackPopupMenuEx,
     HMENU, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
@@ -232,17 +232,6 @@ pub fn client_to_screen(origin: (i32, i32), client: (i32, i32)) -> (i32, i32) {
     (origin.0 + client.0, origin.1 + client.1)
 }
 
-/// 取鼠标当前位置（菜单弹出点兜底用）。
-pub fn cursor_pos() -> (i32, i32) {
-    let mut p = POINT::default();
-    // SAFETY: p 是本地结构体，GetCursorPos 只写出它。
-    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) }.is_ok() {
-        (p.x, p.y)
-    } else {
-        (0, 0)
-    }
-}
-
 /// 菜单项 ID 的调试名。
 pub fn command_name(cmd: MenuCommand) -> &'static str {
     match cmd {
@@ -256,9 +245,6 @@ pub fn command_name(cmd: MenuCommand) -> &'static str {
         MenuCommand::Quit => "Quit",
     }
 }
-
-/// 「关于」对话框用的常量（避免 app.rs 里塞字面量）。
-pub const ABOUT_OK: PCWSTR = w!("OK");
 
 #[cfg(test)]
 mod tests {

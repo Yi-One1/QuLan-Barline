@@ -88,11 +88,6 @@ pub fn threshold_for(name: &str) -> u128 {
     }
 }
 
-/// 是否值得记一条（纯函数，单测直接断言）。
-pub fn is_slow(ms: u128) -> bool {
-    over(ms, SLOW_MS)
-}
-
 /// 「这段耗时算不算慢」的唯一判定（含边界：等于阈值就算）。
 pub fn over(ms: u128, threshold_ms: u128) -> bool {
     ms >= threshold_ms
@@ -322,8 +317,6 @@ pub fn take_capture_window() -> CaptureWindow {
 #[must_use = "Span 必须在作用域内存活才会计时（立即丢弃 = 0ms，什么也不会记）"]
 pub struct Span {
     name: &'static str,
-    /// 可选备注（段名之外的补充，只在慢记录里出现）
-    note: &'static str,
     start: Instant,
     /// 本段的慢阈值（由 [`threshold_for`] 按段名自动选，或调用方显式指定）
     threshold: u128,
@@ -340,19 +333,6 @@ impl Span {
         Self::with_threshold(name, threshold_for(name))
     }
 
-    /// 开始计一段，并在慢记录里附带一句备注。
-    pub fn with_note(name: &'static str, note: &'static str) -> Self {
-        Self {
-            name,
-            note,
-            start: Instant::now(),
-            threshold: threshold_for(name),
-            done: false,
-            #[cfg(test)]
-            collect: false,
-        }
-    }
-
     /// 开始计一段，**自带阈值**（绕过 [`threshold_for`]）。
     ///
     /// 为什么需要：同一套埋点里，跨进程调用的「慢」与一帧绘制的「慢」不是一个量级，
@@ -360,7 +340,6 @@ impl Span {
     pub fn with_threshold(name: &'static str, threshold_ms: u128) -> Self {
         Self {
             name,
-            note: "",
             start: Instant::now(),
             threshold: threshold_ms,
             done: false,
@@ -372,11 +351,6 @@ impl Span {
     /// 显式结算（等价于「提前结束」）。消费 `self`，之后的 `Drop` 不再记。
     pub fn finish(mut self) {
         self.report();
-    }
-
-    /// 丢弃这一段（不计、不记）。场景：中途发现「这段其实不该测」。
-    pub fn cancel(mut self) {
-        self.done = true;
     }
 
     /// 本段已耗时（毫秒）。诊断用，也可以在不结束的情况下读。
@@ -403,20 +377,14 @@ impl Span {
         #[cfg(test)]
         {
             if self.collect {
-                record_for_test(self.name, ms, self.note);
+                record_for_test(self.name, ms);
                 return;
             }
         }
 
         // 限流只在「确实要写日志」时才发生（快路径到此为止，永不拿锁）。
         match admit_record(self.name) {
-            Verdict::Allow => {
-                if self.note.is_empty() {
-                    crate::log_warn!("[perf] {} 耗时={}ms", self.name, ms);
-                } else {
-                    crate::log_warn!("[perf] {} 耗时={}ms {}", self.name, ms, self.note);
-                }
-            }
+            Verdict::Allow => crate::log_warn!("[perf] {} 耗时={}ms", self.name, ms),
             Verdict::Notice => crate::log_warn!(
                 "[perf] {} 60s 内已记满 {} 条，后续丢弃",
                 self.name,
@@ -439,21 +407,21 @@ impl Drop for Span {
 thread_local! {
     /// 线程本地记录：`Span` 都在单测的同一根栈上创建/销毁，
     /// 不进全局状态就不会被并行跑的其他用例串味。
-    static RECORDED: std::cell::RefCell<Vec<(&'static str, u128, &'static str)>> =
+    static RECORDED: std::cell::RefCell<Vec<(&'static str, u128)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
-fn record_for_test(name: &'static str, ms: u128, note: &'static str) {
+fn record_for_test(name: &'static str, ms: u128) {
     RECORDED.with(|v| {
         if let Ok(mut g) = v.try_borrow_mut() {
-            g.push((name, ms, note));
+            g.push((name, ms));
         }
     });
 }
 
 #[cfg(test)]
-fn take_recorded() -> Vec<(&'static str, u128, &'static str)> {
+fn take_recorded() -> Vec<(&'static str, u128)> {
     RECORDED.with(|v| {
         let mut g = match v.try_borrow_mut() {
             Ok(g) => g,
@@ -489,15 +457,6 @@ mod tests {
         std::thread::sleep(Duration::from_millis(SLOW_MS as u64 + 15));
     }
 
-    #[test]
-    fn threshold_is_inclusive_at_50ms() {
-        assert_eq!(SLOW_MS, 50, "阈值口径固定，改它等于改验收标准");
-        assert!(!is_slow(0));
-        assert!(!is_slow(49));
-        assert!(is_slow(50), "恰好 50ms 就要记（≥ 不是 >）");
-        assert!(is_slow(51));
-    }
-
     /// 短的段什么都不记（否则 25fps 下日志会被淹掉）。
     #[test]
     fn fast_span_records_nothing() {
@@ -520,7 +479,6 @@ mod tests {
         assert_eq!(got.len(), 1, "一段只该记一条");
         assert_eq!(got[0].0, "t.slow");
         assert!(got[0].1 >= SLOW_MS, "记录的耗时要过阈值：{}", got[0].1);
-        assert_eq!(got[0].2, "", "无备注时备注为空串");
     }
 
     /// 显式 `finish()` 之后再 `Drop` **不许**重复记。
@@ -531,16 +489,6 @@ mod tests {
         sleep_slow();
         s.finish();
         assert_eq!(take_recorded().len(), 1, "finish 已结算，Drop 不许再记");
-    }
-
-    /// `cancel()` 的段即使超过阈值也不记。
-    #[test]
-    fn cancelled_span_is_never_recorded() {
-        let _ = take_recorded();
-        let s = collecting("t.cancel");
-        sleep_slow();
-        s.cancel();
-        assert!(take_recorded().is_empty());
     }
 
     /// 嵌套不串味：内层只算自己那段，外层覆盖两段。
@@ -579,8 +527,6 @@ mod tests {
         let s = collecting("t.peek");
         sleep_slow();
         assert!(s.elapsed_ms() >= SLOW_MS);
-        s.cancel();
-        assert!(take_recorded().is_empty(), "cancel 后不许残留记录");
     }
 
     // ------------------------------------------------ 自定义阈值（G2 修复版）
@@ -592,11 +538,9 @@ mod tests {
         assert!(!over(7, SMTC_SLOW_MS));
         assert!(over(50, SLOW_MS));
         assert!(!over(49, SLOW_MS));
-        // is_slow 是 50ms 的便捷入口，不许悄悄变语义
+        // 两个阈值的字面口径固定，改它等于改验收标准
         assert_eq!(SLOW_MS, 50);
         assert_eq!(SMTC_SLOW_MS, 8);
-        assert_eq!(is_slow(50), true);
-        assert_eq!(is_slow(49), false);
     }
 
     /// 同样的耗时，自定义阈值（8ms）要记、默认阈值（50ms）**不许**记。
@@ -655,14 +599,11 @@ mod tests {
     fn span_new_picks_threshold_by_name() {
         let ui = Span::new("tick.probe");
         assert_eq!(ui.threshold_ms(), UI_SLOW_MS);
-        ui.cancel();
         let other = Span::new("paint.frame");
         assert_eq!(other.threshold_ms(), SLOW_MS);
-        other.cancel();
         // 显式阈值优先于段名
         let forced = Span::with_threshold("tick.probe", SMTC_SLOW_MS);
         assert_eq!(forced.threshold_ms(), SMTC_SLOW_MS);
-        forced.cancel();
     }
 
     /// 16ms 口径下 20ms 的段要记，50ms 口径下同长度不记（这就是盲区被补上的证明）。

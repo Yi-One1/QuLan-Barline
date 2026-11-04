@@ -14,7 +14,7 @@
 //! 设置页录制新快捷键时，先 [`Hotkeys::suspend`] 全部注销，否则用户按下旧组合键
 //! 会直接触发动作，录制框里就录不到了。
 
-use windows::Win32::Foundation::{HWND, WIN32_ERROR};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
@@ -209,11 +209,6 @@ impl Hotkeys {
         crate::log_info!("全局快捷键已恢复");
     }
 
-    /// 当前生效的动作数（诊断用）。
-    pub fn active_count(&self) -> usize {
-        self.active.len()
-    }
-
     /// 该动作是否注册成功。
     pub fn is_active(&self, action: HotkeyAction) -> bool {
         self.active.contains(&action)
@@ -235,19 +230,6 @@ pub fn bindings(cfg: &crate::config::HotkeyConfig) -> [(HotkeyAction, &HotkeyBin
 /// `WM_HOTKEY` 的 `wParam` → 动作。
 pub fn action_of_wparam(wparam: usize) -> Option<HotkeyAction> {
     action_of_id(wparam as i32)
-}
-
-/// 把 `WIN32_ERROR` 转成可读名字（日志用）。
-pub fn error_name(code: u32) -> &'static str {
-    match code {
-        ERROR_HOTKEY_ALREADY_REGISTERED => "ERROR_HOTKEY_ALREADY_REGISTERED",
-        _ => "UNKNOWN",
-    }
-}
-
-/// 诊断用：`WIN32_ERROR` 的原始值。
-pub fn raw_code(e: &windows::core::Error) -> u32 {
-    WIN32_ERROR(e.code().0 as u32).0
 }
 
 #[cfg(test)]
@@ -328,13 +310,5 @@ mod tests {
         assert_eq!(list[0].0, HotkeyAction::PlayPause);
         assert_eq!(list[0].1.vk, 80);
         assert_eq!(list.len(), 6);
-    }
-
-    #[test]
-    fn conflict_error_name_is_recognised() {
-        assert_eq!(
-            error_name(ERROR_HOTKEY_ALREADY_REGISTERED),
-            "ERROR_HOTKEY_ALREADY_REGISTERED"
-        );
     }
 }

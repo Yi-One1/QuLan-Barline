@@ -12,13 +12,16 @@
 
 // 零 warning 是 M1 的硬门槛。任何新增告警都会让 `cargo build` 直接失败。
 #![deny(warnings)]
-// dead_code 在 M1 阶段整体放行：本里程碑的核心交付是「数据契约 + 最小可观察链路」，
-// ARCHITECTURE.md §7 / §8 里定义的字段与变体有相当一部分要到 M2–M5 才会被真正引用
-// （例如 OptimisticOverride、HoverState、lyric 的 line_at/word_progress、limits 里的
-// 缓存容量常量）。这些**不是死代码**，是已经冻结的跨模块契约，提前删除会破坏后续里程碑。
+// dead_code 整体放行。**这条 allow 早已过期，但不再用"里程碑还没到"当理由**——事实是：
+// M1–M5 全部已发布（v1.8.0），本行却一直留到现在，于是**死码不会被编译器发现**。
+// 当前被它兜住的都是「刻意留档」的东西，而不是"将来会用到"：
+//   - `media::launch::tray_click_activate`（用户裁决搁置的托盘激活实测实现，progress.md 待办 D）；
+//   - `app::start_msg_timer` / `kill_msg_timer`（成对预留的幂等入口，刻意不成单）；
+//   - `Effect::RefreshTrayMenu`（「改语言后托盘不刷新」缺口的修复挂点）。
+// 代价与纪律：**G6 这类死码清理只能靠人工 `rg` 逐符号盘点**（编译器帮不上忙），
+// 每轮清理必须自己维护清单 + 用 `rg` 反向验证零引用，不能指望 `cargo build` 报错。
 // 单独 lint 的优先级高于 lint 组，所以这一行能在 `deny(warnings)` 之下精确开口子，
 // 其余告警（unused_imports / unreachable_code / unused_variables …）仍然是 error。
-// M5 收尾时应移除本行。
 #![allow(dead_code)]
 // GUI 程序：不弹控制台窗口。日志一律走文件。
 #![windows_subsystem = "windows"]

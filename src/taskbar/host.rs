@@ -123,10 +123,6 @@ impl TaskbarHost {
         self.hwnd
     }
 
-    pub fn is_visible(&self) -> bool {
-        self.visible
-    }
-
     /// 当前是否处于「Z 序已降级」的全屏遮挡态。
     pub fn z_demoted(&self) -> bool {
         self.z_demoted
@@ -205,7 +201,7 @@ impl TaskbarHost {
     pub fn apply_geometry(&mut self, target: RECT) -> Result<()> {
         let w = (target.right - target.left).max(1);
         let h = (target.bottom - target.top).max(1);
-        // v1.5.6 / G3.5-A：所有 relayout / Effect::MoveWindow 路径的 Z 序总闸——
+        // v1.5.6 / G3.5-A：所有 relayout / 可见性变更路径的 Z 序总闸——
         // 遮挡态下任何几何应用都必须继续用 HWND_BOTTOM，否则一次重排就会把小组件
         // 重新抬回全屏窗口上方。其余参数与 flags 一字不改。
         // SAFETY: hwnd 有效；选中锚点 + SWP_NOACTIVATE 的组合不会改变焦点。

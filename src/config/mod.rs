@@ -17,25 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::render::theme::BackgroundMode;
 
-/// 强调色来源。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccentSource {
-    #[default]
-    Cover,
-    System,
-    Custom,
-}
-
-/// 独立的 serde 枚举，避免 render 层类型泄漏到配置层。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LyricModeSerde {
-    #[default]
-    TwoLine,
-    OneLine,
-}
-
 /// 音量作用域。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,11 +45,6 @@ pub struct HotkeyBinding {
 }
 
 impl HotkeyBinding {
-    pub const NONE: Self = Self {
-        modifiers: 0,
-        vk: 0,
-    };
-
     pub fn is_bound(&self) -> bool {
         self.vk != 0
     }
@@ -86,10 +62,6 @@ pub struct AppearanceConfig {
     pub hover_alpha: u8,
     /// 常规半透明的不透明度百分比（1..=100，默认 50）
     pub idle_alpha: u8,
-    /// 强调色来源：封面 / 系统 / 自定义
-    pub accent_source: AccentSource,
-    /// 自定义强调色，形如 "#0078D4"
-    pub accent_custom: String,
     /// 显示显示器：0 = 主显示器，否则为显示器序号
     pub monitor_index: u32,
 }
@@ -99,7 +71,6 @@ pub struct AppearanceConfig {
 #[serde(default)]
 pub struct LyricsConfig {
     pub enabled: bool,
-    pub mode: LyricModeSerde,
     pub karaoke_sweep: bool,
     /// 长歌词滚动（跑马灯，v1.1.2 新增；v1.1.4 改行时间窗口驱动 + 提前滚完）：
     /// 歌词超宽时按行时间窗口线性滚动，比该行唱完提前滚到尾；
@@ -179,18 +150,6 @@ pub struct GeneralConfig {
     pub widget_hidden: bool,
 }
 
-/// 记忆的窗口 / 交互状态，重启后恢复。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WindowStateConfig {
-    pub settings_w: i32,
-    pub settings_h: i32,
-    pub settings_x: i32,
-    pub settings_y: i32,
-    pub lyrics_visible: bool,
-    pub lyrics_two_line: bool,
-}
-
 /// 存储配置（v1.1.5 问题 3；v1.1.6 净搬 + A→B 切换）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -222,7 +181,6 @@ pub struct Config {
     pub volume: VolumeConfig,
     pub hotkeys: HotkeyConfig,
     pub general: GeneralConfig,
-    pub window: WindowStateConfig,
     /// v1.1.5：存储位置
     pub storage: StorageConfig,
 }
@@ -254,11 +212,7 @@ impl Config {
 
         match serde_json::from_slice::<Config>(&raw) {
             Ok(mut cfg) => {
-                crate::log_info!(
-                    "配置已加载：version={} lyrics.mode={:?}",
-                    cfg.version,
-                    cfg.lyrics.mode
-                );
+                crate::log_info!("配置已加载：version={}", cfg.version);
                 // v1.1.17（用户裁决）：会话音量（「当前播放器」范围）实测在
                 // 网易云/汽水/Edge 上均无法生效（连匹配环节都失败，根因见
                 // progress.md 待办），暂时禁用——旧配置里的 current_player
@@ -327,32 +281,12 @@ mod tests {
         // v1.2.2：`ui_scale` 已删除（死配置），改用它旁边的两个背景模式字段
         assert_eq!(back.appearance.background_mode, cfg.appearance.background_mode);
         assert_eq!(back.appearance.idle_mode, cfg.appearance.idle_mode);
-        assert_eq!(back.appearance.accent_custom, cfg.appearance.accent_custom);
-        assert_eq!(back.lyrics.mode, cfg.lyrics.mode);
         assert_eq!(back.lyrics.enabled, cfg.lyrics.enabled);
         assert_eq!(back.volume.step, cfg.volume.step);
         assert_eq!(back.volume.hud_ms, cfg.volume.hud_ms);
         assert_eq!(back.hotkeys.play_pause, cfg.hotkeys.play_pause);
         assert_eq!(back.hotkeys.toggle_widget, cfg.hotkeys.toggle_widget);
         assert_eq!(back.general.language, cfg.general.language);
-        assert_eq!(back.window.settings_w, cfg.window.settings_w);
-        assert_eq!(back.window.lyrics_two_line, cfg.window.lyrics_two_line);
-    }
-
-    /// v1.1.1 向后兼容：旧版本配置里的 `lyrics.mode = "two_line"` 与
-    /// `window.lyrics_two_line` 字段必须**读入不报错且忽略**（不迁移、不删除）。
-    #[test]
-    fn legacy_two_line_fields_load_without_error() {
-        let mut cfg = Config::default();
-        cfg.lyrics.mode = LyricModeSerde::TwoLine;
-        cfg.window.lyrics_two_line = true;
-        let json = serde_json::to_vec(&cfg).expect("序列化不应失败");
-        let back: Config = serde_json::from_slice(&json).expect("旧字段反序列化不应失败");
-        // 字段原样读入（不迁移），布局层自行忽略
-        assert_eq!(back.lyrics.mode, LyricModeSerde::TwoLine);
-        assert!(back.window.lyrics_two_line);
-        // 读取路径完全不感知该字段：歌词是否显示只由 enabled 决定
-        assert!(back.lyrics.enabled);
     }
 
     /// v1.1.2 向后兼容：旧配置没有 `lyrics.scroll` 字段 → 反序列化不报错且默认 true。
@@ -421,14 +355,36 @@ mod tests {
     /// 用户机器上现存的 `config.json` 里还留着 `appearance.ui_scale`，
     /// 字段删掉之后必须**照常加载**（serde 默认忽略未知字段），
     /// 且同级的其它字段照常解析、缺省字段照常落默认值。
+    ///
+    /// **v1.8.1（G6）扩表**：本轮又删掉了三组死配置（`window` 整棵、
+    /// `appearance.accent_source` / `accent_custom`、`lyrics.mode`），
+    /// 老用户的 `config.json` 里必然带着它们。这里把它们一起写进「旧版本写出来的
+    /// 真实配置形状」里，钉住「删字段不影响旧文件加载」——这条比原来只测 `ui_scale`
+    /// 更强，也是本轮唯一还能观测到 B-6/B-7/B-8 兼容性口径的地方
+    /// （原来的 `legacy_two_line_fields_load_without_error` 随着被测字段一起删了）。
     #[test]
     fn legacy_ui_scale_field_is_ignored() {
-        // 一段「旧版本写出来的真实配置形状」：既有已删的 ui_scale，也有正常字段
-        let json = br#"{
+        // 一段「旧版本写出来的真实配置形状」：既有已删的 ui_scale，也有正常字段，
+        // 还有 v1.8.1 删掉的三组死配置键。
+        let json = br##"{
             "version": 1,
-            "appearance": {"ui_scale": 1.25, "background_mode": "transparent", "hover_alpha": 85},
-            "lyrics": {"enabled": false}
-        }"#;
+            "appearance": {
+                "ui_scale": 1.25,
+                "background_mode": "transparent",
+                "hover_alpha": 85,
+                "accent_source": "custom",
+                "accent_custom": "#112233"
+            },
+            "lyrics": {"enabled": false, "mode": "two_line"},
+            "window": {
+                "settings_w": 1024,
+                "settings_h": 700,
+                "settings_x": 10,
+                "settings_y": 20,
+                "lyrics_visible": true,
+                "lyrics_two_line": true
+            }
+        }"##;
         let cfg: Config =
             serde_json::from_slice(json).expect("带已删除字段 ui_scale 的旧配置必须仍能加载");
 
@@ -439,7 +395,6 @@ mod tests {
         assert!(!cfg.lyrics.enabled);
 
         // 其余字段全靠 `#[serde(default)]` 补齐，不能因缺字段而失败
-        assert_eq!(cfg.appearance.accent_custom, "#0078D4");
         assert_eq!(cfg.volume.step, 0.02);
         assert!(cfg.hotkeys.play_pause.is_bound());
     }
@@ -470,14 +425,5 @@ mod tests {
         let cfg: Config = serde_json::from_slice(b"{}").expect("空对象应可用");
         assert_eq!(cfg.version, defaults::CURRENT_VERSION);
         assert_eq!(cfg.hotkeys.next.vk, defaults::vk::RIGHT);
-    }
-
-    #[test]
-    fn hex_colour_parsing_is_used_by_appearance() {
-        use crate::media::Rgb;
-        assert_eq!(
-            Rgb::parse_hex(&AppearanceConfig::default().accent_custom),
-            Some(Rgb::SYSTEM_ACCENT_FALLBACK)
-        );
     }
 }

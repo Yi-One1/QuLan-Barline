@@ -391,10 +391,10 @@ impl Interaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::layout::{compute, TaskbarEdge, WidgetForm};
+    use crate::render::layout::{compute_full, TaskbarEdge, WidgetForm};
 
     fn layout() -> WidgetLayout {
-        compute(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48)
+        compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w())
     }
 
     #[test]

@@ -18,16 +18,6 @@ pub fn from_wide(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// 不带 NUL 的 UTF-16 序列 → `String`（整段都算内容，尾部 `0` 会被裁掉）。
-pub fn from_wide_full(buf: &[u16]) -> String {
-    let end = buf
-        .iter()
-        .rposition(|&c| c != 0)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    String::from_utf16_lossy(&buf[..end])
-}
-
 /// `&str` → 不含 NUL 的 UTF-16 切片，供 `ID2D1RenderTarget::DrawText` 等
 /// 「显式长度」API 使用。
 pub fn to_utf16(s: &str) -> Vec<u16> {
@@ -73,11 +63,5 @@ mod tests {
         let mut padded = v.clone();
         padded.extend_from_slice(&[0x4E2D, 0x6587, 0]); // 中文，在 NUL 之后
         assert_eq!(from_wide(&padded), "abc");
-    }
-
-    #[test]
-    fn from_wide_full_keeps_content() {
-        let v = to_utf16("中文abc");
-        assert_eq!(from_wide_full(&v), "中文abc");
     }
 }

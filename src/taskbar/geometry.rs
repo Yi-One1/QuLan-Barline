@@ -78,14 +78,6 @@ impl TaskbarGeometry {
         )
     }
 
-    /// 目标矩形的宽 / 高。
-    pub fn target_size(&self) -> (i32, i32) {
-        (
-            (self.target.right - self.target.left).max(0),
-            (self.target.bottom - self.target.top).max(0),
-        )
-    }
-
     /// 列出与 `other` **实质不同**的字段名（诊断用，v1.2.0 / G5 问题 2）。
     ///
     /// 「几何变了 → 重排」的日志只写一句"几何变化"是没用的：G5 的「截图时左移」

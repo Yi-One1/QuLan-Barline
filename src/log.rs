@@ -271,11 +271,6 @@ pub fn timestamp_compact() -> String {
     )
 }
 
-/// 当前日志级别是否放行 DEBUG（宏用它避免无谓的 `format_args!` 求值）。
-pub fn debug_enabled() -> bool {
-    LOGGER.get().map(|l| l.min_level <= Level::Debug).unwrap_or(false)
-}
-
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {

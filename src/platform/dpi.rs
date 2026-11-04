@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 
 /// 设置进程 DPI 感知为「每显示器 V2」。返回是否成功。
@@ -22,18 +22,6 @@ pub fn set_process_dpi_aware() -> bool {
     // SAFETY: 纯进程级设置，无指针参数；只要在任何窗口创建之前调用即可。
     let r = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     r.is_ok()
-}
-
-/// 取窗口所在显示器的 DPI（96 = 100%）。
-pub fn get_dpi_for_window(hwnd: HWND) -> u32 {
-    // SAFETY: GetDpiForWindow 对任意有效 HWND 安全；hwnd 无效时返回 0，
-    // 这里统一兜底为 96。
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    if dpi == 0 {
-        96
-    } else {
-        dpi
-    }
 }
 
 /// DPI → 缩放系数（96 → 1.0，120 → 1.25，144 → 1.5）。

@@ -90,10 +90,6 @@ impl SettingsService {
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.hwnd.map(|h| !h.is_invalid() && unsafe_is_window(h)).unwrap_or(false)
-    }
-
     pub fn hwnd(&self) -> Option<HWND> {
         self.hwnd
     }

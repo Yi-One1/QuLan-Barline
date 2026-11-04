@@ -40,8 +40,6 @@ pub mod limits {
     pub const LYRIC_W: f32 = 160.0;
     /// 歌词区单行矩形高度（逻辑像素；48px 条带 = 2 + 22 + 22 + 2，上行歌名歌手、下行歌词）
     pub const LYRIC_LINE_H: f32 = 22.0;
-    /// 上下行边距（逻辑像素）
-    pub const LYRIC_PAD: f32 = 2.0;
     /// 上行内歌名与歌手名的横向间隔（逻辑像素）
     pub const TITLE_ARTIST_GAP: f32 = 6.0;
     /// 下行歌词相对行矩形中心的整体上移量（逻辑像素，v1.1.3：再上移 2px，累计 3.5px）
@@ -59,7 +57,6 @@ pub mod limits {
     pub const DOUBLE_CLICK_MS: u64 = 250;
     /// 拖动进入 Seeking 的阈值
     pub const SEEK_DRAG_PX: f32 = 3.0;
-    pub const SEEK_DRAG_MS: u64 = 100;
     /// 背景采样节流
     pub const SAMPLE_THROTTLE_MS: u64 = 300;
     /// **静止态心跳**背景采样的间隔（v1.4.4 / G2-B1：1s → 3s）。
@@ -71,8 +68,6 @@ pub mod limits {
     /// **不受影响**：悬停进入 / 壁纸主题变化 / 几何变化 / 退出截图态 /
     /// 切换播放器导致的几何重排 —— 它们都直接投递采样，不等心跳。
     pub const BACKDROP_IDLE_MS: u64 = 3_000;
-    /// 任务栏轮询兜底周期
-    pub const TASKBAR_POLL_MS: u32 = 500;
     /// 媒体轮询周期 —— **快层**：播放状态（G2 修复版起它只是三层里的一层）
     pub const MEDIA_POLL_MS: u64 = 500;
     /// 媒体轮询 —— **中层**：时间线（时长 + 位置）。UI 侧靠 `position_at` 本地外推，
@@ -102,8 +97,6 @@ pub mod limits {
     pub const ANIM_TIMER_MS: u32 = 16;
     /// 单击判定延迟（PRD §4.3：250ms 内第二下视为双击，不产生动作）
     pub const CLICK_DELAY_MS: u32 = 250;
-    /// 拖动时时间气泡在松开后保留的时长（PRD P0-10：500ms 内消失）
-    pub const SEEK_BUBBLE_MS: u32 = 500;
     /// 封面视觉边长（逻辑像素）
     pub const COVER_SIDE: f32 = 32.0;
     /// 封面圆角（逻辑像素）
@@ -313,10 +306,6 @@ pub mod limits {
     pub const COVER_ARROW_SIZE: f32 = 5.0;
     pub const COVER_ARROW_PAD: f32 = 3.0;
     pub const COVER_ARROW_LINE: f32 = 1.2;
-    /// 与系统媒体控件之间的间距
-    /// 主文字候选色（深 / 浅）
-    pub const TEXT_DARK: u8 = 0x0A;
-    pub const TEXT_LIGHT: u8 = 0xFA;
     /// WCAG AA 最小对比度
     pub const MIN_CONTRAST: f32 = 4.5;
 
@@ -357,7 +346,6 @@ pub mod mods {
     pub const CONTROL: u32 = 0x0002;
     pub const SHIFT: u32 = 0x0004;
     pub const WIN: u32 = 0x0008;
-    pub const NOREPEAT: u32 = 0x4000;
 }
 
 /// 快捷键默认值的版本号。
@@ -385,8 +373,8 @@ pub mod vk {
 }
 
 use super::{
-    AccentSource, AppearanceConfig, Config, GeneralConfig, HotkeyBinding, HotkeyConfig,
-    LangSerde, LyricsConfig, LyricModeSerde, VolumeConfig, VolumeScope, WindowStateConfig,
+    AppearanceConfig, Config, GeneralConfig, HotkeyBinding, HotkeyConfig, LangSerde, LyricsConfig,
+    VolumeConfig, VolumeScope,
 };
 use crate::render::theme::BackgroundMode;
 
@@ -399,7 +387,6 @@ impl Default for Config {
             volume: VolumeConfig::default(),
             hotkeys: HotkeyConfig::default(),
             general: GeneralConfig::default(),
-            window: WindowStateConfig::default(),
             storage: crate::config::StorageConfig::default(),
         }
     }
@@ -412,8 +399,6 @@ impl Default for AppearanceConfig {
             idle_mode: BackgroundMode::Transparent,
             hover_alpha: 70,
             idle_alpha: 50,
-            accent_source: AccentSource::Cover,
-            accent_custom: String::from("#0078D4"),
             monitor_index: 0,
         }
     }
@@ -423,9 +408,6 @@ impl Default for LyricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // v1.1.1 起行数固定单行：`mode` 字段仅为旧配置反序列化兼容保留，
-            // 布局层不再读取（见 `WidgetForm::from_lyric_enabled`）
-            mode: LyricModeSerde::OneLine,
             karaoke_sweep: true,
             // v1.1.2：长歌词滚动（跑马灯），默认开
             scroll: true,
@@ -591,19 +573,6 @@ impl Default for GeneralConfig {
             autostart: false,
             language: LangSerde::System,
             widget_hidden: false,
-        }
-    }
-}
-
-impl Default for WindowStateConfig {
-    fn default() -> Self {
-        Self {
-            settings_w: 880,
-            settings_h: 640,
-            settings_x: i32::MIN, // MIN 表示「居中」
-            settings_y: i32::MIN,
-            lyrics_visible: true,
-            lyrics_two_line: true,
         }
     }
 }
