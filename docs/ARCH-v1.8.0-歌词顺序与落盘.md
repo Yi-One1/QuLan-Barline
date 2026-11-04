@@ -4,7 +4,7 @@
 | --- | --- |
 | 版本 | `v1.8.0`（新增能力 + 新增配置项） |
 | 设计范围 | 只覆盖 `docs/PRD-v1.8.0-歌词顺序与落盘.md` 的 R1–R4；其余行为沿用 `docs/ARCHITECTURE.md` §12.4–12.6 与 v1.7.0 口径 |
-| 前提 | Rust 2021 + windows-rs 0.62 + Direct2D + WebView2；`#![deny(warnings)]` |
+| 前提 | Rust 2021 + windows-rs 0.62 + Direct2D + WebView2；`#![deny(warnings)]` + `#![allow(dead_code)]`（`src/main.rs:15` / `:22`，后者在 M5 收尾时应移除） |
 | 本文件性质 | **纯设计文档**。不改任何源码、不改 PRD、不改 `progress.md`、不动 `deliverables/` |
 | 依据基线 | `src/lyric/service.rs`（1102 行）、`src/lyric/cache.rs`（611）、`src/lyric/writeback.rs`（600）、`src/lyric/locate.rs`（363）、`src/settings/bridge.rs`（548）、`assets/ui/index.html`（831） |
 
@@ -34,7 +34,7 @@ local_first = false →  内存 → 磁盘缓存 → 本地 → 负缓存 → �
 
 | # | 问题 | 裁决 | 一句话理由 |
 | --- | --- | --- | --- |
-| 1 | 缓存 `source` 怎么透出 | **改签名**（`get_mem`/`get_disk` 返回 `Option<Hit>`），**不加 `*_src` 变体** | 见 §3.1：加变体会让旧函数在非 test 构建里无人调用 → `dead_code` → `deny(warnings)` 直接挂构建 |
+| 1 | 缓存 `source` 怎么透出 | **改签名**（`get_mem`/`get_disk` 返回 `Option<Hit>`），**不加 `*_src` 变体** | 见 §3.1：主要依据是「调用点只有 3 处需改」+「一次改对、语义不分叉」。**注意**：本仓 `src/main.rs:22` 有全局 `#![allow(dead_code)]`，所以「编译器会拦死变体方案」不成立（§3.1.1 更正说明） |
 | 2 | R2 统计挂哪 | **新增动作 `lyricsCacheStats` + 新消息类型 `cacheStats` + 新方法 `SettingsService::post()`**，**不进 `state`** | 见 §5.2：`state_json` 是纯函数且每次 `set` 都推，把它变成 IO 会污染热路径；更致命的是 `SettingsService::push()` 会覆写 `last_state`（`src/settings/mod.rs:220`），拿它推统计会把窗口重建后的补推内容换掉 |
 | 3 | 名字算法放哪 | **放 `writeback::display_stem`，不加 `locate::display_candidates`** | `locate.rs` 本轮必须零 diff（它是「查找侧语义不变」的红线）；命名是落盘侧的事 |
 
@@ -436,7 +436,7 @@ fn sanitize(s: &str) -> String {
 | 8 | `CON` / `X` | `CON - X` | `con - x` | `["x - con","con - x","con"]` | `== [1]` ✅ | `CON - X.lrc`（只有裸 `CON` 是保留名，`CON - X` 合法） |
 | 9 | `"a"×120` / `` | 120 码元 | — | — | Ok（恰好 120） | `aaa….lrc` |
 | 10 | `"a"×121` / `` | — | — | — | **Skip::TooLong** | 不写 |
-| 11 | `"a"×120` / `X` | 124 码元 | — | — | **Skip::TooLong**（v1.7.0 下能写，本轮不能 → 记为已接受退化） | 不写 |
+| 11 | `"a"×120` / `X` | 124 码元 | — | — | **Skip::TooLong**（v1.7.0 下能写，本轮不能 → 记为已接受退化）。**注意：不回退** —— 回退规则只对 `Unsearchable` 生效，`TooLong` 换成 title-only 虽能过 120，但那会与「主路径命名口径」不一致且掩盖真问题，故按「title/artist 本身有问题」处理 | 不写 |
 | 12 | `晴天（Live）` / `周杰伦` | `晴天（Live） - 周杰伦` | `晴天(live) - 周杰伦` | `[…,"晴天(live) - 周杰伦",…]` | `== [1]` ✅ | 全角括号保留 |
 | 13 | `a\u{1}b` / `X` | 主路径 `a b - X`；回退 `a b` | `a b - x` / `a b` | `["x - a\u{1}b","a\u{1}b - x","a\u{1}b"]` | ❌ 主路径与**回退都不成立** → **Skip::Unsearchable**（`W26`） | 不写（宁可不写也不写死文件；连 `Barline/` 目录都不建） |
 | 14 | `晴天` / `"   "`（纯空白） | `晴天` | `晴天` | `["晴天"]` | `== [0]` ✅ | `晴天.lrc` |
@@ -780,9 +780,9 @@ function requestCacheStats() {
 
 ### 8.2 必须重跑/加强的既有断言
 
-1. **全量 `cargo test`**：基线 494（493 passed + 1 ignored，`progress.md:4`）→ 预期 494 − 0 + 新增 ≈ 26 条 ≈ **520**；`check`/`clippy`/`build` 全绿、clippy 0 警告（`deny(warnings)` 下 `Skip::Unsearchable` 必须真有构造路径，否则直接编译失败）。
+1. **全量 `cargo test`**：基线 494（493 passed + 1 ignored，`progress.md:4`）→ 预期 494 − 0 + 新增（C1–C5 / W16–W26 / S6–S14 / B1–B2 / P1）≈ 27 条 ≈ **521**；`check`/`clippy`/`build` 全绿、clippy 0 警告（`Skip::Unsearchable` 必须真有构造路径；注意 `src/main.rs:22` 有全局 `#![allow(dead_code)]`，所以「未被构造」不会被编译器抓到，只能靠 W26 这类测试钉住）。
 2. **`s1`–`s5` 全部重跑**（`service.rs:976-1101`）：其中 `s5` 反转、`s1` 换断言、`s2`/`s3`/`s4` 应原样通过 —— **`s4` 原样通过是「`maybe_write_back` 签名没动」的证明**。
-3. **`w1`–`w15` 全部重跑**：`w3`/`w4`/`w5`/`w6`–`w15` 应原样通过（§6.2 已逐条论证），`w1`/`w2` 按新口径改。若 `w5` 挂了，说明有人又在 `display_stem` 里加了尾点裁剪 —— 立刻打回。
+3. **`w1`–`w26` 全部重跑**：`w3`/`w4`/`w5`/`w6`–`w15` 应原样通过（§6.2 已逐条论证），`w1`/`w2` 按新口径改，`w22` 为回退闭环、`w26` 为「回退仍失败 → Skip」。若 `w5` 挂了，说明有人又在 `display_stem` 里加了尾点裁剪 —— 立刻打回；若 `w22` 挂了（写成 Skip），说明回退分支被删或 `check_stem` 被复制成两份且第二份口径不一致。
 4. **`cache.rs` 全部 9 条重跑**：`memory_lru_evicts_beyond_capacity`（`:502`，用 `c.map.len()`）与 `memory_cache_respects_byte_budget`（`:517`，用 `c.mem_bytes`）必须在 `Entry` 改造后仍绿 —— 这两条是「512 KB 预算没被改坏」的唯一证据。
 5. **`bridge.rs` 全部重跑** + 新增 B1/B2：`state_json_contains_config_and_version`（`:538`）必须绿，证明**没有**往 `state` 里塞统计字段。
 6. **QA 独立复核四项**（读码即可判定）：
