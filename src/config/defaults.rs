@@ -219,6 +219,11 @@ pub mod limits {
     /// 字面量 `0xFF`（与按钮同源的写法），本常量保留为**语义占位**并恒等于它。
     /// 真正让 × 看起来更淡的是笔画宽度，见 [`DISMISS_LINE`]。
     pub const DISMISS_ALPHA: u8 = 0xFF;
+    // **历史契约常量（v1.5.1 × 淡底）**：下面三个 `DISMISS_BG_*` 仅被
+    // `layout.rs` 的既有契约测试与 `WidgetLayout::dismiss_bg_rect()` 引用，
+    // v1.6.0 / G4 起**不参与任何绘制路径**（`draw_dismiss` 已改为与三键共用
+    // 双层光晕）。保留符号是「461 条既有测试零删改」的硬要求，
+    // `#![deny(warnings)]` 下删了会直接编译失败。
     /// 关闭 × **悬停底色**的 alpha（`theme.text` @ 0x14 ≈ 8%）。
     ///
     /// 这是 Win11 任务栏图标悬停的常规做法：极淡圆角底，不描边、不光晕。
@@ -232,6 +237,62 @@ pub mod limits {
     /// 与任务栏图标的悬停方块观感一致；再大就会把 14px 方块画成圆形
     /// （半径必须严格小于短边一半 7*s，由 `dismiss_bg_radius_is_safely_under_half_short_side` 把守）。
     pub const DISMISS_BG_RADIUS: f32 = 4.0;
+
+    // ------------------------------------------- v1.6.0 / G4 悬停反馈统一
+    /// 按钮（含 ×）悬停光晕「内层底」的 alpha 上限。
+    ///
+    /// 实际绘制时**按 `theme.hover_bg.a` 缩放**：与全窗悬停背景同源。Q1 用户拍板
+    /// 「保留极淡保底」——始终透明档（`hover_bg.a == 0`）下四 target 的光晕**不会
+    /// 完全消失**，而是在 [`GLOW_FLOOR_ALPHA`] 处取整条强度曲线的非零下限截距；
+    /// 强度仍随全窗档位缩放（不再是 v1.5.1 那层写死的 0x14），修掉 QA 遗留
+    /// 「全局悬停消失但 × 仍亮」，同时保留可感知的悬停反馈。
+    pub const GLOW_INNER_HOVER: u8 = 0x20;
+    pub const GLOW_INNER_PRESSED: u8 = 0x2E;
+    /// 外层「影 / 光」的 alpha 上限，恒显著淡于内层 —— 才是柔和光晕而非描边。
+    pub const GLOW_OUTER_HOVER: u8 = 0x0C;
+    pub const GLOW_OUTER_PRESSED: u8 = 0x14;
+    /// Q1 拍板：始终透明档（`hover_bg.a == 0`）下四 target 保留的极淡保底 alpha。
+    ///
+    /// 它是全窗 hover 强度曲线 `painter::glow_params()` 在 `hover_bg.a → 0` 处的
+    /// **非零下限截距**，四 target（含 ×）共享，**不是 × 专属底色**。真实取值由
+    /// `scaled(nom) = round(nom * a / 255).max(本值).min(nom)` 逐分量产生：
+    /// 保底档 `inner == outer == 0x06` 是预期（双层仍靠不同 RGB + 不同半径区分）。
+    /// 真人验收可在 `[0x01, 0x06]` 内微调，`0x06` 是硬上界
+    /// （由 `g4_constants_are_self_consistent` 把守）。
+    pub const GLOW_FLOOR_ALPHA: u8 = 0x06;
+    /// 按下时外圈扩张的比例（WIP 内联 0.5 → 具名化）。
+    pub const GLOW_GROW_PRESSED_FACTOR: f32 = 0.5;
+    /// 外圈相对内圈的扩张（逻辑像素，乘 scale）；按下时收紧到
+    /// [`GLOW_GROW_PRESSED_FACTOR`] 倍。
+    pub const GLOW_GROW_BUTTON: f32 = 3.0;
+    pub const GLOW_GROW_DISMISS: f32 = 1.5;
+    /// 光晕基准半径（逻辑像素，乘 scale）。三键命中区 28×28（半边 14），
+    /// × 命中区 14×14（半边 7）：`半径 + 扩张` 必须 ≤ 各自半边，由单测把守。
+    pub const GLOW_RADIUS_BUTTON: f32 = 11.0;
+    pub const GLOW_RADIUS_DISMISS: f32 = 5.0;
+    /// 按下时图标等比缩到 94%，并整体下沉 1 逻辑像素。
+    pub const BUTTON_PRESSED_SCALE: f32 = 0.94;
+    pub const BUTTON_PRESSED_SINK: f32 = 1.0;
+    /// 封面悬停：恒暗蒙层 + 恒亮双箭头（边界说明见 `painter::draw_cover`）。
+    /// Q5 蒙层暗度微调钩子：真人验收可在 `[0x40, 0x80]` 内调整，本轮保持 0x5A。
+    pub const COVER_HOVER_DIM: u8 = 0x5A;
+    /// 封面悬停蒙层的 RGB（恒黑）——与 [`COVER_HOVER_DIM`] 一起用，避免
+    /// `painter.rs` 里出现内联 `Rgba::new(0, 0, 0, ...)` 魔法数。
+    pub const COVER_DIM_RGB: (u8, u8, u8) = (0x00, 0x00, 0x00);
+    /// 封面双箭头的 RGB（恒亮白）。**不用 `theme.text`**：浅壁纸的 `theme.text`
+    /// 是深色，叠在黑色蒙层上会看不见；恒亮箭头在深浅两种壁纸下都成立。
+    pub const COVER_ARROW_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+    /// 封面双箭头的 alpha。
+    pub const COVER_ARROW_ALPHA: u8 = 0xE6;
+    /// Q4 拍板：封面双箭头朝向（`↖ + ↘` 对角外扩）。
+    ///
+    /// `0` = 左上 ↖ + 右下 ↘（当前）；`1` = 右上 ↗ + 左下 ↙（另一组对角）；
+    /// 其它值**兜底为 0**。真人验收后只改这一处即可整体换向（两个 tip 与斜杆
+    /// 方向都由它派生）。水平 ←+→ 需要另一套绘制分支，本轮不实现。
+    pub const COVER_ARROW_ORIENTATION: u8 = 0;
+    pub const COVER_ARROW_SIZE: f32 = 5.0;
+    pub const COVER_ARROW_PAD: f32 = 3.0;
+    pub const COVER_ARROW_LINE: f32 = 1.2;
     /// 与系统媒体控件之间的间距
     /// 主文字候选色（深 / 浅）
     pub const TEXT_DARK: u8 = 0x0A;

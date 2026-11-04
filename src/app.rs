@@ -2512,6 +2512,9 @@ impl App {
             st.theme.idle_bg.packed(),
             st.theme.track_bg.packed(),
             st.theme.dim_alpha as u32,
+            // v1.6.0 / G4：光晕影/光层由 on_light 决定，翻转必须重绘；
+            // text / hover_bg 通常同时变，这一项是冗余防护（零额外重绘）。
+            st.theme.on_light as u32,
         ];
         theme.hash(&mut h);
 
@@ -2519,8 +2522,9 @@ impl App {
         hover_key(st.hover).hash(&mut h);
         ((st.hover_alpha.clamp(0.0, 1.0) * 32.0) as u32).hash(&mut h);
         st.pressed.map(target_key).hash(&mut h);
-        // v1.5.0：× 的悬停反馈必须进指纹，否则「悬停 ×」那一帧会被去重吞掉
-        // （v1.5.1 起这个反馈是极淡圆角底而不是变亮，结论不变）
+        // v1.5.0：× 的悬停反馈必须进指纹，否则「悬停 ×」那一帧会被去重吞掉。
+        // v1.6.0 / G4：四 target 共用双层光晕（alpha 随 hover_bg.a 缩放 + 极淡保底），
+        // 透明档也有反馈，结论不变 —— hover_target 仍必须进指纹。
         st.hover_target.map(target_key).hash(&mut h);
 
         // ---- 播放态 ----

@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-04 20:12 · **G3 全链闭环（v1.5.0~v1.5.4 已真人验收）** · **G3.5 返工 v1.5.6 已出包（待真人验收；v1.5.5 全屏冻结因 1s 延迟被用户否定、已作废）** · G2 闭环 · 下一组 G4（v1.6.0）· G7 黑名单待实现（v1.8.0） · 全量回归绿（461 测试：460 passed + 1 ignored）· 工作区干净。
+> **最后更新**：2026-11-04 22:16 · **G3 全链闭环（v1.5.0~v1.5.4 已真人验收）** · **G3.5 全屏遮挡 v1.5.6 已真人验收 ✅** · G2 闭环 · **G4 悬停反馈 v1.6.0 已出包（待真人验收）** · G7 黑名单待实现（v1.8.0） · 全量回归绿（470 测试：469 passed + 1 ignored）· 工作区干净（已单提交）。
 
 ---
 
@@ -142,7 +142,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **G3 右上角 ×（问题 4）→ v1.5.0**：用户定「**常驻**、尽量小但要清晰、位置＝**整个小组件右上角**」；点击＝隐藏到托盘。
   - **布局方案（已拍板）：独占右上角**——右边缘为 × 预留约 16px，三键整体左移，窗口总宽 +≈16px（已确认与 `btn_next` 右对齐垂直居中的 28×28 命中区重叠问题）。新增 `HitTarget::Dismiss`。
   - **交付实况（v1.5.0~v1.5.4，用户逐轮验收微调）**：字形 16 → **6px**、命中区 24 → **14px**、笔画 1.6 → 1.2、常态 100% 不透明（`DISMISS_ALPHA=0xFF`，与三键 enabled 同源）；`DISMISS_GAP` 8 → **2**、`DISMISS_RIGHT_MARGIN=4`（字形右缘距窗口边缘 8px，与左侧 `CONTENT_PAD` 对称）；窗口相对 v1.4.4 为 **+12\*s**；「下一首」图标右缘 → × 字形左缘 = **12px**。
-- **G3.5 全屏遮挡（用户 2026-11-04 追加）→ v1.5.5 ❌ 被用户否定 → v1.5.6 · ✅ 已出包 `deliverables/曲栏_Barline_v1.5.6.exe`（待真人验收）**：全屏应用（电影/播放器/浏览器 F11/游戏）时小组件**直接被盖住且静止**，不得压在全屏窗口上方、不得占后台；退出全屏自动恢复。
+- **G3.5 全屏遮挡（用户 2026-11-04 追加）→ v1.5.5 ❌ 被用户否定 → v1.5.6 · ✅ 已真人验收（用户 21:13「这一项没问题，下一项」）· 包 `deliverables/曲栏_Barline_v1.5.6.exe`**：全屏应用（电影/播放器/浏览器 F11/游戏）时小组件**直接被盖住且静止**，不得压在全屏窗口上方、不得占后台；退出全屏自动恢复。
   - **v1.5.5 验收否定（用户原话）**：「切换全屏时，会有1秒的延迟……我要的效果是像 fluentflyout 那样，全屏时直接被盖住，退出全屏时还在……去查一下这个软件是怎么做的」。根因：v1.5.5 靠 1s `foreground_info()` 轮询发现进出 + 隐藏 + 400ms 解冻兜底，进出各约 1s。用户拍板 **方案 A：事件驱动 + 只降层级不隐藏 + 保留冻结**。
   - **现象（用户原话）**：「其他窗口全屏时，小组件会左移，且小组件会盖在全屏的窗口上方」；追加要求「全屏时让本软件静止或冻结，避免后台占用（例如全屏游戏）」。
   - **已存在的信号（零新增跨进程调用）**：`platform::capture::foreground_info()` 返回 `fullscreen` + `monitor`，v1.4.4（G2-B2）起每秒随心跳刷新；`frozen_decision()`（`app.rs:2971`）**直接复用** `should_skip_idle_backdrop`，不复制同屏判据。
@@ -152,7 +152,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
   - **QA 结论 PASS-WITH-NOTES**（450 测试，12 条独立回归）：主理人疑点 `tick_optimistic()` 冻结期仍在 `frozen` 判断之前执行 —— **证伪为非问题**（只读一个 `Option`，`redraw()` 首行 frozen 守卫挡住整帧）。另发现工程师 `paused` 用例只用 `sleep(30ms)` < 50ms 轮询周期、无法证伪阻塞语义，QA 补 150ms 真阻塞测试。
   - **留档观察（不阻断）**：`AppEvent::Tick` 全仓无发送者（未来启用会多一个 500ms UI 唤醒）；`relayout_with` 与 `sync_visibility` 的 resume 门控写法不一致；`TIMER_CLICK`(3) 冻结期理论上仍可挂（实际不可达）；快速「退出→400ms 内再全屏」会多一次无效 relayout（门控保证不误显示）；`reset_for_resume` 的 `checked_sub(60ms)` 在进程极早期可能退化（实测未触发）。
   - **不可破**：副屏全屏**不得**冻结主屏小组件；monitor 全 0 不冻结（安全方向）；既有 428 条断言一条未放宽。
-  - **v1.5.6 返工实况（方案 A，待真人验收）**：
+  - **v1.5.6 返工实况（方案 A，已真人验收 ✅）**：
     - **根因再确认**：曲栏**不是任务栏子窗口**（`src/taskbar/host.rs` `parent=None` 的 top-level popup），`widget_ex_style()` 含 `WS_EX_TOPMOST` + `ensure_on_top()` 每秒置顶 → 全屏窗口盖不住它。FluentFlyout（`TaskbarWindow.xaml.cs`）用 `SetParent(Shell_TrayWnd)` 变任务栏子窗口、全屏时天然跟随被盖；其 `SHQueryUserNotificationState` 只用于判断是否弹 flyout。本轮按用户拍板**不改 `SetParent`**。
     - **机制**：新增 `src/platform/appbar.rs`「纯通知型 appbar」（只 `ABM_NEW`/`ABM_REMOVE`，**故意不发 `ABM_QUERYPOS/SETPOS`、不占工作区**），注册在 **widget 主窗口**（`TaskbarCreated` 是广播，`HWND_MESSAGE` 收不到），`WM_BARLINE_APPBAR = WM_APP+5` 在 `widget_proc` 唯一派发。`ABN_FULLSCREENAPP(TRUE)` → 先 `SetWindowPos(HWND_BOTTOM)` 预降 → 同一次 WndProc 里一次本地 `foreground_info()` 对账 → `frozen_decision()` 判同屏；`(FALSE)` → `AppbarClose` 强制解冻、立即 `HWND_TOPMOST`。1s `TIMER_GEOM` 的 `foreground_info()` 只作兜底对账（appbar 事件漏报最多 1s 纠错，非主路径）。
     - **为什么是 `HWND_BOTTOM`**：`HWND_NOTOPMOST` 只是「置于所有非 topmost 窗口之上」，对 Chrome F11 / 电影和电视 / 无边框全屏游戏**仍会盖上去**，原 bug 不修；MS 对 `ABN_FULLSCREENAPP` 的要求本就是 drop to bottom。`HWND_BOTTOM` 一次调用同时清 topmost 状态并落到 Z 序底部。「插到 `taskbar_hwnd` 之后」候选亦被否决：顶层窗口之间无 Z 序跟随（只有子窗口才有），且曲栏窗口矩形完全落在任务栏矩形内部，低于任务栏常态就不可见。
@@ -160,7 +160,16 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
     - **R1 竞态修复（QA 提出、出包前补）**：`occlusion_want(AppbarOpen)` 由 `frozen_decision(...)` 改为 `!(fs && !same_monitor(fg, wm))` —— **信任事件，仅「本地确实看到全屏窗口且明确异屏」才还原**。否则「通知早于前台窗口切换」时 `fs=false` 会把刚降的 BOTTOM 在同一 WndProc 内还原、退回 1s。`AppbarClose` 强制 false、`Timer => frozen_decision` 与三个纯函数逐字未动；真值表扩为 30 格 + 独立推导 + 6 组命名竞态用例。
     - **QA 结论 `PASS-WITH-NOTES`**：14/14 PASS、路由 `NoOne`；`check/clippy/test` 全绿、**461 个 `#[test]` / 1 ignored / 460 passed**、clippy 0 警告、`git diff --check` 干净。基线 `src/app.rs` SHA256 `b56a6841…` 构建前后一致（并发写曾两次作废旧轮次，最终以冻结指纹为准）。`deliverables/曲栏_Barline_v1.5.6.exe` 1073 KB、FileVersion/ProductVersion 1.5.6。
     - **留档观察（不阻塞，按 QA 最终增量报告给精确口径）**：① **副屏/全 0 不变量只在 `fs=true` 路径 100% 保住**：`AppbarOpen => !fs || same_monitor(...)` 的 `||` 短路使 `fs=false` 时 monitor **完全不参与判定**，因此 **「monitor 全 0 不冻结」这条 v1.4.4 起的安全方向在事件路径被有意识放宽**。`widget_monitor` 在启动早期 / `geometry::probe()` 失败 / `WM_DISPLAYCHANGE` 瞬间为 `RECT::default()`，此时一条 TRUE 广播会完整冻结（含停 ANIM/LYRIC、`SetPaused(true)`、跳过采样）≤1s，由 1s 心跳按严格的 `frozen_decision` 自动恢复；窗口始终 visible、永不 `SW_HIDE`、无残留状态。真值表把 `fs=false × 全 0 → true` 明钉为契约，属**契约重定义**（有注释与等强度反向替代断言，非静默删）。② `fs=false` 是**完整进入遮挡/降载**，不只是「仅 Z 序预降」，误判时用户看到内容停更 1s。③ **R2 退出抖动**：`AppbarClose` 后 1s 心跳若本地仍报全屏会补冻；且新分支下迟到/重复的 TRUE 广播（close/open 乱序、Explorer 重注册补发）在 `fs=false` 时可**立即**补冻、不再等心跳。建议 v1.5.7 加 1–2s 纯函数抑制（只抑制 Timer、不抑制 AppbarOpen）。④ **v1.5.7 加固首选（QA 建议，不引入新状态/定时器）**：`AppbarOpen` 分支先判 `fg == RECT::default() || wm == RECT::default()` 则回退 `frozen_decision(fs, fg, wm)`，恢复 monitor 全 0 安全方向；正常竞态下 monitor 已知，不牺牲 R1 修复效果。⑤ `ensure_on_top()` 与 `set_z_demoted(false)` 各发一次 `HWND_TOPMOST`（冗余无害，别删）。⑥ **真机验收看日志 `trigger=appbar|timer`：F11 进入应立刻出现 `trigger=appbar` 的「进入」行**，若先出现 `trigger=timer` 说明事件路径没生效；出现 `trigger=appbar` 进入 → 约 1s 后 `trigger=timer` 退出且用户未退出全屏，即为误冻样本。
-- **G4 悬停/按下反馈（问题 3 + 5）→ v1.6.0**：封面悬停＝变暗蒙层 + 左上/右下双箭头（点击整块封面＝打开播放器，沿用 `ClickCover`）；四按钮（含 ×）用户选「**柔和光晕 + 下沉**」——悬停：白底黑影/黑底白光双层低透明度光晕；按下：光晕收紧、图标下沉 1px 并缩到 94%。**× 与四按钮共用同一套悬停/按下状态机与绘制函数**（G3 起设计好复用）。
+- **G4 悬停/按下反馈（问题 3 + 5）→ v1.6.0 · ✅ 已出包 `deliverables/曲栏_Barline_v1.6.0.exe`（待真人验收）**：封面悬停＝变暗蒙层 + 左上/右下双箭头（点击整块封面＝打开播放器，沿用 `ClickCover`）；四按钮（含 ×）用户选「**柔和光晕 + 下沉**」——悬停：白底黑影/黑底白光双层低透明度光晕；按下：光晕收紧、图标下沉 1px 并缩到 94%。**× 与四按钮共用同一套悬停/按下状态机与绘制函数**（G3 起设计好复用）。
+  - **流程（专家团队 SOP）**：PM 许清楚增量 PRD（含 5 个待拍板问题）→ 架构师高见远增量设计（独立评审主理人越权起草的 WIP 原型）→ 工程师寇豆码实现 → QA 严过关独立回归。主理人只做编排 / 汇编 / 出包 / 提交。
+  - **用户三项拍板**：① **Q1 = 保留极淡保底**（与 PM 推荐相反）：`hover_bg.a==0` 时四 target 不归零；② **Q2 = 不做动画**，即时反馈，不新增定时器 / 帧驱动 / 轮询；③ **Q4 = 封面双箭头 ↖+↘ 对角外扩**。Q3（× 是否更淡）、Q5（蒙层暗度）留真人验收微调。
+  - **Q1 落地口径（架构师裁定）**：`GLOW_FLOOR_ALPHA=0x06` 是四 target 共享的 `glow_params(hovering, pressed, hover_bg.a)` 强度曲线在 `a→0` 处的**非零下限截距**，不是 × 专属底色；实现 `round(nom*k).max(FLOOR).min(nom)` 逐分量；透明档悬停 `(0x06,0x06,1.0)`、按下 `(0x06,0x06,0.5)`；普通档 70% 悬停 `(0x16,0x08,1.0)`、按下 `(0x20,0x0E,0.5)`；无态恒 `(0,0,1.0)`。`glow_params` **签名无 `HitTarget`、函数体无 `match target`** → 四 target 同值是结构性保证。R6/A5 原「透明档 alpha 全 0」已作废。
+  - **共用一套实现**：`draw_buttons`（三键循环）与 `draw_dismiss`（×）是 `draw_button_feedback` 仅有的两个调用点；旧 `theme.text@0x14` 淡底绘制路径已移除（`painter.rs` 内 `DISMISS_BG*` / `dismiss_bg_rect` grep 为空）；`DISMISS_BG_HOVER/PRESSED/RADIUS` 符号**保留**（`layout.rs` 契约测试锁死，删则违反 461 零删改 + `deny(warnings)`），注释标注「历史契约常量、v1.6.0 起不参与绘制」。
+  - **架构师两处推翻**：① 封面箭头**不用 `theme.text`**（浅壁纸是深色，叠黑蒙层不可见），改「恒暗蒙层 + 恒亮箭头」；② `glow_params` 的 WIP 线性归零实现与 Q1 冲突，推翻重写。
+  - **交付数据**：`470 个 #[test] / 469 passed / 0 failed / 1 ignored`（基线 461 → +9，零删改零放宽）；check/clippy/test/build 四连全绿、clippy 0 警告；版本 5 处 + `Cargo.lock:7` 同步 1.6.0；包体 1,101,312 B、FileVersion/ProductVersion 1.6.0；历史 32 包只增不删。
+  - **QA 结论 `PASS-WITH-NOTES` / 路由 `NoOne` / 可出包**：12 项核查全 PASS；独立复核 4 处工程师偏差（`center` 元组合并 8→7 参行为等价、`fill_arrow` 泛化 `arrow_axis` 使 orientation=0 逐像素不变、`Option<bitmap>` 语义等价、常量具名化无内联魔法数）；零触碰清单（theme/layout/ui/taskbar/main/platform/media）diff 全空，appbar 全屏遮挡 grep 为空。
+  - **参数集中（`limits`，便于逐轮微调）**：`GLOW_FLOOR_ALPHA∈[0x01,0x06]`、`COVER_HOVER_DIM=0x5A`（建议区间 `[0x40,0x80]`）、`COVER_ARROW_ORIENTATION`（0=↖+↘ / 1=↗+↙ / 其它兜底 0）、光晕 alpha/半径/扩张/按下缩放/下沉/箭头尺寸线宽内边距全部具名。
+  - **留档观察（不阻塞，QA）**：① 透明档保底 2.4% 是否可辨、双层同 alpha 的观感（只剩 RGB+半径区分）；② 100% DPI 下 × 与「下一首」光晕净距 2.5px、三键相邻两圆相切（快速横移可能「光圈串」）；③ **disabled 三键悬停仍出光晕**（`draw_button_feedback` 不读 `on`），可能与 `text@0x55` 的半透明图标组合成「看似可点」，真机判断是否需要 `enabled` 门控；④ `fill_arrow` 是 `COVER_ARROW_ORIENTATION` 的第二读取点（与 `cover_arrow_specs` 同源同兜底，当前无错配调用，建议下一轮把 orientation 变入参）；⑤ 本轮零运行时验证，hover/press 像素合成、DPI 抗锯齿、封面蒙层观感只能真人验收。
 - **G5 在线歌词落盘（用户追加）→ v1.7.0**：写到「歌词目录」**第一个**目录下的 `Barline/` 子目录；文件名 `歌手 - 歌名.lrc`（非法字符替换 `_`）；**已存在一律跳过、绝不覆盖**；只写**行级** LRC + `[ti:]/[ar:]/[al:]`，**不写逐字标签**。副作用：导出后走「本地文件命中」，优先级高于缓存，清缓存/换机不丢。
 - **G6 清理（问题 6）→ v1.7.1**：范围＝**死码 + 未引用资源**。已确认在列：`hotkeys.reset1` 死键（`assets/ui/index.html:418/462`）、`SettingsService::is_open()`（`src/settings/mod.rs:93` 零调用）、`event.rs:201` 去抖注释失实、`Effect::RequestBackdrop`/`Effect::MoveWindow` 零发射点、`deliverables/` 多余的 LICENSE/README 副本；删 `assets/`/`docs/` 资源前**必须先把清单给用户确认**。`deliverables/` 的 exe 永不动。
 

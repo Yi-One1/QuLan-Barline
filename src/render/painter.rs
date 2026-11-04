@@ -6,10 +6,10 @@
 //! 2. Clear(全透明)                 ← 不 clear 会残留上一帧（风险 R3）
 //! 3. 命中区占位 alpha = 1           ← 视觉不可见但整块可点（§10.7）
 //! 4. 悬停背景（idle→hover 两态插值，v1.1.12 起常规态也可半透明）
-//! 5. 封面（真实位图 or 渐变占位 + 音符）
+//! 5. 封面（真实位图 or 渐变占位 + 音符；v1.6.0 悬停叠加变暗蒙层 + 双箭头）
 //! 6. 歌名 / 歌手（读 WidgetLayout 里缓存的截断结果）
-//! 7. 三个按钮（含 disabled / pressed 态）
-//! 7.5 右上角关闭 ×（v1.5.0 / G3；v1.5.1 悬停淡底 / 按下加深并下沉 1px）
+//! 7. 三个按钮（含 disabled / 悬停光晕 / 按下下沉+缩放，v1.6.0 / G4）
+//! 7.5 右上角关闭 ×（v1.5.0 / G3；v1.6.0 起与三键共用同一套悬停/按下反馈）
 //! 8. 进度条（静止 2px / 悬停 4px / 拖动时显示气泡）
 //! 9. 歌词占位（M3 换成真歌词与扫光）
 //! 10. HUD 浮层
@@ -198,53 +198,181 @@ fn draw_cover(
     }
     let radius = limits::COVER_RADIUS * s;
 
-    if let Some(cover) = state.playing.cover.as_ref() {
+    // G4：位图分支不再 early return —— 悬停蒙层必须同时盖住真实位图与占位图。
+    // 用 Option 承接位图，本函数内不留任何朝向布尔字面量：
+    // 两次 fill_arrow 的朝向一律由 cover_arrow_specs 派生。
+    let bitmap = if let Some(cover) = state.playing.cover.as_ref() {
         let rt_clone = frame.rt.clone();
         let wic = frame.wic.clone();
-        if let Some(bmp) = covers.get(&rt_clone, &wic, slot, state.playing.track_id, cover) {
-            // 封面在解码阶段就做好的圆角遮罩（见 media::cover），这里直接贴。
-            // SAFETY: bmp 属于本帧目标；目标矩形来自布局。
-            unsafe {
-                rt.DrawBitmap(
-                    &bmp,
-                    Some(&d2d_rect(c.x, c.y, c.w, c.h)),
-                    1.0,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
-            }
-            return Ok(());
+        covers.get(&rt_clone, &wic, slot, state.playing.track_id, cover)
+    } else {
+        None
+    };
+
+    if let Some(bmp) = bitmap {
+        // 封面在解码阶段就做好的圆角遮罩（见 media::cover），这里直接贴。
+        // SAFETY: bmp 属于本帧目标；目标矩形来自布局。
+        unsafe {
+            rt.DrawBitmap(
+                &bmp,
+                Some(&d2d_rect(c.x, c.y, c.w, c.h)),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            );
+        }
+    } else {
+        // 渐变占位：强调色 → 暗色
+        let grad = frame.gradient_base(Rgba::from_rgb(theme.accent, 0xFF))?;
+        // SAFETY: 栈上圆角矩形；grad 由本帧持有。
+        unsafe {
+            rt.FillRoundedRectangle(&rounded(c.x, c.y, c.w, c.h, radius), &grad);
+        }
+
+        // 音符图标（不引入图标字体 / PNG）：符头椭圆 + 符干 + 符尾
+        let fg = frame.brush(Rgba::new(0xFF, 0xFF, 0xFF, 0xC8))?;
+        let (cx, cy) = c.center();
+        let unit = c.w / 32.0;
+        // SAFETY: 全部是几何图元，坐标由布局推导，恒为有限值。
+        unsafe {
+            rt.FillEllipse(
+                &ellipse(cx - 4.0 * unit, cy + 5.0 * unit, 4.2 * unit, 3.2 * unit),
+                &fg,
+            );
+            rt.FillRectangle(
+                &d2d_rect(cx - 0.4 * unit, cy - 9.0 * unit, 1.6 * unit, 14.0 * unit),
+                &fg,
+            );
+            rt.FillRectangle(
+                &d2d_rect(cx + 1.0 * unit, cy - 9.0 * unit, 5.0 * unit, 1.5 * unit),
+                &fg,
+            );
+            rt.FillRectangle(
+                &d2d_rect(cx + 4.4 * unit, cy - 9.0 * unit, 1.6 * unit, 4.0 * unit),
+                &fg,
+            );
         }
     }
 
-    // 渐变占位：强调色 → 暗色
-    let grad = frame.gradient_base(Rgba::from_rgb(theme.accent, 0xFF))?;
-    // SAFETY: 栈上圆角矩形；grad 由本帧持有。
-    unsafe {
-        rt.FillRoundedRectangle(&rounded(c.x, c.y, c.w, c.h, radius), &grad);
-    }
-
-    // 音符图标（不引入图标字体 / PNG）：符头椭圆 + 符干 + 符尾
-    let fg = frame.brush(Rgba::new(0xFF, 0xFF, 0xFF, 0xC8))?;
-    let (cx, cy) = c.center();
-    let unit = c.w / 32.0;
-    // SAFETY: 全部是几何图元，坐标由布局推导，恒为有限值。
-    unsafe {
-        rt.FillEllipse(&ellipse(cx - 4.0 * unit, cy + 5.0 * unit, 4.2 * unit, 3.2 * unit), &fg);
-        rt.FillRectangle(
-            &d2d_rect(cx - 0.4 * unit, cy - 9.0 * unit, 1.6 * unit, 14.0 * unit),
-            &fg,
-        );
-        rt.FillRectangle(
-            &d2d_rect(cx + 1.0 * unit, cy - 9.0 * unit, 5.0 * unit, 1.5 * unit),
-            &fg,
-        );
-        rt.FillRectangle(
-            &d2d_rect(cx + 4.4 * unit, cy - 9.0 * unit, 1.6 * unit, 4.0 * unit),
-            &fg,
-        );
+    // ---- G4：封面悬停 = 恒暗蒙层 + 恒亮双箭头 ----
+    // `hover_target == Cover` 由 `Interaction::on_move` 维护（G3 起就进 frame_hash），
+    // 点击整块封面仍是 `ClickCover`（打开播放器），不新增交互语义。
+    //
+    // 颜色边界（与 R2「按钮光晕同源」不冲突）：按钮光晕是**全窗 hover_bg 的延伸**，
+    // 所以内层取 hover_bg 的 RGB；封面蒙层是**主动叠暗一层**的独立视觉操作，
+    // 前景色由这个固定操作决定 —— 恒暗蒙层 + 恒亮白箭头。若改用 `theme.text`，
+    // 浅壁纸下深色字叠在黑蒙层上会看不见；恒亮箭头在深浅两种壁纸下都成立。
+    if ctx.state.hover_target == Some(HitTarget::Cover) {
+        let (dr, dg, db) = limits::COVER_DIM_RGB;
+        let dim = frame.brush(Rgba::new(dr, dg, db, limits::COVER_HOVER_DIM))?;
+        // SAFETY: 栈上圆角矩形；半径与封面一致，不会溢出封面。
+        unsafe {
+            rt.FillRoundedRectangle(&rounded(c.x, c.y, c.w, c.h, radius), &dim);
+        }
+        let (ar, ag, ab) = limits::COVER_ARROW_RGB;
+        let fg = frame.brush(Rgba::new(ar, ag, ab, limits::COVER_ARROW_ALPHA))?;
+        let size = limits::COVER_ARROW_SIZE * s;
+        let pad = limits::COVER_ARROW_PAD * s;
+        let line = limits::COVER_ARROW_LINE * s;
+        // Q4：朝向只由 COVER_ARROW_ORIENTATION 一处常量决定，本函数不留方向字面量。
+        let specs = cover_arrow_specs(c, pad);
+        fill_arrow(rt, &fg, specs[0].0, specs[0].1, size, line, specs[0].2);
+        fill_arrow(rt, &fg, specs[1].0, specs[1].1, size, line, specs[1].2);
     }
     Ok(())
+}
+
+/// Q4：封面双箭头的两个 `(tip_x, tip_y, down_right)`，**纯函数**、无 D2D 依赖。
+///
+/// 朝向只由 [`limits::COVER_ARROW_ORIENTATION`] 这一处具名常量决定：
+/// - `0`：左上 ↖ + 右下 ↘（对角外扩，当前拍板值）；
+/// - `1`：左下 ↙ + 右上 ↗（另一组对角）；
+/// - 其它值**兜底为 0**。
+///
+/// 返回固定长度 2 的数组，让 [`draw_cover`] 里两次 [`fill_arrow`] 调用完全
+/// 从派生结果取值，不留任何方向字面量；真人验收后改常量一处即整体换向。
+fn cover_arrow_specs(c: RectF, pad: f32) -> [(f32, f32, bool); 2] {
+    cover_arrow_specs_for(c, pad, limits::COVER_ARROW_ORIENTATION)
+}
+
+/// [`cover_arrow_specs`] 的可测内核：`orientation` 由调用方显式给出，
+/// 便于单测穷举 `0 / 1 / 其它值兜底`，而不必改全局常量。
+fn cover_arrow_specs_for(c: RectF, pad: f32, orientation: u8) -> [(f32, f32, bool); 2] {
+    match orientation {
+        1 => [
+            (c.x + pad, c.y + c.h - pad, true), // 左下 tip → ↙（斜杆向右上延伸）
+            (c.x + c.w - pad, c.y + pad, false), // 右上 tip → ↗（斜杆向左下延伸）
+        ],
+        _ => [
+            (c.x + pad, c.y + pad, false), // 左上 tip → ↖
+            (c.x + c.w - pad, c.y + c.h - pad, true), // 右下 tip → ↘
+        ],
+    }
+}
+
+/// Q4：由「唯一朝向常量 + 本支箭头的选择位」推出斜杆从 tip 延伸的方向 `(sx, sy)`；
+/// 箭头指向恒为 `(-sx, -sy)`。`0` 走主对角线（↖ + ↘），`1` 走另一条对角线
+/// （↗ + ↙），其它值兜底为 `0`。
+fn arrow_axis(orientation: u8, down_right: bool) -> (f32, f32) {
+    match orientation {
+        1 => {
+            if down_right {
+                (1.0, -1.0)
+            } else {
+                (-1.0, 1.0)
+            }
+        }
+        _ => {
+            if down_right {
+                (-1.0, -1.0)
+            } else {
+                (1.0, 1.0)
+            }
+        }
+    }
+}
+
+/// 画一个小 45° 箭头（G4 封面悬停用）：斜杆用逐行矩形模拟，端点两翼是直角短线。
+///
+/// `tip` 是箭头尖端；`down_right` 是 [`cover_arrow_specs`] 给出的「本支箭头选择位」，
+/// 与 [`limits::COVER_ARROW_ORIENTATION`] 一起经 [`arrow_axis`] 决定斜杆方向
+/// （`0` 档 ↖/↘，`1` 档 ↗/↙）。与 [`fill_cross`] / [`fill_triangle`]
+/// 保持同一种「纯 `FillRectangle`」风格，不引入 `ID2D1PathGeometry`。
+fn fill_arrow(
+    rt: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    tip_x: f32,
+    tip_y: f32,
+    size: f32,
+    line: f32,
+    down_right: bool,
+) {
+    let (sx, sy) = arrow_axis(limits::COVER_ARROW_ORIENTATION, down_right);
+    // 0.55（翼长比例）/ 0.6（行间重叠消 AA 接缝）/ max(2.0)（最少行数）与
+    // fill_triangle / fill_cross 是同款 AA 实现细节，**非可调视觉参数**。
+    let rows = size.round().max(2.0) as i32;
+    let step = size / rows as f32;
+    let wing = size * 0.55;
+    // SAFETY: 全部是栈上矩形，坐标由有限输入推导。
+    unsafe {
+        for i in 0..rows {
+            let t = (i as f32 + 0.5) / rows as f32;
+            let xx = tip_x + sx * t * size;
+            let yy = tip_y + sy * t * size;
+            rt.FillRectangle(
+                &d2d_rect(xx - line * 0.5, yy - line * 0.5, line, step + 0.6),
+                brush,
+            );
+        }
+        // 两翼构成 "L" 形箭头头：沿斜杆的两个轴向各从 tip 伸出一支。
+        // sx/sy = (1,1) 时逐像素等价于 WIP 的 ↖ 分支，(-1,-1) 等价于 ↘ 分支。
+        let hx = if sx > 0.0 { tip_x } else { tip_x - wing };
+        let hy = if sy > 0.0 { tip_y } else { tip_y - line };
+        let vx = if sx > 0.0 { tip_x } else { tip_x - line };
+        let vy = if sy > 0.0 { tip_y } else { tip_y - wing };
+        rt.FillRectangle(&d2d_rect(hx, hy, wing, line), brush);
+        rt.FillRectangle(&d2d_rect(vx, vy, line, wing), brush);
+    }
 }
 
 // ------------------------------------------------------------------ 文字
@@ -332,7 +460,172 @@ fn draw_line(
     Ok(())
 }
 
-// ------------------------------------------------------------------ 按钮
+// ------------------------------------------------------------------ 按钮（v1.6.0 / G4 统一反馈）
+
+/// 单个按钮（播控三键或关闭 ×）的交互视觉状态。
+///
+/// G4 要求「× 与四按钮共用同一套悬停/按下状态机与绘制函数」：三键的
+/// `draw_buttons` 与 × 的 `draw_dismiss` 都只经 [`ButtonVisual::new`] 读状态、
+/// 都只经 [`draw_button_feedback`] 画光晕，不再各写一份 `if hovering`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ButtonVisual {
+    hovering: bool,
+    pressed: bool,
+}
+
+impl ButtonVisual {
+    fn new(state: &AppState, target: HitTarget) -> Self {
+        Self {
+            hovering: state.hover_target == Some(target),
+            pressed: state.pressed == Some(target),
+        }
+    }
+
+    /// 是否要画光晕（悬停或按下；Q1 的极淡保底由 [`glow_params`] 统一给出，
+    /// 这里不读背景档位、也不按 target 分支）。
+    fn glowing(self) -> bool {
+        self.hovering || self.pressed
+    }
+
+    /// 按下时图标整体下沉量（物理像素）。
+    fn sink(self, s: f32) -> f32 {
+        if self.pressed {
+            limits::BUTTON_PRESSED_SINK * s
+        } else {
+            0.0
+        }
+    }
+
+    /// 按下时图标等比缩放系数（1.0 = 原尺寸）。
+    fn icon_scale(self) -> f32 {
+        if self.pressed {
+            limits::BUTTON_PRESSED_SCALE
+        } else {
+            1.0
+        }
+    }
+}
+
+/// 双层光晕的绘制参数（把原先的三元组具名化，避免调用点靠位置猜语义）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GlowParams {
+    inner_alpha: u8,
+    outer_alpha: u8,
+    grow_factor: f32,
+}
+
+impl GlowParams {
+    const fn new(inner_alpha: u8, outer_alpha: u8, grow_factor: f32) -> Self {
+        Self {
+            inner_alpha,
+            outer_alpha,
+            grow_factor,
+        }
+    }
+}
+
+/// 纯函数：把「悬停 / 按下 + 全窗悬停背景 alpha」换算成双层光晕参数。
+///
+/// **唯一强度输入是 `theme.hover_bg.a`**（不读 `BackgroundMode` 枚举）；
+/// 色源天然同源：透明档只把 alpha 归零、`hover_bg` 的 RGB 基色完整保留
+/// （见 `theme::apply_bg_config`），所以只需修 alpha 这一个维度。
+///
+/// Q1 用户拍板「保留极淡保底」：逐分量 `.max(GLOW_FLOOR_ALPHA)`，即强度曲线
+/// 在 `a → 0` 处的**非零下限截距** —— 始终透明档下四 target（含 ×）仍有极淡
+/// 光晕，**不是**「仅在 a == 0 时整体覆盖」，也**不会**归零；`.min(nom)`
+/// 保证满档不超过常量上限。无态恒 `(0, 0, 1.0)`，保底不作用于无态（否则常亮）。
+///
+/// 函数签名与函数体都不含 `HitTarget`：四 target 同值是**结构性保证**，
+/// 不是靠调用方自觉。
+fn glow_params(hovering: bool, pressed: bool, hover_bg_a: u8) -> GlowParams {
+    if !hovering && !pressed {
+        return GlowParams::new(0, 0, 1.0);
+    }
+    let (inner_nom, outer_nom) = if pressed {
+        (limits::GLOW_INNER_PRESSED, limits::GLOW_OUTER_PRESSED)
+    } else {
+        (limits::GLOW_INNER_HOVER, limits::GLOW_OUTER_HOVER)
+    };
+    let k = f32::from(hover_bg_a) / 255.0;
+    let scaled = |nom: u8| -> u8 {
+        ((f32::from(nom) * k).round() as u8)
+            .max(limits::GLOW_FLOOR_ALPHA)
+            .min(nom)
+    };
+    GlowParams::new(
+        scaled(inner_nom),
+        scaled(outer_nom),
+        if pressed {
+            limits::GLOW_GROW_PRESSED_FACTOR
+        } else {
+            1.0
+        },
+    )
+}
+
+/// 双层光晕的颜色：内层「底」取全窗悬停背景的 RGB（同源），
+/// 外层「影 / 光」取 `on_light` 的对比色 —— 浅壁纸＝白底黑影、深壁纸＝黑底白光。
+///
+/// 透明档 `hover_bg.a == 0` 时 RGB 仍完整取自 `hover_bg`（基色保留），故
+/// 同色源结论在两档下都成立；alpha 才由 [`glow_params`] 单独缩放。
+fn glow_colors(theme: &Theme) -> (Rgba, Rgba) {
+    let base = Rgba::new(theme.hover_bg.r, theme.hover_bg.g, theme.hover_bg.b, 0xFF);
+    let halo = if theme.on_light {
+        Rgba::new(0x00, 0x00, 0x00, 0xFF)
+    } else {
+        Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)
+    };
+    (base, halo)
+}
+
+/// 画统一的双层柔和光晕（三键与 × 共用），并返回该按钮的交互态。
+///
+/// `center` 取图标中心（`(cx, cy)` 合成一个元组，让参数数守住 clippy 的 7 参上限，
+/// 几何含义与拆开写完全一致）；`radius` / `grow` 是**几何参数**（28×28 三键 vs
+/// 14×14 × 命中区各自收敛），**非反馈强度**：alpha 与颜色一律不按 `target` 分支，
+/// 两者只由 [`glow_params`] / [`glow_colors`] 决定。
+/// 光晕是椭圆而非命中区矩形，因此 ×（14×14）与三键（28×28）能按各自尺寸
+/// 取半径、又共用同一套画法。
+fn draw_button_feedback(
+    rt: &ID2D1RenderTarget,
+    frame: &mut Frame,
+    ctx: &Ctx<'_>,
+    target: HitTarget,
+    center: (f32, f32),
+    radius: f32,
+    grow: f32,
+) -> Result<ButtonVisual> {
+    let (cx, cy) = center;
+    let v = ButtonVisual::new(ctx.state, target);
+    if !v.glowing() {
+        return Ok(v);
+    }
+    let GlowParams {
+        inner_alpha: inner_a,
+        outer_alpha: outer_a,
+        grow_factor: grow_k,
+    } = glow_params(v.hovering, v.pressed, ctx.theme.hover_bg.a);
+    if inner_a == 0 && outer_a == 0 {
+        // 仅当常量被误配（GLOW_FLOOR_ALPHA == 0 且四个 nom 全为 0）时才可能到达；
+        // Q1 保底后正常路径不经过此处。保留它是为了明确「保底逻辑不在这里」。
+        return Ok(v);
+    }
+    let (base, halo) = glow_colors(&ctx.theme);
+    let r = radius * ctx.scale;
+    let outer_r = r + grow * ctx.scale * grow_k;
+    // SAFETY: 椭圆与笔刷都是栈上值 / 本帧持有；半径恒为正且有限。
+    unsafe {
+        if outer_a > 0 {
+            let brush = frame.brush(Rgba { a: outer_a, ..halo })?;
+            rt.FillEllipse(&ellipse(cx, cy, outer_r, outer_r), &brush);
+        }
+        if inner_a > 0 {
+            let brush = frame.brush(Rgba { a: inner_a, ..base })?;
+            rt.FillEllipse(&ellipse(cx, cy, r, r), &brush);
+        }
+    }
+    Ok(v)
+}
 
 fn draw_buttons(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
     let (layout, state, theme, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.scale);
@@ -349,12 +642,27 @@ fn draw_buttons(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Res
     ];
 
     for (target, rect, on) in items {
+        let (cx, cy) = rect.center();
+        // G4：三键与 × 共用同一套悬停/按下反馈（双层光晕 + 下沉 + 等比缩放）。
+        // 几何边界（架构师已算，写进注释备查）：三键外圈 (11+3)*s = 14*s 恰为
+        // 28×28 命中区半边；光晕左缘与歌名/歌手右缘净距 8*s、与进度条垂直
+        // 间隔 4px，不盖文字、不盖进度条。alpha / 颜色不按 target 分支。
+        let v = draw_button_feedback(
+            rt,
+            frame,
+            ctx,
+            target,
+            (cx, cy),
+            limits::GLOW_RADIUS_BUTTON,
+            limits::GLOW_GROW_BUTTON,
+        )?;
         let color = if on { enabled } else { disabled };
         let brush = frame.brush(color)?;
-        // 按下态：图标整体下沉 1px，给出即时反馈
-        let sink = if state.pressed == Some(target) { 1.0 * s } else { 0.0 };
-        let (cx, cy) = rect.center();
-        let icon = limits::BTN_ICON * s;
+        let sink = v.sink(s);
+        // 按下等比缩到 94%：内部所有硬编码偏移同乘 k，图标形状不变；
+        // k == 1 时与 v1.5.6 的逐像素输出完全一致（不引入 DPI 行为变化）。
+        let k = v.icon_scale();
+        let icon = limits::BTN_ICON * s * k;
         let x = cx - icon * 0.5;
         let y = cy - icon * 0.5 + sink;
 
@@ -363,27 +671,62 @@ fn draw_buttons(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Res
             match target {
                 HitTarget::Prev => {
                     // 竖条 + 左向三角
-                    rt.FillRectangle(&d2d_rect(x + 1.0, y + 1.5, 2.2, icon - 3.0), &brush);
-                    fill_triangle(rt, &brush, x + 4.2, y + 1.5, icon - 5.6, icon - 3.0, false);
+                    rt.FillRectangle(
+                        &d2d_rect(x + 1.0 * k, y + 1.5 * k, 2.2 * k, icon - 3.0 * k),
+                        &brush,
+                    );
+                    fill_triangle(
+                        rt,
+                        &brush,
+                        x + 4.2 * k,
+                        y + 1.5 * k,
+                        icon - 5.6 * k,
+                        icon - 3.0 * k,
+                        false,
+                    );
                 }
                 HitTarget::Next => {
-                    fill_triangle(rt, &brush, x + 1.4, y + 1.5, icon - 5.6, icon - 3.0, true);
+                    fill_triangle(
+                        rt,
+                        &brush,
+                        x + 1.4 * k,
+                        y + 1.5 * k,
+                        icon - 5.6 * k,
+                        icon - 3.0 * k,
+                        true,
+                    );
                     rt.FillRectangle(
-                        &d2d_rect(x + icon - 3.2, y + 1.5, 2.2, icon - 3.0),
+                        &d2d_rect(
+                            x + icon - 3.2 * k,
+                            y + 1.5 * k,
+                            2.2 * k,
+                            icon - 3.0 * k,
+                        ),
                         &brush,
                     );
                 }
                 _ => {
                     if playing {
                         // 暂停：两根竖条
-                        rt.FillRectangle(&d2d_rect(x + 4.0, y + 1.5, 3.0, icon - 3.0), &brush);
                         rt.FillRectangle(
-                            &d2d_rect(x + 9.0, y + 1.5, 3.0, icon - 3.0),
+                            &d2d_rect(x + 4.0 * k, y + 1.5 * k, 3.0 * k, icon - 3.0 * k),
+                            &brush,
+                        );
+                        rt.FillRectangle(
+                            &d2d_rect(x + 9.0 * k, y + 1.5 * k, 3.0 * k, icon - 3.0 * k),
                             &brush,
                         );
                     } else {
                         // 播放：右向三角
-                        fill_triangle(rt, &brush, x + 4.6, y + 1.5, icon - 6.0, icon - 3.0, true);
+                        fill_triangle(
+                            rt,
+                            &brush,
+                            x + 4.6 * k,
+                            y + 1.5 * k,
+                            icon - 6.0 * k,
+                            icon - 3.0 * k,
+                            true,
+                        );
                     }
                 }
             }
@@ -437,70 +780,49 @@ fn fill_triangle(
 ///   所以这里**直接写字面量 `0xFF`**（与 `draw_buttons` 的 enabled 同源），
 ///   让「两个值可能漂移」在代码层面也不可能发生。用户看到的「淡」是**笔画太细**
 ///   造成的覆盖率损失，由 `limits::DISMISS_LINE = 1.2` 解决；
-/// - **因此不能再靠"变亮"做悬停反馈**——已经满不透明就没有余量。改为在
-///   `hit_dismiss` 那一格里铺一层**极淡圆角底**：悬停 `theme.text @ 0x14`（≈8%）、
-///   按下 `0x22`（≈13%），圆角 `4 * scale`。这是 Win11 任务栏图标悬停的常规做法：
-///   **不是**描边、**不是**光晕、**不**向外扩（底矩形取自 `dismiss_bg_rect()`，
-///   语义上恒等于 `hit_dismiss`，几何契约由 `layout::tests` 锁住）；
-/// - 按下除了加深底色，字形整体下沉 `1 * scale`（与三键同一套手感）；
-/// - 完整的光晕 / 缩放留 G4 —— 布局里的 `dismiss` / `hit_dismiss` 与
-///   `hover_target` / `pressed` 字段已经建好，G4 直接复用，不再改数据流。
+/// - **v1.6.0 / G4**：v1.5.1 那层 `theme.text @ 0x14` 极淡圆角底已废弃 —— 它与
+///   全窗 `hover_bg` / `on_light` 不同源，透明档下会出现「全局悬停消失但 × 仍亮」
+///   （QA 遗留）。现在 × 与三键共用 [`draw_button_feedback`] 的双层柔和光晕：
+///   内层「底」取 `hover_bg` 的 RGB、外层「影/光」按 `on_light` 取对比色，
+///   两层 alpha 都随 `hover_bg.a` 缩放**且有保底下限**（Q1：透明档下仍有
+///   `GLOW_FLOOR_ALPHA` 的极淡反馈，不是归零淡出）；半径按 14×14 热区收敛到
+///   [`limits::GLOW_RADIUS_DISMISS`]；
+/// - 按下：光晕外圈收紧到一半、字形整体下沉 `1 * scale` 并等比缩到 94%，
+///   与三键同一套 [`ButtonVisual`] 状态机；
+/// - 几何边界（架构师已算）：× 外圈 `(5+1.5)*s = 6.5*s` < 14×14 半边 `7*s`，
+///   与「下一首」光晕净距 `2.5*s` 不重叠（100% DPI 是否视觉粘连留真机验收）；
+/// - 单独保留本函数只是因为 × 的字形（[`fill_cross`]）与播控图标形状不同，
+///   **交互反馈本身没有第二套实现**。
 fn draw_dismiss(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Result<()> {
-    let (layout, state, theme, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.scale);
+    let (layout, theme, s) = (ctx.layout, &ctx.theme, ctx.scale);
     let glyph = layout.dismiss;
     if glyph.is_empty() {
         return Ok(());
     }
 
-    let hovering = state.hover_target == Some(HitTarget::Dismiss);
-    let pressed = state.pressed == Some(HitTarget::Dismiss);
+    let (gcx, gcy) = glyph.center();
+    // G4：与三键共用同一套悬停/按下状态机与绘制函数；半径/扩张按 14×14 热区收敛。
+    let v = draw_button_feedback(
+        rt,
+        frame,
+        ctx,
+        HitTarget::Dismiss,
+        (gcx, gcy),
+        limits::GLOW_RADIUS_DISMISS,
+        limits::GLOW_GROW_DISMISS,
+    )?;
 
-    // ---- 1. 悬停 / 按下的极淡圆角底（v1.5.1）----
-    // 只在 `hit_dismiss` 那一格里画：底矩形 = `dismiss_bg_rect()`，绝不外扩，
-    // 因此天然与 `hit_next` 保持 DISMISS_GAP 的净距。
-    let bg_alpha = if pressed {
-        limits::DISMISS_BG_PRESSED
-    } else if hovering {
-        limits::DISMISS_BG_HOVER
-    } else {
-        0
-    };
-    if bg_alpha > 0 {
-        let bg = layout.dismiss_bg_rect();
-        if !bg.is_empty() {
-            // 圆角钳到短边一半：D2D 对 radius > 半边长 的圆角矩形会画成胶囊/异常。
-            let radius = (limits::DISMISS_BG_RADIUS * s).min(bg.w.min(bg.h) * 0.5);
-            let bg_brush = frame.brush(Rgba::from_rgb(theme.text, bg_alpha))?;
-            // SAFETY: 栈上圆角矩形；坐标全部有限；brush 由本帧持有。
-            unsafe {
-                rt.FillRoundedRectangle(&rounded(bg.x, bg.y, bg.w, bg.h, radius), &bg_brush);
-            }
-        }
-    }
-
-    // ---- 2. 字形：常态即满不透明（不再有 0xCC → 0xFF 的变亮）----
-    //
-    // v1.5.4（用户反馈「× 的不透明度还是改为和按钮"下一首"一致」）：
-    // `draw_buttons` 的 enabled 态是 `Rgba::from_rgb(theme.text, 0xFF)`，这里
-    // **写成同一个字面量** 0xFF（不用 `limits::DISMISS_ALPHA`），好处是任何一方
-    // 想改 alpha 都必须同时改两处、评审一眼可见 —— 「两个常量各自漂移」这种
-    // 隐患在代码层面就不存在了。`limits::DISMISS_ALPHA` 保留为语义占位并恒等于它。
-    // 用户之所以觉得 × 更淡，真正原因是笔画宽度（见 `limits::DISMISS_LINE`
-    // 与下面的 `fill_cross`），alpha 一个 bit 都不差。
+    // 字形：常态即满不透明（与 draw_buttons 的 enabled 态同一个字面量 0xFF）。
+    // 用户曾觉得 × 更淡，真正原因是笔画宽度（见 limits::DISMISS_LINE），不是 alpha。
     let brush = frame.brush(Rgba::from_rgb(theme.text, 0xFF))?;
 
-    // 按下：整体下沉 1px（与三键同一口径：`1.0 * scale`）
-    let sink = if pressed { 1.0 * s } else { 0.0 };
-
-    let side = glyph.w.min(glyph.h);
-    fill_cross(
-        rt,
-        &brush,
-        glyph.x,
-        glyph.y + sink,
-        side,
-        limits::DISMISS_LINE * s,
-    );
+    // 按下：整体下沉 1px + 等比缩到 94%，以字形中心为锚点保持居中。
+    let k = v.icon_scale();
+    let sink = v.sink(s);
+    let side = glyph.w.min(glyph.h) * k;
+    let x = gcx - side * 0.5;
+    let y = gcy - side * 0.5 + sink;
+    fill_cross(rt, &brush, x, y, side, limits::DISMISS_LINE * s * k);
     Ok(())
 }
 
@@ -1004,6 +1326,8 @@ fn push_mmss(out: &mut String, ms: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::layout::{compute, TaskbarEdge, WidgetForm};
+    use crate::render::theme::BackgroundMode;
 
     #[test]
     fn time_pair_formats_with_leading_zeros() {
@@ -1052,5 +1376,458 @@ mod tests {
             assert!((0.0..=excess).contains(&o), "越界：t={t} o={o}");
             prev = o;
         }
+    }
+
+    // ------------------------------------------- v1.6.0 / G4 悬停反馈统一
+
+    /// 双层光晕参数真值表（A5 五条）：① 保底常量 ② 透明档保底 ③ 无态不常亮
+    /// ④ 四 target 一致性 ⑤ `glow_colors` 恒定；并钉住 `a=0xFF` / `a=0xB3` 期望值。
+    #[test]
+    fn glow_params_truth_table() {
+        let p = limits::GLOW_FLOOR_ALPHA;
+        // ① Q1 保底常量必须为正，且不超过硬上界 0x06
+        assert!(p > 0 && p <= 0x06, "Q1 保底必须为正且 ≤ 0x06");
+        assert_eq!(p, 0x06, "本轮拍板值；真人验收微调请同步此断言");
+
+        // ③ 无态：任意档位恒不画，保底不作用于无态（否则按钮常亮）
+        for a in [0u8, 0x40, 0xB3, 0xFF] {
+            assert_eq!(
+                glow_params(false, false, a),
+                GlowParams::new(0, 0, 1.0),
+                "无态 a={a}"
+            );
+        }
+        assert_eq!(glow_params(false, false, 0), GlowParams::new(0, 0, 1.0));
+
+        // ② 透明档 Q1 保底：inner == outer == P（双层靠 RGB + 半径区分），
+        //    光晕始终保留极淡反馈、强度仍随全窗档位缩放。
+        assert_eq!(glow_params(true, false, 0), GlowParams::new(p, p, 1.0));
+        assert_eq!(glow_params(true, true, 0), GlowParams::new(p, p, 0.5));
+        assert_eq!(glow_params(false, true, 0), GlowParams::new(p, p, 0.5));
+
+        // 普通档 70% → hover_bg.a = alpha_pct(70) = 0xB3 = 179
+        assert_eq!(glow_params(true, false, 0xB3), GlowParams::new(0x16, 0x08, 1.0));
+        assert_eq!(glow_params(true, true, 0xB3), GlowParams::new(0x20, 0x0E, 0.5));
+
+        // 满档：悬停 / 按下 / 按下但指针拖走仍按着
+        assert_eq!(glow_params(true, false, 0xFF), GlowParams::new(0x20, 0x0C, 1.0));
+        assert_eq!(glow_params(true, true, 0xFF), GlowParams::new(0x2E, 0x14, 0.5));
+        assert_eq!(glow_params(false, true, 0xFF), GlowParams::new(0x2E, 0x14, 0.5));
+        assert_eq!(
+            glow_params(true, false, 0xFF),
+            GlowParams::new(limits::GLOW_INNER_HOVER, limits::GLOW_OUTER_HOVER, 1.0)
+        );
+        assert_eq!(
+            glow_params(true, true, 0xFF),
+            GlowParams::new(
+                limits::GLOW_INNER_PRESSED,
+                limits::GLOW_OUTER_PRESSED,
+                limits::GLOW_GROW_PRESSED_FACTOR,
+            )
+        );
+
+        // 半透明档按曲线缩放，恒落在 [P, nom] 内
+        let mid = glow_params(true, false, 0x80);
+        assert!(mid.inner_alpha >= p && mid.inner_alpha < limits::GLOW_INNER_HOVER);
+        assert!(mid.outer_alpha >= p && mid.outer_alpha <= limits::GLOW_OUTER_HOVER);
+        assert_eq!(mid.grow_factor, 1.0);
+
+        // ④ 四 target 一致性：经 ButtonVisual::new 走真实状态通道
+        let targets = [
+            HitTarget::Prev,
+            HitTarget::Toggle,
+            HitTarget::Next,
+            HitTarget::Dismiss,
+        ];
+        for &t in &targets {
+            let mut st = AppState::default();
+            st.hover_target = Some(t);
+            let v = ButtonVisual::new(&st, t);
+            assert_eq!(
+                glow_params(v.hovering, v.pressed, 0),
+                glow_params(true, false, 0),
+                "{t:?} 悬停"
+            );
+            st.pressed = Some(t);
+            let v = ButtonVisual::new(&st, t);
+            assert_eq!(
+                glow_params(v.hovering, v.pressed, 0xFF),
+                glow_params(true, true, 0xFF),
+                "{t:?} 按下"
+            );
+        }
+
+        // ⑤ glow_colors 对两壁纸 / 两档 / 三态恒定，且 base 恒取 hover_bg 的 RGB
+        let accent = crate::media::Rgb::SYSTEM_ACCENT_FALLBACK;
+        for (on_light, luma) in [(true, 0.9f32), (false, 0.02f32)] {
+            for mode in [BackgroundMode::Translucent, BackgroundMode::Transparent] {
+                let theme = Theme::from_backdrop_on(
+                    on_light,
+                    luma,
+                    accent,
+                    mode,
+                    BackgroundMode::Transparent,
+                    70,
+                    50,
+                );
+                let expected = glow_colors(&theme);
+                for (h, pr) in [(false, false), (true, false), (true, true)] {
+                    let _ = glow_params(h, pr, theme.hover_bg.a);
+                    assert_eq!(glow_colors(&theme), expected, "glow_colors 与三态无关");
+                }
+                assert_eq!(
+                    (expected.0.r, expected.0.g, expected.0.b),
+                    (theme.hover_bg.r, theme.hover_bg.g, theme.hover_bg.b),
+                    "内层底恒取 hover_bg 的 RGB（含透明档）"
+                );
+            }
+        }
+    }
+
+    /// 光晕颜色与全窗 `hover_bg` / `on_light` 同源（QA v1.5.1 遗留的正面守卫）。
+    #[test]
+    fn glow_colors_follow_hover_bg_and_on_light() {
+        let accent = crate::media::Rgb::SYSTEM_ACCENT_FALLBACK;
+        let light = Theme::from_backdrop_on(
+            true,
+            0.9,
+            accent,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        let dark = Theme::from_backdrop_on(
+            false,
+            0.02,
+            accent,
+            BackgroundMode::Translucent,
+            BackgroundMode::Transparent,
+            70,
+            50,
+        );
+        for (theme, want_halo) in [
+            (light, Rgba::new(0, 0, 0, 0xFF)),
+            (dark, Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)),
+        ] {
+            let (base, halo) = glow_colors(&theme);
+            assert_eq!(
+                (base.r, base.g, base.b),
+                (theme.hover_bg.r, theme.hover_bg.g, theme.hover_bg.b),
+                "内层底必须取全窗 hover_bg 的 RGB"
+            );
+            assert_eq!(halo, want_halo, "外层影/光必须由 on_light 决定");
+        }
+        // 浅壁纸 = 白底黑影、深壁纸 = 黑底白光
+        let (lb, _) = glow_colors(&light);
+        let (db, _) = glow_colors(&dark);
+        assert!(lb.r > 0xE0 && db.r < 0x40, "浅底应近白、深底应近黑");
+
+        // Q1 补强：透明档 alpha 归零但 RGB 基色完整保留，故 base 仍取 hover_bg 的 RGB，
+        // 「四 target 与全窗同源」在透明档下同样成立（不是黑色 / 不是 text 色）。
+        for (on_light, luma, want_rgb) in [
+            (true, 0.9f32, (0xF2u8, 0xF2u8, 0xF4u8)),
+            (false, 0.02f32, (0x1Au8, 0x1Au8, 0x1Eu8)),
+        ] {
+            let t = Theme::from_backdrop_on(
+                on_light,
+                luma,
+                accent,
+                BackgroundMode::Transparent,
+                BackgroundMode::Transparent,
+                70,
+                50,
+            );
+            assert_eq!(t.hover_bg.a, 0, "透明档 alpha 必须为 0");
+            let (base, _) = glow_colors(&t);
+            assert_eq!(
+                (base.r, base.g, base.b),
+                want_rgb,
+                "透明档 RGB 基色必须完整保留"
+            );
+            assert_eq!(
+                (base.r, base.g, base.b),
+                (t.hover_bg.r, t.hover_bg.g, t.hover_bg.b),
+                "透明档 base 仍取 hover_bg 的 RGB"
+            );
+        }
+    }
+
+    /// 按钮交互态：只有按下才下沉 / 缩放，悬停本身不改图标几何。
+    #[test]
+    fn button_visual_sink_and_scale_truth_table() {
+        for (hovering, pressed) in [(false, false), (true, false), (false, true), (true, true)] {
+            let v = ButtonVisual { hovering, pressed };
+            assert_eq!(v.glowing(), hovering || pressed);
+            assert_eq!(
+                v.icon_scale(),
+                if pressed { limits::BUTTON_PRESSED_SCALE } else { 1.0 }
+            );
+            assert_eq!(
+                v.sink(2.0),
+                if pressed { limits::BUTTON_PRESSED_SINK * 2.0 } else { 0.0 }
+            );
+        }
+    }
+
+    /// 常量自洽：外层恒淡于内层、按下加深并收紧、Q1 保底 / 椭圆几何 / Q4 / Q5。
+    #[test]
+    fn g4_constants_are_self_consistent() {
+        assert!(limits::GLOW_OUTER_HOVER < limits::GLOW_INNER_HOVER);
+        assert!(limits::GLOW_OUTER_PRESSED < limits::GLOW_INNER_PRESSED);
+        assert!(limits::GLOW_INNER_PRESSED > limits::GLOW_INNER_HOVER);
+        assert!(limits::GLOW_GROW_BUTTON > 0.0 && limits::GLOW_GROW_DISMISS > 0.0);
+        // Q1：保底 ∈ (0, 0x06]，0x06 是硬上界；按下扩张比例 ∈ (0, 1)
+        assert!(limits::GLOW_FLOOR_ALPHA > 0 && limits::GLOW_FLOOR_ALPHA <= 0x06);
+        assert!(
+            limits::GLOW_GROW_PRESSED_FACTOR > 0.0 && limits::GLOW_GROW_PRESSED_FACTOR < 1.0
+        );
+        assert_eq!(limits::GLOW_GROW_PRESSED_FACTOR, 0.5);
+        // 椭圆几何边界：三键命中区 28×28（半边 14），× 命中区 14×14（半边 7）
+        assert!(limits::GLOW_RADIUS_BUTTON + limits::GLOW_GROW_BUTTON <= 14.0);
+        assert!(limits::GLOW_RADIUS_DISMISS + limits::GLOW_GROW_DISMISS <= 7.0);
+        assert!((0.90..1.0).contains(&limits::BUTTON_PRESSED_SCALE));
+        assert!(limits::BUTTON_PRESSED_SINK > 0.0);
+        // Q4：本轮只实现 0/1 两个对角朝向；Q5：蒙层暗度微调区间 [0x40, 0x80]
+        assert!(limits::COVER_ARROW_ORIENTATION <= 1, "只做 0/1 两个对角朝向");
+        assert!((0x40..=0x80).contains(&limits::COVER_HOVER_DIM), "Q5 区间");
+        assert_eq!(limits::COVER_DIM_RGB, (0x00, 0x00, 0x00));
+        assert_eq!(limits::COVER_ARROW_RGB, (0xFF, 0xFF, 0xFF));
+        assert!(limits::COVER_ARROW_ALPHA > 0);
+        assert!(limits::COVER_HOVER_DIM > 0 && limits::COVER_HOVER_DIM < 0xC0);
+        assert!(limits::COVER_ARROW_SIZE > 0.0 && limits::COVER_ARROW_PAD > 0.0);
+    }
+
+    /// alpha 缩放单调不减、Q1 下界恒为 P、满档不超过常量上限。
+    #[test]
+    fn glow_alpha_scaling_is_monotonic_and_bounded() {
+        let p = limits::GLOW_FLOOR_ALPHA;
+        // 显式钉住 a=0 的下界为 P，消除「prev=0 隐含归零」的旧假设
+        let first = glow_params(true, false, 0);
+        assert_eq!(first.inner_alpha, p);
+        assert_eq!(first.outer_alpha, p);
+        assert_eq!(first.grow_factor, 1.0);
+
+        let (mut prev_i, mut prev_o) = (p, p);
+        for a in 0..=255u8 {
+            let g = glow_params(true, false, a);
+            assert!(g.inner_alpha >= prev_i && g.outer_alpha >= prev_o, "a={a} 不能回退");
+            assert!(g.inner_alpha >= p && g.outer_alpha >= p, "a={a} 不得跌破 Q1 保底");
+            assert!(
+                g.inner_alpha <= limits::GLOW_INNER_HOVER
+                    && g.outer_alpha <= limits::GLOW_OUTER_HOVER
+            );
+            (prev_i, prev_o) = (g.inner_alpha, g.outer_alpha);
+        }
+        assert_eq!(prev_i, limits::GLOW_INNER_HOVER);
+        assert_eq!(prev_o, limits::GLOW_OUTER_HOVER);
+
+        // 按下态走同一条曲线：下界仍是 P、满档不超上限、外圈恒定收紧
+        let (mut prev_i, mut prev_o) = (p, p);
+        for a in 0..=255u8 {
+            let g = glow_params(true, true, a);
+            assert!(g.inner_alpha >= prev_i && g.outer_alpha >= prev_o, "a={a} 不能回退");
+            assert!(g.inner_alpha >= p && g.outer_alpha >= p, "a={a} 不得跌破 Q1 保底");
+            assert!(
+                g.inner_alpha <= limits::GLOW_INNER_PRESSED
+                    && g.outer_alpha <= limits::GLOW_OUTER_PRESSED
+            );
+            assert_eq!(g.grow_factor, limits::GLOW_GROW_PRESSED_FACTOR);
+            (prev_i, prev_o) = (g.inner_alpha, g.outer_alpha);
+        }
+        assert_eq!(prev_i, limits::GLOW_INNER_PRESSED);
+        assert_eq!(prev_o, limits::GLOW_OUTER_PRESSED);
+    }
+
+    /// 4 target × 3 态 × 2 壁纸 × 2 档 = 48 组合的穷举矩阵。
+    #[test]
+    fn g4_glow_matrix_four_targets_two_wallpapers_two_modes() {
+        let p = limits::GLOW_FLOOR_ALPHA;
+        let targets = [
+            HitTarget::Prev,
+            HitTarget::Toggle,
+            HitTarget::Next,
+            HitTarget::Dismiss,
+        ];
+        let states: [(bool, bool); 3] = [(false, false), (true, false), (true, true)];
+        let accent = crate::media::Rgb::SYSTEM_ACCENT_FALLBACK;
+        let mut combos = 0usize;
+
+        for (on_light, luma) in [(true, 0.9f32), (false, 0.02f32)] {
+            for mode in [BackgroundMode::Translucent, BackgroundMode::Transparent] {
+                let theme = Theme::from_backdrop_on(
+                    on_light,
+                    luma,
+                    accent,
+                    mode,
+                    BackgroundMode::Transparent,
+                    70,
+                    50,
+                );
+                let a = theme.hover_bg.a;
+                assert_eq!(
+                    a == 0,
+                    mode == BackgroundMode::Transparent,
+                    "档位与 hover_bg.a 必须一致"
+                );
+                let (base, halo) = glow_colors(&theme);
+                let want_halo = if on_light {
+                    Rgba::new(0, 0, 0, 0xFF)
+                } else {
+                    Rgba::new(0xFF, 0xFF, 0xFF, 0xFF)
+                };
+                assert_eq!(halo, want_halo, "两壁纸 halo 必须翻转");
+                assert_eq!(
+                    (base.r, base.g, base.b),
+                    (theme.hover_bg.r, theme.hover_bg.g, theme.hover_bg.b),
+                    "base 恒取 hover_bg.rgb（含透明档）"
+                );
+
+                for &(hovering, pressed) in &states {
+                    let reference = glow_params(hovering, pressed, a);
+                    if !hovering && !pressed {
+                        assert_eq!(reference, GlowParams::new(0, 0, 1.0), "无态全 0");
+                    } else if mode == BackgroundMode::Transparent {
+                        assert_eq!(reference.inner_alpha, p, "透明档 inner 保底");
+                        assert_eq!(reference.outer_alpha, p, "透明档 outer 保底");
+                        assert!(p > 0 && p <= 0x06);
+                    }
+                    // glow_colors 对三态 / 两档恒定
+                    assert_eq!(glow_colors(&theme), (base, halo), "颜色与三态/档位无关");
+
+                    for &t in &targets {
+                        let mut st = AppState::default();
+                        if hovering {
+                            st.hover_target = Some(t);
+                        }
+                        if pressed {
+                            st.pressed = Some(t);
+                        }
+                        let v = ButtonVisual::new(&st, t);
+                        assert_eq!(v.hovering, hovering, "{t:?} hovering");
+                        assert_eq!(v.pressed, pressed, "{t:?} pressed");
+                        let g = glow_params(v.hovering, v.pressed, a);
+                        assert_eq!(g, reference, "{t:?} 必须与其它 target 同值");
+                        combos += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(combos, 48, "4 target × 3 态 × 2 壁纸 × 2 档 = 48");
+    }
+
+    /// 结构性保证：函数签名 / 函数体不含 `HitTarget` 分支，四 target 组合恒同值。
+    #[test]
+    fn glow_params_is_target_agnostic() {
+        // 说明：`glow_params(bool, bool, u8) -> GlowParams` 无 HitTarget 参数，
+        // 函数体也无 `match target`；四 target 同值靠签名结构保证，不靠调用方自觉。
+        let targets = [
+            HitTarget::Prev,
+            HitTarget::Toggle,
+            HitTarget::Next,
+            HitTarget::Dismiss,
+        ];
+        for a in [0u8, 0x40, 0xB3, 0xFF] {
+            for (hovering, pressed) in [(false, false), (true, false), (true, true), (false, true)] {
+                let want = glow_params(hovering, pressed, a);
+                for &t in &targets {
+                    let mut st = AppState::default();
+                    st.hover_target = if hovering { Some(t) } else { None };
+                    st.pressed = if pressed { Some(t) } else { None };
+                    let v = ButtonVisual::new(&st, t);
+                    assert_eq!(
+                        glow_params(v.hovering, v.pressed, a),
+                        want,
+                        "{t:?} @ a={a} 必须与 target 无关"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 用 `layout::compute` 实算椭圆几何：不越出各自命中区半边、与「下一首」不重叠。
+    #[test]
+    fn g4_glow_geometry_stays_inside_hit_and_clear_of_next() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            for form in [WidgetForm::Compact, WidgetForm::Lyric] {
+                let l = compute(TaskbarEdge::Bottom, form, scale, (48.0 * scale).round() as i32);
+                let s = l.effective_scale();
+                let outer_button = (limits::GLOW_RADIUS_BUTTON + limits::GLOW_GROW_BUTTON) * s;
+                let outer_dismiss = (limits::GLOW_RADIUS_DISMISS + limits::GLOW_GROW_DISMISS) * s;
+                assert!(outer_button <= 14.0 * s + 1e-3, "三键外圈不得越出 28×28 半边");
+                assert!(outer_dismiss <= 7.0 * s + 1e-3, "× 外圈不得越出 14×14 半边");
+
+                // 按下态外圈收紧到一半，同样不越界
+                let pressed_button = (limits::GLOW_RADIUS_BUTTON
+                    + limits::GLOW_GROW_BUTTON * limits::GLOW_GROW_PRESSED_FACTOR)
+                    * s;
+                let pressed_dismiss = (limits::GLOW_RADIUS_DISMISS
+                    + limits::GLOW_GROW_DISMISS * limits::GLOW_GROW_PRESSED_FACTOR)
+                    * s;
+                assert!(pressed_button <= 14.0 * s + 1e-3);
+                assert!(pressed_dismiss <= 7.0 * s + 1e-3);
+
+                // painter 用的两个中心：三键取 btn_next.center()，× 取 dismiss.center()
+                let (nx, ny) = l.btn_next.center();
+                let (dx, dy) = l.dismiss.center();
+                let gap_x = (dx - nx).abs() - outer_button - outer_dismiss;
+                assert!(gap_x > 0.0, "与「下一首」光晕水平净距必须为正：{gap_x}");
+                assert!(
+                    (gap_x - 2.5 * s).abs() < 0.01,
+                    "净距应恰为 2.5*s，实得 {gap_x}"
+                );
+                let dist = ((dx - nx).powi(2) + (dy - ny).powi(2)).sqrt();
+                assert!(dist - outer_button - outer_dismiss > 0.0, "两椭圆不得相交");
+            }
+        }
+    }
+
+    /// Q4：`0` 返回 ↖/↘ 主对角、`1` 返回另一组对角、其它值兜底 0；两 tip 不重合。
+    #[test]
+    fn cover_arrow_specs_returns_diagonal_pairs() {
+        let c = RectF::new(10.0, 20.0, 32.0, 32.0);
+        let pad = 3.0;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+
+        let main = cover_arrow_specs_for(c, pad, 0);
+        assert!(close(main[0].0, c.x + pad) && close(main[0].1, c.y + pad), "0: 左上 ↖ tip");
+        assert!(
+            close(main[1].0, c.x + c.w - pad) && close(main[1].1, c.y + c.h - pad),
+            "0: 右下 ↘ tip"
+        );
+        assert!(!main[0].2 && main[1].2, "0 档两支朝向必须相反");
+
+        let other = cover_arrow_specs_for(c, pad, 1);
+        assert!(
+            close(other[0].0, c.x + pad) && close(other[0].1, c.y + c.h - pad),
+            "1: 左下 ↙ tip"
+        );
+        assert!(
+            close(other[1].0, c.x + c.w - pad) && close(other[1].1, c.y + pad),
+            "1: 右上 ↗ tip"
+        );
+        assert_ne!(other[0].2, other[1].2, "1 档两支朝向必须相反");
+        assert!(!(close(other[0].0, main[0].0) && close(other[0].1, main[0].1)), "另一组对角");
+        assert!(!(close(other[1].0, main[1].0) && close(other[1].1, main[1].1)), "另一组对角");
+
+        // 其它值兜底为 0；公共入口固定取唯一那处具名常量
+        assert_eq!(cover_arrow_specs_for(c, pad, 2), main);
+        assert_eq!(cover_arrow_specs_for(c, pad, 255), main);
+        assert_eq!(
+            cover_arrow_specs(c, pad),
+            cover_arrow_specs_for(c, pad, limits::COVER_ARROW_ORIENTATION)
+        );
+
+        // 两支 tip 不重合
+        assert!(!(close(main[0].0, main[1].0) && close(main[0].1, main[1].1)));
+        assert!(!(close(other[0].0, other[1].0) && close(other[0].1, other[1].1)));
+
+        // 斜杆轴向：0 = 主对角线 ↖/↘，1 = 另一组 ↗/↙，其它兜底 0
+        assert_eq!(arrow_axis(0, false), (1.0, 1.0));
+        assert_eq!(arrow_axis(0, true), (-1.0, -1.0));
+        assert_eq!(arrow_axis(1, false), (-1.0, 1.0));
+        assert_eq!(arrow_axis(1, true), (1.0, -1.0));
+        assert_eq!(arrow_axis(99, false), arrow_axis(0, false));
+        assert_eq!(arrow_axis(99, true), arrow_axis(0, true));
     }
 }

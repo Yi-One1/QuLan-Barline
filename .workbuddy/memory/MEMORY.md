@@ -7,7 +7,7 @@ category: 曲栏Barline
 # 曲栏 Barline 项目长期记忆
 
 Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2。
-当前版本 **v1.5.6**（G3.5 返工，待真人验收），测试 **461 项**（460 passed + 1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。G1 歌词提速、G2 卡顿缓解（专档 `progress.md §3.1`）、G3 全链（v1.5.0~v1.5.4）均已闭环；**G3.5 v1.5.5 因 1s 延迟被用户否定、v1.5.6 按方案 A 重做（专档 `progress.md §3.2`）**；下一组 **G4**；G7 黑名单（v1.8.0）PRD/ARCH 已入库待实现。
+当前版本 **v1.6.0**（G4 悬停反馈统一，**已出包待真人验收**），测试 **470 项**（469 passed + 1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。G1 歌词提速、G2 卡顿缓解（专档 `progress.md §3.1`）、G3 全链（v1.5.0~v1.5.4）、**G3.5 全屏遮挡（v1.5.6 方案 A）** 均已闭环；**G4 已交付待验收**；下一组 G5 歌词落盘；G7 黑名单（v1.8.0）PRD/ARCH 已入库待实现。
 
 ## 铁律（违反必踩坑）
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（用 PowerShell 工具跑），**禁止裸 cargo**（Git Bash 抢 link.exe）。
@@ -27,6 +27,7 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - **SMTC 轮询（v1.4.2/1.4.3，卡顿的根）**：**禁止全量轮询**（14 次/秒会拖卡网易云）；分层 500/1000/2000ms + 网易云 (0,0)×3 退避 5s；**主通道=事件**（MediaPropertiesChanged 等三事件→置脏位→60ms 下限 forced；回调只许置 AtomicBool）。
 - **位置锚点 `position_at`**（歌词同步命门）：读了时间线→读取时刻；没读但切歌→检测时刻；其余沿用上一份。绝不许用陈旧 `timeline_at`（网易云恒报 (0,0)）。
 - **G3.5-A 全屏遮挡（v1.5.6）**：曲栏是 top-level popup（**非任务栏子窗口**），全屏盖不住的根因是 `WS_EX_TOPMOST` + 每秒 `ensure_on_top()`。纯通知型 appbar（只 `ABM_NEW/ABM_REMOVE`、**不发 `ABM_QUERYPOS/SETPOS`、不占工作区**）注册在 **widget 主窗口**（`TaskbarCreated` 是广播，`HWND_MESSAGE` 收不到）；`ABM_REMOVE` 必须在 `host.destroy()` 之前。`ABN_FULLSCREENAPP` 事件驱动 → `HWND_BOTTOM`（**禁用 `HWND_NOTOPMOST`**）→ 退出 `HWND_TOPMOST`。**永不 `SW_HIDE`**：`frozen` 只降 Z 序 + 静止降载，`compute_visible()` 不含 frozen；`z_demoted` 双份状态幂等、只在 `SetWindowPos` 成功后翻转；退出须**先清 `frozen/z_demoted` 逻辑门控再恢复 Z 序**。1s 心跳只作兜底对账。`occlusion_want(AppbarOpen) = !(fs && !same_monitor(fg,wm))`（信任事件、仅明确异屏还原）。**坑：`||` 短路使 `fs=false` 时 monitor 完全不参与判定 → 「monitor 全 0 不冻结」安全方向在事件路径被放宽，只有 `fs=true` 路径 100% 保住；v1.5.7 应对 `fg/wm == RECT::default()` 回退 `frozen_decision`**。
+- **G4 悬停反馈（v1.6.0）**：四按钮（Prev/Toggle/Next/Dismiss）共用 `ButtonVisual` + `glow_params` + `glow_colors` + `draw_button_feedback`；`glow_params(hovering,pressed,hover_bg.a)` **禁止加 `HitTarget` 参数 / `match target`**（四 target 同值的结构性保证）；Q1 保底 `GLOW_FLOOR_ALPHA=0x06` 是曲线下限截距（透明档恒 `(P,P)`、无态仍 0），不是 × 专属底色；按下 = 外圈收紧 0.5 + 下沉 `1.0*s` + 图标 94%（所有内部偏移同乘 k）；封面恒暗蒙层 + 恒亮双箭头（**不用 `theme.text`**），朝向由 `COVER_ARROW_ORIENTATION` 派生；旧 `DISMISS_BG_*` 符号保留（layout 契约）但不得进绘制路径。所有视觉参数集中在 `limits`。
 - 热键：`HOTKEYS_VERSION=2`，默认 `Ctrl+Alt+P/←/→/L/M/H`。单实例 `Local\Barline.SingleInstance.v1`。
 - 性能埋点（仍在）：`perf::Span`，默认 50ms / `smtc.*` 8ms 才记 `[perf]`；统计行每 60s 一条。
 
