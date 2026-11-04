@@ -213,7 +213,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
   - **留档（不阻塞）**：① **pre-existing 死码 30 项**（HEAD 就存在，不属本轮清单，下轮候选：`app::sink/msg_hwnd/is_enabled`、`LOG_MAX_BYTES`、`net::as_str/get/get_with`、`provider::{new,query,query_with_source}`、`media::LyricSource::Wasapi` + `Track.source`、`layout::{inset,lyric_w,edge}` 等）；② **语言切换需重启**（设置页改 `general.language` 后 `App::lang` 不更新、托盘不刷新，`Effect::RefreshTrayMenu` 是挂点）；③ D-6 两份进度实现；④ 截图删除后 `README.md` 与 6 份报告的图片引用已失效（README 已换成「截图归档于 git 历史」的说明，`git show 890c07f^:docs/screenshots/` 可取回）。
   - **`#![allow(dead_code)]` 的真相**：`src/main.rs` 的注释原写「M5 收尾时应移除」，实际 M1–M5 全发布后它仍在 → **死码不会被编译器发现，G6 这类清理只能靠人工逐符号盘点**。已把注释改成如实表述并列出三条真正被兜住的留档项。
 
-- **G7 媒体会话黑名单（用户 2026-11-03 追加）→ v1.9.0 · ✅ 已出包 `deliverables/曲栏_Barline_v1.9.0.exe`（待真人验收）**：`docs/PRD-G7-黑名单.md` + `docs/ARCH-G7-黑名单.md`（已入库，**待实现**）。
+- **G7 媒体会话黑名单（用户 2026-11-03 追加）→ v1.9.0 · ✅ 已真人验收通过（2026-11-05 02:45，用户「没问题，最后收尾吧」）**：`docs/PRD-G7-黑名单.md` + `docs/ARCH-G7-黑名单.md`（已入库，**待实现**）。
   - **四项已拍板决策**：① 排最后（不打断 G3~G6）② 按**进程名**匹配 ③ 语义 = **完全忽略**（不渲染/不查歌词/不响应播控；唯一会话被拉黑 → `NoSession` 空态）④ 入口三处（设置页分区含检测列表 + 托盘「拉黑/恢复当前应用」+ 清单增删）。
   - **U1=B 的实现口径（已定稿）**：反查结果**落盘**到 `config.json` 的 `media.app_names`（`BTreeMap<aumid_lower, process_name>`，**上限 64 条**，满时淘汰字典序最小键 = 确定性 + 自愈 + 零额外状态，不做负缓存，`blacklist_clear` 不清它）；判定三级回退「缓存 → 静态表 → AUMID 末段」全内存；预算常量 `ENUM_LOOKUP_BUDGET_MS=120` / `ENUM_TOTAL_BUDGET_MS=200` / `ENUM_MAX_LOOKUPS=16` / `ENUM_MAX_AUDIO_SESSIONS=64`（单点定义在 `config::defaults::limits`）；静态表已命中的会话**不反查**（典型机器反查 0 次）。
   - **已知残留**：从没出现过、且不在静态表的进程名，手输时无法验证 → 温和提示 + 引导用「检测到的应用」，**不许静默失效**。

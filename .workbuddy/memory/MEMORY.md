@@ -7,7 +7,7 @@ category: 曲栏Barline
 # 曲栏 Barline 项目长期记忆
 
 Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2。
-当前版本 **v1.9.0**（G7 媒体会话黑名单，**已出包待真人验收**），测试 **556 项**（555 passed + 1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。G1~G6 全部闭环（G6=v1.8.1 清理，已验收）；**G7 v1.9.0 已出包待验收**；G 系列功能清单至此全部完成，下一组待用户提出。
+当前版本 **v1.9.0**（G7 媒体会话黑名单，**已真人验收通过 2026-11-05**），测试 **556 项**（555 passed + 1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。**G1~G7 全部闭环**（G6=v1.8.1 清理、G7=v1.9.0 黑名单，均已验收）；**G 系列功能清单全部完成，下一组待用户提出**；遗留待办见「下一轮候选」。
 
 ## 铁律（违反必踩坑）
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（用 PowerShell 工具跑），**禁止裸 cargo**（Git Bash 抢 link.exe）。
@@ -66,5 +66,5 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - 待办 D：汽水音乐托盘态激活（搁置：外部 ShowWindow 让 CEF 输入挂起）。
 - 小尾巴（**v1.8.1 已清**）：~~`hotkeys.reset1` 死词条~~、~~`SettingsService::is_open()` 零调用~~、~~`event.rs` "300ms 去抖"注释失实~~；「冲突一键换组」仍未做。
 - **v1.5.6 观察项（QA 最终报告，均不阻塞出包）**：① R2 退出抖动（`AppbarClose` 后 1s 心跳可能补冻，可加 1–2s 纯函数抑制，只抑制 Timer）；② R1 新分支 `AppbarOpen × fs=false` 会**完整冻结含降载** ≤1s、可自愈、窗口不 hide，且 monitor 全 0 安全方向在该路径被放宽；③ 迟到/重复的 TRUE 广播可立即补冻；④ `ensure_on_top()` 与 `set_z_demoted(false)` 各发一次 `HWND_TOPMOST`（冗余无害，别删）。**v1.5.7 首选加固**：`AppbarOpen` 遇 `fg/wm == RECT::default()` 回退 `frozen_decision`。真机验收看日志 `trigger=appbar|timer`：F11 进入应立刻出现 `trigger=appbar` 的「进入」行。
-- **当前**：G7 黑名单 v1.9.0 已出包待验收（**G 系列功能清单至此全部完成**）。真机走查 7 条见 `progress.md` G7 段末；遗留待办见「下一轮候选」。
+- **当前**：**G1~G7 全部验收闭环（2026-11-05）**，G 系列功能清单全部完成，下一组待用户提出。真机走查 7 条已过。
 - **下一轮候选（不阻塞）**：① **pre-existing 死码 30 项**（HEAD 就有，QA 已列：`app::sink/msg_hwnd/is_enabled`、`LOG_MAX_BYTES`、`net::as_str/get/get_with`、`provider::{new,query,query_with_source}`、`media::LyricSource::Wasapi` + `Track.source`、`layout::{inset,lyric_w,edge}` 等）；② **语言切换需重启**（`general.language` 改了 `App::lang` 不更新、托盘不刷新，挂点 `Effect::RefreshTrayMenu`）；③ **D-6 两份进度实现**（`State::progress_fraction` 与 `painter.rs:911-923` 内联，屏幕上画的不是被测试的那个）；④ 「清空歌词缓存」一键按钮；⑤ 测试脚手架 `worker()` 的 cache 指向问题**已于 v1.8.0 关闭**。
