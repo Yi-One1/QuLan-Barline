@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-04 03:00 · **G3 右上角 × 已出包 v1.5.4（待真人验收）** · **G3.5 全屏遮挡修复已立项（v1.5.5，插在 G4 前）** · G2 闭环 · G7 黑名单待实现（v1.8.0） · 全量回归绿（428 测试）· 工作区干净。
+> **最后更新**：2026-11-04 18:10 · **G3 全链闭环（v1.5.0~v1.5.4 已真人验收）** · **G3.5 全屏冻结 v1.5.5 已出包（待真人验收）** · G2 闭环 · 下一组 G4（v1.6.0）· G7 黑名单待实现（v1.8.0） · 全量回归绿（450 测试）· 工作区干净。
 
 ---
 
@@ -142,12 +142,15 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **G3 右上角 ×（问题 4）→ v1.5.0**：用户定「**常驻**、尽量小但要清晰、位置＝**整个小组件右上角**」；点击＝隐藏到托盘。
   - **布局方案（已拍板）：独占右上角**——右边缘为 × 预留约 16px，三键整体左移，窗口总宽 +≈16px（已确认与 `btn_next` 右对齐垂直居中的 28×28 命中区重叠问题）。新增 `HitTarget::Dismiss`。
   - **交付实况（v1.5.0~v1.5.4，用户逐轮验收微调）**：字形 16 → **6px**、命中区 24 → **14px**、笔画 1.6 → 1.2、常态 100% 不透明（`DISMISS_ALPHA=0xFF`，与三键 enabled 同源）；`DISMISS_GAP` 8 → **2**、`DISMISS_RIGHT_MARGIN=4`（字形右缘距窗口边缘 8px，与左侧 `CONTENT_PAD` 对称）；窗口相对 v1.4.4 为 **+12\*s**；「下一首」图标右缘 → × 字形左缘 = **12px**。
-- **G3.5 全屏遮挡修复（用户 2026-11-04 追加）→ v1.5.5**：全屏应用（电影/播放器/浏览器 F11/游戏）时小组件**必须消失**，不得压在全屏窗口上方；退出全屏自动恢复。
-  - **现象（用户原话）**：「其他窗口全屏时，小组件会左移，且小组件会盖在全屏的窗口上方」——两件事：① z-order 压过全屏窗口；② 同时发生**位置左移**。
-  - **已存在的信号（零新增跨进程调用）**：`platform::capture::foreground_info()` 每次都返回 `fullscreen`（`is_fullscreen_window(rect, monitor)`）与 `monitor`，v1.4.4（G2-B2）起**每秒随心跳刷新**，当前**仅**用于「同屏全屏时暂停静止态背景采样」。`AppState::foreground_fullscreen` / `AppState::foreground_monitor` 已就绪，`compute_visible()` 却没用它们。
-  - **「左移」根因已定位（本机日志实证，2026-11-04 02:47~02:48）**：全屏开始时任务栏**托盘区变宽 28px**（`tray_left 2130 → 2102`、`tray 宽 430 → 458`），`geometry::place_widget` 按 `tray_left` 定位 → `target x 1922 → 1894`（左移 28px）；退出全屏后几何自动恢复（`2102 → 2130`、`1894 → 1922`）。**跟随逻辑本身没 bug，问题是全屏时不该显示**。因此本轮只需解决"全屏时隐藏"，不需要额外修正定位。
-  - **修复方向（待架构确认）**：`compute_visible()` 增加「同屏全屏 → false」；全屏翻转时触发 `sync_visibility()`；`ensure_on_top()` 在全屏期间跳过（否则每秒仍会把窗口顶到最前）；`widget.raise()` 同理。**不得新增轮询频率**（全屏信号随既有 1s 心跳免费刷新；1s 延迟可接受）。
-  - **不可破**：副屏全屏**不得**隐藏主屏小组件（沿用 v1.4.4「同屏才生效」判据）；不得新增轮询频率。
+- **G3.5 全屏冻结（用户 2026-11-04 追加）→ v1.5.5 · ✅ 已出包 `deliverables/曲栏_Barline_v1.5.5.exe`（`2a637db`，待真人验收）**：全屏应用（电影/播放器/浏览器 F11/游戏）时小组件**消失并静止**，不得压在全屏窗口上方、不得占后台；退出全屏自动恢复。
+  - **现象（用户原话）**：「其他窗口全屏时，小组件会左移，且小组件会盖在全屏的窗口上方」；追加要求「全屏时让本软件静止或冻结，避免后台占用（例如全屏游戏）」。
+  - **已存在的信号（零新增跨进程调用）**：`platform::capture::foreground_info()` 返回 `fullscreen` + `monitor`，v1.4.4（G2-B2）起每秒随心跳刷新；`frozen_decision()`（`app.rs:2971`）**直接复用** `should_skip_idle_backdrop`，不复制同屏判据。
+  - **「左移」根因（本机日志实证，02:47~02:48）**：全屏时任务栏托盘区变宽 28px（`tray_left 2130→2102`），`place_widget` 按 `tray_left` 定位 → `target x 1922→1894`；退出后自动恢复。**跟随逻辑没 bug，不改**；退出全屏那一 tick 仍跑 `geometry::probe()`，位置自然拉回。
+  - **冻结内容**：`widget.set_visible(false)` + 停 `TIMER_ANIM/LYRIC`（`start_widget_timer` 有 frozen 守卫）+ 媒体线程 `SetPaused(true)` 走**阻塞 `recv()`**（0 唤醒 / 0 跨进程）+ `redraw`/`ensure_on_top`/`request_backdrop`/几何探测/`detect_capture_with` 全跳过。**只保留 `TIMER_GEOM 1000ms` 的 `foreground_info()`**（纯本地）作为发现退出的唯一途径；热键仍可用；不新增轮询频率、不用 WinEventHook、不动 `SetThreadExecutionState`。
+  - **解冻顺序（不闪旧帧）**：`SetPaused(false)+Refresh` → `resume_pending=true` + `sync_visibility` 加 `&& !resume_pending` 保持隐藏 → 收第一份 `NowPlaying`（`Effect::ResumeFromFreeze`）或 400ms `TIMER_RESUME=6` 兜底 → `finish_resume` 在隐藏态 `relayout+redraw` → 才 `set_visible(true)`；门控是 `geometry.is_some() && compute_visible()`（用户冻结期主动隐藏时兜底不得强行弹出）。`PollState::reset_for_resume()` 保证解冻首轮即 `Plan::full()`。
+  - **QA 结论 PASS-WITH-NOTES**（450 测试，12 条独立回归）：主理人疑点 `tick_optimistic()` 冻结期仍在 `frozen` 判断之前执行 —— **证伪为非问题**（只读一个 `Option`，`redraw()` 首行 frozen 守卫挡住整帧）。另发现工程师 `paused` 用例只用 `sleep(30ms)` < 50ms 轮询周期、无法证伪阻塞语义，QA 补 150ms 真阻塞测试。
+  - **留档观察（不阻断）**：`AppEvent::Tick` 全仓无发送者（未来启用会多一个 500ms UI 唤醒）；`relayout_with` 与 `sync_visibility` 的 resume 门控写法不一致；`TIMER_CLICK`(3) 冻结期理论上仍可挂（实际不可达）；快速「退出→400ms 内再全屏」会多一次无效 relayout（门控保证不误显示）；`reset_for_resume` 的 `checked_sub(60ms)` 在进程极早期可能退化（实测未触发）。
+  - **不可破**：副屏全屏**不得**冻结主屏小组件；monitor 全 0 不冻结（安全方向）；既有 428 条断言一条未放宽。
 - **G4 悬停/按下反馈（问题 3 + 5）→ v1.6.0**：封面悬停＝变暗蒙层 + 左上/右下双箭头（点击整块封面＝打开播放器，沿用 `ClickCover`）；四按钮（含 ×）用户选「**柔和光晕 + 下沉**」——悬停：白底黑影/黑底白光双层低透明度光晕；按下：光晕收紧、图标下沉 1px 并缩到 94%。**× 与四按钮共用同一套悬停/按下状态机与绘制函数**（G3 起设计好复用）。
 - **G5 在线歌词落盘（用户追加）→ v1.7.0**：写到「歌词目录」**第一个**目录下的 `Barline/` 子目录；文件名 `歌手 - 歌名.lrc`（非法字符替换 `_`）；**已存在一律跳过、绝不覆盖**；只写**行级** LRC + `[ti:]/[ar:]/[al:]`，**不写逐字标签**。副作用：导出后走「本地文件命中」，优先级高于缓存，清缓存/换机不丢。
 - **G6 清理（问题 6）→ v1.7.1**：范围＝**死码 + 未引用资源**。已确认在列：`hotkeys.reset1` 死键（`assets/ui/index.html:418/462`）、`SettingsService::is_open()`（`src/settings/mod.rs:93` 零调用）、`event.rs:201` 去抖注释失实、`Effect::RequestBackdrop`/`Effect::MoveWindow` 零发射点、`deliverables/` 多余的 LICENSE/README 副本；删 `assets/`/`docs/` 资源前**必须先把清单给用户确认**。`deliverables/` 的 exe 永不动。
@@ -219,5 +222,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态**：G3 右上角 × 已出包 **v1.5.4**（字形 6px / 命中 14 / 笔画 1.2 / 与三键墨色一致），**等用户真人验收**；验收通过即闭环 G3。**下一组是 G3.5 全屏遮挡修复（v1.5.5）**——范围与根因见 §3.2；`foreground_fullscreen` 信号已存在（每秒免费刷新），不要新造轮询。G4 悬停反馈（v1.6.0）排其后；G7 黑名单文档已就绪但排在最后，别提前开工。
+6. **当前状态**：G3 右上角 × **已真人验收通过**（v1.5.4 定稿：字形 6px / 命中 14 / 笔画 1.2 / 与三键同墨色）。**G3.5 全屏冻结 v1.5.5 已出包，等用户真人验收**（重点：全屏进出、后台占用、热键切歌、退出不闪旧帧），详见 §3.2。**下一组是 G4 悬停/按下反馈统一（v1.6.0）**——含 v1.5.1 QA 遗留的 × 悬停底色口径（`theme.text@0x14` 与全窗 `hover_bg`/`on_light` 不同源，透明背景下全局悬停消失但 × 仍亮）。G5 歌词落盘、G6 清理、G7 黑名单依次排队，别提前开工。
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。
