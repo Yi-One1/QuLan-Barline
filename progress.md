@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-05 02:50 · **G1~G7 全部真人验收通过，G 系列功能清单完成** · 当前 **v1.9.0**（556 测试：555 passed + 1 ignored，clippy 0 警告）· 工作区干净（main 领先远端 13 提交；push + 发 GitHub Release 的操作教学已交付用户自行操作）· 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-05 03:10 · **G1~G7 全部真人验收通过，G 系列功能清单完成** · 当前 **v1.9.0**（556 测试：555 passed + 1 ignored，clippy 0 警告）· 源码已推 GitHub（`origin/main` @ `6bbf0e4`）· **v1.9.0 Release（tag + 附 exe）仍待用户到 Releases 页手动发** · LICENSE 版权人已实名 `Yi One`、README 已内嵌设置页/小组件截图、MEMORY.md 已精简合并 · 新对话从 §5 接手须知开始。
 
 ---
 
@@ -76,6 +76,12 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **测试 390 → 556**（中间 515 的低谷是 G6 删死码连带测试）；包体 1066 KB → 1159 KB；exe 24 → 37 个。
 - 全程专家团队 SOP（PM/架构/工程/QA 四角色，主理人编排），每轮出包 → 用户验收 → 才进下一组。**逐组细节与 QA 证据见 §3.2。**
 
+### 收尾补遗（2026-11-05 03:10）—— 文档 / 许可 / 推送 / 记忆
+- **LICENSE 版权人实名化**：占位 "The Barline Authors" → **"Yi One"**（MIT 正文其余未动）。
+- **README 内嵌截图**：原「截图归档至 git 历史」说明换成两张内嵌图（设置页外观 + 任务栏小组件），存 `assets/screenshots/{settings,widget}.png`（36KB/31KB），GitHub 可直接渲染。
+- **源码推送 GitHub**：commit `6bbf0e4`，`git push origin main` 成功（`95b2a13..6bbf0e4`）；`gh` CLI 本机未装、无 GitHub token，故 v1.9.0 Release（tag + 附 exe）无法在此环境自动建，留待用户在 Releases 页手动发。
+- **MEMORY.md 精简合并**：`17914B → 5670B`（去重跨节重复坑、删过时项），保留全部保命级不变量；逐日细节仍在 `.workbuddy/memory/2026-11-0X.md`。
+
 ---
 
 ## 2. 关键决策
@@ -113,6 +119,11 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 21. **调 SMTC 的节奏永远优先事件、其次降频轮询**：对第三方播放器的跨进程调用次数要当「预算」管（v1.4.2 教训）。
 22. ~~`src/event.rs` 注释声称「保存配置带 300ms 去抖」~~（**G6 已修**：改为如实表述「同步写盘：tmp + 原子 rename，不做去抖」）。
 23. ~~`Effect::RequestBackdrop` / `Effect::MoveWindow` 死变体~~（**G6 已删**：`Effect` 从 15 → 9 变体；注意 `src/main.rs` 仍有全局 `#![allow(dead_code)]`，死码编译器不报，清理靠人工逐符号盘点 + `rg` 前先验证 `rg` 能跑）。
+
+### 2.4 收尾决策（2026-11-05）
+- **LICENSE 版权人**：占位 "The Barline Authors" 改为实名 **"Yi One"**（用户拍板）。
+- **最终推送授权**：用户明确授权由助手完成收尾文档/许可改动的提交与推送，覆盖 §5.4「工程师不 commit」通则（仅限本次收尾，常态纪律不变）。
+- **记忆文件精简**：因 MEMORY.md 超注入上限被截断，用户授权将其精简合并（保留不变量、去重、删过时），不删逐日日志。
 
 ---
 
@@ -255,7 +266,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 3.5 小尾巴与存量（不阻塞）
 - `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
 - M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- ~~GitHub Release 发布~~（2026-11-05 教学已交付：push 提交 + Releases/new 发 v1.9.0 + 附 exe）；**✅ LICENSE 版权人已实名化 `Yi One`**（占位 "The Barline Authors" → "Yi One"，2026-11-05）；**✅ README 已内嵌两张截图**（设置页外观 + 任务栏小组件，存 `assets/screenshots/{settings,widget}.png`，替换原「截图归档至 git 历史」说明，2026-11-05）；剩余：设置页标题栏明暗跟随、热键日志冗余清理。
+- **源码已推 GitHub**（2026-11-05，commit `6bbf0e4`，`git push origin main` 成功）；**✅ LICENSE 版权人已实名化 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`，替换原「截图归档至 git 历史」说明）；**⏳ v1.9.0 Release（GitHub tag `v1.9.0` + 附 `deliverables/曲栏_Barline_v1.9.0.exe`）仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
 
@@ -302,6 +313,10 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - 每组交付前主理人自己跑 `check`/`clippy`/`test` 并读测试二进制汇总（不信工程师自述）。
 - 1 个 `#[ignore]` 联网用例（lrclib），不联网时属正常跳过。
 
+### 4.5 记忆与项目数据
+- `.workbuddy/memory/MEMORY.md`：项目长期记忆总纲（本会话精简至 5.7KB，去重）；逐日细节在 `.workbuddy/memory/2026-11-0X.md`（2026-11-02 ~ 11-05）。
+- `.workbuddy/` 为项目数据目录（非临时缓存，勿删）；是否入库由用户定。本会话 LICENSE/README/截图已入库，MEMORY.md 精简未提交 git。
+
 ---
 
 ## 5. 接手须知（新对话从这里开始）
@@ -311,5 +326,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态**：**G1~G7 全部真人验收通过（2026-11-05），G 系列功能清单全部完成**，当前 v1.9.0。下一组等用户提需求；遗留候选见 §3.6（30 项 pre-existing 死码 / 语言切换需重启 / D-6 两份进度实现 / 清空缓存按钮 / G7 三个 P3）。push 与 GitHub Release 由用户按已交付的教学自行操作。
+6. **当前状态**：**G1~G7 全部真人验收通过（2026-11-05），G 系列功能清单全部完成**，当前 v1.9.0。下一组等用户提需求；遗留候选见 §3.6（30 项 pre-existing 死码 / 语言切换需重启 / D-6 两份进度实现 / 清空缓存按钮 / G7 三个 P3）。**源码已推 GitHub（`origin/main` @ `6bbf0e4`）；v1.9.0 Release（tag + 附 exe）由用户到 Releases 页手动发。**
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。
