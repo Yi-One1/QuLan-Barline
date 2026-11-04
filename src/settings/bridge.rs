@@ -134,6 +134,12 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             cfg.lyrics.online_enabled = v;
             true
         }
+        // v1.7.0：在线歌词落盘（只新建不覆盖）
+        "lyrics.write_back" => {
+            let Some(v) = value.as_bool() else { return false };
+            cfg.lyrics.write_back = v;
+            true
+        }
         "lyrics.local_dirs_add" => {
             let Some(s) = value.as_str() else { return false };
             let s = s.trim();
@@ -380,6 +386,20 @@ mod tests {
         let mut c = Config::default();
         assert!(!apply_set(&mut c, "lyrics.mode", &json!("OneLine")));
         assert!(!apply_set(&mut c, "lyrics.mode", &json!("two_line")));
+    }
+
+    /// v1.7.0：`lyrics.write_back` 必须在白名单里（它是显式 match，
+    /// 不加就被 `_` 分支静默拒绝——设置页的勾选会永远无效且不报错）。
+    #[test]
+    fn apply_set_lyrics_write_back() {
+        let mut c = Config::default();
+        assert!(apply_set(&mut c, "lyrics.write_back", &json!(false)));
+        assert!(!c.lyrics.write_back);
+        assert!(apply_set(&mut c, "lyrics.write_back", &json!(true)));
+        assert!(c.lyrics.write_back);
+        // 类型不对 → 拒绝，且不改配置
+        assert!(!apply_set(&mut c, "lyrics.write_back", &json!("yes")));
+        assert!(c.lyrics.write_back);
     }
 
     /// v1.2.2：「界面缩放」整项删除，白名单必须同时关掉这个口子——

@@ -12,6 +12,7 @@
 //! net.rs       WinHTTP GET（零依赖）
 //! cache.rs     内存 LRU + 磁盘正缓存 + 负缓存
 //! service.rs   T2 线程：请求 → 查询 → AppEvent（网络查询在独立线程，v1.3.2）
+//! writeback.rs 在线歌词落盘（只新建不覆盖，v1.7.0）
 //! ```
 //!
 //! 本文件只放**数据模型**（`Lyrics` / `LyricLine` / `LyricWord` / `LyricView`，逐字段
@@ -27,6 +28,7 @@ pub mod parser;
 pub mod provider;
 pub mod query;
 pub mod service;
+pub mod writeback;
 
 use std::sync::Arc;
 

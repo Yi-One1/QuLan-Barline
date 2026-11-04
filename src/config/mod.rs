@@ -108,6 +108,9 @@ pub struct LyricsConfig {
     pub online_enabled: bool,
     /// 本地歌词搜索目录（绝对路径）。空数组表示只用默认目录。
     pub local_dirs: Vec<String>,
+    /// 在线歌词落盘（v1.7.0）：命中在线歌词后保存到第一个本地歌词目录的 Barline 子目录。
+    /// 只新建、绝不覆盖已有文件。默认开。
+    pub write_back: bool,
 }
 
 /// 音量。
@@ -356,6 +359,27 @@ mod tests {
             .remove("scroll");
         let back: Config = serde_json::from_value(json).expect("缺 scroll 字段不应报错");
         assert!(back.lyrics.scroll, "旧配置缺省 scroll 必须为 true（默认开）");
+    }
+
+    /// v1.7.0 向后兼容：旧配置没有 `lyrics.write_back` 字段 → 反序列化不报错且默认 true。
+    ///
+    /// `LyricsConfig` 容器的 `#[serde(default)]` 负责兜底：缺字段时整个字段取
+    /// `LyricsConfig::default()` 的值，所以旧用户升级后落盘是**开着**的，
+    /// 不需要额外的配置迁移代码。
+    #[test]
+    fn legacy_config_without_write_back_defaults_true() {
+        let mut cfg = Config::default();
+        cfg.lyrics.write_back = false; // 故意写非默认值再删掉字段，验证走 serde default
+        let mut json = serde_json::to_value(&cfg).expect("序列化不应失败");
+        json["lyrics"]
+            .as_object_mut()
+            .expect("lyrics 必须是对象")
+            .remove("write_back");
+        let back: Config = serde_json::from_value(json).expect("缺 write_back 字段不应报错");
+        assert!(
+            back.lyrics.write_back,
+            "旧配置缺省 write_back 必须为 true（默认开）"
+        );
     }
 
     /// **v1.2.2 旧配置兼容（删除 `ui_scale` 后最重要的回归保障）**：

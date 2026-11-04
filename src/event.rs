@@ -248,6 +248,8 @@ pub struct LyricRequest {
     /// 已知的本地歌词目录（来自 Config）
     pub local_dirs: Vec<String>,
     pub online_enabled: bool,
+    /// 在线歌词落盘开关（v1.7.0）。歌词线程看不到 Config，开关随请求带过去。
+    pub write_back: bool,
     /// 是否为重试
     pub retry: bool,
 }

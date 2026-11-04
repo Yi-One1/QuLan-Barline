@@ -266,6 +266,11 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
             <div class="desc" data-i18n="lyrics.online.desc">无本地文件时依次向 lrclib.net、网易云音乐查询。</div></div>
           <div class="right"><label class="switch"><input type="checkbox" id="lyrics-online"><span class="track"></span><span class="knob"></span></label></div>
         </div>
+        <div class="row" data-dep="lyrics">
+          <div><div class="label" data-i18n="lyrics.writeback">在线歌词保存到本地</div>
+            <div class="desc" data-i18n="lyrics.writeback.desc">在线命中的歌词会保存到「本地歌词目录」的第一个目录下的 Barline 子文件夹，文件名与曲目对应。只新建，不覆盖已有文件。已存在的歌词缓存（30 天）优先于本地文件，因此手工修改 .lrc 需要等缓存过期或清理缓存后才会生效。</div></div>
+          <div class="right"><label class="switch"><input type="checkbox" id="lyrics-writeback"><span class="track"></span><span class="knob"></span></label></div>
+        </div>
       </div>
       <div class="card" id="lyrics-dirs-card" data-dep="lyrics">
         <h2 data-i18n="lyrics.dirs">本地歌词目录</h2>
@@ -405,6 +410,7 @@ const I18N = {
     "storage.dir": "数据目录", "storage.dir.desc": "歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。",
     "storage.browse": "更改", "storage.reset": "恢复默认", "storage.pending": "重启后生效",
     "lyrics.online": "在线歌词", "lyrics.online.desc": "无本地文件时依次向 lrclib.net、网易云音乐查询。",
+    "lyrics.writeback": "在线歌词保存到本地", "lyrics.writeback.desc": "在线命中的歌词会保存到「本地歌词目录」的第一个目录下的 Barline 子文件夹，文件名与曲目对应。只新建，不覆盖已有文件。已存在的歌词缓存（30 天）优先于本地文件，因此手工修改 .lrc 需要等缓存过期或清理缓存后才会生效。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
     "volume.wheel": "滚轮调节", "volume.wheel.desc": "仅指针悬停在小组件上时生效。",
@@ -449,6 +455,7 @@ const I18N = {
     "storage.dir": "Data folder", "storage.dir.desc": "Where lyric cache and app files live. Applies after restart; you choose whether to migrate files and delete the old folder (config stays put). Click the path to open it.",
     "storage.browse": "Change", "storage.reset": "Reset", "storage.pending": "applies after restart",
     "lyrics.online": "Online lyrics", "lyrics.online.desc": "Queries lrclib.net, then NetEase Cloud Music, when no local file exists.",
+    "lyrics.writeback": "Save online lyrics locally", "lyrics.writeback.desc": "Online matches are saved into a Barline subfolder of the first local lyric folder, named after the track. New files only — existing files are never overwritten. The 30-day lyric cache takes precedence over local files, so manual edits to a .lrc only take effect after the cache expires or is cleared.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
@@ -566,6 +573,7 @@ function render() {
   document.getElementById("lyrics-sweep").checked = c.lyrics.karaoke_sweep;
   document.getElementById("lyrics-scroll").checked = c.lyrics.scroll;
   document.getElementById("lyrics-online").checked = c.lyrics.online_enabled;
+  document.getElementById("lyrics-writeback").checked = c.lyrics.write_back;
   renderDirs(c.lyrics.local_dirs);
   syncLyricsDeps();   // v1.1.22：目录列表刚重建，置灰态要重新贴一遍
 
@@ -643,7 +651,7 @@ function syncLyricsDeps() {
     el.classList.toggle("dimmed", !on);
   });
 
-  ["lyrics-sweep", "lyrics-scroll", "lyrics-online"].forEach((id) => {
+  ["lyrics-sweep", "lyrics-scroll", "lyrics-online", "lyrics-writeback"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = !on;
   });
@@ -777,6 +785,7 @@ bind("lyrics-enabled", "lyrics.enabled", "bool");
 bind("lyrics-sweep", "lyrics.karaoke_sweep", "bool");
 bind("lyrics-scroll", "lyrics.scroll", "bool");
 bind("lyrics-online", "lyrics.online_enabled", "bool");
+bind("lyrics-writeback", "lyrics.write_back", "bool");
 // v1.1.22：主开关一动就立刻刷新置灰态，不等 Rust 回推 state（回推后 render() 还会再刷一次）
 document.getElementById("lyrics-enabled").addEventListener("change", syncLyricsDeps);
 bind("wheel-enabled", "volume.wheel_enabled", "bool");

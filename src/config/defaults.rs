@@ -21,6 +21,9 @@ pub mod limits {
     /// 「单源网络失败立刻重试」后，一次查询最坏能烧到分钟级（日志实测 83.8s）。
     /// 现在整链有 8s 硬截止，再退回三连只是在已经确定慢的路上继续等。
     pub const LYRIC_RETRY_BACKOFF_MS: [u64; 1] = [3_000];
+    /// 歌词落盘「本次运行内已处理」集合的容量上限（v1.7.0）。
+    /// 满了直接 clear：真正的幂等由 `writeback` 的 `create_new` 保证，这个集合只省 syscall。
+    pub const WRITE_BACK_DEDUP_CAP: usize = 64;
     /// 小组件宽度范围（100% DPI 逻辑像素）
     pub const WIDGET_MIN_W: f32 = 200.0;
     pub const WIDGET_MAX_W: f32 = 340.0;
@@ -422,6 +425,8 @@ impl Default for LyricsConfig {
             scroll: true,
             online_enabled: true,
             local_dirs: Vec::new(),
+            // v1.7.0：在线歌词落盘（只新建不覆盖），默认开
+            write_back: true,
         }
     }
 }

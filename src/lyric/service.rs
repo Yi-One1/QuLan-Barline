@@ -32,6 +32,7 @@
 //! 1. **超时不重试**：8 秒截止到点说明两个源都已给过机会，再来一轮只是让用户多等；
 //! 2. **换歌就作废**：重试前必查当前代次，旧曲目的重试绝不执行。
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -46,7 +47,8 @@ use crate::lyric::provider::{
     LocalProvider, LyricProvider, LyricQuery, ParallelOutcome, ProviderChain,
 };
 use crate::lyric::query;
-use crate::lyric::LyricMissReason;
+use crate::lyric::writeback::{self, Outcome};
+use crate::lyric::{LyricMissReason, Lyrics};
 use crate::media::TrackId;
 use crate::platform::wake::EventSink;
 
@@ -202,6 +204,7 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<Msg>, job_tx: Sender<Msg>) {
         dispatch: spawn_dispatcher(job_tx),
         current_track: 0,
         pending: None,
+        wrote: HashSet::new(),
     };
 
     loop {
@@ -263,6 +266,8 @@ struct Worker<O: EventOut> {
     /// 最近一次被受理的请求代次（在线结果与重试的唯一守卫）
     current_track: TrackId,
     pending: Option<Retry>,
+    /// v1.7.0：本次运行已处理过落盘的曲目 key（有界，见 `limits::WRITE_BACK_DEDUP_CAP`）
+    wrote: HashSet<String>,
 }
 
 impl<O: EventOut> Worker<O> {
@@ -403,11 +408,15 @@ impl<O: EventOut> Worker<O> {
                 out.keywords,
                 out.result.elapsed_ms
             );
+            // v1.7.0：先显示后落盘。用 Arc 共享同一份 Lyrics，落盘不再深拷贝。
+            let arc = Arc::new(l);
             self.out.emit(AppEvent::LyricReady {
                 track_id,
-                lyrics: Arc::new(l),
+                lyrics: Arc::clone(&arc),
             });
             self.pending = None;
+            // 代次守卫已在前面通过；用结果自带的 req（不是"当前播放"）
+            self.maybe_write_back(&out.req, &arc, out.result.source);
             return;
         }
 
@@ -463,6 +472,30 @@ impl<O: EventOut> Worker<O> {
                 });
                 self.pending = None;
             }
+        }
+    }
+
+    /// 在线歌词落盘（v1.7.0 / G5）。失败静默降级：只记日志，绝不改事件、不改缓存。
+    fn maybe_write_back(&mut self, req: &LyricRequest, l: &Arc<Lyrics>, source: &str) {
+        if source == "local" {
+            return; // 防御性冗余：本地命中的歌词本来就在磁盘上
+        }
+        if !req.write_back {
+            return;
+        }
+        let key = query::cache_key(&req.track);
+        if self.wrote.contains(&key) {
+            return;
+        }
+        if self.wrote.len() >= limits::WRITE_BACK_DEDUP_CAP {
+            self.wrote.clear();
+        }
+        self.wrote.insert(key);
+
+        match writeback::save(&req.track, &req.local_dirs, l.as_ref()) {
+            Outcome::Written(p) => crate::log_info!("歌词已落盘：{}", p.display()),
+            Outcome::Skipped(s) => crate::log_debug!("歌词不落盘：{s:?}"),
+            Outcome::Failed(e) => crate::log_warn!("歌词落盘失败：{e}"),
         }
     }
 
@@ -594,6 +627,7 @@ mod tests {
             dispatch,
             current_track: 0,
             pending: None,
+            wrote: HashSet::new(),
         }
     }
 
@@ -618,6 +652,9 @@ mod tests {
             },
             local_dirs: dirs,
             online_enabled: online,
+            // v1.7.0：默认关闭，既有测试绝不写盘（污染用户目录）；
+            // 需要验落盘的测试自己把这一位改成 true
+            write_back: false,
             retry: false,
         }
     }
@@ -908,5 +945,158 @@ mod tests {
         let job = jobs.try_recv().expect("到点应再次派发");
         assert_eq!(job.attempt, 1, "重试次数要带上去，结果回来后才知道该不该再试");
         assert_eq!(job.req.track_id, 7);
+    }
+
+    // ------------------------------------------------ 落盘（G5 / v1.7.0）
+
+    /// 独立的「本地歌词目录」临时目录（先清空再建，避免残留影响断言）。
+    fn write_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("barline_service_{tag}_lyrics"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn write_dirs(dir: &std::path::Path) -> Vec<String> {
+        vec![dir.to_string_lossy().to_string()]
+    }
+
+    /// `Barline` 子目录里的文件名（不存在时返回空表）。
+    fn written_files(dir: &std::path::Path) -> Vec<String> {
+        match std::fs::read_dir(dir.join("Barline")) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// S1：开关打开 + 有目录 → 落盘，且**事件只推 1 个** `LyricReady`（先显示后落盘）。
+    #[test]
+    fn s1_online_hit_writes_back_and_emits_one_ready() {
+        let dir = write_dir("s1");
+        let col = Arc::new(Collector::default());
+        let mut w = worker("wb_s1", Arc::clone(&col), never_dispatch());
+
+        let mut req = request_with_id(7, "测试曲目α", "无名歌手α", write_dirs(&dir), true);
+        req.write_back = true;
+        w.on_request(req.clone());
+        let _ = col.take();
+
+        w.on_online(outcome(
+            &req,
+            0,
+            Some(one_line_lyrics("第一句")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+
+        assert_eq!(col.ready(), 1, "命中只许推 1 个 LyricReady（不许因落盘再推一个）");
+        let files = written_files(&dir);
+        assert_eq!(files.len(), 1, "应落盘 1 个文件，实际 {files:?}");
+        let want = format!(
+            "{}.lrc",
+            crate::lyric::locate::candidates(&req.track)
+                .first()
+                .cloned()
+                .expect("应有候选名")
+        );
+        assert_eq!(files[0], want, "文件名必须等于首选候选名 + .lrc");
+        assert!(w.wrote.contains(&query::cache_key(&req.track)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2：开关关闭 → 既不落盘，也不记账。
+    #[test]
+    fn s2_write_back_off_writes_nothing() {
+        let dir = write_dir("s2");
+        let col = Arc::new(Collector::default());
+        let mut w = worker("wb_s2", Arc::clone(&col), never_dispatch());
+
+        let mut req = request_with_id(7, "测试曲目β", "无名歌手β", write_dirs(&dir), true);
+        req.write_back = false;
+        w.on_request(req.clone());
+        let _ = col.take();
+        w.on_online(outcome(
+            &req,
+            0,
+            Some(one_line_lyrics("第一句")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+
+        assert_eq!(col.ready(), 1, "歌词照常显示");
+        assert!(written_files(&dir).is_empty(), "关了开关就不许写盘");
+        assert!(!dir.join("Barline").exists(), "连目录都不许建");
+        assert!(w.wrote.is_empty(), "不落盘就不记账");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3：**旧代结果不落盘**（代次守卫先于落盘生效）。
+    #[test]
+    fn s3_stale_generation_does_not_write_back() {
+        let dir = write_dir("s3");
+        let col = Arc::new(Collector::default());
+        let mut w = worker("wb_s3", Arc::clone(&col), never_dispatch());
+
+        let mut a = request_with_id(7, "测试曲目γ", "无名歌手γ", write_dirs(&dir), true);
+        a.write_back = true;
+        let mut b = request_with_id(9, "测试曲目δ", "无名歌手δ", write_dirs(&dir), true);
+        b.write_back = true;
+        w.on_request(a.clone());
+        w.on_request(b);
+        let _ = col.take();
+
+        // A 的结果迟到回来
+        w.on_online(outcome(
+            &a,
+            0,
+            Some(one_line_lyrics("迟到的歌词")),
+            LyricMissReason::NotFound,
+            false,
+        ));
+
+        assert_eq!(col.take().len(), 0, "旧代不许产生任何事件");
+        assert!(written_files(&dir).is_empty(), "旧代不许落盘");
+        assert!(w.wrote.is_empty(), "旧代不许记账");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S4：`source == "local"` 的防御分支——本地歌词已在磁盘上，不再写一份。
+    #[test]
+    fn s4_local_source_never_writes_back() {
+        let dir = write_dir("s4");
+        let col = Arc::new(Collector::default());
+        let mut w = worker("wb_s4", Arc::clone(&col), never_dispatch());
+
+        let mut req = request_with_id(7, "测试曲目ε", "无名歌手ε", write_dirs(&dir), true);
+        req.write_back = true;
+        let l = Arc::new(one_line_lyrics("第一句"));
+        w.maybe_write_back(&req, &l, "local");
+
+        assert!(written_files(&dir).is_empty(), "本地源不许落盘");
+        assert!(w.wrote.is_empty(), "防御分支连账都不记");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S5：**磁盘缓存命中不落盘**——防止有人把钩子塞进 `query_fast_path`。
+    #[test]
+    fn s5_disk_cache_hit_does_not_write_back() {
+        let dir = write_dir("s5");
+        let col = Arc::new(Collector::default());
+        let mut w = worker("wb_s5", Arc::clone(&col), never_dispatch());
+
+        let mut req = request_with_id(7, "测试曲目ζ", "无名歌手ζ", write_dirs(&dir), true);
+        req.write_back = true;
+        // 预置磁盘缓存：快路径第 2 步就会命中并早退
+        w.cache
+            .put(&query::cache_key(&req.track), &one_line_lyrics("第一句"), "lrclib");
+
+        w.on_request(req.clone());
+
+        assert_eq!(col.ready(), 1, "磁盘命中照常推歌词");
+        assert!(written_files(&dir).is_empty(), "磁盘命中不该落盘（钩子只在 on_online）");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1437,6 +1437,7 @@ impl App {
             track: self.state.playing.track.clone().unwrap_or_default(),
             local_dirs: self.config.lyrics.local_dirs.clone(),
             online_enabled: self.config.lyrics.online_enabled,
+            write_back: self.config.lyrics.write_back,
             retry,
         }
     }
