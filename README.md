@@ -2,7 +2,11 @@
 
 **Windows 10/11 任务栏媒体播控小组件**：一条贴着托盘区左侧的内嵌任务栏条带，逐像素透明，用 Rust + Direct2D 直接绘制——不注入 Explorer、不弹独立悬浮窗。
 
-> 界面截图已归档至 git 历史（v1.8.0 及更早），如需查看可用 `git show 890c07f^:docs/screenshots/` 取回。
+> 界面示意如下（设置页 + 任务栏小组件）：
+
+| 设置界面 | 任务栏小组件 |
+| --- | --- |
+| ![设置界面](assets/screenshots/settings.png) | ![任务栏小组件](assets/screenshots/widget.png) |
 
 **最新版本 [v1.9.0](https://github.com/Yi-One1/QuLan-Barline/releases/latest)** — 单文件绿色便携（约 1.1 MB，零运行时依赖），从 [Releases](https://github.com/Yi-One1/QuLan-Barline/releases) 下载 `曲栏_Barline_v1.9.0.exe` 直接运行即可。
 

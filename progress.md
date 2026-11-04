@@ -255,7 +255,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 3.5 小尾巴与存量（不阻塞）
 - `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
 - M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- ~~GitHub Release 发布~~（2026-11-05 教学已交付：push 13 提交 + Releases/new 发 v1.9.0 + 附 exe，用户自行操作）；LICENSE 版权人实名（现为占位）、设置页标题栏明暗跟随、热键日志冗余清理。
+- ~~GitHub Release 发布~~（2026-11-05 教学已交付：push 提交 + Releases/new 发 v1.9.0 + 附 exe）；**✅ LICENSE 版权人已实名化 `Yi One`**（占位 "The Barline Authors" → "Yi One"，2026-11-05）；**✅ README 已内嵌两张截图**（设置页外观 + 任务栏小组件，存 `assets/screenshots/{settings,widget}.png`，替换原「截图归档至 git 历史」说明，2026-11-05）；剩余：设置页标题栏明暗跟随、热键日志冗余清理。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
 
