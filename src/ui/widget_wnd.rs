@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Shell::{
+    ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE, ABN_WINDOWARRANGE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, LoadCursorW, RegisterClassW,
     RegisterWindowMessageW, SetWindowLongPtrW, GWLP_USERDATA, IDC_ARROW, MA_NOACTIVATE, WNDCLASSW,
@@ -27,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::app::App;
 use crate::platform::wake::{
-    WM_BARLINE_SHOW_SETTINGS, WM_BARLINE_WAKE, WM_BARLINE_WHEEL,
+    WM_BARLINE_APPBAR, WM_BARLINE_SHOW_SETTINGS, WM_BARLINE_WAKE, WM_BARLINE_WHEEL,
 };
 
 /// `WM_MOUSELEAVE`。
@@ -59,13 +62,6 @@ pub const TIMER_LYRIC: usize = 5;
 /// 平均停留 250–350ms，扫光边界每帧只移动 ~1px；25fps 已经完全看不出台阶，
 /// 而 60fps 会让「播放中空闲 CPU」逼近 PRD P0-14 的 0.5% 红线。
 pub const TIMER_LYRIC_MS: u32 = 40;
-/// 解冻兜底定时器 ID（v1.5.5 / G3.5）：挂在**消息窗**上的一次性定时器。
-///
-/// 退出全屏后置 `resume_pending`，等第一份 `NowPlaying` 把隐藏窗口刷成最新内容
-/// 再显示；万一媒体线程异常 / 当前无会话（永远不会来 `NowPlaying`），
-/// [`crate::app::RESUME_FALLBACK_MS`] 到点由它兜底，不会「再也不显示」。
-/// 它是一次性的，不是新的轮询频率；`TIMER_GEOM` 仍是唯一常驻的 1s 心跳。
-pub const TIMER_RESUME: usize = 6;
 
 /// 全局的「小组件窗口句柄」与「App 指针」——`WH_MOUSE_LL` 钩子回调需要它们。
 ///
@@ -314,6 +310,22 @@ unsafe extern "system" fn widget_proc(
 
     let app = app_ptr(hwnd);
     if !app.is_null() {
+        // v1.5.6 / G3.5-A：appbar 通知的**唯一**派发点。注册用的是本窗口（top-level），
+        // 因为 `TaskbarCreated` 是 HWND_BROADCAST，HWND_MESSAGE 的消息窗收不到广播。
+        if msg == WM_BARLINE_APPBAR {
+            let code = wparam.0 as u32;
+            // SAFETY: app 是 UI 线程上存活的 Box<App> 裸指针，本函数在 UI 线程执行，
+            // 不存在并发别名；三个入口都不弹模态框、不 join 媒体线程。
+            match code {
+                ABN_FULLSCREENAPP => unsafe { (*app).on_appbar_fullscreen(lparam.0 != 0) },
+                ABN_POSCHANGED | ABN_STATECHANGE => unsafe { (*app).on_appbar_pos_changed() },
+                ABN_WINDOWARRANGE => crate::log_debug!(
+                    "appbar: ABN_WINDOWARRANGE 到达 → 忽略（纯通知型，不占工作区）"
+                ),
+                _ => crate::log_debug!("appbar: 未处理的通知码 {code} → 忽略"),
+            }
+            return LRESULT(0);
+        }
         // SAFETY: 同上。
         if let Some(r) = unsafe { (*app).on_widget_message(msg, wparam, lparam) } {
             return r;
@@ -351,8 +363,8 @@ unsafe extern "system" fn msg_proc(
         WM_TIMER => {
             let app = app_ptr(hwnd);
             if !app.is_null() {
-                // v1.5.5 / G3.5：消息窗上现在有两个定时器——常驻的 TIMER_GEOM
-                // 与一次性的 TIMER_RESUME，必须把 id 传下去区分。
+                // 消息窗上只有常驻的 TIMER_GEOM（1s）一个定时器；仍把 id 传下去，
+                // 便于 on_timer 做防御性识别。
                 // SAFETY: 同上。
                 unsafe { (*app).on_timer(wparam.0) };
             }

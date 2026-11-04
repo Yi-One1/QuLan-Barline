@@ -22,6 +22,15 @@ pub const WM_BARLINE_SHOW_SETTINGS: u32 = WM_APP + 3;
 /// 但用 `PostMessageW` 能让「钩子 → 业务」的路径与其它输入完全一致，
 /// 也避免了在回调里重入消息泵的风险。
 pub const WM_BARLINE_WHEEL: u32 = WM_APP + 4;
+/// appbar 通知回调（v1.5.6 / G3.5-A）：`SHAppBarMessage(ABM_NEW)` 注册时填进
+/// `APPBARDATA::uCallbackMessage`，Explorer 用它投递 `ABN_FULLSCREENAPP` /
+/// `ABN_POSCHANGED` / `ABN_STATECHANGE` / `ABN_WINDOWARRANGE`。
+///
+/// 编号与既有的 `+1 WAKE` / `+2 TRAY` / `+3 SHOW_SETTINGS` / `+4 WHEEL` 互不冲突，
+/// 也与 `taskbar::host::WM_BARLINE_WIDGET_BASE`（`+16`，小组件窗口内部消息段）不冲突。
+/// 注册必须用 **widget 主窗口**：`TaskbarCreated` 是 `HWND_BROADCAST`，`HWND_MESSAGE`
+/// 的消息窗收不到广播，appbar 通知同理只投递给 top-level 窗口。
+pub const WM_BARLINE_APPBAR: u32 = WM_APP + 5;
 
 /// `HWND` 不实现 `Send`/`Sync`（`#[repr(transparent)] pub struct HWND(pub *mut c_void)`），
 /// 跨线程持有窗口句柄必须自己包一层。
@@ -79,5 +88,38 @@ impl<T: Send + 'static> Clone for EventSink<T> {
             tx: self.tx.clone(),
             wake: self.wake,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v1.5.6：appbar 回调消息号不得与任何既有 `WM_APP + N` 撞车。
+    #[test]
+    fn wm_barline_appbar_is_mutually_exclusive_with_existing_ids() {
+        let ids = [
+            ("WAKE", WM_BARLINE_WAKE),
+            ("TRAY", WM_BARLINE_TRAY),
+            ("SHOW_SETTINGS", WM_BARLINE_SHOW_SETTINGS),
+            ("WHEEL", WM_BARLINE_WHEEL),
+            ("APPBAR", WM_BARLINE_APPBAR),
+            ("WIDGET_BASE", crate::taskbar::host::WM_BARLINE_WIDGET_BASE),
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(
+                    ids[i].1, ids[j].1,
+                    "{} 与 {} 消息号冲突",
+                    ids[i].0, ids[j].0
+                );
+            }
+        }
+        assert_eq!(WM_BARLINE_WAKE, WM_APP + 1);
+        assert_eq!(WM_BARLINE_TRAY, WM_APP + 2);
+        assert_eq!(WM_BARLINE_SHOW_SETTINGS, WM_APP + 3);
+        assert_eq!(WM_BARLINE_WHEEL, WM_APP + 4);
+        assert_eq!(WM_BARLINE_APPBAR, WM_APP + 5);
+        assert_eq!(crate::taskbar::host::WM_BARLINE_WIDGET_BASE, WM_APP + 16);
     }
 }

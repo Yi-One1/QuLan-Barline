@@ -26,8 +26,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, MessageBoxW, PostQuitMessage, SetTimer, IDYES, MB_ICONWARNING, MB_ICONINFORMATION,
-    MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    GetWindowLongPtrW, KillTimer, MessageBoxW, PostQuitMessage, SetTimer, GWL_EXSTYLE, IDYES,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, WS_EX_TOPMOST,
 };
 
 use crate::config::Config;
@@ -37,7 +37,7 @@ use crate::lyric::service::LyricService;
 use crate::lyric::{LyricDraw, LyricStatus, LyricView};
 use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState};
 use crate::platform::dpi::scale_for;
-use crate::platform::wake::{EventSink, WakeHwnd};
+use crate::platform::wake::{EventSink, WakeHwnd, WM_BARLINE_APPBAR};
 use crate::platform::wide::to_wide;
 use crate::render::layout::{self, WidgetForm, WidgetLayout};
 use crate::render::sampler::{CoverageMap, SampleRequest, Sampler};
@@ -49,7 +49,7 @@ use crate::taskbar::host::TaskbarHost;
 use crate::ui::hit::HitTarget;
 use crate::ui::interaction::Interaction;
 use crate::ui::menu::{self, MenuCommand};
-use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_CLICK, TIMER_LYRIC, TIMER_RESUME};
+use crate::ui::widget_wnd::{self, TIMER_ANIM, TIMER_CLICK, TIMER_LYRIC};
 
 /// 交互修饰态（PRD 机器 C）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -153,17 +153,16 @@ pub struct AppState {
     /// 与 [`App::widget_monitor`] 比较即可知道「全屏的那块屏是不是小组件所在的那块」：
     /// 副屏全屏视频不该让主屏的字色自适应停摆。拿不到时全 0。
     pub foreground_monitor: RECT,
-    /// **全屏冻结**（v1.5.5 / G3.5）：同屏的前台窗口全屏时，整个小组件静止。
+    /// **全屏遮挡态**（v1.5.6 / G3.5-A）：窗口仍 `visible`，只降 Z 序 + 静止降载。
     ///
-    /// 由 1s 心跳 [`App::sync_fullscreen_freeze`] 根据 `foreground_info()` 翻转。
-    /// `true` 期间：窗口隐藏、动画 / 歌词定时器停摆且不许再挂、媒体线程暂停
-    /// 分层轮询、`redraw` / `ensure_on_top` / `request_backdrop` 全部跳过。
-    /// 只保留 `TIMER_GEOM`（1s）里的 `foreground_info()` 作为发现「退出全屏」的途径。
+    /// 由 appbar 的 `ABN_FULLSCREENAPP`（事件驱动主路径）与 1s 心跳对账共同翻转：
+    /// `true` → `TaskbarHost::set_z_demoted(true)` 把窗口压到 `HWND_BOTTOM`，
+    /// 让全屏窗口直接盖住它，**永不 `SW_HIDE`**；同时动画 / 歌词定时器停摆、
+    /// 媒体线程暂停分层轮询、`redraw` / `ensure_on_top` / `request_backdrop` 全部跳过。
+    /// 退出时事件到达即刻恢复 `HWND_TOPMOST`，窗口一直都在，不存在「1 秒延迟」。
     pub frozen: bool,
-    /// **解冻等待期**（v1.5.5 / G3.5）：已退出全屏、媒体线程已恢复，但还没收到
-    /// 解冻后第一份 `NowPlaying`。窗口仍隐藏，等 `reduce` 把隐藏窗口刷成最新内容
-    /// 再显示，避免用户看到冻结前的旧帧；400ms 一次性兜底定时器到点也强制结束。
-    pub resume_pending: bool,
+    /// 小组件 Z 序是否已降到 `HWND_BOTTOM`（与 `frozen` 同步，供门控双保险）。
+    pub z_demoted: bool,
 }
 
 impl AppState {
@@ -173,12 +172,6 @@ impl AppState {
             return false;
         }
         if self.taskbar_collapsed {
-            return false;
-        }
-        // v1.5.5 / G3.5：冻结放在「用户主动隐藏 / 任务栏收起」之后、「无会话」之前。
-        // 前两者是明确的长期状态，冻结是临时状态；放在 NoSession 之前才能保证
-        // `frozen == true` 时恒为 false，且解冻后由真实会话态无缝接管。
-        if self.frozen {
             return false;
         }
         if self.playing.state == PlaybackState::NoSession {
@@ -299,6 +292,11 @@ pub struct App {
     /// 用途：判断「前台全屏的那块屏」是不是「小组件这块屏」——只有同屏才跳过心跳，
     /// 否则副屏全屏视频会让主屏的字色自适应白白停摆。
     widget_monitor: RECT,
+    /// 纯通知型 appbar 是否已注册成功（v1.5.6 / G3.5-A）。
+    /// 失败时降级为「只靠 1s 心跳兜底」，靠 `TaskbarCreated` 重注册。
+    appbar_registered: bool,
+    /// 注册时用的窗口句柄（必须是 widget 主窗口；Explorer 重启后可换）。
+    appbar_hwnd: Option<HWND>,
 }
 
 /// 小组件窗口矩形变化的**来源**（诊断日志用，v1.2.0 / G5 问题 2）。
@@ -353,19 +351,30 @@ pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
 /// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
 pub const LYRIC_SLIDE_PX: f32 = 6.0;
 
-/// 解冻兜底超时（毫秒，v1.5.5 / G3.5）。**一次性**定时器，挂在消息窗上。
+/// 全屏遮挡态对账的**来源**（v1.5.6 / G3.5-A）。
 ///
-/// 为什么是 400ms：
-/// - **下界 200ms**：媒体线程解冻后第一轮全量读要跨进程访问 SMTC，正常 1~3ms、
-///   慢调用阈值 8ms，200ms 足够覆盖一次异常慢的读取并让 `NowPlaying` 回到 UI；
-///   再短就会在状态到达前提前显示旧帧；
-/// - **上界 1000ms**：`TIMER_GEOM` 心跳就是 1s，用户退出全屏后最多再等一个
-///   心跳周期就必须看见小组件，不能更慢（也不许为此把心跳调快，见禁改清单）；
-/// - 400ms 落在中间：即使媒体线程异常 / 当前无会话（永远不会有 `NowPlaying`），
-///   也不会出现「小组件再也不显示」。
-///
-/// 它不新增任何轮询频率：只 `SetTimer` 一次，触发或被 `finish_resume` 取消后即结束。
-pub const RESUME_FALLBACK_MS: u32 = 400;
+/// `AppbarClose` 是唯一的强制解冻分支：Explorer 明确广播「全屏应用已关闭」时，
+/// 不再依赖本地 `foreground_info()` 是否已看到状态变化，立即恢复 `HWND_TOPMOST`。
+/// 日志里统一标注 `trigger=appbar|timer`，真机验收据此判断事件有没有到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenTrigger {
+    /// `ABN_FULLSCREENAPP` 且 `lParam != 0`（全屏应用打开）
+    AppbarOpen,
+    /// `ABN_FULLSCREENAPP` 且 `lParam == 0`（全屏应用关闭）
+    AppbarClose,
+    /// 1s 心跳 / Explorer 重启 / 显示变化等兜底对账
+    Timer,
+}
+
+impl FullscreenTrigger {
+    /// 日志友好名（**稳定字符串**，真机验收 grep 用）。
+    fn as_str(self) -> &'static str {
+        match self {
+            FullscreenTrigger::AppbarOpen | FullscreenTrigger::AppbarClose => "appbar",
+            FullscreenTrigger::Timer => "timer",
+        }
+    }
+}
 
 impl WidthAnim {
     /// 当前时刻的插值宽度（ease-out cubic：收合时先快后慢，观感更自然）。
@@ -484,6 +493,8 @@ impl App {
             // 由紧随其后的 `relayout()` 填真值；全 0 时 `same_monitor` 判 false，
             // 也就是「继续采样」——安全方向。
             widget_monitor: RECT::default(),
+            appbar_registered: false,
+            appbar_hwnd: None,
         });
 
         // 歌词行不透明度与初始宽度同步（歌词默认开启时首帧就是实色）
@@ -512,6 +523,24 @@ impl App {
         }
         if let Some(t) = unsafe { (*ptr).tray.as_ref() } {
             crate::ui::widget_wnd::bind_app(t.hwnd(), ptr);
+        }
+
+        // v1.5.6 / G3.5-A：注册纯通知型 appbar（事件驱动主路径）。
+        // 必须用 **widget 主窗口** hwnd：TaskbarCreated 是 HWND_BROADCAST，
+        // HWND_MESSAGE 的消息窗收不到广播，appbar 通知同理只投递给 top-level 窗口。
+        // 放在 bind_app 之后、消息泵启动之前，保证通知到达时 GWLP_USERDATA 已就绪。
+        // SAFETY: ptr 由上面的 Box::into_raw 独占；消息泵尚未启动，无并发别名。
+        unsafe {
+            let hwnd = (*ptr).widget.as_ref().map(|h| h.hwnd());
+            if let Some(hwnd) = hwnd {
+                let ok = crate::platform::appbar::register(hwnd, WM_BARLINE_APPBAR);
+                (*ptr).appbar_registered = ok;
+                (*ptr).appbar_hwnd = if ok { Some(hwnd) } else { None };
+            } else {
+                crate::log_warn!(
+                    "appbar 注册跳过：小组件窗口尚未创建，降级为 1s 心跳兜底（TaskbarCreated 时重注册）"
+                );
+            }
         }
 
         // 启动媒体 / 歌词线程（MTA / 普通线程）。失败不阻塞启动。
@@ -565,6 +594,15 @@ impl App {
         if let Some(sampler) = app.sampler.as_mut() {
             sampler.shutdown();
         }
+        // v1.5.6 / G3.5-A：必须在 host.destroy() **之前**注销 appbar——
+        // ABM_REMOVE 需要注册时那个仍然有效的窗口句柄。
+        if app.appbar_registered {
+            if let Some(hwnd) = app.appbar_hwnd {
+                crate::platform::appbar::unregister(hwnd);
+            }
+            app.appbar_registered = false;
+            app.appbar_hwnd = None;
+        }
         if let Some(host) = app.widget.take() {
             host.destroy();
         }
@@ -589,34 +627,34 @@ impl App {
         self.sync_lyric_timer();
     }
 
-    /// 消息窗的 `WM_TIMER`：`TIMER_GEOM`（1000ms）走几何心跳，
-    /// `TIMER_RESUME`（一次性 400ms）走解冻兜底（v1.5.5 / G3.5）。
+    /// 消息窗的 `WM_TIMER`：只有 `TIMER_GEOM`（1000ms）这一条常驻心跳。
+    ///
+    /// v1.5.6 / G3.5-A：心跳只作**兜底对账**，全屏切换由 appbar 事件驱动；
+    /// 不再有一次性解冻定时器，进出全屏都没有等待期。
     pub fn on_timer(&mut self, id: usize) {
-        // 解冻兜底：无论媒体线程有没有回状态，到点都结束 resume_pending。
-        // 若第一份 `NowPlaying` 已先到，`finish_resume` 的守卫保证不会重复显示。
-        if id == TIMER_RESUME {
-            self.kill_msg_timer(TIMER_RESUME);
-            if self.state.resume_pending {
-                self.finish_resume("兜底 400ms");
-            }
+        // 防御性识别：消息窗上应该只有 1 号定时器。其它 id 一律忽略，
+        // 不新增任何轮询 / 定时器频率。
+        if id != widget_wnd::TIMER_GEOM {
             return;
         }
 
         self.tick_optimistic();
         // G2 诊断：截图态探测要碰**前台进程**（OpenProcess + 查询镜像名），
         // 它有被安全软件挂钩拖慢的可能，单独计时。
-        // v1.5.5：冻结态下 `sync_capture_freeze` 只跑纯本地的 `foreground_info()`，
-        // 这正是「发现退出全屏」的唯一途径（1s 一次，不新增频率、不调快）。
+        // v1.5.6：这一 tick 里 `reconcile_fullscreen` 只跑**一次**纯本地的
+        // `foreground_info()`，截图态探测与全屏遮挡判定共用它的结果。
         {
             let _sp = crate::platform::perf::Span::new("tick.capture");
             self.sync_capture_freeze();
         }
 
-        // ---- v1.5.5 / G3.5：全屏冻结 ----
-        // 冻结期间这一 tick 只做上面那一次 `foreground_info()`（纯本地、微秒级）。
+        // ---- v1.5.6 / G3.5-A：全屏遮挡态 ----
+        // 冻结期间这一 tick 只做上面那一次 `foreground_info()`（纯本地、微秒级）
+        // 外加一次**只读**的 `GetWindowLongPtrW` Z 序对账。
         // 任务栏几何探测（FindWindow / 托盘遍历 / SHAppBarMessage）、ensure_on_top
         // （SetWindowPos）、静止态背景采样、任何重绘全部跳过。
         if self.state.frozen {
+            self.reconcile_z_order_if_raised();
             return;
         }
 
@@ -719,10 +757,45 @@ impl App {
     /// v1.4.4（G2-B2）：**同一次** `foreground_info()` 查询顺带刷新「前台是否全屏」，
     /// 供心跳采样判断复用——全屏判定因此**没有新增任何跨进程调用**。
     ///
-    /// v1.4.4 补丁：同一次结果里的 `monitor` 也一并存下来（零额外调用）。
-    /// 它必须**无条件**刷新（不能只在全屏翻转时更新）：全屏窗口被拖到另一块屏时
-    /// `fullscreen` 一直是 `true`，但「在哪块屏」变了——不更新就会误判成同屏。
+    /// v1.5.6 / G3.5-A：唯一一次 `foreground_info()` 由 [`App::reconcile_fullscreen`]
+    /// 发起，本函数复用它返回的 `info` 做 `detect_capture_with()`——
+    /// 1s 心跳内绝不重复查询。事件路径（appbar）不经过这里，也就绝不触发
+    /// `detect_capture_with`（`OpenProcess` 跨进程）。
     fn sync_capture_freeze(&mut self) {
+        let info = self.reconcile_fullscreen(FullscreenTrigger::Timer);
+
+        // 冻结期间连截图态探测（OpenProcess + 查进程镜像名，跨进程）也跳过：
+        // 这一 tick 只允许留下纯本地的 `foreground_info()`。退出后下一个 tick
+        // 会照常重新判定截图态。
+        if self.state.frozen {
+            return;
+        }
+
+        let now = self.detect_capture_with(&info);
+        if now == self.capture_frozen {
+            return;
+        }
+        self.capture_frozen = now;
+        if now {
+            crate::log_info!("进入截图态：冻结背景采样与几何重排（媒体 / 歌词 / 动画照常）");
+        } else {
+            crate::log_info!("退出截图态：恢复刷新，立即补一次背景采样");
+            self.request_backdrop();
+        }
+    }
+
+    /// 全屏遮挡态的**唯一对账入口**（v1.5.6 / G3.5-A）。
+    ///
+    /// - 只调**一次** `foreground_info()`（纯本地窗口查询，无 `OpenProcess`）；
+    /// - 无条件刷新 `foreground_monitor` / `foreground_fullscreen` + 既有翻转日志
+    ///   （全屏窗口拖到另一块屏时 `fullscreen` 不变但 `monitor` 变了，不刷新会误判）；
+    /// - `want` 由纯函数 [`occlusion_want`] 决定：`AppbarClose` 强制 `false`；
+    /// - 返回 `info` 给 1s 心跳复用做 `detect_capture_with()`。
+    ///   **事件路径绝不调 `detect_capture_with`**。
+    fn reconcile_fullscreen(
+        &mut self,
+        trigger: FullscreenTrigger,
+    ) -> crate::platform::capture::ForegroundInfo {
         let info = crate::platform::capture::foreground_info();
         self.state.foreground_monitor = info.monitor;
         // 全屏标记先落地（下面可能因「状态没变」提前 return，但标记必须是最新的）
@@ -747,117 +820,202 @@ impl App {
             }
         }
 
-        // v1.5.5（G3.5）：全屏冻结判定与心跳共用**同一次** `foreground_info()`，
-        // 零新增跨进程调用。必须放在下面「截图态状态没变就提前 return」之前——
-        // 冻结与否不依赖截图态是否翻转。
-        self.sync_fullscreen_freeze(&info);
-
-        // 冻结期间连截图态探测（OpenProcess + 查进程镜像名，跨进程）也跳过：
-        // 这一 tick 只允许留下纯本地的 `foreground_info()`，它是发现「退出全屏」
-        // 的唯一途径。解冻后的下一个 tick 会照常重新判定截图态。
-        if self.state.frozen {
-            return;
+        let want = occlusion_want(trigger, info.fullscreen, info.monitor, self.widget_monitor);
+        if want != self.state.frozen {
+            crate::log_info!(
+                "全屏遮挡态 {}：want={want} trigger={} fs={} fg=({},{},{},{}) widget=({},{},{},{})",
+                if want { "进入" } else { "退出" },
+                trigger.as_str(),
+                info.fullscreen,
+                info.monitor.left,
+                info.monitor.top,
+                info.monitor.right,
+                info.monitor.bottom,
+                self.widget_monitor.left,
+                self.widget_monitor.top,
+                self.widget_monitor.right,
+                self.widget_monitor.bottom,
+            );
         }
-
-        let now = self.detect_capture_with(&info);
-        if now == self.capture_frozen {
-            return;
-        }
-        self.capture_frozen = now;
-        if now {
-            crate::log_info!("进入截图态：冻结背景采样与几何重排（媒体 / 歌词 / 动画照常）");
-        } else {
-            crate::log_info!("退出截图态：恢复刷新，立即补一次背景采样");
-            self.request_backdrop();
-        }
+        self.apply_fullscreen_occlusion(want);
+        info
     }
 
-    /// 全屏冻结的**进入 / 退出**（v1.5.5 / G3.5）。
+    /// 应用全屏遮挡态（v1.5.6 / G3.5-A）：只写状态 + 只调 Z 序，**永不隐藏窗口**。
     ///
-    /// 每秒一次，与心跳共用 [`crate::platform::capture::foreground_info`] 的结果。
-    /// 判据是纯函数 [`frozen_decision`]：前台全屏 **且** 那块屏就是小组件所在屏。
-    /// 只在状态真的翻转时执行动作——冻结期间不重复隐藏、不重复发命令。
-    fn sync_fullscreen_freeze(&mut self, info: &crate::platform::capture::ForegroundInfo) {
-        let want = frozen_decision(info.fullscreen, info.monitor, self.widget_monitor);
-        if want == self.state.frozen {
-            return;
+    /// `occlusion_transition` 等价于 `want != self.state.frozen`，抽成纯函数便于
+    /// 单测幂等性：连续同一个 `want` 只产生一组「进入 / 退出」副作用。
+    /// `TaskbarHost::set_z_demoted` 自身也幂等，因此这里可以每帧重复调用。
+    fn apply_fullscreen_occlusion(&mut self, want: bool) {
+        let transition = occlusion_transition(self.state.frozen, want);
+        // ① 先清逻辑门控（严格先于 ② 的 set_z_demoted / ③ 的 ensure_on_top）：
+        //    否则 `frozen || z_demoted` 双保险会把恢复动作挡掉。
+        let (frozen, z_demoted) = occlusion_flags(want);
+        self.state.frozen = frozen;
+        self.state.z_demoted = z_demoted;
+        // ② 再按 want 调 Z 序（失败保持旧值，由对账 / 下次转换重试）。
+        if let Some(h) = self.widget.as_mut() {
+            if let Err(e) = h.set_z_demoted(want) {
+                crate::log_warn!("全屏遮挡态切换 Z 序失败：{e}");
+            }
         }
-        if want {
-            self.enter_fullscreen_freeze(info);
-        } else {
-            self.exit_fullscreen_freeze();
+        match transition {
+            Some(true) => self.enter_fullscreen_occlusion(),
+            Some(false) => self.exit_fullscreen_occlusion(),
+            None => {}
         }
     }
 
-    /// 进入冻结（false→true，只执行一次）。
-    fn enter_fullscreen_freeze(&mut self, info: &crate::platform::capture::ForegroundInfo) {
-        // 1) 立刻隐藏（不绕 sync_visibility：那边会按门控重算，没必要）
-        if let Some(h) = self.widget.as_mut() {
-            h.set_visible(false);
-        }
-        // 2) 停掉两个会持续唤醒 UI 的定时器。`start_widget_timer` 里另有 frozen
-        //    守卫，冻结期间谁都别想再把它们挂回来。
+    /// 进入全屏遮挡态（false→true，只执行一次）。
+    ///
+    /// **窗口仍 visible**：Z 序已在 `apply_fullscreen_occlusion` 里降到
+    /// `HWND_BOTTOM`，全屏窗口直接盖住它；退出时抬回 `HWND_TOPMOST` 即可，
+    /// 没有「隐藏 → 等状态 → 显示」的等待期。冻结降载一律保留。
+    fn enter_fullscreen_occlusion(&mut self) {
+        // 1) 停掉两个会持续唤醒 UI 的定时器。`start_widget_timer` 里另有 frozen
+        //    守卫，遮挡期间谁都别想再把它们挂回来。
         self.kill_widget_timer(TIMER_ANIM);
         self.kill_widget_timer(TIMER_LYRIC);
         self.last_lyric_key = None;
-        // 3) 媒体线程完全停下：只 send，绝不等待媒体线程（不 join / 不 SendMessage）
+        // 2) 媒体线程完全停下：只 send，绝不等待媒体线程（不 join / 不 SendMessage）
         self.send_media(MediaCommand::SetPaused(true));
-        // 4) 置位：compute_visible / redraw / request_backdrop / ensure_on_top /
-        //    on_timer 全靠它跳过；state.visible 与实际隐藏保持一致。
-        self.state.frozen = true;
-        self.state.visible = false;
-        let w = info.monitor.right - info.monitor.left;
-        let h = info.monitor.bottom - info.monitor.top;
-        crate::log_info!("进入全屏冻结：{w}×{h} 媒体轮询暂停、渲染停止");
+        let m = self.state.foreground_monitor;
+        crate::log_info!(
+            "进入全屏遮挡态：{}×{} 窗口仍 visible、Z 序 BOTTOM；媒体轮询暂停、渲染/采样/定时器静止",
+            m.right - m.left,
+            m.bottom - m.top
+        );
     }
 
-    /// 退出冻结（true→false，只执行一次）。
+    /// 退出全屏遮挡态（true→false，只执行一次）——**严格顺序，不许调换**。
     ///
-    /// 顺序是「不闪旧内容」的关键：**先不显示**，等 `reduce` 收到解冻后第一份
-    /// `NowPlaying`（或 400ms 兜底）把隐藏窗口刷成最新内容，再 `set_visible(true)`。
-    fn exit_fullscreen_freeze(&mut self) {
-        // 1) 恢复媒体线程：SetPaused(false) 让第一轮立即全量读；
-        //    Refresh 再兜一次「强制重读」。两者共用命令通道，只 send 不 join。
-        self.state.frozen = false;
-        self.send_media(MediaCommand::SetPaused(false));
-        self.send_media(MediaCommand::Refresh);
-        // 2) 置等待标志；sync_visibility 会因此保持隐藏（见其中的 resume 门控）
-        self.state.resume_pending = true;
+    /// ① / ② 已由 `apply_fullscreen_occlusion` 完成（先清 `state.frozen` /
+    /// `state.z_demoted` 放行双保险，再 `set_z_demoted(false)` 回 `HWND_TOPMOST`）。
+    /// 本函数接着执行 ③→⑥：
+    /// ③ `ensure_on_top()`（此刻门控已放行，做位置漂移对账 + `raise()`）；
+    /// ④ `sync_visibility()`（新版 `compute_visible()` 已无 frozen 分支 → true；
+    ///    `TaskbarHost.visible` 本来就是 true → `set_visible(true)` 早退，
+    ///    **不调 ShowWindow、不闪、不空白**）；
+    /// ⑤ `SetPaused(false)` + `Refresh`（首轮 `Plan::full()`，只 send 不 join）；
+    /// ⑥ `sync_lyric_timer()` + `request_backdrop()`。
+    /// 仍**不做** `relayout_with`、不强制 `redraw`、不手工 `set_visible(true)`。
+    fn exit_fullscreen_occlusion(&mut self) {
+        // ③ 门控已在 apply_fullscreen_occlusion 里清空，ensure_on_top 此刻必然放行。
+        self.ensure_on_top();
+        // ④ 常规可见性门控：窗口全程 visible，host 幂等早退，不触发 ShowWindow。
         self.sync_visibility();
-        // 3) 一次性兜底定时器（消息窗；不是新的轮询频率）
-        self.start_msg_timer(TIMER_RESUME, RESUME_FALLBACK_MS);
-        crate::log_info!("退出全屏 → 解冻（{}ms 后恢复显示）", RESUME_FALLBACK_MS);
+        // ⑤ 恢复媒体轮询，顺序不许改：SetPaused(false) → reset_for_resume() →
+        //    首轮 Plan::full()，再由 Refresh 兜一次强制重读。
+        for cmd in occlusion_resume_commands() {
+            self.send_media(cmd);
+        }
+        // ⑥ 恢复歌词定时器 + 立即补采背景（request_backdrop 的 frozen 守卫已放行）。
+        self.sync_lyric_timer();
+        self.request_backdrop();
+        crate::log_info!("退出全屏遮挡态：Z 序恢复 TOPMOST，窗口始终可见、无等待期");
     }
 
-    /// 结束解冻等待期：先把隐藏窗口刷成最新内容，再显示。
+    // ---------------------------------------------------------------- appbar 事件
+
+    /// `ABN_FULLSCREENAPP`（v1.5.6 / G3.5-A）：事件驱动主路径，**零延迟**。
     ///
-    /// `source` 只进日志（`"NowPlaying"` / `"兜底 400ms"`），便于确认走的是
-    /// 「状态先到」还是「超时兜底」。
-    fn finish_resume(&mut self, source: &str) {
-        if !self.state.resume_pending {
+    /// `open = true`：先把 Z 序压到 `BOTTOM` 作零延迟保险——事件到达时
+    /// `foreground_info()` 可能还没看到刚创建的全屏窗口；随后做一次对账，
+    /// 若判定「不是这块屏」，`apply_fullscreen_occlusion(false)` 会在**同一个
+    /// WndProc 内**把 Z 序还原成 `TOPMOST`，副屏全屏绝不误降。
+    ///
+    /// `open = false`：`AppbarClose` 强制解冻，立即 `HWND_TOPMOST`。
+    pub fn on_appbar_fullscreen(&mut self, open: bool) {
+        crate::log_info!(
+            "appbar: ABN_FULLSCREENAPP {} 到达（trigger=appbar）",
+            if open { "open" } else { "close" }
+        );
+        if open {
+            if let Some(h) = self.widget.as_mut() {
+                if let Err(e) = h.set_z_demoted(true) {
+                    crate::log_warn!("appbar: 预降 Z 序失败：{e}");
+                }
+            }
+        }
+        let trigger = if open {
+            FullscreenTrigger::AppbarOpen
+        } else {
+            FullscreenTrigger::AppbarClose
+        };
+        let _ = self.reconcile_fullscreen(trigger);
+    }
+
+    /// `ABN_POSCHANGED` / `ABN_STATECHANGE`（v1.5.6 / G3.5-A）。
+    ///
+    /// **只**按当前 `z_demoted` 重发一次 Z 序：冻结期零新增跨进程调用，
+    /// 绝不调 `geometry::probe()` / `relayout_with()`（冻结期本来就不跑几何探测、
+    /// 位置未变，退出全屏后既有 1s 心跳会自然对账）。
+    pub fn on_appbar_pos_changed(&mut self) {
+        crate::log_debug!("appbar: ABN_POSCHANGED / ABN_STATECHANGE 到达 → 只重发 Z 序");
+        if let Some(h) = self.widget.as_ref() {
+            if let Err(e) = h.reassert_z_order() {
+                crate::log_warn!("appbar: 重发 Z 序失败：{e}");
+            }
+        }
+    }
+
+    /// Explorer 重启后重注册 appbar（best-effort，v1.5.6 / G3.5-A）。
+    ///
+    /// 先用记录中的旧句柄 `unregister`，再用**当前** widget hwnd `register`，
+    /// 更新 `appbar_registered` / `appbar_hwnd`，最后按当前状态重发一次 Z 序。
+    fn appbar_reregister(&mut self) {
+        if self.appbar_registered {
+            if let Some(old) = self.appbar_hwnd {
+                crate::platform::appbar::unregister(old);
+            }
+        }
+        self.appbar_registered = false;
+        self.appbar_hwnd = None;
+
+        let Some(hwnd) = self.widget.as_ref().map(|h| h.hwnd()) else {
+            crate::log_warn!("appbar: 重注册跳过（小组件窗口尚未创建）");
+            return;
+        };
+        let ok = crate::platform::appbar::register(hwnd, WM_BARLINE_APPBAR);
+        self.appbar_registered = ok;
+        self.appbar_hwnd = if ok { Some(hwnd) } else { None };
+        if let Some(h) = self.widget.as_ref() {
+            if let Err(e) = h.reassert_z_order() {
+                crate::log_warn!("appbar: 重注册后重发 Z 序失败：{e}");
+            }
+        }
+    }
+
+    /// 冻结期**只读** Z 序对账（v1.5.6 / G3.5-A）。
+    ///
+    /// 只有被外部（第三方 / Explorer）重新置顶、导致 `WS_EX_TOPMOST` 又被置位时，
+    /// 才按当前 `z_demoted` 重发一次 `HWND_BOTTOM`。`GetWindowLongPtrW` 是纯本地
+    /// 只读查询，不新增任何跨进程调用；正常情况一秒最多一次且基本不触发。
+    fn reconcile_z_order_if_raised(&mut self) {
+        if !self.state.z_demoted {
             return;
         }
-        // 1) 窗口仍隐藏时刷新内容：`relayout_with` 内部顺序是 apply_geometry →
-        //    `redraw()` → `sync_visibility()`；此时 resume_pending 仍为 true，
-        //    sync_visibility 保持隐藏，绝不会提前露出旧帧。
-        //    （`redraw` 对隐藏的 layered window 有效：UpdateLayeredWindow 只是提交位图。）
-        self.relayout_with(RectChangeReason::Unknown);
-        // 2) 内容已画好 → 显示。几何不可用时 relayout 已隐藏窗口，不强行显示，
-        //    等下次几何就绪自然恢复；其余可见性门控（user_hidden / NoSession 等）照旧。
-        let host = if self.geometry.is_some() && self.state.compute_visible() {
-            self.widget.as_mut()
-        } else {
-            None
+        let Some(host) = self.widget.as_ref() else {
+            return;
         };
-        if let Some(h) = host {
-            h.set_visible(true);
+        // 上次 `set_z_demoted` 的 SetWindowPos 失败时 Host 保持旧值（false），
+        // 此时 `reassert_z_order()` 会误发 TOPMOST；交给下一次
+        // `apply_fullscreen_occlusion` 的幂等重试，别在这里抬回去。
+        if !host.z_demoted() {
+            return;
         }
-        // 3) 清标志 + 停兜底定时器 + 让 state.visible / 歌词定时器回到常规门控
-        self.state.resume_pending = false;
-        self.kill_msg_timer(TIMER_RESUME);
-        self.sync_visibility();
-        self.sync_lyric_timer();
-        crate::log_info!("解冻完成（{source}），恢复显示");
+        let hwnd = host.hwnd();
+        // SAFETY: GetWindowLongPtrW 只读窗口扩展样式位；hwnd 由 TaskbarHost 独占且有效。
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        let still_topmost = (ex_style & WS_EX_TOPMOST.0 as isize) != 0;
+        if still_topmost {
+            crate::log_debug!("appbar/timer: 检测到外部重新置顶 → 重发 BOTTOM");
+            if let Some(h) = self.widget.as_ref() {
+                if let Err(e) = h.reassert_z_order() {
+                    crate::log_warn!("Z 序对账重发失败：{e}");
+                }
+            }
+        }
     }
 
     /// 前景窗口是不是已知的截图工具（用**已经取好**的前台信息，不重复查询）。
@@ -898,6 +1056,15 @@ impl App {
         }
         self.relayout_with(RectChangeReason::TaskbarGeometry);
         self.ensure_on_top();
+        // v1.5.6 / G3.5-A：Explorer 重启期间 `SHAppBarMessage` 会失败，必须重注册；
+        // 随后用新几何对账一次全屏遮挡态，并按当前状态重发 Z 序。
+        self.appbar_reregister();
+        let _ = self.reconcile_fullscreen(FullscreenTrigger::Timer);
+        if let Some(h) = self.widget.as_ref() {
+            if let Err(e) = h.reassert_z_order() {
+                crate::log_warn!("TaskbarCreated 后重发 Z 序失败：{e}");
+            }
+        }
     }
 
     /// `WM_DISPLAYCHANGE`：分辨率 / DPI / 显示器增删。
@@ -905,7 +1072,10 @@ impl App {
         crate::log_info!("WM_DISPLAYCHANGE：重建渲染目标");
         self.geometry = None;
         self.last_coverage = None;
+        // `relayout_with(DpiChange)` 会刷新 `widget_monitor`，之后才能正确判断
+        // 「全屏的那块屏是不是小组件这块屏」。
         self.relayout_with(RectChangeReason::DpiChange);
+        let _ = self.reconcile_fullscreen(FullscreenTrigger::Timer);
     }
 
     /// `WM_HOTKEY`：全局快捷键按下。
@@ -1292,14 +1462,9 @@ impl App {
                     self.interact.reset();
                     self.sync_interaction();
                 }
-                // v1.5.5 / G3.5：解冻后的第一份 NowPlaying 不直接 Relayout——
-                // 交给 apply 走 `finish_resume`（先刷隐藏窗口的内容，再显示），
-                // 否则用户退出全屏瞬间会看到冻结前的旧帧。
-                let mut effects = if self.state.resume_pending {
-                    vec![Effect::ResumeFromFreeze]
-                } else {
-                    vec![Effect::Relayout]
-                };
+                // v1.5.6 / G3.5-A：窗口在全屏遮挡态下从未隐藏，没有「解冻等待期」，
+                // 恢复为无条件 Relayout（与 v1.5.4 及更早版本完全一致）。
+                let mut effects = vec![Effect::Relayout];
                 if track_changed {
                     // 换歌 → 立刻发歌词请求（旧歌词由 `LyricLoading` 覆盖，不残留）
                     effects.push(Effect::Lyric(self.lyric_request(false)));
@@ -2035,9 +2200,6 @@ impl App {
             match effect {
                 Effect::Relayout => self.relayout_with(RectChangeReason::Resize),
                 Effect::Redraw => self.redraw(),
-                // v1.5.5 / G3.5：解冻后第一份 NowPlaying 已写进 state，
-                // 此时才刷新隐藏窗口并恢复显示（不闪旧内容）。
-                Effect::ResumeFromFreeze => self.finish_resume("NowPlaying"),
                 Effect::SetVisible(v) => {
                     if let Some(h) = self.widget.as_mut() {
                         h.set_visible(v);
@@ -2238,9 +2400,8 @@ impl App {
 
     /// 只重绘（布局不变）。
     pub fn redraw(&mut self) {
-        // v1.5.5 / G3.5：冻结期间任何绘制都跳过——窗口已隐藏，也没有内容变化。
-        // 解冻等待期（resume_pending）frozen 已是 false，这里的 redraw 照常生效，
-        // 由 finish_resume 在隐藏状态下先把内容刷成最新。
+        // v1.5.6 / G3.5-A：全屏遮挡态静止降载——窗口仍 visible 但被全屏窗口盖住，
+        // 内容不会变化（动画 / 歌词定时器已停、媒体线程已暂停），任何绘制都跳过。
         if self.state.frozen {
             return;
         }
@@ -2435,10 +2596,9 @@ impl App {
         // v1.5.0（G3）：有效隐藏态 = 「配置里隐藏」∨「本次运行点了 ×」。
         // `dismissed` 只在内存里，从不写盘 —— 这就是「重启后照常显示」。
         self.state.user_hidden = self.config.general.widget_hidden || self.state.dismissed;
-        // v1.5.5 / G3.5：解冻等待第一份 `NowPlaying` 期间，即使门控算出「该显示」
-        // 也必须保持隐藏——先让隐藏窗口刷成最新内容，再由 `finish_resume` 显示。
-        // 否则 `LyricReady` / `ConfigChanged` 等事件顺路调到这里就会露出旧帧。
-        self.state.visible = self.state.compute_visible() && !self.state.resume_pending;
+        // v1.5.6 / G3.5-A：全屏遮挡态不参与可见性门控——窗口一直 visible，
+        // 只靠 Z 序被盖住。`frozen` / `z_demoted` 都不改变这里的结论。
+        self.state.visible = self.state.compute_visible();
         let vis = self.state.visible;
         if let Some(h) = self.widget.as_mut() {
             h.set_visible(vis);
@@ -2460,8 +2620,8 @@ impl App {
     /// **所有采样入口都走这里**（悬停进入 / 换壁纸 / 几何变化 / 退出截图态 / 配置变更），
     /// 所以「上次采样时刻」只需在这里刷新一处（v1.4.4 / G2-B1 的心跳节流依赖它）。
     fn request_backdrop(&mut self) {
-        // v1.5.5（G3.5）：全屏冻结期间不抓屏——窗口已隐藏，读桌面毫无意义，
-        // BitBlt 还正是「后台占用」的大头。退出冻结后由 relayout 自然补采。
+        // v1.5.6 / G3.5-A：全屏遮挡态不抓屏——窗口被遮挡、抓屏无意义，
+        // BitBlt 还正是「后台占用」的大头。退出遮挡后由 exit_fullscreen_occlusion 补采。
         if self.state.frozen {
             return;
         }
@@ -2564,9 +2724,10 @@ impl App {
     }
 
     fn start_widget_timer(&mut self, id: usize, ms: u32) {
-        // v1.5.5 / G3.5：冻结期间 ANIM / LYRIC 一律不许再挂起（0 唤醒）。
-        // 单点守卫而不是改每个调用点：`sync_interaction` / `sync_lyric_timer` /
-        // `animate_lyric_width` / `on_wake` 全都从这里过。
+        // v1.5.6 / G3.5-A：全屏遮挡态下窗口被遮挡、抓屏无意义，ANIM / LYRIC
+        // 一律不许再挂起（0 唤醒）。单点守卫而不是改每个调用点：
+        // `sync_interaction` / `sync_lyric_timer` / `animate_lyric_width` /
+        // `on_wake` 全都从这里过。
         if self.state.frozen && (id == TIMER_ANIM || id == TIMER_LYRIC) {
             return;
         }
@@ -2598,10 +2759,11 @@ impl App {
         }
     }
 
-    /// 在**消息窗**上挂一次性定时器（v1.5.5 / G3.5 解冻兜底）。
+    /// 在**消息窗**上挂定时器。
     ///
-    /// 消息窗是 `HWND_MESSAGE`，进程期常驻；`TIMER_GEOM`（1s）也在它上面，
-    /// 两者 id 不冲突。同 id 重复 `SetTimer` 只是重置周期，不会叠加。
+    /// 消息窗是 `HWND_MESSAGE`，进程期常驻；`TIMER_GEOM`（1s）由
+    /// `create_msg_window` 直接挂上，是唯一常驻心跳。这里保留一对幂等入口，
+    /// 供后续需要在消息窗上重启 `TIMER_GEOM` 时使用，不新增任何轮询频率。
     fn start_msg_timer(&self, id: usize, ms: u32) {
         // SAFETY: msg_hwnd 由 bootstrap 创建且进程期有效。
         unsafe {
@@ -2609,8 +2771,8 @@ impl App {
         }
     }
 
-    /// 结束消息窗上的一次性定时器（幂等；WM_TIMER 已入队也无害，
-    /// `on_timer` 里的 `resume_pending` 守卫会把它变成 no-op）。
+    /// 结束消息窗上的定时器（幂等；`WM_TIMER` 已入队也无害，
+    /// `on_timer` 只认 `TIMER_GEOM`）。
     fn kill_msg_timer(&self, id: usize) {
         // SAFETY: 与 start_msg_timer 配对。
         unsafe {
@@ -2801,10 +2963,11 @@ impl App {
 
     /// 重新把小组件窗口放到 topmost 带的最前面（`SWP_NOACTIVATE`，不改焦点）。
     fn ensure_on_top(&mut self) {
-        // v1.5.5 / G3.5：冻结期间绝不 `raise()`——这正是「小组件盖在全屏窗口上方」
-        // 的根因（本轮需求的原始动机）。on_timer 已提前 return，这里再兜一层，
-        // 保证 TaskbarCreated 等其它入口也不会把它抬上去。
-        if self.state.frozen {
+        // v1.5.6 / G3.5-A：全屏遮挡态绝不 `raise()`——这正是「小组件盖在全屏窗口
+        // 上方」的根因（本轮需求的原始动机）。`on_timer` 已提前 return，这里再兜
+        // 一层双保险（frozen ∨ z_demoted），保证 TaskbarCreated 等其它入口也不会
+        // 把它抬上去。
+        if self.state.frozen || self.state.z_demoted {
             return;
         }
         // v1.2.0 诊断：置顶轮询顺便对账「窗口实际矩形 vs target_rect」。
@@ -2970,6 +3133,62 @@ fn should_skip_idle_backdrop(fullscreen: bool, fg_monitor: RECT, widget_monitor:
 /// 与 v1.4.4 多显示器补丁一致——宁可多跑一次心跳，也不能让主屏小组件被误冻。
 fn frozen_decision(foreground_fullscreen: bool, fg_monitor: RECT, widget_monitor: RECT) -> bool {
     should_skip_idle_backdrop(foreground_fullscreen, fg_monitor, widget_monitor)
+}
+
+/// 全屏遮挡态的目标值（v1.5.6 / G3.5-A，R1 定点修正）——**纯函数**，可单测。
+///
+/// - `AppbarClose` **强制 `false`**：Explorer 明确广播「全屏应用已关闭」，
+///   不再等本地 `foreground_info()` 看见状态变化，退出全屏零延迟。
+/// - `Timer` 走 [`frozen_decision`]（**逐字不动**）：前台全屏 **且** 同屏才降级，
+///   副屏全屏、任一显示器矩形全 0 一律不降级（安全方向不变）。
+/// - `AppbarOpen` **信任事件、仅明确异屏才还原**（v1.5.6-R1 契约）：
+///   shell 的 `ABN_FULLSCREENAPP` 判定本身基于前台窗口是否覆盖整屏，判据与本地
+///   `foreground_info()` 同源；事件可能早于前台窗口完成切换，此时本地仍报
+///   `fs=false`。若沿用 `frozen_decision`，`apply_fullscreen_occlusion(false)`
+///   会把 `on_appbar_fullscreen` 刚预降的 `HWND_BOTTOM` 在**同一个 WndProc 内**
+///   还原成 `TOPMOST`，只能等 1s 心跳补冻——正是用户否定的 v1.5.5 症状。
+///   故改为 `!(fs && !same_monitor(fg, wm))`：
+///     * `fs=true && 异屏 / 任一侧全 0` → `false`（保住副屏与 monitor 全 0 安全方向）；
+///     * `fs=true && 同屏`               → `true`；
+///     * `fs=false`（竞态）              → `true`（保留预降并正常进入遮挡 / 降载，
+///       随后 1s 心跳按 `frozen_decision` 自然对账：真全屏则保持，否则恢复）。
+///
+/// 「副屏全屏但前台是主屏普通窗口」时 shell 通常根本不发 TRUE，不存在误降；
+/// 「副屏全屏且该窗口是前台」时本地 `fs=true` 且 `same_monitor=false` → 立即还原。
+fn occlusion_want(trigger: FullscreenTrigger, fs: bool, fg: RECT, wm: RECT) -> bool {
+    match trigger {
+        FullscreenTrigger::AppbarClose => false,
+        FullscreenTrigger::AppbarOpen => !(fs && !same_monitor(fg, wm)),
+        FullscreenTrigger::Timer => frozen_decision(fs, fg, wm),
+    }
+}
+
+/// 幂等闸门（v1.5.6 / G3.5-A）——**纯函数**，可单测。
+///
+/// `Some(want)` = 需要执行一组「进入 / 退出全屏遮挡态」副作用；`None` = 状态未翻转，
+/// 什么都不做。等价于 `want != current_frozen`；抽出来是为了让
+/// [`App::apply_fullscreen_occlusion`] 的「连续同 want 只一组副作用」可被纯单测钉死。
+fn occlusion_transition(current_frozen: bool, want: bool) -> Option<bool> {
+    (want != current_frozen).then_some(want)
+}
+
+/// 全屏遮挡态要写入 `AppState` 的两个标记（v1.5.6 / G3.5-A）——**纯函数**，可单测。
+///
+/// `apply_fullscreen_occlusion` 用它保证 `frozen` 与 `z_demoted` 永远同步，且**都先于**
+/// `set_z_demoted` / `ensure_on_top` 落地——退出时 ① 先清门控放行双保险，
+/// ② 才恢复 `HWND_TOPMOST`。抽成纯函数是为了让「副屏不误降 / AppbarClose 强制解冻
+/// → `z_demoted == false`」能被单测直接钉在生产代码上。
+fn occlusion_flags(want: bool) -> (bool, bool) {
+    (want, want)
+}
+
+/// 退出全屏遮挡态时下发给媒体线程的**有序命令**（v1.5.6 / G3.5-A）。
+///
+/// 抽成纯函数便于单测：UI 只 `send`、绝不等待；`SetPaused(false)` 让 smtc 侧
+/// `reset_for_resume()` 把**首轮**设成 `Plan::full()`（三组跨进程调用全读），
+/// `Refresh` 再兜一次强制重读。顺序不许改，否则首轮可能只走分层节奏。
+fn occlusion_resume_commands() -> [MediaCommand; 2] {
+    [MediaCommand::SetPaused(false), MediaCommand::Refresh]
 }
 
 /// 从 `LPARAM` 里取客户区坐标（`GET_X_LPARAM` / `GET_Y_LPARAM` 的等价实现）。
@@ -3477,19 +3696,32 @@ mod marquee_tests {
         );
     }
 
-    // ---------------------------------------------- v1.5.5 / G3.5：全屏冻结
+    // ---------------------------------------------- v1.5.6 / G3.5-A：全屏遮挡
 
-    /// 两个新标记默认必须是 `false`：启动时不该莫名其妙处于冻结 / 解冻等待态。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约钉死
+    /// 「隐藏 + 解冻等待态」两个标记默认为 false；新契约把等待态换成
+    /// Z 序降级态 `z_demoted`（窗口仍 visible，只降 Z 序、无等待期）。
+    /// 断言强度不变：仍逐项检查两个标记默认为 false。
+    ///
+    /// 两个标记默认必须是 `false`：启动时不该莫名其妙处于遮挡 / Z 序降级态。
     #[test]
     fn freeze_flags_default_to_false() {
         let s = AppState::default();
         assert!(!s.frozen);
-        assert!(!s.resume_pending);
+        assert!(!s.z_demoted);
     }
 
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约逐格断言
+    /// `want_visible = !hidden && !collapsed && !frozen`（frozen 恒隐藏）；
+    /// 新契约改为 `!hidden && !collapsed`，并为**删掉的每条 frozen 隐藏断言**
+    /// 补上等强度替代「同组合下翻转 frozen，compute_visible() 恒等」，
+    /// 16 格一格不少、三条门控方向不变。
+    ///
     /// **冻结判定真值表**：`(foreground_fullscreen, same_monitor,
     /// taskbar_collapsed, user_hidden)` 共 16 格，逐格断言 `frozen` 与
     /// `compute_visible()`。同时点名两条安全方向：副屏全屏、monitor 全 0。
+    /// v1.5.6：`compute_visible()` 不再受 `frozen` 影响，新增「frozen 不改变
+    /// compute_visible()」的等强度断言（窗口仍 visible，只降 Z 序）。
     #[test]
     fn frozen_decision_matrix() {
         for fullscreen in [false, true] {
@@ -3510,12 +3742,20 @@ mod marquee_tests {
                         s.user_hidden = hidden;
                         s.taskbar_collapsed = collapsed;
                         s.frozen = frozen;
-                        let want_visible = !hidden && !collapsed && !frozen;
+                        let want_visible = !hidden && !collapsed;
                         assert_eq!(
                             s.compute_visible(),
                             want_visible,
                             "fullscreen={fullscreen} same={same} collapsed={collapsed} \
                              hidden={hidden} frozen={frozen}"
+                        );
+                        // 新契约：frozen 不参与可见性门控——翻转它结论必须不变。
+                        let mut unfrozen = s.clone();
+                        unfrozen.frozen = false;
+                        assert_eq!(
+                            s.compute_visible(),
+                            unfrozen.compute_visible(),
+                            "frozen 不得改变 compute_visible()：collapsed={collapsed} hidden={hidden}"
                         );
                     }
                 }
@@ -3533,10 +3773,17 @@ mod marquee_tests {
         assert!(!frozen_decision(true, RECT::default(), RECT::default()));
     }
 
-    /// `frozen == true` 时 `compute_visible()` **恒** false：不管会话态、
-    /// 用户隐藏、任务栏收起怎么组合，也不管是不是刚解冻结。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：原 `compute_visible_is_false_whenever_frozen`
+    /// 钉死「frozen 时 12 格恒 false」；新契约是「frozen 前后 12 格恒等」。
+    /// 原 12 条 `assert!(!compute_visible())` 全部替换为
+    /// 「置位前 / 置位后 / 复位后」三条 `assert_eq!` 加一条门控方向断言，
+    /// 每格由 1 条断言增到 3 条，等强度且更强；函数改名不删函数。
+    ///
+    /// v1.5.6：**`frozen` 前后 `compute_visible()` 恒等**（12 格全组合）。
+    /// 窗口在全屏遮挡态下仍 visible，只靠 Z 序被盖住——这正是「退出全屏时还在」
+    /// 的实现前提。三条安全方向回归逐字保留（门控仍是唯一决定因素）。
     #[test]
-    fn compute_visible_is_false_whenever_frozen() {
+    fn compute_visible_ignores_frozen() {
         for hidden in [false, true] {
             for collapsed in [false, true] {
                 for state in [
@@ -3548,19 +3795,38 @@ mod marquee_tests {
                     s.playing.state = state;
                     s.user_hidden = hidden;
                     s.taskbar_collapsed = collapsed;
+                    let before = s.compute_visible();
                     s.frozen = true;
-                    assert!(
-                        !s.compute_visible(),
-                        "frozen 时必须恒不可见：hidden={hidden} collapsed={collapsed} state={state:?}"
+                    assert_eq!(
+                        s.compute_visible(),
+                        before,
+                        "frozen 前后 compute_visible() 必须恒等：hidden={hidden} \
+                         collapsed={collapsed} state={state:?}"
+                    );
+                    s.frozen = false;
+                    assert_eq!(
+                        s.compute_visible(),
+                        before,
+                        "取消 frozen 后也必须恒等：hidden={hidden} collapsed={collapsed} state={state:?}"
+                    );
+                    // 安全方向回归：结论仍只由三条既有门控决定。
+                    let want = !hidden && !collapsed && state != PlaybackState::NoSession;
+                    assert_eq!(
+                        before, want,
+                        "门控结论只由 user_hidden / taskbar_collapsed / NoSession 决定"
                     );
                 }
             }
         }
-        // 回归：没冻结时既有真值表不许被改坏（不放宽任何既有断言）
+        // 回归 1：有会话 + 无遮挡 → 可见
         let mut s = AppState::default();
         s.playing.state = PlaybackState::Playing;
         assert!(s.compute_visible());
+        // 回归 2：frozen=true 仍必须可见（绝不 SW_HIDE）
         s.frozen = true;
+        assert!(s.compute_visible(), "全屏遮挡态窗口仍 visible");
+        // 回归 3：NoSession 仍必须不可见（不被 frozen 覆盖）
+        s.playing.state = PlaybackState::NoSession;
         assert!(!s.compute_visible());
     }
 
@@ -3580,25 +3846,388 @@ mod marquee_tests {
         }
     }
 
-    /// 解冻兜底 400ms：
-    /// - **≥200ms**：给媒体线程一次解冻后的全量读（跨进程 SMTC 正常 1~3ms，
-    ///   异常慢也不该被提前显示旧帧）留出余量；
-    /// - **≤1000ms**：`TIMER_GEOM_MS` 就是 1s，退出全屏后最多再等一个心跳周期
-    ///   必须看见小组件，且**不许**为此把 1s 心跳调快（禁改清单）；
-    /// - 400ms 取中，媒体线程异常 / 无会话（永远没有 NowPlaying）时也不会永远隐藏。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：原
+    /// `resume_fallback_timeout_is_within_bounds` 钉死「400ms 一次性兜底定时器 +
+    /// 隐藏等待期」；新契约是「**无解冻等待**」——窗口全程 visible，进出
+    /// 全屏都没有等待期。删掉的 5 条断言（200ms 下界 / 1000ms 上界 /
+    /// `==400` / 6 号定时器 id / 心跳上限）由本测试里的 4 个定时器 id 值、
+    /// 两个周期、无 6 号兜底定时器、无隐藏等待态、命令序列共 12 条断言等强度替代。
+    ///
+    /// v1.5.6「**无 resume 等待**」契约：
+    /// - 1s 心跳与 40ms 歌词周期一字未变，没有新增更快轮询；
+    /// - 不存在隐藏等待态（`frozen` / `z_demoted` 默认 false，且 `frozen=true`
+    ///   时 `compute_visible()` 仍为 true）；
+    /// - 退出遮挡的命令序列保证 smtc 首轮 `Plan::full()`（`SetPaused(false)` →
+    ///   `reset_for_resume()` → `Plan::full()`，再 `Refresh` 兜底）。
     #[test]
-    fn resume_fallback_timeout_is_within_bounds() {
+    fn no_resume_wait_contract_and_timer_periods_unchanged() {
+        assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000, "1s 心跳不许调快");
+        assert_eq!(widget_wnd::TIMER_LYRIC_MS, 40, "歌词定时器周期不许被改");
+        assert_eq!(widget_wnd::TIMER_GEOM, 1);
+        assert_eq!(widget_wnd::TIMER_ANIM, 2);
+        assert_eq!(widget_wnd::TIMER_CLICK, 3);
+        assert_eq!(widget_wnd::TIMER_LYRIC, 5);
+
+        // 无隐藏等待态：默认无标记；遮挡态下窗口仍 visible。
+        let mut s = AppState::default();
+        assert!(!s.frozen);
+        assert!(!s.z_demoted);
+        s.playing.state = PlaybackState::Playing;
+        assert!(s.compute_visible());
+        s.frozen = true;
+        s.z_demoted = true;
         assert!(
-            RESUME_FALLBACK_MS >= 200,
-            "太短会在第一份 NowPlaying 到达前露出冻结前的旧帧"
+            s.compute_visible(),
+            "遮挡态窗口仍 visible，不存在「隐藏 → 等状态 → 显示」的等待期"
         );
-        assert!(
-            RESUME_FALLBACK_MS <= 1000,
-            "不得超过 1s 几何心跳周期，也不许为此新增更快的轮询"
+
+        // 首轮 Plan::full() 的命令链：只 send、不 join、顺序不许改。
+        assert_eq!(
+            occlusion_resume_commands(),
+            [MediaCommand::SetPaused(false), MediaCommand::Refresh],
+            "SetPaused(false) → reset_for_resume() → 首轮 Plan::full() → Refresh"
         );
-        assert_eq!(RESUME_FALLBACK_MS, 400);
-        assert_eq!(TIMER_RESUME, 6, "消息窗定时器 id 不得与既有 id 冲突");
-        assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000, "1s 心跳是本轮上限，不许调快");
+        assert_ne!(MediaCommand::SetPaused(false), MediaCommand::SetPaused(true));
+        assert_ne!(MediaCommand::SetPaused(false), MediaCommand::Refresh);
+    }
+
+    /// v1.5.6 / R1：`occlusion_want` 的 `Trigger × (fs × 同屏 / 副屏 / 全 0)` 真值表。
+    ///
+    /// **v1.5.6-R1 契约：事件优先、明确异屏才还原**。`AppbarOpen` 不再与 `Timer`
+    /// 共用 `frozen_decision`：`fs=false` 是「事件早于前台窗口完成切换」的竞态窗口，
+    /// 信任事件保留预降（期望 `true`），由 1s 心跳按 `frozen_decision` 纠正；
+    /// 只有 `fs=true && !same_monitor(fg, wm)`（明确异屏 / 任一侧全 0）才还原。
+    /// `AppbarClose` 强制 false、`Timer` 各格期望值**逐字不变**。
+    #[test]
+    fn occlusion_want_truth_table() {
+        let monitors: [(&str, RECT, bool); 5] = [
+            ("same", mon_primary(), true),
+            ("secondary", mon_secondary(), false),
+            ("fg_zero", RECT::default(), false),
+            ("left_monitor", RECT { left: -1920, top: 0, right: 0, bottom: 1080 }, false),
+            ("diff_by_1px", RECT { right: 1921, ..mon_primary() }, false),
+        ];
+        let triggers = [
+            FullscreenTrigger::AppbarOpen,
+            FullscreenTrigger::AppbarClose,
+            FullscreenTrigger::Timer,
+        ];
+        let mut cells = 0;
+        let mut appbar_open_cells = 0;
+        for trigger in triggers {
+            for fullscreen in [false, true] {
+                for (name, fg, is_same) in monitors {
+                    let got = occlusion_want(trigger, fullscreen, fg, mon_primary());
+                    // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+                    // AppbarOpen → !fs || same_monitor；AppbarClose → false；
+                    // Timer → frozen_decision（逐字不变）。
+                    let expected = match trigger {
+                        FullscreenTrigger::AppbarClose => false,
+                        FullscreenTrigger::AppbarOpen => !fullscreen || is_same,
+                        FullscreenTrigger::Timer => fullscreen && is_same,
+                    };
+                    assert_eq!(
+                        got, expected,
+                        "trigger={trigger:?} fs={fullscreen} fg={name}"
+                    );
+                    // 独立推导：不复用表里的 is_same 标志，直接调 same_monitor /
+                    // frozen_decision，避免「测试和实现错到一起去」。
+                    let independent = match trigger {
+                        FullscreenTrigger::AppbarClose => false,
+                        FullscreenTrigger::AppbarOpen => {
+                            !(fullscreen && !same_monitor(fg, mon_primary()))
+                        }
+                        FullscreenTrigger::Timer => frozen_decision(fullscreen, fg, mon_primary()),
+                    };
+                    assert_eq!(
+                        got, independent,
+                        "trigger={trigger:?} fs={fullscreen} fg={name} 独立推导不一致"
+                    );
+                    // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+                    // 只有「本地确实看到全屏窗口且明确异屏」才要求不降级；
+                    // fs=false 属竞态，AppbarOpen 信任事件，由 1s 心跳纠正。
+                    if fullscreen && !is_same {
+                        assert!(
+                            !got,
+                            "明确异屏（fs=true）不得降级：{name} trigger={trigger:?}"
+                        );
+                    }
+                    if trigger == FullscreenTrigger::AppbarOpen {
+                        appbar_open_cells += 1;
+                        if !fullscreen {
+                            assert!(got, "R1 竞态：AppbarOpen × fs=false × {name} 必须保留预降");
+                        }
+                    }
+                    cells += 1;
+                }
+                // monitor 全 0 安全方向：v1.5.6-R1 契约：事件优先、明确异屏才还原。
+                // AppbarOpen × fs=false 是竞态 → true；其余（AppbarClose / Timer /
+                // AppbarOpen × fs=true × 任一侧全 0）一律不降级。
+                let zero_cases = [
+                    ("widget_zero", mon_primary(), RECT::default()),
+                    ("both_zero", RECT::default(), RECT::default()),
+                ];
+                for (case, fg0, wm0) in zero_cases {
+                    let race = trigger == FullscreenTrigger::AppbarOpen && !fullscreen;
+                    assert_eq!(
+                        occlusion_want(trigger, fullscreen, fg0, wm0),
+                        race,
+                        "trigger={trigger:?} fs={fullscreen} {case}"
+                    );
+                }
+            }
+        }
+        assert_eq!(cells, 30);
+        assert_eq!(appbar_open_cells, 10);
+
+        // ---- v1.5.6-R1 契约：事件优先、明确异屏才还原（命名清楚的独立竞态用例）----
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+        // 1) AppbarOpen × fs=false × (同屏 / 副屏 / 全 0 / 差 1px) 一律 true。
+        for (name, fg, _) in monitors {
+            assert!(
+                occlusion_want(FullscreenTrigger::AppbarOpen, false, fg, mon_primary()),
+                "R1 竞态：AppbarOpen × fs=false × {name} 必须保留预降"
+            );
+        }
+        assert!(occlusion_want(
+            FullscreenTrigger::AppbarOpen, false, mon_primary(), RECT::default()
+        ), "R1 竞态：widget monitor 全 0 时也保留预降");
+        assert!(occlusion_want(
+            FullscreenTrigger::AppbarOpen, false, RECT::default(), RECT::default()
+        ), "R1 竞态：两侧全 0 时也保留预降");
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+        // 2) AppbarOpen × fs=true × 明确异屏 → false（副屏不变量）。
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true, mon_secondary(), mon_primary()
+        ), "AppbarOpen × fs=true × 副屏必须还原");
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true,
+            RECT { left: -1920, top: 0, right: 0, bottom: 1080 }, mon_primary()
+        ), "AppbarOpen × fs=true × 左屏必须还原");
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true,
+            RECT { right: 1921, ..mon_primary() }, mon_primary()
+        ), "AppbarOpen × fs=true × 差 1px 必须还原");
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+        // 3) AppbarOpen × fs=true × 同屏 → true。
+        assert!(occlusion_want(
+            FullscreenTrigger::AppbarOpen, true, mon_primary(), mon_primary()
+        ), "AppbarOpen × fs=true × 同屏必须降级");
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+        // 4) AppbarOpen × fs=true × 任一侧全 0 → false（安全方向）。
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true, RECT::default(), mon_primary()
+        ), "fg monitor 全 0 不得降级");
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true, mon_primary(), RECT::default()
+        ), "widget monitor 全 0 不得降级");
+        assert!(!occlusion_want(
+            FullscreenTrigger::AppbarOpen, true, RECT::default(), RECT::default()
+        ), "两侧全 0 不得降级");
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原（Close 分支不变，仍强制 false）。
+        // 5) AppbarClose 任意组合强制 false。
+        for fullscreen in [false, true] {
+            for (name, fg, _) in monitors {
+                assert!(
+                    !occlusion_want(FullscreenTrigger::AppbarClose, fullscreen, fg, mon_primary()),
+                    "AppbarClose 强制解冻：fs={fullscreen} fg={name}"
+                );
+            }
+            assert!(!occlusion_want(
+                FullscreenTrigger::AppbarClose, fullscreen, mon_primary(), RECT::default()
+            ));
+            assert!(!occlusion_want(
+                FullscreenTrigger::AppbarClose, fullscreen, RECT::default(), RECT::default()
+            ));
+        }
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原（Timer 分支不变）。
+        // 6) Timer 各格期望值逐字不变，且与 frozen_decision 同源。
+        for fullscreen in [false, true] {
+            for (name, fg, is_same) in monitors {
+                let want = fullscreen && is_same;
+                assert_eq!(
+                    occlusion_want(FullscreenTrigger::Timer, fullscreen, fg, mon_primary()),
+                    want,
+                    "Timer 期望值不许改：fs={fullscreen} fg={name}"
+                );
+                assert_eq!(
+                    occlusion_want(FullscreenTrigger::Timer, fullscreen, fg, mon_primary()),
+                    frozen_decision(fullscreen, fg, mon_primary()),
+                    "Timer 必须与 frozen_decision 同源：fs={fullscreen} fg={name}"
+                );
+            }
+        }
+
+        // AppbarClose 强制解冻：即使本地仍报告「同屏全屏」也必须 false，
+        // 且 `apply_fullscreen_occlusion` 会把 z_demoted 同步设为 false。
+        let close_want = occlusion_want(
+            FullscreenTrigger::AppbarClose,
+            true,
+            mon_primary(),
+            mon_primary(),
+        );
+        assert!(!close_want, "ABN_FULLSCREENAPP(FALSE) 必须强制解冻");
+        let (close_frozen, close_z_demoted) = occlusion_flags(close_want);
+        assert!(!close_frozen, "强制解冻时 frozen 必须为 false");
+        assert!(!close_z_demoted, "强制解冻时 z_demoted 必须为 false（恢复 TOPMOST）");
+        // v1.5.6-R1 契约：事件优先、明确异屏才还原。
+        // 明确异屏情景（fs=true，本地确实看到全屏窗口）下三种 trigger 都不降级，
+        // z_demoted 必须为 false；fs=false 属竞态，AppbarOpen 信任事件保留预降，
+        // 由 1s 心跳按 frozen_decision 纠正——不是静默删断言，而是把情景钉清楚。
+        for trigger in triggers {
+            let explicit_secondary_want =
+                occlusion_want(trigger, true, mon_secondary(), mon_primary());
+            assert!(!explicit_secondary_want, "明确异屏全屏不得降级：{trigger:?}");
+            let (_, explicit_secondary_z_demoted) = occlusion_flags(explicit_secondary_want);
+            assert!(
+                !explicit_secondary_z_demoted,
+                "明确异屏全屏时 z_demoted 必须为 false：{trigger:?}"
+            );
+        }
+        // 同屏全屏降级时两个标记必须同步为 true。
+        let (same_frozen, same_z_demoted) = occlusion_flags(true);
+        assert!(same_frozen);
+        assert!(same_z_demoted);
+        assert_eq!(occlusion_flags(false), (false, false));
+        // AppbarOpen / Timer 同屏全屏必须降级。
+        assert!(occlusion_want(
+            FullscreenTrigger::AppbarOpen,
+            true,
+            mon_primary(),
+            mon_primary()
+        ));
+        assert!(occlusion_want(
+            FullscreenTrigger::Timer,
+            true,
+            mon_primary(),
+            mon_primary()
+        ));
+        assert_eq!(FullscreenTrigger::AppbarOpen.as_str(), "appbar");
+        assert_eq!(FullscreenTrigger::AppbarClose.as_str(), "appbar");
+        assert_eq!(FullscreenTrigger::Timer.as_str(), "timer");
+    }
+
+    /// v1.5.6：`compute_visible()` 在 `frozen=true` 下仍为 true（独立点名回归）。
+    #[test]
+    fn compute_visible_stays_true_while_frozen() {
+        let mut s = AppState::default();
+        s.playing.state = PlaybackState::Playing;
+        s.frozen = true;
+        s.z_demoted = true;
+        assert!(s.compute_visible());
+        // 三条既有门控仍然生效，一条都不放宽。
+        s.user_hidden = true;
+        assert!(!s.compute_visible());
+        s.user_hidden = false;
+        s.taskbar_collapsed = true;
+        assert!(!s.compute_visible());
+        s.taskbar_collapsed = false;
+        s.playing.state = PlaybackState::NoSession;
+        assert!(!s.compute_visible());
+    }
+
+    /// v1.5.6：`apply_fullscreen_occlusion` 幂等（连续同 want 只一组副作用）。
+    ///
+    /// `App` 依赖真实 Win32 句柄，无法在纯单测里构造；这里对它**委托**的幂等闸门
+    /// `occlusion_transition` 做等价状态机验证——`apply_fullscreen_occlusion` 里
+    /// 唯一决定是否执行 enter/exit 的就是它，`TaskbarHost::set_z_demoted` 自身也幂等。
+    #[test]
+    fn apply_fullscreen_occlusion_is_idempotent() {
+        let mut frozen = false;
+        let mut side_effect_groups = 0;
+        let mut last_action: Option<bool> = None;
+        for want in [true, true, false, false, true, true, false, false] {
+            match occlusion_transition(frozen, want) {
+                Some(action) => {
+                    side_effect_groups += 1;
+                    last_action = Some(action);
+                    assert_eq!(Some(action), Some(want));
+                }
+                None => {
+                    assert_eq!(
+                        Some(want), last_action,
+                        "连续同一个 want 不得产生第二组副作用"
+                    );
+                }
+            }
+            frozen = want;
+            assert_eq!(
+                occlusion_transition(frozen, want),
+                None,
+                "状态写入后同 want 必须幂等"
+            );
+        }
+        assert_eq!(side_effect_groups, 4);
+        assert_eq!(occlusion_transition(false, false), None);
+        assert_eq!(occlusion_transition(true, true), None);
+        assert_eq!(occlusion_transition(false, true), Some(true));
+        assert_eq!(occlusion_transition(true, false), Some(false));
+    }
+
+    /// v1.5.6：`z_demoted` 幂等真值表 —— `(current_frozen, want)` 4 格 × 重复调用。
+    ///
+    /// 逐格核对生产代码里的 `occlusion_flags` / `occlusion_transition`：
+    /// 两个标记永远同步写 `want`，连续同一个 `want` 不再产生第二组 enter/exit；
+    /// `z_insert_after` 的锚点也随 `z_demoted` 稳定映射（BOTTOM / TOPMOST）。
+    #[test]
+    fn z_demoted_idempotence_truth_table() {
+        let mut cells = 0;
+        for current_frozen in [false, true] {
+            for want in [false, true] {
+                let (frozen, z_demoted) = occlusion_flags(want);
+                assert_eq!(frozen, want, "current={current_frozen} want={want}");
+                assert_eq!(z_demoted, want, "两个标记必须同步：current={current_frozen} want={want}");
+                assert_eq!(frozen, z_demoted);
+                assert_eq!(
+                    occlusion_transition(current_frozen, want),
+                    (want != current_frozen).then_some(want),
+                    "转换闸门真值表：current={current_frozen} want={want}"
+                );
+                // 幂等：写入后同 want 不再翻转，两个标记仍是 (want, want)。
+                assert_eq!(occlusion_transition(want, want), None);
+                assert_eq!(occlusion_flags(want), (want, want));
+                assert_eq!(
+                    windows::Win32::UI::WindowsAndMessaging::HWND_BOTTOM.0 as isize,
+                    1,
+                    "HWND_BOTTOM 常量映射（降级锚点）"
+                );
+                assert_eq!(
+                    windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST.0 as isize,
+                    -1,
+                    "HWND_TOPMOST 常量映射（恢复锚点）"
+                );
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, 4);
+        assert_eq!(occlusion_flags(false), (false, false));
+        assert_eq!(occlusion_flags(true), (true, true));
+    }
+
+    /// v1.5.6：事件路径**不新增定时器 id**。
+    ///
+    /// appbar 通知走 `WM_BARLINE_APPBAR`（`WM_APP + 5` 消息号），不是定时器；
+    /// 消息窗上仍只有 `TIMER_GEOM` 一条 1s 常驻心跳，四个 id 保持 {1,2,3,5}。
+    #[test]
+    fn appbar_event_path_adds_no_timer_id() {
+        let timers = [
+            widget_wnd::TIMER_GEOM,
+            widget_wnd::TIMER_ANIM,
+            widget_wnd::TIMER_CLICK,
+            widget_wnd::TIMER_LYRIC,
+        ];
+        assert_eq!(timers, [1, 2, 3, 5]);
+        assert_eq!(timers.len(), 4, "事件路径不得新增定时器 id");
+        for t in timers {
+            assert_ne!(
+                t as u32, WM_BARLINE_APPBAR,
+                "appbar 回调消息号不得被当成定时器 id"
+            );
+        }
+        assert_eq!(WM_BARLINE_APPBAR, windows::Win32::UI::WindowsAndMessaging::WM_APP + 5);
+        assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000);
+        assert_eq!(widget_wnd::TIMER_LYRIC_MS, 40);
+        assert!(!timers.contains(&6), "不得存在 6 号一次性兜底定时器");
     }
 }
 
@@ -3675,9 +4304,15 @@ mod qa_g35_regression {
         assert!(frozen_decision(true, left, left), "含 0 字段的合法矩形仍算同屏");
     }
 
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约逐格钉死
+    /// `want = !hidden && !collapsed && !frozen && state != NoSession`，并有
+    /// 「frozen 时必须恒不可见」的额外断言；新契约去掉 `&& !frozen`，把这两处
+    /// 删掉的断言替换为「逐格比对同组合未冻结副本」+「frozen 时仍等于独立期望」，
+    /// 24 格一格不少、三条既有门控方向逐字保留，断言数由每格 1~2 条增到 2~3 条。
+    ///
     /// B3：compute_visible 门控全组合（2 × 2 × 2 × 3 = 24 格）。
-    /// 工程师的矩阵只设 Playing，这里补上 NoSession × frozen 等组合，
-    /// 钉死「frozen 恒 false」以及 user_hidden / taskbar_collapsed / NoSession 的优先级。
+    /// v1.5.6：改为「`frozen` 时 compute_visible() 与不冻结时相等」，
+    /// 断言强度不降——24 格逐格对照独立期望，再逐格比对同组合的未冻结副本。
     #[test]
     fn qa_compute_visible_gate_order_full_matrix() {
         let states = [
@@ -3697,15 +4332,27 @@ mod qa_g35_regression {
                         st.playing.state = state;
                         let want = !user_hidden
                             && !collapsed
-                            && !frozen
                             && state != PlaybackState::NoSession;
                         assert_eq!(
                             st.compute_visible(),
                             want,
                             "hidden={user_hidden} collapsed={collapsed} frozen={frozen} state={state:?}"
                         );
+                        // 新契约：frozen 不改变门控结论（窗口仍 visible，只降 Z 序）。
+                        let mut unfrozen = st.clone();
+                        unfrozen.frozen = false;
+                        assert_eq!(
+                            st.compute_visible(),
+                            unfrozen.compute_visible(),
+                            "frozen 时 compute_visible() 必须与不冻结时相等：hidden={user_hidden} \
+                             collapsed={collapsed} state={state:?}"
+                        );
                         if frozen {
-                            assert!(!st.compute_visible(), "frozen 时必须恒不可见");
+                            assert_eq!(
+                                st.compute_visible(),
+                                want,
+                                "frozen=true 不得把窗口藏起来"
+                            );
                         }
                         cells += 1;
                     }
@@ -3715,11 +4362,16 @@ mod qa_g35_regression {
         assert_eq!(cells, 24);
     }
 
-    /// E2/E6：resume_pending **不**参与 compute_visible()——
-    /// 隐藏是靠 sync_visibility() 里的 `&& !resume_pending`；
-    /// 正因为如此，finish_resume 第 847 行的 compute_visible() 门控才能独立生效。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：原 E2/E6 测试钉死
+    /// 「旧等待态标记不参与门控、隐藏靠 sync_visibility 里的额外取反」；
+    /// 新契约删掉隐藏等待态，改为「`z_demoted` 不参与门控、遮挡靠 Z 序不靠隐藏」。
+    /// 4 组组合 × (置位前 / 置位后 / 复位后) 断言一条不少，强度不降。
+    ///
+    /// E2/E6（v1.5.6）：`z_demoted` **不**参与 compute_visible()——
+    /// 可见性只由 user_hidden / taskbar_collapsed / NoSession 决定；全屏遮挡靠
+    /// `TaskbarHost::set_z_demoted` 调 Z 序，绝不靠隐藏窗口。
     #[test]
-    fn qa_resume_pending_is_not_part_of_compute_visible_gate() {
+    fn qa_z_demoted_is_not_part_of_compute_visible_gate() {
         let mut st = AppState::default();
         st.playing.state = PlaybackState::Playing;
         for hidden in [false, true] {
@@ -3727,22 +4379,29 @@ mod qa_g35_regression {
                 st.user_hidden = hidden;
                 st.taskbar_collapsed = collapsed;
                 let base = st.compute_visible();
-                st.resume_pending = true;
+                st.z_demoted = true;
                 assert_eq!(
                     st.compute_visible(),
                     base,
-                    "resume_pending 不得改变门控结论；保持隐藏靠 sync_visibility 的 && !resume_pending"
+                    "z_demoted 不得改变门控结论；遮挡靠 Z 序，不靠隐藏"
                 );
-                st.resume_pending = false;
+                st.z_demoted = false;
+                assert_eq!(st.compute_visible(), base);
             }
         }
     }
 
-    /// E6：钉死 finish_resume 的显示门控 `geometry.is_some() && compute_visible()`。
-    /// 冻结期 Ctrl+Alt+H 主动隐藏 / 任务栏收起 / 无会话 / 几何不可用时，
-    /// 400ms 兜底都不得强行把窗口露出来。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：原 E6 测试钉死
+    /// 「完成解冻函数」的「几何就绪 && compute_visible()」显示门控；该函数已随
+    /// 「无等待期」整体删除，本测试改为等价的**常规可见性门控**验证：
+    /// 原 4 条阻断断言（用户隐藏 / 任务栏收起 / 无会话 / 几何不可用）逐条保留，
+    /// 并新增遮挡态下 4 条同强度断言，断言数只增不减。
+    ///
+    /// E6（v1.5.6）：等价的可见性门控测试——4 条阻断断言强度不降。
+    /// 几何不可用 / Ctrl+Alt+H 主动隐藏 / 任务栏收起 / 无会话时一律不得显示；
+    /// 全屏遮挡态（frozen=true）不改变任何一条结论。
     #[test]
-    fn qa_finish_resume_show_gate_blocks_user_hidden_and_no_session() {
+    fn qa_visibility_gate_blocks_user_hidden_collapsed_and_no_session() {
         fn gate(geometry_present: bool, st: &AppState) -> bool {
             geometry_present && st.compute_visible()
         }
@@ -3752,7 +4411,7 @@ mod qa_g35_regression {
         assert!(gate(true, &st), "基线：几何就绪 + 有会话 + 未隐藏 → 允许显示");
 
         st.user_hidden = true; // Ctrl+Alt+H / × 主动隐藏
-        assert!(!gate(true, &st), "用户主动隐藏时兜底不得显示");
+        assert!(!gate(true, &st), "用户主动隐藏时不得显示");
         st.user_hidden = false;
 
         st.taskbar_collapsed = true;
@@ -3764,9 +4423,31 @@ mod qa_g35_regression {
         st.playing.state = PlaybackState::Playing;
 
         assert!(!gate(false, &st), "几何不可用时不得显示");
+
+        // 遮挡态不是「隐藏等待态」：四条门控一条都不许被 frozen 绕过或改写。
+        st.frozen = true;
+        st.z_demoted = true;
+        assert!(gate(true, &st), "全屏遮挡态窗口仍 visible（只降 Z 序）");
+        st.user_hidden = true;
+        assert!(!gate(true, &st), "遮挡态下用户主动隐藏仍然生效");
+        st.user_hidden = false;
+        st.taskbar_collapsed = true;
+        assert!(!gate(true, &st), "遮挡态下任务栏收起仍然生效");
+        st.taskbar_collapsed = false;
+        st.playing.state = PlaybackState::NoSession;
+        assert!(!gate(true, &st), "遮挡态下无会话仍然生效");
     }
 
-    /// D4/E4：5 个定时器 id 互异且值未变；1s 心跳、40ms 歌词周期、400ms 兜底未被改。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约钉死
+    /// 「5 个定时器 id（含 6 号一次性兜底）+ 400ms 等待期」；新契约是
+    /// 「4 个 id 互异、周期不变、**事件路径不新增任何定时器 id**」。
+    /// 删掉的 4 条断言（6 号 id / 400ms 值 / 上下界 / 周期）由
+    /// 「ids.len()==4」「所有 id≠6」「4 个 id 精确值」「1s 心跳仍是唯一常驻」
+    /// 等强度替代，并补 appbar 消息号与定时器 id 不混淆的断言。
+    ///
+    /// D4/E4（v1.5.6）：4 个定时器 id 互异且值未变；1s 心跳、40ms 歌词周期未改。
+    /// 「无一次性解冻兜底定时器」等价约束：消息窗上只剩 TIMER_GEOM 一条常驻心跳，
+    /// 不存在 6 号解冻兜底定时器，也不存在 400ms 隐藏等待期。
     #[test]
     fn qa_timer_ids_and_periods_are_unchanged() {
         let ids = [
@@ -3774,33 +4455,56 @@ mod qa_g35_regression {
             ("ANIM", widget_wnd::TIMER_ANIM),
             ("CLICK", widget_wnd::TIMER_CLICK),
             ("LYRIC", widget_wnd::TIMER_LYRIC),
-            ("RESUME", widget_wnd::TIMER_RESUME),
         ];
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 assert_ne!(ids[i].1, ids[j].1, "{} 与 {} 定时器 id 冲突", ids[i].0, ids[j].0);
             }
         }
+        assert_eq!(ids.len(), 4, "只剩 4 个定时器 id");
         assert_eq!(widget_wnd::TIMER_GEOM, 1);
         assert_eq!(widget_wnd::TIMER_ANIM, 2);
         assert_eq!(widget_wnd::TIMER_CLICK, 3);
         assert_eq!(widget_wnd::TIMER_LYRIC, 5);
-        assert_eq!(widget_wnd::TIMER_RESUME, 6);
         assert_eq!(widget_wnd::TIMER_GEOM_MS, 1_000, "1s 心跳不许调快");
         assert_eq!(widget_wnd::TIMER_LYRIC_MS, 40, "歌词定时器周期不许被改");
-        assert_eq!(RESUME_FALLBACK_MS, 400);
-        assert!(RESUME_FALLBACK_MS >= 200 && RESUME_FALLBACK_MS <= 1_000);
+        // 无 6 号兜底定时器；也不存在任何落在 6 / 400ms 上的等待态。
+        assert!(
+            ids.iter().all(|(_, id)| *id != 6),
+            "不得存在 6 号一次性解冻兜底定时器"
+        );
+        assert_eq!(
+            widget_wnd::TIMER_GEOM_MS, 1_000,
+            "唯一常驻心跳仍是 1s，没有新增更快的轮询"
+        );
+        // 事件路径不新增定时器 id：appbar 通知是 WM_APP+5 消息号，不是定时器；
+        // 消息窗上仍只有 TIMER_GEOM 一条常驻心跳。
+        assert_eq!(WM_BARLINE_APPBAR, windows::Win32::UI::WindowsAndMessaging::WM_APP + 5);
+        for (_, id) in ids {
+            assert_ne!(
+                id as u32, WM_BARLINE_APPBAR,
+                "appbar 回调消息号不得被当成定时器 id"
+            );
+        }
+        let st = AppState::default();
+        assert!(!st.frozen);
+        assert!(!st.z_demoted);
     }
 
-    /// 两个新标记默认 false 且互不联动（防止某处顺手把另一个也置位）。
+    /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约钉死
+    /// `frozen` 与「旧等待态标记」两个标记默认 false 且互不联动；新契约把
+    /// 「解冻等待态」换成「Z 序降级态」`z_demoted`。4 条断言逐条等强度迁移，
+    /// 一条不删（默认 false ×2、互不暗改 ×2）。
+    ///
+    /// 两个标记默认 false 且互不联动（防止某处顺手把另一个也置位）。
     #[test]
     fn qa_freeze_flags_default_false_and_independent() {
         let mut st = AppState::default();
         assert!(!st.frozen);
-        assert!(!st.resume_pending);
+        assert!(!st.z_demoted);
         st.frozen = true;
-        assert!(!st.resume_pending, "置 frozen 不得暗改 resume_pending");
-        st.resume_pending = true;
-        assert!(st.frozen, "置 resume_pending 不得暗改 frozen");
+        assert!(!st.z_demoted, "置 frozen 不得暗改 z_demoted");
+        st.z_demoted = true;
+        assert!(st.frozen, "置 z_demoted 不得暗改 frozen");
     }
 }

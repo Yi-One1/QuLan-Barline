@@ -1,21 +1,22 @@
 ---
-description: 曲栏 Barline 项目长期记忆总纲：构建/版本/交付纪律、架构不变量（含 v1.4 歌词并发与 SMTC 分层轮询/事件/锚点）、已验证的踩坑清单、当前留档待办。接手前只需读这一份即可恢复上下文。
-tags: [曲栏Barline, 项目总纲, 架构不变量, 构建纪律, 踩坑, SMTC分层轮询, 卡顿专档]
+description: 曲栏 Barline 项目长期记忆总纲：构建/版本/交付纪律、架构不变量（含 v1.4 歌词并发、SMTC 分层轮询/事件/锚点、v1.5.6 G3.5-A 全屏遮挡）、已验证的踩坑清单、当前留档待办。接手前只需读这一份即可恢复上下文。
+tags: [曲栏Barline, 项目总纲, 架构不变量, 构建纪律, 踩坑, SMTC分层轮询, 卡顿专档, 全屏遮挡]
 category: 曲栏Barline
 ---
 
 # 曲栏 Barline 项目长期记忆
 
 Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct2D/DWM/SMTC + WebView2。
-当前版本 **v1.4.3**，测试 **363 项**（1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。第四轮（2026-11-03）：G1 歌词提速 ✅、G2 卡顿大幅缓解 ✅（专档在 `progress.md §3.1`），**G3~G6 待做**。
+当前版本 **v1.5.6**（G3.5 返工，待真人验收），测试 **461 项**（460 passed + 1 ignored 联网），clippy 0 警告。仓库 `https://github.com/Yi-One1/QuLan-Barline.git`（main）。G1 歌词提速、G2 卡顿缓解（专档 `progress.md §3.1`）、G3 全链（v1.5.0~v1.5.4）均已闭环；**G3.5 v1.5.5 因 1s 延迟被用户否定、v1.5.6 按方案 A 重做（专档 `progress.md §3.2`）**；下一组 **G4**；G7 黑名单（v1.8.0）PRD/ARCH 已入库待实现。
 
 ## 铁律（违反必踩坑）
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（用 PowerShell 工具跑），**禁止裸 cargo**（Git Bash 抢 link.exe）。
 - 测试汇总要直跑 `target/<profile>/deps/barline-*.exe`——`windows_subsystem` 会吞 stdout。
-- `deliverables/` 的 exe **只增不删**；每次改动 bump 版本（**5 处**：Cargo.toml 1 + barline.rc 4）并出包。
+- `deliverables/` 的 exe **只增不删**；每次改动 bump 版本（**5 处**：Cargo.toml 1 + barline.rc 4）并出包；`Cargo.lock` 会由 cargo 自动同步 1 行，一并提交。
 - 版本策略（用户定）：改可见行为/新增能力 → 升第二位；纯修正/文案/内部重构 → 升第三位。
 - 禁用 `reg.exe` / `Add-Type` / `cmd.exe`；工程师不启动 exe、不截屏、不动 deliverables、不 commit（主理人统一提交）。
 - 节奏（用户定）：一次一组 → 全绿测试 → 单提交 → 出包 → 用户真人验收 → 才更新文档并进下一组。
+- **多成员协作时，解除代码冻结必须同步告知所有在跑成员并给新的源码 SHA256 指纹**，否则整轮验证作废（v1.5.6 教训）。
 
 ## 架构不变量
 - 小组件高度**恒定 48px**；信息区宽 = max(歌名+歌手自然宽, 160px)，上限 340px。
@@ -25,6 +26,7 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - **歌词链（v1.4.0）**：内存→磁盘→本地→负缓存→**在线并发**（lrclib+网易云抢答，8s 硬截止）；换歌抢占（独立线程 + TrackId 代次守卫）；重试最多 1 次/3s、超时不重试；缓存键 `cache_title_key` 摘平台后缀与首尾装饰但**版本标记不摘**；`MIN_PICK_SCORE=60`、时长差 >10s 淘汰。
 - **SMTC 轮询（v1.4.2/1.4.3，卡顿的根）**：**禁止全量轮询**（14 次/秒会拖卡网易云）；分层 500/1000/2000ms + 网易云 (0,0)×3 退避 5s；**主通道=事件**（MediaPropertiesChanged 等三事件→置脏位→60ms 下限 forced；回调只许置 AtomicBool）。
 - **位置锚点 `position_at`**（歌词同步命门）：读了时间线→读取时刻；没读但切歌→检测时刻；其余沿用上一份。绝不许用陈旧 `timeline_at`（网易云恒报 (0,0)）。
+- **G3.5-A 全屏遮挡（v1.5.6）**：曲栏是 top-level popup（**非任务栏子窗口**），全屏盖不住的根因是 `WS_EX_TOPMOST` + 每秒 `ensure_on_top()`。纯通知型 appbar（只 `ABM_NEW/ABM_REMOVE`、**不发 `ABM_QUERYPOS/SETPOS`、不占工作区**）注册在 **widget 主窗口**（`TaskbarCreated` 是广播，`HWND_MESSAGE` 收不到）；`ABM_REMOVE` 必须在 `host.destroy()` 之前。`ABN_FULLSCREENAPP` 事件驱动 → `HWND_BOTTOM`（**禁用 `HWND_NOTOPMOST`**）→ 退出 `HWND_TOPMOST`。**永不 `SW_HIDE`**：`frozen` 只降 Z 序 + 静止降载，`compute_visible()` 不含 frozen；`z_demoted` 双份状态幂等、只在 `SetWindowPos` 成功后翻转；退出须**先清 `frozen/z_demoted` 逻辑门控再恢复 Z 序**。1s 心跳只作兜底对账。`occlusion_want(AppbarOpen) = !(fs && !same_monitor(fg,wm))`（信任事件、仅明确异屏还原）。
 - 热键：`HOTKEYS_VERSION=2`，默认 `Ctrl+Alt+P/←/→/L/M/H`。单实例 `Local\Barline.SingleInstance.v1`。
 - 性能埋点（仍在）：`perf::Span`，默认 50ms / `smtc.*` 8ms 才记 `[perf]`；统计行每 60s 一条。
 
@@ -38,10 +40,15 @@ Windows 任务栏媒体小组件：Rust 1.99.1(MSVC) + `windows` 0.62.2 + Direct
 - **网易云 SMTC 恒报 `(duration=0, position=0)`**：进度条/时长对它不可用，歌词钟靠锚点外推。
 - windows-rs 0.62 SMTC 事件：EventArgs 名不带会话前缀；反注册是 PascalCase `Remove*`。
 - 卡顿类问题方法学：埋点（慢才记）→ 用户两阶段对照 → 日志按时间点对齐 → 只对"共同动作"定罪。
+- **`HWND_NOTOPMOST` ≠ 降到底**：它只是「置于所有非 topmost 窗口之上」，对 F11 / 无边框全屏游戏仍会盖上去；顶层窗口之间也无 Z 序跟随，只有 `SetParent` 子窗口才跟随任务栏。
+- `git grep` **不含 untracked 文件**（新增文件里的测试会漏数）；`#[ignore]` 注释字面串会误计 → 计数用 ripgrep 全量 + `--list`。
+- `check` 遇 `target/debug/incremental` 陈旧锁文件告警用 `$env:CARGO_INCREMENTAL="0"` 跑同一条 build.ps1，别删缓存；测试 exe 直跑需 Git Bash 管道取 stdout。
+- 睡眠时长必须超过被测周期，否则测试是橡皮图章。
 
 ## 留档待办（不阻塞）
 - **G2 残余卡顿**：低频、间隔大，用户接受；续查路线与二分杠杆全在 `progress.md §3.1`（埋点仍在，别重搭）。
 - 待办 A：会话音量（禁用中，入口 `media/wasapi.rs::session_simple_volume`）。
 - 待办 D：汽水音乐托盘态激活（搁置：外部 ShowWindow 让 CEF 输入挂起）。
 - 小尾巴：`hotkeys.reset1` 死词条；`SettingsService::is_open()` 零调用；`event.rs:201` "300ms 去抖"注释失实（实为同步写盘）；「冲突一键换组」未做。
-- **下一组 G3**（右上角常驻 ×，v1.5.0）→ G4 悬停反馈 → G5 歌词落盘（`歌词目录/Barline/歌手 - 歌名.lrc`，已存在跳过，行级 LRC）→ G6 清理（死码+未引用资源，删前列清单；含埋点去留决策）。
+- **v1.5.6 观察项**：R2 退出抖动（`AppbarClose` 后 1s 心跳可能补冻，可加 1–2s 纯函数抑制，只抑制 Timer）；R1 新分支 `AppbarOpen × fs=false` 误冻 ≤1s 可自愈、窗口不 hide。真机验收看日志 `trigger=appbar|timer`：F11 进入应立刻出现 `trigger=appbar` 的「进入」行。
+- **下一组 G4**（悬停反馈，v1.6.0，含 × 悬停底色与全窗 hover 不同源的遗留）→ G5 歌词落盘（`歌词目录/Barline/歌手 - 歌名.lrc`，已存在跳过，行级 LRC）→ G6 清理（死码+未引用资源，删前列清单）→ G7 黑名单（v1.8.0，PRD/ARCH 已入库）。

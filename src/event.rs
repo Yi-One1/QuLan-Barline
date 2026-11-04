@@ -188,9 +188,6 @@ pub enum Effect {
     Relayout,
     /// 只重绘（布局不变）
     Redraw,
-    /// 解冻（v1.5.5 / G3.5）：收到解冻后第一份 `NowPlaying` 时，
-    /// 由 `apply` 先把隐藏窗口刷成最新内容，再恢复显示（不闪旧帧）。
-    ResumeFromFreeze,
     /// 应用窗口可见性
     SetVisible(bool),
     /// 把窗口移到新位置 / 新尺寸

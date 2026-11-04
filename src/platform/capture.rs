@@ -91,8 +91,10 @@ pub struct ForegroundInfo {
 /// 无前台窗口（锁屏 / 桌面切换瞬间）返回 `pid = 0`、矩形全 0、`fullscreen = false`，
 /// 调用方按「不是截图工具、不是全屏」处理即可。
 ///
-/// **调用次数约束（v1.4.4）**：`App::on_timer` 每秒只调用本函数**一次**，
-/// 截图态探测与全屏判定共用这一次的结果——不要在别处再调一遍。
+/// **调用次数约束（v1.4.4 / v1.5.6）**：1s 心跳里只调用本函数**一次**，
+/// 截图态探测与全屏遮挡判定共用这一次的结果；appbar 事件到达时会**追加一次**
+/// 纯本地查询（同样只调一次，不做 `detect_capture_with` / `OpenProcess`）。
+/// 事件路径绝不触发 `detect_capture_with`。
 pub fn foreground_info() -> ForegroundInfo {
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
