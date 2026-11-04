@@ -210,14 +210,17 @@ embed-resource = "3.0.12"   # 编译 assets/barline.rc（图标 + VERSIONINFO + 
 > `Win32_System_Diagnostics_ToolHelp` / `Win32_Globalization` / `Foundation_Numerics`，
 > 多列了 `Win32_UI_Accessibility` / `Foundation_Collections`）。
 >
-> 摘掉的两个 feature 是**实测**结论（各自单独摘掉后 `build.ps1 -Task build` 全绿）：
+> 摘掉 `Win32_UI_Accessibility` 是**实测**结论（单独摘掉后 `build.ps1 -Task build` 全绿）：
 > - `Win32_UI_Accessibility`：全仓零 import（没有 `SetWinEventHook` / `WINEVENTPROC`；
->   自动隐藏跟随走 500ms 轮询 + appbar 回调，不靠 WinEvent 钩子）；
-> - `Foundation_Collections`：全仓零 import（没有 `GetSessions()` / `IVectorView`；
->   媒体层只用 `GetCurrentSession()`，其返回类型不要求该 feature）。
+>   自动隐藏跟随走 500ms 轮询 + appbar 回调，不靠 WinEvent 钩子）。
 >
-> 两者都**不是**传递依赖——若是，`webview2-com-sys` 会自行 `features = [...]` 打开，
-> 与我们是否显式声明无关。
+> **v1.9.0（G7）**：`Foundation_Collections` **加回**——黑名单「检测到的应用」枚举
+> 走 `mgr.GetSessions()` → `IVectorView`，其 `GetCount()` / `GetAt()` 方法由该 feature
+> 门控（G6 时代媒体层只用 `GetCurrentSession()`，故当时摘掉；G7 重新需要）。
+> windows crate 的 feature 是依赖图统一叠加（additive），与 `webview2-com-sys` 无冲突。
+>
+> `Win32_UI_Accessibility` **不是**传递依赖——若是，`webview2-com-sys` 会自行
+> `features = [...]` 打开，与我们是否显式声明无关。
 
 ```toml
 windows = { version = "0.62.2", features = [
@@ -264,6 +267,7 @@ windows = { version = "0.62.2", features = [
   # ---- WinRT ----
   "Foundation",
   "Foundation_Numerics",                  # D2D1_ELLIPSE 的 Vector2
+  "Foundation_Collections",               # G7（v1.9.0）：mgr.GetSessions() → IVectorView 的 GetCount()/GetAt()
   "Media",
   "Media_Control",
   "Storage",
@@ -1806,7 +1810,7 @@ sequenceDiagram
 | 取 manager | `GlobalSystemMediaTransportControlsSessionManager::RequestAsync() -> Result<IAsyncOperation<Manager>>` | 静态方法 |
 | **阻塞取值** | **`op.join() -> Result<Manager>`** | **不是 `.get()`**（§2.2 第 1 条） |
 | 当前会话 | `mgr.GetCurrentSession() -> Result<Session>` | 无会话时返回 `Err` |
-| 全部会话 | `mgr.GetSessions() -> Result<IVectorView<Session>>` | 需要 `Foundation_Collections`。**本项目未使用**（只用 `GetCurrentSession()`），v1.8.1 已从 `Cargo.toml` 摘掉该 feature |
+| 全部会话 | `mgr.GetSessions() -> Result<IVectorView<Session>>` | 需要 `Foundation_Collections`。**v1.9.0（G7）起使用**：黑名单「检测到的应用」枚举（`docs/ARCH-G7-黑名单.md` §5） |
 | 会话变化事件 | `mgr.CurrentSessionChanged(TypedEventHandler::new(..)) -> Result<i64>` | **无 `Add` 前缀** |
 | 会话列表变化 | `mgr.SessionsChanged(..)` | — |
 | 媒体属性变化 | `session.MediaPropertiesChanged(..)` | 会话级 |

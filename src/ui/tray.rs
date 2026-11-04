@@ -22,9 +22,9 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
     GetWindowLongPtrW, LoadImageW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenuEx, GWLP_USERDATA, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_LBUTTONDBLCLK, WM_NULL,
-    WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    TrackPopupMenuEx, GWLP_USERDATA, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_ENABLED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::event::TrayCommand;
@@ -41,6 +41,35 @@ const ICON_RESOURCE_ID: usize = 1;
 const CMD_OPEN: usize = 101;
 const CMD_TOGGLE: usize = 102;
 const CMD_QUIT: usize = 103;
+/// v1.9.0（G7）：拉黑/恢复当前应用——共用一个 id，语义由 `App` 决定。
+/// 托盘菜单（101..104）与小组件右键菜单（`MenuCommand` 1..8）是两套独立
+/// HMENU 命名空间，互不冲突。
+const CMD_IGNORE: usize = 104;
+
+/// 托盘菜单「拉黑/恢复当前应用」项的内容（v1.9.0 / G7）。
+///
+/// 菜单项由 `App` 决定（文案 / 置灰），`tray` 只负责画——这样 `tray.rs`
+/// 不依赖 `i18n` 之外的任何业务状态，也不必认识"黑名单"。
+pub struct IgnoreMenuItem {
+    pub label: String,
+    pub enabled: bool,
+}
+
+/// 应用名截断：**按 `char` 计数**（不是字节），超长截到 `max_chars` 个字符
+/// （含省略号）并在尾部加 `…`。
+///
+/// 为什么必须按 char：`"网易云音乐".len()==15` 字节但 `chars().count()==5`，
+/// 字节截断会把 UTF-8 切碎 → panic。这是"中文截断"必踩的坑。
+pub fn clamp_label(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
 
 /// 托盘图标句柄 + 宿主窗口。
 pub struct Tray {
@@ -199,20 +228,31 @@ impl Tray {
     /// `widget_visible` = **小组件当前是否显示**（勾选态语义）。
     /// 传进来的必须是"可见与否"，不是配置里的 `widget_hidden`——
     /// 换算统一走 [`toggle_checked`]，避免再次传反。
-    pub fn show_menu(&self, lang: Lang, widget_visible: bool) -> Option<TrayCommand> {
+    ///
+    /// `ignore`（v1.9.0 / G7）：「拉黑/恢复当前应用」项的文案与置灰，由 `App` 组装
+    /// （读内存态当前会话身份，**不调 SMTC**）。
+    pub fn show_menu(
+        &self,
+        lang: Lang,
+        widget_visible: bool,
+        ignore: IgnoreMenuItem,
+    ) -> Option<TrayCommand> {
         // SAFETY: 菜单句柄由本函数创建并在末尾销毁；所有字符串缓冲在调用期间存活。
         unsafe {
             let menu = CreatePopupMenu().ok()?;
-            append(menu, i18n::t(lang, "menu.settings"), CMD_OPEN, false);
+            append(menu, i18n::t(lang, "menu.settings"), CMD_OPEN, false, true);
             append(
                 menu,
                 i18n::t(lang, "menu.toggle_widget"),
                 CMD_TOGGLE,
                 widget_visible,
+                true,
             );
+            // G7：落位 = 设置 / 显示隐藏 / 拉黑当前应用 / ─── / 退出
+            append(menu, &ignore.label, CMD_IGNORE, false, ignore.enabled);
             // SAFETY: 分隔线不需要文本。
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            append(menu, i18n::t(lang, "menu.quit"), CMD_QUIT, false);
+            append(menu, i18n::t(lang, "menu.quit"), CMD_QUIT, false, true);
 
             // MSDN：弹出前必须把宿主窗口设为前台，否则点别处菜单不消失。
             // 宿主是隐藏窗口时 SetForegroundWindow 可能失败，这里显式记日志便于诊断。
@@ -243,6 +283,7 @@ impl Tray {
             match cmd {
                 CMD_OPEN => Some(TrayCommand::OpenSettings),
                 CMD_TOGGLE => Some(TrayCommand::ToggleWidget),
+                CMD_IGNORE => Some(TrayCommand::ToggleIgnoreCurrent),
                 CMD_QUIT => Some(TrayCommand::Quit),
                 _ => None,
             }
@@ -284,10 +325,21 @@ fn copy_into(dst: &mut [u16], src: &str) {
     dst[..n].copy_from_slice(&wide[..n]);
 }
 
-/// 追加一个菜单项（`checked` 为真时带勾）。
-fn append(menu: windows::Win32::UI::WindowsAndMessaging::HMENU, label: &str, id: usize, checked: bool) {
+/// 追加一个菜单项（v1.9.0 / G7：扩成五参）。
+///
+/// `checked` 为真时带勾；`enabled == false` 时置灰（`MF_GRAYED`）。
+/// `MF_UNCHECKED` 与 `MF_GRAYED` 都是 0 值，直接 `|` 无副作用。
+fn append(
+    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    label: &str,
+    id: usize,
+    checked: bool,
+    enabled: bool,
+) {
     let wide = to_wide(label);
-    let flags = MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED };
+    let flags = MF_STRING
+        | if checked { MF_CHECKED } else { MF_UNCHECKED }
+        | if enabled { MF_ENABLED } else { MF_GRAYED };
     // SAFETY: menu 有效；wide 在调用期间存活且以 NUL 结尾。
     unsafe {
         let _ = AppendMenuW(menu, flags, id, PCWSTR(wide.as_ptr()));
@@ -357,5 +409,36 @@ mod tests {
         let lp2 = LPARAM(((TRAY_UID as isize) << 16) | WM_LBUTTONDBLCLK as isize);
         assert!(is_double_click(lp2));
         assert!(!is_right_up(lp2));
+    }
+
+    // ------------------------------------------ v1.9.0（G7）：clamp_label
+
+    /// **按 char 截断**——字节截断会把 UTF-8 切碎 panic；这是"中文截断"必踩的坑。
+    #[test]
+    fn clamp_label_counts_chars_not_bytes() {
+        // 5 个中文字符（15 字节）远小于 40 → 原样
+        assert_eq!(clamp_label("网易云音乐", 40), "网易云音乐");
+        // 45 个中文字符 → 截到 40 char（39 字符 + …）
+        let long = "音".repeat(45);
+        let clamped = clamp_label(&long, 40);
+        assert_eq!(clamped.chars().count(), 40, "必须按 char 计数");
+        assert!(clamped.ends_with('…'));
+        assert_eq!(clamped.chars().next_back().unwrap(), '…');
+    }
+
+    /// 中英混排 + UTF-8 边界：截断点落在多字节字符上不许 panic。
+    #[test]
+    fn clamp_label_handles_mixed_scripts_and_char_boundaries() {
+        let mixed = "CloudMusic网e易云音3乐AB乐";
+        let clamped = clamp_label(mixed, 7);
+        assert_eq!(clamped.chars().count(), 7);
+        assert!(clamped.ends_with('…'));
+        // 刚好 40 → 原样不加省略号
+        let exact = "a".repeat(40);
+        assert_eq!(clamp_label(&exact, 40), exact);
+        let exact_zh = "曲".repeat(40);
+        assert_eq!(clamp_label(&exact_zh, 40), exact_zh, "恰好 40 char 不截断");
+        // max_chars=1 → 只有省略号
+        assert_eq!(clamp_label("abcdef", 1), "…");
     }
 }

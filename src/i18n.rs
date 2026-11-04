@@ -60,6 +60,13 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
 
         // ---------------- 托盘 / 菜单 ----------------
         (Lang::Zh, "tray.tip") => "曲栏 Barline",
+        // v1.9.0（G7）：托盘「拉黑/恢复当前应用」两态 + 未知应用名
+        (Lang::Zh, "menu.blacklist_current") => "拉黑当前应用",
+        (Lang::En, "menu.blacklist_current") => "Ignore this app",
+        (Lang::Zh, "menu.unblacklist_current") => "恢复当前应用",
+        (Lang::En, "menu.unblacklist_current") => "Stop ignoring this app",
+        (Lang::Zh, "menu.unknown_app") => "未知应用",
+        (Lang::En, "menu.unknown_app") => "Unknown app",
         (Lang::Zh, "settings.webview_missing_title") => "需要 WebView2 运行时",
         (Lang::En, "settings.webview_missing_title") => "WebView2 Runtime required",
         (Lang::Zh, "settings.webview_missing_body") => "设置页需要 Microsoft Edge WebView2 运行时，小组件本身不受影响。\n\n是否现在打开下载页？",
@@ -124,6 +131,31 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
             "Lyrics provided by lrclib.net and NetEase Cloud Music"
         ),
 
+        // ---------------- 黑名单 toast（v1.9.0 / G7，ARCH-G7 §8.2）----------------
+        // 设置页的静态标签在 index.html 自带字典里（blacklist.*）；这里只管
+        // Rust 发的 toast 与托盘菜单文案。`blacklist.hint.match` 的末句口径
+        // 采用 PRD P0-06 版（「从「检测到的应用」里加入最稳」）。
+        (Lang::Zh, "toast.blacklist.added") => "已加入黑名单",
+        (Lang::En, "toast.blacklist.added") => "Added to the blacklist",
+        (Lang::Zh, "toast.blacklist.dup") => "已在黑名单中",
+        (Lang::En, "toast.blacklist.dup") => "Already in the blacklist",
+        (Lang::Zh, "toast.blacklist.empty") => "请输入进程名",
+        (Lang::En, "toast.blacklist.empty") => "Enter a process name",
+        (Lang::Zh, "toast.blacklist.invalid") => "进程名不支持通配符或路径之外的特殊字符",
+        (Lang::En, "toast.blacklist.invalid") => "Process name cannot contain wildcards or special characters",
+        (Lang::Zh, "toast.blacklist.too_long") => "进程名过长（最多 260 字符）",
+        (Lang::En, "toast.blacklist.too_long") => "Process name too long (max 260)",
+        (Lang::Zh, "toast.blacklist.full") => "黑名单已满（上限 200 条）",
+        (Lang::En, "toast.blacklist.full") => "The blacklist is full (max 200)",
+        (Lang::Zh, "toast.blacklist.removed") => "已从黑名单移除",
+        (Lang::En, "toast.blacklist.removed") => "Removed from the blacklist",
+        (Lang::Zh, "toast.blacklist.cleared") => "黑名单已清空",
+        (Lang::En, "toast.blacklist.cleared") => "Blacklist cleared",
+        (Lang::Zh, "toast.blacklist.unverified") => "已加入。这个进程名还没在这台机器上出现过；如果之后没生效，请到「检测到的应用」里点「加入」。",
+        (Lang::En, "toast.blacklist.unverified") => "Added. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add in \"Detected apps\" instead.",
+        (Lang::Zh, "toast.blacklist.enum_failed") => "未检测到正在播放的应用",
+        (Lang::En, "toast.blacklist.enum_failed") => "No playing apps detected",
+
         // ---------------- 兜底 ----------------
         (_, _) => key,
     }
@@ -142,6 +174,35 @@ mod tests {
     #[test]
     fn unknown_key_falls_back_to_key() {
         assert_eq!(t(Lang::Zh, "no.such.key"), "no.such.key");
+    }
+
+    /// 契约回归（v1.9.0 / G7）：黑名单全部 13 个词条（托盘 3 + toast 10）必须
+    /// 中英双语都存在且非空。`t()` 未知 key 原样返回（`i18n.rs` 兜底）——
+    /// **没有这条测试就发现不了漏翻**，界面上会直接显示裸键名。
+    #[test]
+    fn blacklist_keys_are_bilingual_and_non_empty() {
+        for key in [
+            "menu.blacklist_current",
+            "menu.unblacklist_current",
+            "menu.unknown_app",
+            "toast.blacklist.added",
+            "toast.blacklist.dup",
+            "toast.blacklist.empty",
+            "toast.blacklist.invalid",
+            "toast.blacklist.too_long",
+            "toast.blacklist.full",
+            "toast.blacklist.removed",
+            "toast.blacklist.cleared",
+            "toast.blacklist.unverified",
+            "toast.blacklist.enum_failed",
+        ] {
+            for lang in [Lang::Zh, Lang::En] {
+                assert_ne!(t(lang, key), key, "{lang:?} 缺词条 {key}");
+                assert!(!t(lang, key).is_empty(), "{lang:?} 词条为空：{key}");
+            }
+        }
+        // 旧命名空间不得残留（黑名单 toast 一律走 i18n.rs，不在 app.rs 写中英 match）
+        assert_eq!(t(Lang::Zh, "blacklist.invalid"), "blacklist.invalid");
     }
 
     /// 契约回归（v1.1.22）：托盘菜单与右键菜单共用的「设置」项，中文只留两字。

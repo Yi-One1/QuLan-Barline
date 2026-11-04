@@ -49,21 +49,159 @@ pub fn parse(msg: &str) -> Option<Incoming> {
 
 /// 组装 `state` 消息（页面首次加载与每次配置变更都推一次全量）。
 pub fn state_json(cfg: &Config, version: &str, conflicts: &[(&str, u32)]) -> String {
+    state_json_with_section(cfg, version, conflicts, None)
+}
+
+/// 组装带可选 `openSection` 的 `state` 消息（v1.9.0 / G7 P1-03）。
+///
+/// 托盘「设置」且当前无会话时带 `"blacklist"`：页面**首次**收到 state 时一次性
+/// 导航到黑名单分区（`navInitialized` 守卫），并走与 nav 点击同一条
+/// "分区激活 → 首次枚举" 路径——保证直达后列表不空。
+pub fn state_json_with_section(
+    cfg: &Config,
+    version: &str,
+    conflicts: &[(&str, u32)],
+    open_section: Option<&str>,
+) -> String {
     let conflicts: Vec<Value> = conflicts
         .iter()
         .map(|(action, code)| json!({ "action": action, "code": code }))
         .collect();
+    let mut payload = json!({
+        "config": cfg,
+        "version": version,
+        "conflicts": conflicts,
+        // v1.1.5：当前生效的数据目录（storage.data_dir 为空时 = 默认根目录）
+        "dataDir": crate::platform::data_dir().to_string_lossy(),
+    });
+    if let Some(section) = open_section {
+        payload["openSection"] = json!(section);
+    }
+    json!({ "type": "state", "payload": payload }).to_string()
+}
+
+/// 组装 `mediaApps` 消息（v1.9.0 / G7，ARCH-G7 §6.1）。
+///
+/// 字段名与 PRD 一致 + `resolved` / `source` 两个（U1=B）：
+/// 前端必须能区分"真实名"（`resolved=true`）与"AUMID 末段兜底"（`false`）。
+/// **已拉黑的条目照常下发**（Rust 不过滤），JS 按 `state.config.media.blacklist`
+/// 渲染时过滤——点「加入」后配置回推即可让该行消失，不需要重新枚举。
+/// `at` 是 epoch **毫秒**整数（JS 用 `new Date(at)` 格式化，Rust 不写时间格式化）。
+pub fn media_apps_json(snap: &crate::media::MediaAppsSnapshot) -> String {
+    let apps: Vec<Value> = snap
+        .apps
+        .iter()
+        .map(|a| {
+            json!({
+                "process": a.process,
+                "displayName": a.display_name,
+                "playable": a.playable,
+                "resolved": a.resolved,
+                "source": a.source,
+            })
+        })
+        .collect();
     json!({
-        "type": "state",
+        "type": "mediaApps",
         "payload": {
-            "config": cfg,
-            "version": version,
-            "conflicts": conflicts,
-            // v1.1.5：当前生效的数据目录（storage.data_dir 为空时 = 默认根目录）
-            "dataDir": crate::platform::data_dir().to_string_lossy(),
+            "apps": apps,
+            "at": snap.at_ms,
+            "overBudget": snap.over_budget,
         }
     })
     .to_string()
+}
+
+/// 这个键"能不能被识别"——U1=B 要求桥接层回传的状态，**别只回 ok**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRecognition {
+    /// 该进程名在本机的内存缓存（`MediaIndex.app_names` 的值里）或
+    /// `player_map::TABLE` 里出现过 → 下次它开播时**保证**命中
+    Verified,
+    /// 两处都查不到：可能有效（若它的 AUMID 末段恰好等于这个值），也可能永不命中
+    /// → 添加成功，但必须温和提示用户"从「检测到的应用」点加入更稳"
+    Unverified,
+}
+
+/// 黑名单写入的结果分档（决定给用户哪条 toast）。
+/// **带 payload，不是 `Copy`**（`Added` 携带 `KeyRecognition`），实现用 `Clone`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlacklistOutcome {
+    /// 加成功；`recognition` 决定要不要多一条"未能验证"的温和提示
+    Added(KeyRecognition),
+    Duplicate,
+    Invalid(crate::media::blacklist::NormError),
+    Full,
+    Removed,
+    NotFound,
+    Cleared,
+    BadPath,
+}
+
+/// 黑名单写入的**唯一**入口（`apply_set` 不走这条路）。
+///
+/// 为什么不复用 `apply_set` 的 `bool`：黑名单要区分
+/// 「重复 / 非法 / 超长 / 已满 / **未能验证**」五种结果给不同 toast，`bool` 表达不了。
+///
+/// `index` 用于 `KeyRecognition` 判据（纯内存，UI 线程可直接算）：
+/// `Verified` ⟺ `index.knows_process(key)`——它同时查内存缓存值与
+/// `player_map::TABLE` 的进程名主干。**不查运行时 AUMID**（那要跨进程），
+/// 所以 `Unverified` 不等于"一定不生效"，只是"不能保证"——文案必须这么写。
+pub fn apply_blacklist(
+    cfg: &mut Config,
+    path: &str,
+    value: &Value,
+    index: &crate::media::blacklist::MediaIndex,
+) -> BlacklistOutcome {
+    match path {
+        "media.blacklist_add" => {
+            let Some(s) = value.as_str() else {
+                return BlacklistOutcome::Invalid(crate::media::blacklist::NormError::Empty);
+            };
+            let key = match crate::media::blacklist::normalize_entry(s) {
+                Ok(k) => k,
+                Err(e) => return BlacklistOutcome::Invalid(e),
+            };
+            if cfg.media.blacklist.contains(&key) {
+                return BlacklistOutcome::Duplicate;
+            }
+            if cfg.media.blacklist.len()
+                >= crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES
+            {
+                return BlacklistOutcome::Full;
+            }
+            let recognition = if index.knows_process(&key) {
+                KeyRecognition::Verified
+            } else {
+                KeyRecognition::Unverified
+            };
+            cfg.media.blacklist.push(key);
+            BlacklistOutcome::Added(recognition)
+        }
+        "media.blacklist_remove" => {
+            let Some(s) = value.as_str() else {
+                return BlacklistOutcome::BadPath;
+            };
+            let key = match crate::media::blacklist::normalize_entry(s) {
+                Ok(k) => k,
+                Err(_) => return BlacklistOutcome::BadPath,
+            };
+            let before = cfg.media.blacklist.len();
+            cfg.media.blacklist.retain(|e| *e != key);
+            if cfg.media.blacklist.len() == before {
+                BlacklistOutcome::NotFound
+            } else {
+                BlacklistOutcome::Removed
+            }
+        }
+        "media.blacklist_clear" => {
+            // 只清 blacklist，**不动 app_names**（D12：缓存是"AUMID → 真实名"的
+            // 实测事实，与用户意图无关；清了只会让下次枚举白跑一遍反查）
+            cfg.media.blacklist.clear();
+            BlacklistOutcome::Cleared
+        }
+        _ => BlacklistOutcome::BadPath,
+    }
 }
 
 /// 组装 `toast` 消息。
@@ -237,6 +375,14 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             }
             cfg.storage.data_dir = new_val;
             true
+        }
+        // ---------------- 黑名单（v1.9.0 / G7）----------------
+        // 黑名单必须走 apply_blacklist（归一化 + 分档 toast + KeyRecognition）。
+        // 从 apply_set 进来的一律拒绝（app.rs 的 reduce_settings_message 已前置分流，
+        // 这里是纵深防御）：保证旧页面/注入脚本无法绕过归一化写入原始字符串。
+        "media.blacklist_add" | "media.blacklist_remove" | "media.blacklist_clear" => {
+            crate::log_warn!("黑名单写入必须走 apply_blacklist，拒绝路径：{path}");
+            false
         }
         // ---------------- 快捷键 ----------------
         "hotkeys.enabled" => {
@@ -611,5 +757,182 @@ mod tests {
         assert_eq!(v["payload"]["conflicts"][0]["action"], "prev");
         assert_eq!(v["payload"]["config"]["lyrics"]["enabled"], true);
         assert!(v["payload"]["dataDir"].as_str().map(|d| !d.is_empty()).unwrap_or(false));
+    }
+
+    // ------------------------------------------------ v1.9.0（G7）黑名单桥接
+
+    /// `state_json_with_section`：带 openSection 时 payload 里出现该字段；None 时不出现。
+    #[test]
+    fn state_json_open_section_is_optional() {
+        let c = Config::default();
+        let with = state_json_with_section(&c, "1.9.0", &[], Some("blacklist"));
+        let v: Value = serde_json::from_str(&with).expect("合法 JSON");
+        assert_eq!(v["payload"]["openSection"], "blacklist");
+        let without = state_json(&c, "1.9.0", &[]);
+        let v: Value = serde_json::from_str(&without).expect("合法 JSON");
+        assert!(v["payload"].get("openSection").is_none(), "None 时不得出现 openSection");
+    }
+
+    /// `media_apps_json` 的形状（ARCH-G7 §6.1，PRD `:399` 字段不增不减）。
+    #[test]
+    fn media_apps_json_shape() {
+        let snap = crate::media::MediaAppsSnapshot {
+            apps: vec![
+                crate::media::smtc::MediaAppEntry {
+                    process: "cloudmusic.exe".into(),
+                    display_name: "网易云音乐".into(),
+                    playable: true,
+                    resolved: true,
+                    source: "cache",
+                },
+                crate::media::smtc::MediaAppEntry {
+                    process: String::new(),
+                    display_name: "未知播放器".into(),
+                    playable: false,
+                    resolved: false,
+                    source: "aumid",
+                },
+            ],
+            at_ms: 1_762_222_200_000,
+            learned: vec![],
+            over_budget: true,
+        };
+        let s = media_apps_json(&snap);
+        let v: Value = serde_json::from_str(&s).expect("mediaApps 不是合法 JSON");
+        assert_eq!(v["type"], "mediaApps");
+        assert_eq!(v["payload"]["apps"].as_array().unwrap().len(), 2);
+        let first = &v["payload"]["apps"][0];
+        assert_eq!(first["process"], "cloudmusic.exe");
+        assert_eq!(first["displayName"], "网易云音乐");
+        assert_eq!(first["playable"], true);
+        assert_eq!(first["resolved"], true);
+        assert_eq!(first["source"], "cache");
+        assert_eq!(v["payload"]["at"], 1_762_222_200_000u64, "at 是 epoch 毫秒数字");
+        assert!(v["payload"]["at"].is_u64());
+        assert_eq!(v["payload"]["overBudget"], true);
+        // playable=false 的行同样带全部字段（前端灰态渲染用）
+        let second = &v["payload"]["apps"][1];
+        assert_eq!(second["playable"], false);
+        assert_eq!(second["resolved"], false);
+    }
+
+    /// add：表内进程名（CloudMusic）→ `Added(Verified)`；大小写/路径/无后缀都归一化。
+    #[test]
+    fn apply_blacklist_add_verified_for_table_process() {
+        let cfg = &mut Config::default();
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+        let out = apply_blacklist(cfg, "media.blacklist_add", &json!("  CloudMusic  "), &idx);
+        assert_eq!(out, BlacklistOutcome::Added(KeyRecognition::Verified));
+        assert_eq!(cfg.media.blacklist, vec!["cloudmusic.exe".to_string()]);
+    }
+
+    /// add：从未出现过的名字 → `Added(Unverified)`（U1=B 失败不静默的桥接层落点）。
+    /// 重复添加（任何大小写/形态）→ `Duplicate`，且不产生第二条。
+    #[test]
+    fn apply_blacklist_add_unverified_for_unknown_process() {
+        let cfg = &mut Config::default();
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+        let out = apply_blacklist(cfg, "media.blacklist_add", &json!("zzz-test.exe"), &idx);
+        assert_eq!(out, BlacklistOutcome::Added(KeyRecognition::Unverified));
+        assert_eq!(cfg.media.blacklist, vec!["zzz-test.exe".to_string()]);
+        // 同一条的其它形态 → Duplicate（重复判定先于识别判定）
+        let out = apply_blacklist(cfg, "media.blacklist_add", &json!("ZZZ-TEST"), &idx);
+        assert_eq!(out, BlacklistOutcome::Duplicate);
+        assert_eq!(cfg.media.blacklist.len(), 1);
+        // 添加成功后缓存里学到了它 → 同名键变 Verified（同源判据）
+        let mut learned = crate::config::MediaConfig::default();
+        learned.app_names.insert("a!b".into(), "zzz-test.exe".into());
+        let idx2 = crate::media::blacklist::MediaIndex::new(&learned);
+        let mut cfg2 = Config::default();
+        let out = apply_blacklist(&mut cfg2, "media.blacklist_add", &json!("zzz-test"), &idx2);
+        assert_eq!(out, BlacklistOutcome::Added(KeyRecognition::Verified));
+    }
+
+    /// add：非法字符 / 空串 / 超长 / 满 200 → 各自的分档。
+    #[test]
+    fn apply_blacklist_add_rejects_invalid_empty_too_long_full() {
+        use crate::media::blacklist::NormError;
+        let cfg = &mut Config::default();
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!("a*b.exe"), &idx),
+            BlacklistOutcome::Invalid(NormError::InvalidChar)
+        );
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!(""), &idx),
+            BlacklistOutcome::Invalid(NormError::Empty)
+        );
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!(".exe"), &idx),
+            BlacklistOutcome::Invalid(NormError::Empty)
+        );
+        let long = format!("{}.exe", "a".repeat(300));
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!(long), &idx),
+            BlacklistOutcome::Invalid(NormError::TooLong)
+        );
+        // 满 200
+        for i in 0..crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES {
+            cfg.media.blacklist.push(format!("app{i}.exe"));
+        }
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!("overflow.exe"), &idx),
+            BlacklistOutcome::Full
+        );
+        assert_eq!(cfg.media.blacklist.len(), crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES);
+        // 非 string value → Invalid(Empty)（toast「请输入进程名」）
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_add", &json!(42), &idx),
+            BlacklistOutcome::Invalid(NormError::Empty)
+        );
+    }
+
+    /// remove：归一化后精确删除（大小写不敏感）；不存在 → NotFound。
+    #[test]
+    fn apply_blacklist_remove_normalizes_and_reports_not_found() {
+        let cfg = &mut Config::default();
+        cfg.media.blacklist = vec!["cloudmusic.exe".into()];
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+        // 无后缀 / 大小写 / 路径形态都能删掉同一条
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_remove", &json!("C:\\x\\CloudMusic"), &idx),
+            BlacklistOutcome::Removed
+        );
+        assert!(cfg.media.blacklist.is_empty());
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_remove", &json!("cloudmusic.exe"), &idx),
+            BlacklistOutcome::NotFound
+        );
+    }
+
+    /// clear：只清 blacklist，**绝不清 app_names**（D12：缓存是实测事实）。
+    #[test]
+    fn apply_blacklist_clear_keeps_learned_app_names() {
+        let cfg = &mut Config::default();
+        cfg.media.blacklist = vec!["a.exe".into(), "b.exe".into()];
+        cfg.media
+            .app_names
+            .insert("x!y".into(), "real.exe".into());
+        let idx = crate::media::blacklist::MediaIndex::new(&cfg.media);
+        assert_eq!(
+            apply_blacklist(cfg, "media.blacklist_clear", &json!(true), &idx),
+            BlacklistOutcome::Cleared
+        );
+        assert!(cfg.media.blacklist.is_empty());
+        assert_eq!(cfg.media.app_names.len(), 1, "app_names 不许被 clear 连带清掉");
+    }
+
+    /// apply_set 显式拒绝黑名单三条 path（纵深防御：防旧页面/注入脚本绕过归一化）。
+    #[test]
+    fn apply_set_rejects_media_blacklist_paths() {
+        let mut c = Config::default();
+        for path in [
+            "media.blacklist_add",
+            "media.blacklist_remove",
+            "media.blacklist_clear",
+        ] {
+            assert!(!apply_set(&mut c, path, &json!("cloudmusic.exe")), "{path} 必须被拒绝");
+        }
+        assert!(c.media.blacklist.is_empty(), "被拒绝的写入不许改动配置");
     }
 }

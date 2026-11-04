@@ -43,6 +43,15 @@ pub enum AppEvent {
     SessionCleared,
     /// 播控命令执行结果（用于回滚乐观更新）
     CommandResult { kind: MediaCommandKind, ok: bool },
+    /// 枚举结果（T1 → T0，v1.9.0 / G7）。设置页"检测到的应用"的唯一数据来源。
+    ///
+    /// `learned` 不随本事件回传给渲染层：反查结果由媒体线程直接写进 `MediaIndex`（内存），
+    /// UI 线程收到后 `merge_learned` 进 `config.media.app_names` → `SaveConfig` 落盘
+    /// （顺序陷阱见 ARCH-G7 §5.6）。送达走 `SettingsService::post()`（不碰 `last_state`）。
+    MediaApps(Box<crate::media::MediaAppsSnapshot>),
+    /// 当前会话被拉黑 / 解除拉黑（T1 → T0，v1.9.0 / G7）。`None` = 当前无被拉黑的会话。
+    /// 用途**只有**托盘菜单文案与置灰，不得据此恢复任何渲染/歌词/播控。
+    IgnoredSession(Option<Box<crate::media::IgnoredSessionInfo>>),
 
     // ---------------- 歌词（T2 → T0） ----------------
     LyricLoading {
@@ -133,10 +142,14 @@ impl HotkeyAction {
 }
 
 /// 托盘菜单命令。
+///
+/// v1.9.0（G7）：`ToggleIgnoreCurrent` —— 拉黑/恢复共用一个 id（104），
+/// 由 `App` 按当前状态（`App.ignored`）决定语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     OpenSettings,
     ToggleWidget,
+    ToggleIgnoreCurrent,
     Quit,
 }
 
@@ -218,6 +231,11 @@ pub enum MediaCommand {
     Seek(Ms),
     /// 强制重新读取一次会话（用于乐观更新回滚校验）
     Refresh,
+    /// 枚举"检测到的应用"（v1.9.0 / G7）。**只允许两处触发**：进入黑名单分区
+    /// （`detectedLoaded` 守卫）+ 用户点「刷新」——零定时器、零轮询。
+    /// 媒体线程收到后跑 `enumerate_apps`（含 WASAPI 反查与三道闸门），结果随
+    /// `AppEvent::MediaApps` 回传。
+    EnumerateApps,
     /// **全屏冻结**（v1.5.5 / G3.5）：暂停 / 恢复媒体线程的「分层轮询」。
     ///
     /// - `true`：线程阻塞在 `cmd_rx.recv()` 上，0 唤醒、0 跨进程调用；

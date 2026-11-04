@@ -36,7 +36,8 @@ use crate::event::{AppEvent, Effect, LyricRequest, MediaCommand, TrayCommand, Wi
 use crate::i18n::{self, Lang};
 use crate::lyric::service::LyricService;
 use crate::lyric::{LyricDraw, LyricStatus, LyricView};
-use crate::media::{self, MediaService, Ms, NowPlaying, PlaybackState};
+use crate::media::blacklist::MediaIndex;
+use crate::media::{self, IgnoredSessionInfo, MediaService, Ms, NowPlaying, PlaybackState};
 use crate::platform::dpi::scale_for;
 use crate::platform::wake::{EventSink, WakeHwnd, WM_BARLINE_APPBAR};
 use crate::platform::wide::to_wide;
@@ -245,6 +246,12 @@ pub struct App {
     renderer: Option<Renderer>,
     media: Option<MediaService>,
     lyric: Option<LyricService>,
+    /// UI 线程与媒体线程共享的黑名单 / 真实名索引（v1.9.0 / G7）。
+    /// 媒体线程每轮 tick 读它做纯内存判定；UI 线程在配置变化时 `set` 整组同步。
+    index: Arc<MediaIndex>,
+    /// 当前被拉黑的会话（v1.9.0 / G7，来自 `AppEvent::IgnoredSession`）。
+    /// **不放 `AppState`**——渲染层不需要它；只用于托盘菜单文案与置灰。
+    ignored: Option<IgnoredSessionInfo>,
     sampler: Option<Sampler>,
     geometry: Option<TaskbarGeometry>,
     /// 小组件当前的屏幕矩形（由 `relayout` 算好，`redraw` 直接用）
@@ -448,6 +455,10 @@ impl App {
 
         let target_rect = geometry.as_ref().map(|g| g.target).unwrap_or_default();
 
+        // v1.9.0（G7）：黑名单 / 真实名共享索引——在媒体线程 spawn **之前**构建，
+        // 两个线程各持一份 Arc；判定阶段读副本、写路径只有 index.set。
+        let index = MediaIndex::new(&config.media);
+
         // 歌词区初始宽度 = 配置对应的信息区最小宽（不做入场动画）
         let lyric_w = lyric_w_logical(&config);
 
@@ -469,6 +480,8 @@ impl App {
             renderer,
             media: None,
             lyric: None,
+            index,
+            ignored: None,
             sampler,
             geometry,
             target_rect,
@@ -547,7 +560,7 @@ impl App {
         // SAFETY: 同上——`ptr` 是刚 `Box::into_raw` 出来的独占指针，且本函数还没返回，
         // 没有任何其它线程或窗口过程持有它（GWLP_USERDATA 刚写入，消息泵尚未启动）。
         unsafe {
-            (*ptr).media = MediaService::spawn(sink.clone());
+            (*ptr).media = MediaService::spawn(sink.clone(), (*ptr).index.clone());
             (*ptr).lyric = LyricService::spawn(sink);
             if let Some(t) = (*ptr).tray.as_mut() {
                 t.add((*ptr).lang);
@@ -1104,10 +1117,11 @@ impl App {
             let widget_visible = crate::ui::tray::toggle_checked(
                 self.config.general.widget_hidden || self.state.dismissed,
             );
-            let cmd = self
-                .tray
-                .as_ref()
-                .and_then(|t| t.show_menu(self.lang, widget_visible));
+            let cmd = self.tray.as_ref().and_then(|t| {
+                // v1.9.0（G7）：菜单内容由 App 决定（文案 / 置灰），tray 只负责画；
+                // 读的是 App 内存态的当前会话身份，**不调 SMTC**。
+                t.show_menu(self.lang, widget_visible, self.ignore_menu_item())
+            });
             if let Some(cmd) = cmd {
                 let effects = self.reduce(AppEvent::TrayCommand(cmd));
                 self.apply(effects);
@@ -1533,6 +1547,13 @@ impl App {
                 Vec::new()
             }
             AppEvent::SettingsMessage(msg) => self.reduce_settings_message(&msg),
+            // v1.9.0（G7）：枚举结果 → 学到的名字先合并再同步索引（顺序陷阱 §5.6）
+            AppEvent::MediaApps(snap) => self.reduce_media_apps(&snap),
+            // v1.9.0（G7）：当前会话被拉黑 / 解除。**只**影响托盘菜单，不碰 state。
+            AppEvent::IgnoredSession(info) => {
+                self.ignored = info.map(|b| *b);
+                Vec::new()
+            }
             AppEvent::Hotkey(action) => self.reduce_hotkey(action),
             AppEvent::TrayCommand(cmd) => match cmd {
                 TrayCommand::OpenSettings => {
@@ -1540,6 +1561,8 @@ impl App {
                     Vec::new()
                 }
                 TrayCommand::ToggleWidget => self.toggle_widget_visible(),
+                // v1.9.0（G7）：拉黑/恢复共用一个菜单 id，语义由 App.ignored 决定
+                TrayCommand::ToggleIgnoreCurrent => self.toggle_ignore_current(),
                 TrayCommand::Quit => {
                     crate::log_info!("托盘：退出");
                     vec![Effect::Quit]
@@ -1617,6 +1640,11 @@ impl App {
                 Vec::new()
             }
             Incoming::Set { path, value } => {
+                // v1.9.0（G7）：黑名单三条走专属入口（归一化 + 分档 toast + KeyRecognition），
+                // 不进 apply_set 的 bool 白名单。前置分流，防止旧页面/注入脚本绕过归一化。
+                if path.starts_with("media.blacklist") {
+                    return self.reduce_blacklist_set(&path, &value);
+                }
                 if !bridge::apply_set(&mut self.config, &path, &value) {
                     return Vec::new();
                 }
@@ -1659,6 +1687,10 @@ impl App {
     }
 
     /// 设置页里的「动作」按钮。
+    ///
+    /// v1.9.0（G7）：`blacklistEnumerate` —— 进入黑名单分区（首次）或点「刷新」时
+    /// 由页面发来。枚举跑在媒体线程，UI 线程零参与；`other =>` 仍然只 log_debug，
+    /// 所以新 action **必须**在这里真的加一条分支（否则请求会静默消失）。
     fn run_settings_action(&mut self, action: &str) {
         // 歌词目录逐行「更改…」：browseLyricsDir:<idx>
         if let Some(idx) = action
@@ -1890,12 +1922,240 @@ impl App {
                     );
                 }
             }
+            // v1.9.0（G7）：枚举"检测到的应用"（唯一两个触发点：
+            // 首次进入黑名单分区 + 点「刷新」；零定时器、零轮询）
+            "blacklistEnumerate" => match self.media.as_ref() {
+                Some(m) => m.send(MediaCommand::EnumerateApps),
+                None => {
+                    crate::log_warn!("媒体服务未启动，枚举请求丢弃");
+                    let toast = crate::settings::bridge::toast_json(
+                        "info",
+                        i18n::t(self.lang, "toast.blacklist.enum_failed"),
+                    );
+                    // post（不碰 last_state）：枚举结果是一次点查，不是配置快照
+                    self.settings.post(&toast);
+                }
+            },
             "ready" => {
                 // 页面加载完了：补推一次全量状态
                 self.settings.on_webview_ready();
             }
             other => crate::log_debug!("设置页未知动作：{other}"),
         }
+    }
+
+    // ------------------------------------------------ 黑名单（v1.9.0 / G7）
+
+    /// 黑名单 set 消息的**唯一**入口（`apply_set` 显式拒绝这三条 path）。
+    ///
+    /// 顺序（ARCH-G7 §6.4）：① `apply_blacklist` 归一化 + 改配置 → ② 失败只 toast
+    /// → ③ `index.set` 同步共享索引 → ④ `sync_blacklist_now` 命中当前播放立即回落
+    /// → ⑤ toast（`Added(Unverified)` 再补一条温和提示）→ ⑥ 落盘 + 回推 state。
+    fn reduce_blacklist_set(&mut self, path: &str, value: &serde_json::Value) -> Vec<Effect> {
+        use crate::media::blacklist::NormError;
+        use crate::settings::bridge::{apply_blacklist, toast_json, BlacklistOutcome as O};
+        let outcome = apply_blacklist(&mut self.config, path, value, &self.index);
+        // ② 失败只 toast：不改状态、不写盘、不回推 state
+        // （NotFound / BadPath 配置未变：静默记日志，不打扰用户）
+        match &outcome {
+            O::Added(_) | O::Removed | O::Cleared => {}
+            O::Duplicate => {
+                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.dup"));
+                self.settings.push(&toast);
+                return Vec::new();
+            }
+            O::Invalid(NormError::Empty) => {
+                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.empty"));
+                self.settings.push(&toast);
+                return Vec::new();
+            }
+            O::Invalid(NormError::InvalidChar) => {
+                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.invalid"));
+                self.settings.push(&toast);
+                return Vec::new();
+            }
+            O::Invalid(NormError::TooLong) => {
+                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.too_long"));
+                self.settings.push(&toast);
+                return Vec::new();
+            }
+            O::Full => {
+                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.full"));
+                self.settings.push(&toast);
+                return Vec::new();
+            }
+            other => {
+                crate::log_debug!("黑名单请求无效果：{other:?}");
+                return Vec::new();
+            }
+        }
+        // ③ 同步共享索引（两张表一起替换，媒体线程立即看到）
+        self.index.set(&self.config.media);
+        // ④ 命中当前播放 → 立即回落空态（不必等媒体线程下一轮）
+        self.sync_blacklist_now();
+        // ⑤ toast：成功一条；Added(Unverified) 再补一条温和提示（U1=B 失败不静默）
+        let ok_key = match outcome {
+            O::Added(_) => "toast.blacklist.added",
+            O::Removed => "toast.blacklist.removed",
+            O::Cleared => "toast.blacklist.cleared",
+            _ => "toast.blacklist.added",
+        };
+        let toast = toast_json("info", i18n::t(self.lang, ok_key));
+        self.settings.push(&toast);
+        if let O::Added(crate::settings::bridge::KeyRecognition::Unverified) = outcome {
+            let hint = toast_json("info", i18n::t(self.lang, "toast.blacklist.unverified"));
+            self.settings.push(&hint);
+        }
+        // ⑥ 落盘 + 回推 state + 立即全量读一轮（解绑后媒体线程 ≤1s 内重新广播）
+        let json = self.settings_state_json();
+        self.settings.push(&json);
+        vec![
+            Effect::SaveConfig(Box::new(self.config.clone())),
+            Effect::Relayout,
+            Effect::Media(MediaCommand::Refresh),
+        ]
+    }
+
+    /// 枚举结果落地（ARCH-G7 §5.6 三段式的 UI 线程侧 + §6.4）。
+    ///
+    /// ⚠️ **顺序陷阱**：`merge_learned` 必须先改 `config.media.app_names`，
+    /// **再** `index.set(&config.media)`——反了会用旧表把刚学到的名字盖掉，
+    /// 症状只在"重启后第一次枚举"显形。学到的名字没变就不写盘
+    /// （反复点「刷新」不会反复写 config.json）。
+    fn reduce_media_apps(&mut self, snap: &media::MediaAppsSnapshot) -> Vec<Effect> {
+        let changed =
+            crate::media::blacklist::merge_learned(&mut self.config.media.app_names, &snap.learned);
+        self.index.set(&self.config.media); // merge 之后才 set
+        let json = crate::settings::bridge::media_apps_json(snap);
+        // post（不碰 last_state）：mediaApps 是一次点查的结果，
+        // 混进 last_state 会让窗口重建后补推错内容（R8）
+        self.settings.post(&json);
+        if changed {
+            vec![Effect::SaveConfig(Box::new(self.config.clone()))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// UI 线程的即时对账：命中当前播放 → 立即回落空态（小组件同帧隐藏）；
+    /// 忽略态对应的条目已不在黑名单 → 解除（媒体线程 ≤1s 内重发 NowPlaying）。
+    /// 只改内存态与 `App.ignored`，不写盘、不向媒体线程额外发号施令。
+    fn sync_blacklist_now(&mut self) {
+        let s = self.state.playing.session.clone();
+        let hit = !s.aumid.is_empty() && self.index.matches(&s.process_name, &s.aumid);
+        if hit {
+            self.ignored = Some(IgnoredSessionInfo {
+                process_name: s.process_name.clone(),
+                aumid: s.aumid.clone(),
+                app_name: s.app_name.clone(),
+            });
+            // 与 SessionCleared 同语义：playing/lyrics 复位，小组件立即隐藏
+            self.state.playing = NowPlaying::default();
+            self.state.lyrics = LyricView::default();
+            return;
+        }
+        if self.ignored.is_some() {
+            self.ignored = None;
+        }
+    }
+
+    /// 托盘「拉黑 / 恢复当前应用」（G7 P1：拉黑/恢复共用一个菜单 id，
+    /// 语义由 `App.ignored` 决定；已存在则移除 → 幂等 toggle）。
+    fn toggle_ignore_current(&mut self) -> Vec<Effect> {
+        if let Some(ig) = self.ignored.clone() {
+            // 恢复：把被忽略会话的身份键从黑名单移除
+            let key = self.index.identity(&ig.process_name, &ig.aumid).key;
+            if key.is_empty() {
+                return Vec::new();
+            }
+            let before = self.config.media.blacklist.len();
+            self.config
+                .media
+                .blacklist
+                .retain(|e| !crate::media::blacklist::matches_entry(e, &key));
+            if self.config.media.blacklist.len() == before {
+                return Vec::new();
+            }
+            return self.after_blacklist_change("toast.blacklist.removed");
+        }
+        // 拉黑：当前会话身份 → normalize → 追加
+        let s = &self.state.playing.session;
+        let id = self.index.identity(&s.process_name, &s.aumid);
+        if id.key.is_empty() {
+            crate::log_debug!("托盘拉黑：当前会话身份不可解析，忽略");
+            return Vec::new();
+        }
+        let existed = self
+            .config
+            .media
+            .blacklist
+            .iter()
+            .any(|e| crate::media::blacklist::matches_entry(e, &id.key));
+        if existed {
+            // 幂等 toggle：已存在（媒体线程广播滞后）→ 移除
+            self.config
+                .media
+                .blacklist
+                .retain(|e| !crate::media::blacklist::matches_entry(e, &id.key));
+            self.after_blacklist_change("toast.blacklist.removed")
+        } else {
+            self.config.media.blacklist.push(id.key);
+            self.after_blacklist_change("toast.blacklist.added")
+        }
+    }
+
+    /// 托盘拉黑/恢复的共同收尾：同步索引 → 即时对账 → toast → 落盘 + 重排。
+    fn after_blacklist_change(&mut self, ok_key: &'static str) -> Vec<Effect> {
+        self.index.set(&self.config.media);
+        self.sync_blacklist_now();
+        let toast =
+            crate::settings::bridge::toast_json("info", i18n::t(self.lang, ok_key));
+        self.settings.push(&toast);
+        vec![
+            Effect::SaveConfig(Box::new(self.config.clone())),
+            Effect::Relayout,
+        ]
+    }
+
+    /// 托盘菜单「拉黑/恢复」项的文案与置灰（纯函数：App 状态 → (label, enabled)）。
+    ///
+    /// R1 的主要防线：**只要 `ignored.is_some()` 就 enabled=true**——用户把唯一的
+    /// 播放器拉黑后小组件消失，托盘这一项是唯一常驻的恢复入口。
+    fn ignore_menu_item(&self) -> crate::ui::tray::IgnoreMenuItem {
+        use crate::ui::tray::{clamp_label, IgnoreMenuItem};
+        if let Some(ig) = self.ignored.as_ref() {
+            let label = match self.lang {
+                Lang::Zh => format!("{}（{}）", i18n::t(self.lang, "menu.unblacklist_current"), clamp_label(&ig.app_name, 40)),
+                Lang::En => format!("{} ({})", i18n::t(self.lang, "menu.unblacklist_current"), clamp_label(&ig.app_name, 40)),
+            };
+            return IgnoreMenuItem { label, enabled: true };
+        }
+        let s = &self.state.playing.session;
+        let name = if s.app_name.is_empty() {
+            i18n::t(self.lang, "menu.unknown_app")
+        } else {
+            s.app_name.as_str()
+        };
+        // 无会话或身份不可解析 → 置灰（点了也不会有身份可拉黑）
+        let resolvable = !self.index.identity(&s.process_name, &s.aumid).key.is_empty();
+        let enabled = self.state.playing.state != PlaybackState::NoSession && resolvable;
+        let label = if enabled {
+            match self.lang {
+                Lang::Zh => format!(
+                    "{}（{}）",
+                    i18n::t(self.lang, "menu.blacklist_current"),
+                    clamp_label(name, 40)
+                ),
+                Lang::En => format!(
+                    "{} ({})",
+                    i18n::t(self.lang, "menu.blacklist_current"),
+                    clamp_label(name, 40)
+                ),
+            }
+        } else {
+            i18n::t(self.lang, "menu.blacklist_current").to_string()
+        };
+        IgnoreMenuItem { label, enabled }
     }
 
     /// 「迁移？删除原文件？」两个确认弹窗。返回 `(迁移, 删除)`——用户各自决定。
@@ -1979,13 +2239,26 @@ impl App {
 
     /// 组装给设置页的全量状态 JSON。
     fn settings_state_json(&self) -> String {
+        self.settings_state_json_with(None)
+    }
+
+    /// 带可选 `openSection` 的全量状态（v1.9.0 / G7 P1-03）：
+    /// 托盘「设置」且当前 `NoSession` 时带 `"blacklist"`，页面首次收到 state 时
+    /// 一次性导航到黑名单分区（`navInitialized` 守卫，走与 nav 点击同一条
+    /// "分区激活 → 首次枚举" 路径，保证直达后列表不空）。
+    fn settings_state_json_with(&self, open_section: Option<&str>) -> String {
         let conflicts: Vec<(&str, u32)> = self
             .hotkeys
             .conflicts
             .iter()
             .map(|c| (crate::settings::bridge::action_name(c.action), c.code))
             .collect();
-        crate::settings::bridge::state_json(&self.config, env!("CARGO_PKG_VERSION"), &conflicts)
+        crate::settings::bridge::state_json_with_section(
+            &self.config,
+            env!("CARGO_PKG_VERSION"),
+            &conflicts,
+            open_section,
+        )
     }
 
     /// 设置窗口尺寸变化 → 同步 WebView2。
@@ -2186,7 +2459,10 @@ impl App {
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
                 Effect::OpenSettings => {
-                    let json = self.settings_state_json();
+                    // v1.9.0（G7 / P1-03）：当前无会话 → 打开后直达黑名单分区
+                    let open_section = (self.state.playing.state == PlaybackState::NoSession)
+                        .then_some("blacklist");
+                    let json = self.settings_state_json_with(open_section);
                     // 标题栏明暗必须与页面内容同源（QA-M4 缺陷 #3）：页面 CSS 跟随
                     // 系统 prefers-color-scheme，所以这里读系统设置而不是小组件的
                     // 壁纸采样结果（浅色系统 + 深壁纸时两者会不一致）。
@@ -2216,6 +2492,10 @@ impl App {
                     None => crate::log_warn!("歌词线程未启动，请求被丢弃"),
                 },
                 Effect::SaveConfig(cfg) => {
+                    // v1.9.0（G7）：所有写配置路径的唯一收口——两张表一起替换
+                    // （blacklist + app_names）。app_names 已在上游（枚举路径的
+                    // merge_learned）合并好，这里**不要**再 merge 或清空缓存表。
+                    self.index.set(&cfg.media);
                     if let Err(e) = cfg.save() {
                         crate::log_err!("保存配置失败：{e}");
                     }

@@ -24,12 +24,15 @@ mod tests {
         assert!(INDEX_HTML.len() < 200_000, "HTML 过大：{}", INDEX_HTML.len());
     }
 
+    /// v1.9.0（G7）：七个分组（原六组 + `group-blacklist`）都必须存在。
+    /// 原名 `html_has_all_six_groups` 随 G7 分区并入扩成七组（断言只增不减）。
     #[test]
-    fn html_has_all_six_groups() {
+    fn html_has_all_seven_groups() {
         for key in [
             "group-appearance",
             "group-lyrics",
             "group-volume",
+            "group-blacklist",
             "group-hotkeys",
             "group-general",
             "group-about",
@@ -252,5 +255,110 @@ mod tests {
             2,
             "zh 的静态标签与 i18n 字典两处都要改成「不再显示歌词行」"
         );
+    }
+
+    // ------------------------------------------------ v1.9.0（G7）黑名单分区
+
+    /// G7 契约一：黑名单分区的 7 个关键 id 必须存在，且配置路径三条都在页面里。
+    #[test]
+    fn blacklist_section_ids_and_paths_exist() {
+        for id in [
+            "blacklist-card",
+            "blacklist-title",
+            "blacklist-items",
+            "blacklist-input",
+            "blacklist-candidates",
+            "blacklist-add",
+            "blacklist-clear",
+            "detected-card",
+            "detected-at",
+            "detected-refresh",
+            "detected-items",
+        ] {
+            assert!(INDEX_HTML.contains(&format!("id=\"{id}\"")), "缺少 #{id}");
+        }
+        for path in [
+            "media.blacklist_add",
+            "media.blacklist_remove",
+            "media.blacklist_clear",
+        ] {
+            assert!(INDEX_HTML.contains(path), "页面没有接配置路径 {path}");
+        }
+        // 新 action 字面量必须进断言（先例 lyricsCacheStats / openLyricsCacheDir）
+        assert!(INDEX_HTML.contains("\"blacklistEnumerate\""), "缺少 blacklistEnumerate 动作");
+    }
+
+    /// G7 契约二：动态文本不得挂 data-i18n（#blacklist-title 计数会被
+    /// render() 的 [data-i18n] 循环打回模板串——先例 #lyrics-cache-usage）；
+    /// `nav.blacklist` 与 `blacklist.detected.unverified` 中英词条都在；
+    /// `[data-i18n-placeholder]` 循环必须补齐（否则 placeholder 永远中文）。
+    #[test]
+    fn blacklist_dynamic_title_has_no_data_i18n_and_keys_are_bilingual() {
+        // ① #blacklist-title 不带 data-i18n
+        let at = INDEX_HTML.find("id=\"blacklist-title\"").expect("找不到 #blacklist-title");
+        let tag_start = INDEX_HTML[..at].rfind('<').unwrap_or(0);
+        let tag = &INDEX_HTML[tag_start..at];
+        assert!(
+            !tag.contains("data-i18n"),
+            "#blacklist-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
+        );
+        // ② 关键词条中英都在（I18N.zh 与 I18N.en 各一份；needle = key + 文案前缀）
+        for (key, zh, en) in [
+            ("nav.blacklist", "黑名单", "Blacklist"),
+            ("blacklist.detected.unverified", "进程名未能验证", "Name unverified"),
+            ("blacklist.hint.match", "只按进程名匹配", "Matched by process name only"),
+            ("blacklist.clear.confirm", "清空后所有应用", "Clearing the list"),
+        ] {
+            let needle_zh = format!("\"{key}\": \"{zh}");
+            assert!(INDEX_HTML.contains(&needle_zh), "zh 缺词条：{key}");
+            let needle_en = format!("\"{key}\": \"{en}");
+            assert!(INDEX_HTML.contains(&needle_en), "en 缺词条：{key}");
+        }
+        // hint.match 的末句必须采用 PRD P0-06 版（指路「检测到的应用」）
+        assert!(
+            INDEX_HTML.contains("从「检测到的应用」里加入最稳"),
+            "blacklist.hint.match 缺 PRD 版末句"
+        );
+        // ③ placeholder 属性与 JS 循环补齐
+        assert!(
+            INDEX_HTML.contains("data-i18n-placeholder"),
+            "缺少 data-i18n-placeholder（placeholder 永远中文）"
+        );
+        assert!(
+            INDEX_HTML.contains("i18nPlaceholder"),
+            "render() 缺 [data-i18n-placeholder] 循环（dataset 名是 i18nPlaceholder）"
+        );
+    }
+
+    /// G7 契约三：枚举**只允许两处触发**（activateNav 守卫 + 刷新按钮）——
+    /// 零定时器（setTimeout 仍只许 toast 那一处）、零轮询；
+    /// 清空确认必须走 window.confirm()（裁决 A5，不用原生弹窗）；
+    /// P0-03：零新增 CSS（仍只有一个 <style> 块）。
+    #[test]
+    fn blacklist_enumerate_has_two_triggers_and_no_timers() {
+        // ① 触发点恰好两处：守卫 + 刷新按钮
+        let guard = INDEX_HTML.matches("requestDetect()").count();
+        assert_eq!(
+            guard, 2,
+            "requestDetect 调用点必须恰好 2 处（activateNav 守卫 + detected-refresh）：{guard}"
+        );
+        assert!(
+            INDEX_HTML.contains("!detectedLoaded) requestDetect()"),
+            "首次进入分区必须有 detectedLoaded 守卫"
+        );
+        // ② 零定时器：setTimeout 仍只许 toast 那一处（既有断言的 G7 侧重申）
+        assert_eq!(
+            INDEX_HTML.matches("setTimeout").count(),
+            1,
+            "枚举置灰的解除靠 mediaApps 消息回推，不许加 setTimeout"
+        );
+        assert_eq!(INDEX_HTML.matches("setInterval").count(), 0);
+        // ③ 清空确认走 window.confirm()
+        assert!(
+            INDEX_HTML.contains("confirm(t(\"blacklist.clear.confirm\"))"),
+            "清空黑名单必须用 window.confirm()"
+        );
+        // ④ P0-03：不新增 CSS——全页仍只有 1 个 <style> 块
+        assert_eq!(INDEX_HTML.matches("<style").count(), 1, "不许新增 <style> 规则");
     }
 }

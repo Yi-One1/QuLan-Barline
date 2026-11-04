@@ -170,6 +170,26 @@ pub struct StorageConfig {
     pub pending_delete_old: bool,
 }
 
+/// 媒体源过滤（v1.9.0 / G7，U1=B，`docs/ARCH-G7-黑名单.md` §3.1）。
+///
+/// 两个字段都只存**归一化后**的值。
+/// * `blacklist` 是**用户资产**（顺序有意义：首次添加顺序，不排序）；
+/// * `app_names` 是**实测缓存**（顺序无意义，用 `BTreeMap` 保证 JSON 输出稳定，
+///   否则 `HashMap` 的随机迭代顺序会让 `config.json` 每次保存都字节级变化）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MediaConfig {
+    /// 黑名单。上限 `limits::BLACKLIST_MAX_ENTRIES`，单条 ≤ `limits::BLACKLIST_MAX_LEN`。
+    /// **只清这个表不清 `app_names`**（缓存是实测事实，与用户意图无关）。
+    pub blacklist: Vec<String>,
+    /// AUMID（**小写**）→ 真实进程名（小写、含 `.exe`）。**落盘**，重启后仍有效。
+    ///
+    /// 来源：设置页枚举时的 WASAPI 反查（ARCH-G7 §5）。用途：`identity()` 的**第①级**。
+    /// 上限 `limits::APP_NAME_CACHE_MAX`，满时淘汰字典序最小的键；
+    /// `Config::load` 会做双表归一化（手改 json 写坏也不炸）。
+    pub app_names: std::collections::BTreeMap<String, String>,
+}
+
 /// 全量配置。`#[serde(default)]` 保证缺字段 / 新增字段时都能正常反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -183,6 +203,8 @@ pub struct Config {
     pub general: GeneralConfig,
     /// v1.1.5：存储位置
     pub storage: StorageConfig,
+    /// v1.9.0（G7）：媒体源过滤（黑名单 + 真实进程名缓存）
+    pub media: MediaConfig,
 }
 
 /// `%LOCALAPPDATA%\Barline\config.json`
@@ -225,6 +247,27 @@ impl Config {
                     // 迁移结果要立刻落盘，否则下次启动又会判定为「旧配置」
                     if let Err(e) = cfg.save() {
                         crate::log_warn!("迁移后的配置保存失败：{e}");
+                    }
+                }
+                // v1.9.0（G7）：黑名单 + 真实名缓存归一化。手改 json 也安全——
+                // 坏值静默丢弃，不 panic、不弹窗。**顺序必须"先 normalize 后 save"**
+                // （反了会把未归一化的脏表写回磁盘，ARCH-G7 §3.3 / R12）。
+                // 归一化必须幂等（R12）：正常第二次启动不再判定为"有变化"。
+                let bl = crate::media::blacklist::normalize_list(&cfg.media.blacklist);
+                let an = crate::media::blacklist::normalize_app_names(&cfg.media.app_names);
+                if bl != cfg.media.blacklist || an != cfg.media.app_names {
+                    crate::log_info!(
+                        "media 已归一化：blacklist {} → {} 条，app_names {} → {} 条",
+                        cfg.media.blacklist.len(),
+                        bl.len(),
+                        cfg.media.app_names.len(),
+                        an.len()
+                    );
+                    cfg.media.blacklist = bl;
+                    cfg.media.app_names = an;
+                    // 归一化结果立刻落盘，避免每次启动重复清洗
+                    if let Err(e) = cfg.save() {
+                        crate::log_warn!("归一化后的 media 配置保存失败：{e}");
                     }
                 }
                 cfg
@@ -425,5 +468,31 @@ mod tests {
         let cfg: Config = serde_json::from_slice(b"{}").expect("空对象应可用");
         assert_eq!(cfg.version, defaults::CURRENT_VERSION);
         assert_eq!(cfg.hotkeys.next.vk, defaults::vk::RIGHT);
+    }
+
+    // ------------------------------------------------ v1.9.0（G7）media 分组
+
+    /// 旧配置（v1.8.1 及更早）没有 `media` 字段 → 反序列化不报错且两表均空
+    /// （容器级 `#[serde(default)]` 兜底；ARCH-G7 B3 兼容性口径）。
+    #[test]
+    fn legacy_config_without_media_defaults_empty() {
+        let cfg: Config = serde_json::from_slice(br#"{"version":1}"#).expect("旧配置必须仍能加载");
+        assert!(cfg.media.blacklist.is_empty());
+        assert!(cfg.media.app_names.is_empty());
+    }
+
+    /// `media` 双表随 `Config` 一起落盘：roundtrip 后逐字节一致
+    /// （BTreeMap 保证 JSON 输出稳定；`blacklist` 顺序有意义不排序）。
+    #[test]
+    fn media_roundtrip_preserves_blacklist_and_app_names() {
+        let mut cfg = Config::default();
+        cfg.media.blacklist = vec!["cloudmusic.exe".to_string(), "msedge.exe".to_string()];
+        cfg.media
+            .app_names
+            .insert("com.sesame.qishui.desktop".to_string(), "sodamusic.exe".to_string());
+        let json = serde_json::to_vec(&cfg).expect("序列化");
+        let back: Config = serde_json::from_slice(&json).expect("反序列化");
+        assert_eq!(back.media, cfg.media);
+        assert_eq!(back.version, cfg.version);
     }
 }

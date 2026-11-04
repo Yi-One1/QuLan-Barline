@@ -1,6 +1,6 @@
 [package]
 name         = "barline"
-version      = "1.8.1"
+version      = "1.9.0"
 edition      = "2021"
 rust-version = "1.82"
 description  = "曲栏 Barline — Windows 11 任务栏媒体播控小组件"
@@ -62,6 +62,9 @@ windows = { version = "0.62.2", features = [
   "Foundation",
   # D2D 的 D2D1_ELLIPSE / 渐变属性用 windows_numerics::Vector2，该模块在 Foundation_Numerics 下
   "Foundation_Numerics",
+  # G7（v1.9.0）：黑名单「检测到的应用」枚举走 mgr.GetSessions() → IVectorView，
+  # 其 GetCount()/GetAt() 方法由本 feature 门控
+  "Foundation_Collections",
   "Media",
   "Media_Control",
   "Storage",

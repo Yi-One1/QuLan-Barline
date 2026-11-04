@@ -335,10 +335,38 @@ pub mod limits {
     /// 慢速通道不受约束，所以真实的反向切换最坏 = 本值 + 1 个样本，不会被锁死。
     /// 取 2 → 极端场景（0.85 ↔ 0.04 逐秒横跳）从「每帧翻」降到「每 3 帧翻」。
     pub const LUMA_FAST_COOLDOWN_SAMPLES: u64 = 2;
+
+    // ------------------------------------------- v1.9.0（G7）黑名单 / 媒体会话枚举
+    /// 黑名单列表上限（防手改 json 写坏配置拖慢启动）。
+    /// **数值唯一定义处**：`media/blacklist.rs` 用 `limits::` 引用，不许自带字面量。
+    pub const BLACKLIST_MAX_ENTRIES: usize = 200;
+    /// 黑名单单条上限（260 = Windows MAX_PATH 量级，足够任何进程名）。
+    pub const BLACKLIST_MAX_LEN: usize = 260;
+    /// 真实进程名缓存（`config.media.app_names`）上限。满时淘汰字典序最小键。
+    /// 64 ≈ 日常机器出现过的播放器 AUMID 数的 10 倍余量；落盘体积 ≤ 4KB。
+    pub const APP_NAME_CACHE_MAX: usize = 64;
+    /// 黑名单命中日志的限流窗口（同一进程名一条 INFO，窗口内不重复）。
+    pub const HIT_LOG_WINDOW_MS: u64 = 60_000;
+    /// 反查阶段预算（毫秒）：`OpenProcess`+`QueryFullProcessImageNameW` 被安全软件
+    /// 挂钩时"随机几~几十 ms"，120ms ≈ 忍 2~3 次被挂钩的调用。
+    pub const ENUM_LOOKUP_BUDGET_MS: u64 = 120;
+    /// 整个枚举（COM 激活 + 会话枚举 + 反查）的总预算。出口复核，超了照发结果 +
+    /// `over_budget=true`，只记 WARN。
+    pub const ENUM_TOTAL_BUDGET_MS: u64 = 200;
+    /// 反查的**进程级**硬上限（真正贵的 `process_image_name` 次数，按 pid 去重后）。
+    /// 去重后的进程数通常 ≤8 → 16 是 2× 保险丝。
+    pub const ENUM_MAX_LOOKUPS: usize = 16;
+    /// 反查的**会话级**硬上限（遍历音频会话个数）。超过即降级
+    /// （`resolved=false`、AUMID 末段兜底），不追求解析成功。
+    pub const ENUM_MAX_AUDIO_SESSIONS: usize = 64;
 }
 
 /// 配置结构版本。`Config.version < CURRENT_VERSION` 时走迁移链。
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// v1.9.0（G7）：1 → 2 —— `media` 分组一次引入 `blacklist` + `app_names` 两个字段，
+/// 提一次版本足够（版本号表达 schema 代数，不是字段计数）。纯标记，零迁移分支，
+/// 为未来迁移留闸门。回滚注意：老版本读 version=2 的配置会把 `media` 整组丢掉。
+pub const CURRENT_VERSION: u32 = 2;
 
 /// 热键修饰位（与 `MOD_*` 一致）。
 pub mod mods {
@@ -374,7 +402,7 @@ pub mod vk {
 
 use super::{
     AppearanceConfig, Config, GeneralConfig, HotkeyBinding, HotkeyConfig, LangSerde, LyricsConfig,
-    VolumeConfig, VolumeScope,
+    MediaConfig, VolumeConfig, VolumeScope,
 };
 use crate::render::theme::BackgroundMode;
 
@@ -388,6 +416,8 @@ impl Default for Config {
             hotkeys: HotkeyConfig::default(),
             general: GeneralConfig::default(),
             storage: crate::config::StorageConfig::default(),
+            // v1.9.0（G7）：媒体源过滤（黑名单 + 真实进程名缓存）
+            media: MediaConfig::default(),
         }
     }
 }

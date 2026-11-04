@@ -3,6 +3,7 @@
 //! 数据模型（`Track` / `NowPlaying` / `MediaSessionInfo` / `CoverImage` / `Rgb`）是
 //! **跨模块契约**，逐字段照抄 `ARCHITECTURE.md` §7.1，不得改名改类型。
 
+pub mod blacklist;
 pub mod cover;
 pub mod launch;
 pub mod player_map;
@@ -260,6 +261,29 @@ mod match_tests {
     }
 }
 
+/// 被拉黑的会话信息（v1.9.0 / G7）。媒体线程 → UI 线程，**只**用于托盘菜单
+/// 文案与置灰（`App.ignored`），不得据此恢复任何渲染/歌词/播控。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredSessionInfo {
+    pub process_name: String,
+    pub aumid: String,
+    /// player_map 显示名；可能 "未知播放器"
+    pub app_name: String,
+}
+
+/// 一次枚举的完整快照（v1.9.0 / G7，`docs/ARCH-G7-黑名单.md` §5.1 / §6.1）。
+#[derive(Debug, Clone)]
+pub struct MediaAppsSnapshot {
+    pub apps: Vec<smtc::MediaAppEntry>,
+    /// epoch 毫秒；JS 用 `new Date(at_ms)` 格式化 HH:MM
+    pub at_ms: u64,
+    /// `(aumid, process)` 本轮新学到的真实名 → UI 线程负责落盘
+    /// （媒体线程已先写进 `MediaIndex` 内存副本，见 ARCH-G7 §5.6 三段式）。
+    pub learned: Vec<(String, String)>,
+    /// 是否因超上限/超预算被截断（前端可提示"结果可能不完整"）
+    pub over_budget: bool,
+}
+
 /// 媒体线程门面：持有命令发送端与 join 句柄。
 pub struct MediaService {
     tx: Sender<MediaCommand>,
@@ -268,12 +292,15 @@ pub struct MediaService {
 
 impl MediaService {
     /// 启动媒体线程（MTA）。失败（线程创建失败）返回 `None`，不影响小组件运行。
-    pub fn spawn(sink: EventSink<AppEvent>) -> Option<Self> {
+    ///
+    /// `index` 是 UI 线程与媒体线程共享的黑名单/真实名索引（G7）：
+    /// 由 `App::bootstrap` 从 `Config.media` 构建并注入。
+    pub fn spawn(sink: EventSink<AppEvent>, index: Arc<blacklist::MediaIndex>) -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::channel::<MediaCommand>();
         let spawned = std::thread::Builder::new()
             .name(String::from("barline-media"))
             .stack_size(512 * 1024)
-            .spawn(move || smtc::run(sink, rx));
+            .spawn(move || smtc::run(sink, rx, index));
 
         match spawned {
             Ok(handle) => Some(Self {

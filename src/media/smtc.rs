@@ -45,6 +45,7 @@
 //! `timeline_at`：对网易云（恒 0/0、时间线退避 5s、切歌由 2s 慢层发现）等于把
 //! 歌词钟拨快最多 5s。现在按 [`anchor_of`] 的三规则取值，细节见该函数注释。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -61,13 +62,21 @@ use windows::Media::Control::{
     MediaPropertiesChangedEventArgs, PlaybackInfoChangedEventArgs,
     SessionsChangedEventArgs, TimelinePropertiesChangedEventArgs,
 };
+use windows::Win32::Media::Audio::{
+    eMultimedia, eRender, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
+    IMMDeviceEnumerator, MMDeviceEnumerator,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::core::Interface;
 
 use crate::config::defaults::limits;
 use crate::event::{AppEvent, MediaCommand, MediaCommandKind};
+use crate::media::blacklist::{self, MediaIndex};
 use crate::media::cover::load_cover;
 use crate::media::player_map;
 use crate::media::{
-    CoverImage, MediaSessionInfo, MediaSource, Ms, NowPlaying, PlaybackState, Track, TrackId,
+    CoverImage, IgnoredSessionInfo, MediaAppsSnapshot, MediaSessionInfo, MediaSource, Ms,
+    NowPlaying, PlaybackState, Track, TrackId,
 };
 use crate::platform::com::{backoff_ms, timed_join, ComApartment};
 use crate::platform::perf::{self, Span};
@@ -79,6 +88,13 @@ const MANAGER_RETRIES: u32 = 5;
 const STATS_WINDOW_SECS: u64 = 60;
 /// 事件驱动的强制补读下限：避免播放器高频事件造成读取风暴（沿用旧值）。
 const FORCED_FLOOR_MS: u64 = 60;
+
+/// 忽略态下的**身份重查**下限（毫秒）（v1.9.0 / G7，ARCH-G7 §4.3）。
+///
+/// 被拉黑的应用通常还在放歌 → 会话级事件（MediaPropertiesChanged 等）持续置脏位 →
+/// `forced` 每 60ms 就来一次。若每次都重读 AUMID，忽略态反而比正常态更费。
+/// 1s 一次足够：解绑后 ≤1s 内发现，仍远优于验收要求的 3s。
+const IGNORE_RECHECK_MS: u64 = 1_000;
 
 /// 封面解码记忆。
 ///
@@ -255,6 +271,24 @@ impl Cadence {
     /// 记录一次属性组读取。
     fn note_props(&mut self, now: Instant) {
         self.last_props = Some(now);
+    }
+
+    /// **只推进三层时间戳**，不做任何分析（v1.9.0 / G7，ARCH-G7 §4.3）。
+    ///
+    /// 为什么需要它：忽略态下我们跳过了所有读取，若不推进时间戳，`plan` 会永远
+    /// "到点"，主循环每 50ms 就发一次 `GetCurrentSession`。用 `note_*` 代推不行——
+    /// 它们会改退避状态机（例如喂 (0,0) 会把网易云式退避推到 5s），是副作用。
+    /// 铁律：不碰 `zero_streak` / `timeline_backoff` / `prev_timeline` / `prev_state`。
+    fn consume(&mut self, now: Instant, plan: Plan) {
+        if plan.playback {
+            self.last_playback = Some(now);
+        }
+        if plan.timeline {
+            self.last_timeline = Some(now);
+        }
+        if plan.props {
+            self.last_props = Some(now);
+        }
     }
 }
 
@@ -441,10 +475,20 @@ struct PollState {
     dirty: Arc<AtomicBool>,
     /// 会话级事件订阅（AUMID 变了就重挂；`None` = 还没挂过 / 会话已清空）
     session_events: Option<SessionSubscriptions>,
+    /// UI 线程与媒体线程共享的黑名单 / 真实名索引（v1.9.0 / G7）。
+    /// 判定只走它的纯内存方法——这里**绝不**出现 OpenProcess / COM / 文件 IO。
+    index: Arc<MediaIndex>,
+    /// 上一次广播给 UI 的"被忽略会话"（diff 用；`None` = 当前无被忽略会话）
+    last_ignored: Option<IgnoredSessionInfo>,
+    /// 上次真正发起身份重查的时刻（忽略态的 `IGNORE_RECHECK_MS` 闸）
+    last_ignore_probe: Instant,
+    /// 命中日志限流（按进程名分桶；`perf::RateLimiter` 的 key 是 `&'static str`，
+    /// 表达不了动态进程名，所以自己实现）
+    last_hit: Option<(String, Instant)>,
 }
 
 impl PollState {
-    fn new(dirty: Arc<AtomicBool>) -> Self {
+    fn new(dirty: Arc<AtomicBool>, index: Arc<MediaIndex>) -> Self {
         Self {
             last: None,
             cover: CoverMemo::default(),
@@ -454,6 +498,10 @@ impl PollState {
             last_tick: Instant::now(),
             dirty,
             session_events: None,
+            index,
+            last_ignored: None,
+            last_ignore_probe: Instant::now(),
+            last_hit: None,
         }
     }
 
@@ -523,6 +571,128 @@ impl PollState {
         ));
     }
 
+    // ------------------------------------------ 忽略态（v1.9.0 / G7，ARCH-G7 §4.3）
+
+    /// 当前会话是否被拉黑。**纯内存**：用上一轮缓存的 `parts` 身份，零跨进程调用。
+    /// 每轮主循环（含 50ms 空转轮次）最多调 1 次。
+    fn ignored_now(&self) -> bool {
+        self.index.matches(&self.parts.process_name, &self.parts.aumid)
+    }
+
+    /// 命中日志限流（按进程名 60s 窗口）。返回是否真的要打日志。
+    fn hit_log_due(&mut self, name: &str, now: Instant) -> bool {
+        match &self.last_hit {
+            Some((prev, at))
+                if prev == name
+                    && now.saturating_duration_since(*at)
+                        < Duration::from_millis(limits::HIT_LOG_WINDOW_MS) =>
+            {
+                false
+            }
+            _ => {
+                self.last_hit = Some((name.to_string(), now));
+                true
+            }
+        }
+    }
+
+    /// 进入（或保持）忽略态的**一次性**转移（正常 → 忽略 / 忽略中身份变化复用）。
+    ///
+    /// 四件事，顺序固定：① `last = None`（解绑后才可能重新广播）
+    /// ② `SessionCleared`（复用既有变体：UI 侧复位 playing/lyrics 并隐藏小组件）
+    /// ③ 命中 INFO（按进程名 60s 限流）④ `IgnoredSession(Some)`。
+    /// **绝不**清 `parts` / `cadence` / `session_events`——`parts` 是唯一身份来源。
+    fn enter_ignored(&mut self, sink: &EventSink<AppEvent>, now: Instant) {
+        // ① 丢弃上一份快照
+        self.last = None;
+        self.cover.done = false;
+        // ② 复用既有 SessionCleared（UI 侧已会把 playing/lyrics 复位并隐藏小组件）
+        sink.send(AppEvent::SessionCleared);
+        // ③ 命中日志（限流）
+        let id = self.index.identity(&self.parts.process_name, &self.parts.aumid);
+        let label = if id.key.is_empty() {
+            self.parts.aumid.clone()
+        } else {
+            id.key.clone()
+        };
+        if self.hit_log_due(&label, now) {
+            crate::log_info!("黑名单命中，忽略会话：{}（aumid={}）", label, self.parts.aumid);
+        }
+        // ④ 广播忽略态
+        let info = IgnoredSessionInfo {
+            process_name: self.parts.process_name.clone(),
+            aumid: self.parts.aumid.clone(),
+            app_name: self.parts.app_name.clone(),
+        };
+        self.last_ignored = Some(info.clone());
+        sink.send(AppEvent::IgnoredSession(Some(Box::new(info))));
+    }
+
+    /// 忽略态轮次：不发 NowPlaying、不读时间线/属性/封面/controls。
+    ///
+    /// 唯一可能发生的跨进程调用：`forced || plan.props` 且距上次重查 ≥
+    /// [`IGNORE_RECHECK_MS`] 时，做 1 次 `GetCurrentSession()` +
+    /// 1 次 `SourceAppUserModelId()`，用来判断「身份变了 / 已解绑」。
+    /// 其余轮次只推进节奏（[`Cadence::consume`]）后直接 return。
+    ///
+    /// **红线**：本方法绝不复位 `parts` / `cadence` / `session_events`
+    /// （那是正常 tick 里"会话真没了"分支的专属动作）——清了就永远认不出解绑。
+    fn tick_ignored(
+        &mut self,
+        mgr: &Manager,
+        sink: &EventSink<AppEvent>,
+        now: Instant,
+        plan: Plan,
+        forced: bool,
+    ) {
+        self.last_tick = now;
+        self.cadence.consume(now, plan);
+        if !(forced || plan.props) {
+            return;
+        }
+        if now.saturating_duration_since(self.last_ignore_probe)
+            < Duration::from_millis(IGNORE_RECHECK_MS)
+        {
+            return;
+        }
+        self.last_ignore_probe = now;
+
+        let session = match mgr.GetCurrentSession() {
+            Ok(s) => s,
+            Err(_) => {
+                // 会话暂时拿不到（可能被拉黑应用刚退出、SMTC 还在过渡）：
+                // 保持忽略态不动、不发事件——下一轮重查自会分辨「真没了」还是「换会话」。
+                return;
+            }
+        };
+        let aumid = session
+            .SourceAppUserModelId()
+            .map(|h| h.to_string())
+            .unwrap_or_default();
+        let resolved = player_map::resolve(&aumid);
+        // 身份字段照常刷新（ARCH-G7 §4.5：不改 parts 字段语义，
+        // process_name 还被 session_matches / has_changed 消费）
+        self.parts.aumid = aumid;
+        self.parts.app_name = resolved.display_name.to_string();
+        self.parts.process_name = resolved.process_name.to_string();
+
+        if self.index.matches(&self.parts.process_name, &self.parts.aumid) {
+            // 忽略 → 忽略（身份变了才再广播；进程名变了必然过限流）
+            let changed = match &self.last_ignored {
+                Some(prev) => prev.aumid != self.parts.aumid,
+                None => true,
+            };
+            if changed {
+                self.enter_ignored(sink, now);
+            }
+            return;
+        }
+        // 忽略 → 正常（解绑 / 换会话）：什么都不清，主循环下一轮走正常 tick()，
+        // 因 `last == None` 必然重新广播 NowPlaying。
+        self.last_ignored = None;
+        sink.send(AppEvent::IgnoredSession(None));
+    }
+
     /// 按计划做一轮读取，diff 后决定是否广播。
     fn tick(&mut self, mgr: &Manager, sink: &EventSink<AppEvent>, now: Instant, mut plan: Plan) {
         self.last_tick = now;
@@ -582,22 +752,34 @@ impl PollState {
 
         // ---- 慢层：AUMID + 元数据 + 播控标志 + 封面 ----
         if plan.props {
-            let (meta, ms) = timed("smtc.props", || {
-                let aumid = session
-                    .SourceAppUserModelId()
-                    .map(|h| h.to_string())
-                    .unwrap_or_default();
-                let props = timed_join("TryGetMediaPropertiesAsync", || {
+            // ---- G7 拦截点①（ARCH-G7 §4.2①）：AUMID 提出 timed 闭包，身份已知即早退 ----
+            // 命中则跳过 TryGetMediaPropertiesAsync / 封面解码 / 播控标志读取——
+            // 且**不计入** props 统计（60s 统计 props 下降的验收依据）。
+            let aumid = session
+                .SourceAppUserModelId()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            if self.index.matches(player_map::resolve(&aumid).process_name, &aumid) {
+                self.parts.aumid = aumid;
+                let resolved = player_map::resolve(&self.parts.aumid);
+                self.parts.app_name = resolved.display_name.to_string();
+                self.parts.process_name = resolved.process_name.to_string();
+                // 刚读过一次 AUMID → 重查闸从现在起算
+                self.last_ignore_probe = now;
+                self.enter_ignored(sink, now);
+                return;
+            }
+            let (props, ms) = timed("smtc.props", || {
+                timed_join("TryGetMediaPropertiesAsync", || {
                     session.TryGetMediaPropertiesAsync()?.join()
-                });
-                (aumid, props)
+                })
             });
             self.stats.props += 1;
             self.stats.observe(ms);
 
-            match meta.1 {
+            match props {
                 Ok(props) => {
-                    self.parts.aumid = meta.0;
+                    self.parts.aumid = aumid;
                     let resolved = player_map::resolve(&self.parts.aumid);
                     self.parts.app_name = resolved.display_name.to_string();
                     self.parts.process_name = resolved.process_name.to_string();
@@ -645,6 +827,14 @@ impl PollState {
 
         // 属性一次都没成功读过 → 组不出有意义的快照（与旧行为一致）
         if !self.parts.props_ok {
+            return;
+        }
+
+        // ---- G7 拦截点②（发布点，ARCH-G7 §4.2②）：命中则**不发** NowPlaying ----
+        // 与①同时存在不是冗余：①省成本、②保证语义（防 AUMID 与 metadata
+        // 在轮次间不同步的窗口；漏一处就是 bug）。
+        if self.index.matches(&self.parts.process_name, &self.parts.aumid) {
+            self.enter_ignored(sink, now);
             return;
         }
 
@@ -732,7 +922,10 @@ fn recv_command(rx: &Receiver<MediaCommand>, paused: bool) -> RecvOutcome {
 }
 
 /// 媒体线程主函数。**整个函数体都在 MTA 上运行**，因此可以随意 `join()`。
-pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
+///
+/// `index` 由 `App::bootstrap` 从 `Config.media` 构建注入（G7）：
+/// 黑名单判定与真实名缓存全是它的纯内存方法，主循环零新增跨进程调用。
+pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>, index: Arc<MediaIndex>) {
     let _com = ComApartment::mta();
     crate::log_info!("媒体线程启动（MTA）");
 
@@ -747,7 +940,7 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
 
     // 事件回调只做两件事：置脏位 + PostMessage 唤醒 UI。绝不在回调里做重活。
     let dirty = Arc::new(AtomicBool::new(true));
-    let mut state = PollState::new(dirty.clone());
+    let mut state = PollState::new(dirty.clone(), index);
     let _handlers = subscribe(&mgr, &dirty, &sink);
 
     // v1.5.5 / G3.5：全屏冻结时整个轮询停摆，只留命令通道（阻塞 recv）。
@@ -799,7 +992,13 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>) {
             state.dirty.store(false, Ordering::Relaxed);
         }
         if plan.any() {
-            state.tick(&mgr, &sink, now, plan);
+            // G7：被拉黑的会话走专用轮次——不发 NowPlaying、不读时间线/属性/封面，
+            // 只按 IGNORE_RECHECK_MS 重查身份（判断「身份变了 / 已解绑」）。
+            if state.ignored_now() {
+                state.tick_ignored(&mgr, &sink, now, plan, forced);
+            } else {
+                state.tick(&mgr, &sink, now, plan);
+            }
         }
     }
 
@@ -1041,7 +1240,24 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         // `SetPaused` 由 `run` 在命令入口截获，绝不该走到这里；
         // 显式列出是防御未来有人在别处调用 `execute`。
         MediaCommand::SetPaused(_) => return,
+        // v1.9.0 / G7：枚举"检测到的应用"。**直接 return**，不许走
+        // GetCurrentSession 之后的任何逻辑（ARCH-G7 §5.4 白名单 / R4）。
+        MediaCommand::EnumerateApps => {
+            let snap = enumerate_apps(mgr, &state.index); // 内部自带预算与降级，不会 panic
+            sink.send(AppEvent::MediaApps(Box::new(snap)));
+            return;
+        }
         _ => {}
+    }
+
+    // ---- G7 拦截点③（ARCH-G7 §4.2③）：播控命令入口拦截 ----
+    // 命中则整条丢弃 + log_debug，**不发 CommandResult**——app.rs 收到 ok:false
+    // 会打「命令未被播放器接受，回滚乐观更新」，把"我们主动丢弃"说成"播放器拒绝"，
+    // 会误导以后看日志的人。parts 里就有身份（process_name / aumid），零新增调用。
+    // 若不拦，热键（Ctrl+Alt+P）会把 TryTogglePlayPauseAsync 打到被拉黑的应用上。
+    if state.ignored_now() {
+        crate::log_debug!("黑名单命中，播控命令 {cmd:?} 丢弃");
+        return;
     }
 
     let kind = match cmd {
@@ -1051,6 +1267,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         MediaCommand::Seek(_) => MediaCommandKind::Seek,
         MediaCommand::Refresh | MediaCommand::Quit => return,
         MediaCommand::SetPaused(_) => return,
+        MediaCommand::EnumerateApps => return,
     };
 
     let session = match mgr.GetCurrentSession() {
@@ -1080,6 +1297,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         }),
         MediaCommand::Refresh | MediaCommand::Quit => return,
         MediaCommand::SetPaused(_) => return,
+        MediaCommand::EnumerateApps => return,
     };
 
     match result {
@@ -1099,6 +1317,246 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
             sink.send(AppEvent::CommandResult { kind, ok: false });
         }
     }
+}
+
+// ---------------------------------------------------------------- 枚举（v1.9.0 / G7）
+
+/// 检测到的应用（一条，ARCH-G7 §5.1）。
+#[derive(Debug, Clone)]
+pub struct MediaAppEntry {
+    /// 身份键（= `MediaIndex::identity().key`），小写含 `.exe`；解析失败为空串
+    pub process: String,
+    /// `player_map` 的显示名；未命中为 "未知播放器"
+    pub display_name: String,
+    /// 能否加入黑名单（`process` 非空 = 能）
+    pub playable: bool,
+    /// true = 名字是**真实进程名**（来自缓存或静态表）；false = AUMID 末段兜底（可能是猜的）
+    pub resolved: bool,
+    /// "cache" | "table" | "aumid"（诊断 + 前端软提示用）
+    pub source: &'static str,
+}
+
+/// 枚举一次（**必须跑在媒体线程**：`Manager` 是 MTA 对象，反查含 `OpenProcess`）。
+///
+/// 三步（ARCH-G7 §5.1）：① collect（`GetSessions` → 逐会话 AUMID）
+/// → ② reverse（只对表未命中且缓存未命中的条目做 WASAPI 反查）
+/// → ③ finish（`identity()` 三级回退定 process / resolved / source）。
+///
+/// **读取白名单（§5.4，超出的都是 bug）**：`GetSessions` / `GetAt` /
+/// `SourceAppUserModelId` / WASAPI 会话枚举 + `GetProcessId` +
+/// `launch::process_image_name` / `session_matches`（纯内存）。
+/// **禁止** `TryGetMediaPropertiesAsync` / `GetTimelineProperties` /
+/// `GetPlaybackInfo` / 封面读取 / `Manager::RequestAsync().join()` / 任何文件写。
+fn enumerate_apps(mgr: &Manager, index: &MediaIndex) -> MediaAppsSnapshot {
+    let start = Instant::now();
+    let _sp = Span::with_threshold("smtc.enumerate", perf::SMTC_SLOW_MS);
+
+    // ---- ① collect：SMTC 会话 → (aumid, display_name, 表是否命中) ----
+    let sessions: Vec<String> = match mgr.GetSessions() {
+        Ok(view) => {
+            // windows-rs 0.62：IVectorView 的取元素方法是 GetAt(i)，
+            // 大小属性方法名是 Size()（ARCH 文档里的 GetCount 是笔误口径）
+            let count = view.Size().unwrap_or(0);
+            let mut out = Vec::new();
+            for i in 0..count {
+                match view.GetAt(i) {
+                    Ok(s) => {
+                        let aumid = s
+                            .SourceAppUserModelId()
+                            .map(|h| h.to_string())
+                            .unwrap_or_default();
+                        if !aumid.is_empty() {
+                            out.push(aumid);
+                        }
+                    }
+                    Err(e) => crate::log_debug!("枚举：GetAt({i}) 失败：{e}"),
+                }
+            }
+            out
+        }
+        Err(e) => {
+            // COM 异常 / manager 失效：发**空快照**（不是不发），UI 空态文案
+            crate::log_warn!("枚举媒体会话失败：{e}");
+            return MediaAppsSnapshot {
+                apps: Vec::new(),
+                at_ms: epoch_ms(),
+                learned: Vec::new(),
+                over_budget: false,
+            };
+        }
+    };
+
+    // 每条的身份要素：表命中与否决定要不要反查（D9：静态表已命中的不反查）
+    let mut entries: Vec<(String, bool)> = sessions
+        .into_iter()
+        .map(|aumid| {
+            let table_hit = !player_map::resolve(&aumid).process_name.is_empty();
+            (aumid, table_hit)
+        })
+        .collect();
+    // 内存缓存已命中的同样不反查（identity ① 级已是实测真实名）
+    let mut over_budget = false;
+    let mut learned: Vec<(String, String)> = Vec::new();
+    let targets: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (aumid, table_hit))| {
+            !*table_hit && !index.identity("", aumid).key.is_empty()
+        })
+        .filter(|(_, (aumid, _))| {
+            // 缓存命中（source == Cache）说明已有实测名 → 不反查
+            index.identity("", aumid).source != blacklist::IdentitySource::Cache
+        })
+        .map(|(i, (aumid, _))| (i, aumid.clone()))
+        .collect();
+
+    // ---- ② reverse：一次 WASAPI 遍历，拿「音频会话 pid → 真实镜像名」----
+    if !targets.is_empty() {
+        let _lp = Span::with_threshold("smtc.lookup", perf::SMTC_SLOW_MS);
+        let (images, budget_hit) = collect_audio_session_images();
+        if budget_hit {
+            over_budget = true;
+        }
+        let mut learned_set: HashSet<String> = HashSet::new();
+        for (_, want_aumid) in &targets {
+            // 对得上音频会话 → 真实进程名；对不上 → 留给 ③ 级兜底（失败不静默）
+            if let Some((_, image)) = images
+                .iter()
+                .find(|(_, image)| crate::media::session_matches(image, "", want_aumid))
+            {
+                if learned_set.insert(want_aumid.clone()) {
+                    learned.push((want_aumid.clone(), image.clone()));
+                }
+            }
+        }
+        if !learned.is_empty() {
+            // 反查成功后**立刻**写内存副本（本轮 tick 即生效；配置落盘由 UI 线程做）
+            index.learn(&learned);
+        }
+    }
+
+    // ---- ③ finish：identity() 三级回退 → process / resolved / source ----
+    // 硬规定：枚举、判定、UI 显示三处只能通过 `MediaIndex::identity()`（R6）。
+    let apps: Vec<MediaAppEntry> = entries
+        .drain(..)
+        .map(|(aumid, _table_hit)| {
+            let resolved_info = player_map::resolve(&aumid);
+            let id = index.identity(resolved_info.process_name, &aumid);
+            let source = match id.source {
+                blacklist::IdentitySource::Cache => "cache",
+                blacklist::IdentitySource::Table => "table",
+                _ => "aumid",
+            };
+            MediaAppEntry {
+                playable: !id.key.is_empty(),
+                resolved: matches!(
+                    id.source,
+                    blacklist::IdentitySource::Cache | blacklist::IdentitySource::Table
+                ),
+                process: id.key,
+                display_name: resolved_info.display_name.to_string(),
+                source,
+            }
+        })
+        .collect();
+
+    // 出口复核总预算：超了照发结果 + over_budget，只记日志（ARCH-G7 §5.2 检查点 4）
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_millis(limits::ENUM_TOTAL_BUDGET_MS) {
+        over_budget = true;
+        crate::log_warn!("枚举超出总预算 {}ms", elapsed.as_millis());
+    }
+    MediaAppsSnapshot {
+        apps,
+        at_ms: epoch_ms(),
+        learned,
+        over_budget,
+    }
+}
+
+/// WASAPI 反查的采集步：**一次** `CoCreateInstance` → `GetDefaultAudioEndpoint`
+/// → `Activate(IAudioSessionManager2)` → `GetSessionEnumerator`，遍历音频会话取
+/// `(pid, 镜像名)`。三道闸门：会话数 ≤ `limits::ENUM_MAX_AUDIO_SESSIONS`、
+/// 进程镜像名查询 ≤ `limits::ENUM_MAX_LOOKUPS` 且每次调用**之前**查
+/// `limits::ENUM_LOOKUP_BUDGET_MS` deadline、pid 去重（浏览器每标签一个会话）。
+/// 返回 `(去重后的 (pid, 镜像名) 列表, 是否撞了闸门)`。
+///
+/// **单次失败只跳过、绝不 `?` 提前返回整个枚举**（wasapi.rs 的既有教训）。
+/// `OpenProcess` / `QueryFullProcessImageNameW` 是同步系统调用、不可中断——
+/// 兜底只能是"调用前查预算 + 失败即降级"，不许写伪超时。
+fn collect_audio_session_images() -> (Vec<(u32, String)>, bool) {
+    let deadline = Instant::now() + Duration::from_millis(limits::ENUM_LOOKUP_BUDGET_MS);
+    let mut over_budget = false;
+    let chain: windows::core::Result<IAudioSessionEnumerator> = (|| {
+        // SAFETY: 所有 COM 对象在闭包作用域内释放；CLSID 是系统注册的进程内组件。
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+            let mgr: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
+            mgr.GetSessionEnumerator()
+        }
+    })();
+    let sessions = match chain {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log_warn!("音频会话不可用，反查跳过：{e}");
+            return (Vec::new(), false);
+        }
+    };
+    // SAFETY: sessions 是活的 COM 对象，以下调用全部在作用域内。
+    let count = unsafe { sessions.GetCount().unwrap_or(0) };
+    let mut images: Vec<(u32, String)> = Vec::new();
+    let mut seen_pids: HashSet<u32> = HashSet::new();
+    let mut visited = 0usize;
+    for i in 0..count {
+        if visited >= limits::ENUM_MAX_AUDIO_SESSIONS {
+            over_budget = true;
+            break;
+        }
+        visited += 1;
+        // SAFETY: 同上。
+        let Ok(ctrl) = (unsafe { sessions.GetSession(i) }) else {
+            continue;
+        };
+        let Ok(ctl2) = ctrl.cast::<IAudioSessionControl2>() else {
+            continue;
+        };
+        // SAFETY: ctl2 有效。
+        let Ok(pid) = (unsafe { ctl2.GetProcessId() }) else {
+            continue;
+        };
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        if !seen_pids.insert(pid) {
+            continue; // pid 去重：同一进程的多个音频会话只查一次镜像名
+        }
+        if Instant::now() >= deadline || images.len() >= limits::ENUM_MAX_LOOKUPS {
+            over_budget = true;
+            crate::log_warn!(
+                "枚举反查超上限：会话={visited} 进程={}（上限 {} / {}）",
+                images.len(),
+                limits::ENUM_MAX_AUDIO_SESSIONS,
+                limits::ENUM_MAX_LOOKUPS
+            );
+            break;
+        }
+        let name = crate::media::launch::process_image_name(pid);
+        if name.is_empty() {
+            continue; // 权限 / 进程已退出 → 该进程降级，不影响其它
+        }
+        images.push((pid, name));
+    }
+    (images, over_budget)
+}
+
+/// 当前时刻的 epoch 毫秒（`at` 字段；JS 用 `new Date(at)` 格式化）。
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// manager 不可用时的降级循环：只消费命令，保证发送端不会因为通道满而阻塞。
@@ -1195,6 +1653,11 @@ mod tests {
     /// `Instant` 的相对工具：全部由参数注入，**不 sleep**。
     fn at(base: Instant, ms: u64) -> Instant {
         base + Duration::from_millis(ms)
+    }
+
+    /// 空黑名单的共享索引（G7：PollState::new 需要注入）。
+    fn test_index() -> Arc<MediaIndex> {
+        MediaIndex::new(&crate::config::MediaConfig::default())
     }
 
     /// 三层各走各的节奏；499ms 内一层都不该动。
@@ -1459,7 +1922,7 @@ mod tests {
     /// 这条测的是「接线」本身：`schedule` 里包含 `flush_if_due`。
     #[test]
     fn loop_schedule_flushes_stats_and_maps_dirty_to_forced() {
-        let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
         let t0 = st.last_tick;
         // 先「演」一轮全量读（真实主循环首轮就是全量）：三层计时起点都落在 t0
         st.cadence.note_playback(t0, PlaybackState::Playing);
@@ -1557,7 +2020,7 @@ mod tests {
     /// `reset_for_resume` 之后第一次 `schedule` 必须 `forced` + `Plan::full()`。
     #[test]
     fn resume_forces_full_read_on_first_schedule() {
-        let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
         let t0 = st.last_tick;
         st.cadence.note_playback(t0, PlaybackState::Playing);
         st.cadence.note_timeline(t0, 1_000, 180_000);
@@ -1672,7 +2135,10 @@ mod qa_g35_regression {
     #[test]
     fn qa_reset_for_resume_forces_full_read_at_any_now_and_is_idempotent() {
         for step_ms in [0u64, 1, 60, 137, 2_000] {
-            let mut st = PollState::new(Arc::new(AtomicBool::new(false)));
+            let mut st = PollState::new(
+                Arc::new(AtomicBool::new(false)),
+                MediaIndex::new(&crate::config::MediaConfig::default()),
+            );
             let base = st.last_tick;
             // 前置：三层都「刚读过」，常规节奏这一轮一组都不该读
             st.cadence.note_playback(base, PlaybackState::Playing);
@@ -1710,5 +2176,137 @@ mod qa_g35_regression {
         assert_eq!(limits::MEDIA_POLL_ZERO_STREAK, 3);
         assert_eq!(FORCED_FLOOR_MS, 60);
         assert_eq!(limits::BACKDROP_IDLE_MS, 3_000);
+    }
+}
+
+// ============================================================================
+// G7 回归（v1.9.0）—— 忽略态状态机 / Cadence::consume / 命中日志限流
+// ============================================================================
+#[cfg(test)]
+mod g7_blacklist_regression {
+    use super::*;
+
+    /// `Instant` 的相对工具：全部由参数注入，**不 sleep**（与上层 tests 同款）。
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// 空黑名单的共享索引。
+    fn test_index() -> Arc<MediaIndex> {
+        MediaIndex::new(&crate::config::MediaConfig::default())
+    }
+
+    /// **关键回归（主理人红线）**：`Cadence::consume` 只推进三层时间戳，
+    /// 绝不污染退避状态机（`zero_streak` / `timeline_backoff` / prev_*）——
+    /// 被拉黑应用的 ignored 专用轮次靠它免于每 50ms 发一次 GetCurrentSession，
+    /// 且解绑后网易云式退避必须还是进入忽略前的那个状态。
+    #[test]
+    fn cadence_consume_only_advances_timestamps_and_never_touches_backoff() {
+        let mut c = Cadence::default();
+        let t0 = Instant::now();
+        // 前置：把退避状态机喂成「已进入 5s 退避 + prev_timeline 有值 + prev_state 有值」
+        c.note_playback(t0, PlaybackState::Playing);
+        for i in 0..limits::MEDIA_POLL_ZERO_STREAK {
+            c.note_timeline(at(t0, i as u64 * 1_000), 0, 0);
+        }
+        assert!(c.timeline_backoff, "前置：网易云已进入退避");
+        assert_eq!(c.zero_streak, limits::MEDIA_POLL_ZERO_STREAK);
+        let prev_tl = c.prev_timeline;
+        let prev_st = c.prev_state;
+
+        // 模拟忽略态连续 200 轮 consume（≈ 全拉黑 + 高频事件下 10s 的 forced 轮次）
+        for i in 0..200u32 {
+            let now = at(t0, 10_000 + i as u64 * 50);
+            c.consume(now, Plan::full());
+            assert_eq!(c.zero_streak, limits::MEDIA_POLL_ZERO_STREAK, "zero_streak 不许被动");
+            assert!(c.timeline_backoff, "timeline_backoff 不许被动");
+            assert_eq!(c.prev_timeline, prev_tl, "prev_timeline 不许被动");
+            assert_eq!(c.prev_state, prev_st, "prev_state 不许被动");
+        }
+
+        // 时间戳被推进 → plan 不再「永远到点」
+        let last_consume = at(t0, 10_000 + 199 * 50);
+        let plan = c.plan(at(t0, 10_400), false);
+        assert!(!plan.any(), "consume 之后 plan 必须空闲（否则每 50ms 发一次 GetCurrentSession）");
+        let _ = last_consume;
+
+        // 解绑后真实事件到达 → note_timeline 照常恢复（退避状态机未被破坏）
+        assert!(
+            c.note_timeline(at(t0, 20_000), 5_000, 180_000),
+            "非零时间线 → 立即补读属性（正常恢复路径）"
+        );
+        assert!(!c.timeline_backoff, "解绑后出现非零值 → 退避解除");
+    }
+
+    /// `consume(full)` 后紧接的 `plan` 必须三组都不读；`consume` 不产生任何跃迁信号。
+    #[test]
+    fn cadence_consume_makes_plan_idle_without_refill_signals() {
+        let mut c = Cadence::default();
+        let t0 = Instant::now();
+        c.note_playback(t0, PlaybackState::Playing);
+        c.note_timeline(t0, 1_000, 180_000);
+        c.note_props(t0);
+        let t1 = at(t0, 100);
+        // 忽略态一轮：三组全 consume（forced 全量计划）
+        c.consume(t1, Plan::full());
+        let p = c.plan(t1, false);
+        assert!(!p.playback && !p.timeline && !p.props, "consume 后三组都该空闲");
+        let t2 = at(t0, 600);
+        let p = c.plan(t2, false);
+        assert!(p.playback, "500ms 后快层照常到点（节奏推进是它唯一的职责）");
+    }
+
+    /// `ignored_now` 在 parts 为空（无会话）时绝不命中；
+    /// 黑名单配置变化（index.set）后同一份 parts 立即翻转。
+    #[test]
+    fn ignored_now_is_empty_parts_safe_and_follows_config() {
+        let idx = MediaIndex::new(&crate::config::MediaConfig::default());
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), idx);
+        assert!(!st.ignored_now(), "空 parts（无会话）不许命中");
+
+        // 模拟「上一轮缓存的身份」是被拉黑应用
+        st.parts.aumid = "NeteaseCloudMusic!App".into();
+        st.parts.process_name = "cloudmusic.exe".into();
+        assert!(!st.ignored_now(), "黑名单为空 → 不命中");
+
+        // 托盘拉黑 → index.set 整组替换 → 下一轮主循环立即识别
+        let mut cfg = crate::config::MediaConfig::default();
+        cfg.blacklist = vec!["cloudmusic.exe".into()];
+        st.index.set(&cfg);
+        assert!(st.ignored_now(), "拉黑后 cached parts 必须立即命中（纯内存）");
+        assert!(st.index.matches("cloudmusic.exe", "NeteaseCloudMusic!App"));
+        // 解绑（清空）→ 立即恢复
+        st.index.set(&crate::config::MediaConfig::default());
+        assert!(!st.ignored_now(), "解绑后必须立即不命中（≤1s 恢复的前提）");
+    }
+
+    /// 命中日志限流：同进程名 60s 内只打一条；进程名变了必然过限流。
+    #[test]
+    fn hit_log_is_throttled_by_process_name_for_60s() {
+        let idx = MediaIndex::new(&crate::config::MediaConfig::default());
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), idx);
+        let t0 = Instant::now();
+        assert!(st.hit_log_due("cloudmusic.exe", t0), "首条必打");
+        assert!(!st.hit_log_due("cloudmusic.exe", at(t0, 59_999)), "59.9s 内不许重打");
+        assert!(st.hit_log_due("cloudmusic.exe", at(t0, 60_000)), "满 60s 重打");
+        assert!(st.hit_log_due("msedge.exe", at(t0, 61_000)), "换了进程名必打");
+        assert!(!st.hit_log_due("msedge.exe", at(t0, 62_000)));
+        assert_eq!(
+            limits::HIT_LOG_WINDOW_MS,
+            60_000,
+            "限流窗口常量钉死（与既有 60s 统计窗口同口径）"
+        );
+    }
+
+    /// `IGNORE_RECHECK_MS` 与既有轮询常量并列钉死（防止被顺手改掉）。
+    #[test]
+    fn ignore_recheck_constant_is_pinned() {
+        assert_eq!(IGNORE_RECHECK_MS, 1_000);
+        assert_eq!(FORCED_FLOOR_MS, 60);
+        // 枚举预算常量（数值唯一定义处在 limits）
+        assert_eq!(limits::ENUM_LOOKUP_BUDGET_MS, 120);
+        assert_eq!(limits::ENUM_TOTAL_BUDGET_MS, 200);
+        assert_eq!(limits::ENUM_MAX_LOOKUPS, 16);
+        assert_eq!(limits::ENUM_MAX_AUDIO_SESSIONS, 64);
     }
 }
