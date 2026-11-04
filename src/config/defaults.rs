@@ -246,11 +246,22 @@ pub mod limits {
     /// 完全消失**，而是在 [`GLOW_FLOOR_ALPHA`] 处取整条强度曲线的非零下限截距；
     /// 强度仍随全窗档位缩放（不再是 v1.5.1 那层写死的 0x14），修掉 QA 遗留
     /// 「全局悬停消失但 × 仍亮」，同时保留可感知的悬停反馈。
-    pub const GLOW_INNER_HOVER: u8 = 0x20;
-    pub const GLOW_INNER_PRESSED: u8 = 0x2E;
+    ///
+    /// **v1.6.1（真人验收 Bug 2「悬停反馈不够明显」）**：用户已在「温和 / 中等 /
+    /// 明显 / 很强」四档中拍板 **中等** —— 四个 `GLOW_*_{HOVER,PRESSED}` 标称值
+    /// 整体上调（悬停 `0x20/0x0C` → `0x42/0x1C`，按下 `0x2E/0x14` → `0x60/0x2E`），
+    /// 默认 70% 档（`hover_bg.a == 0xB3 == 179`，k ≈ 0.702）下内层约 **18%**、
+    /// 外圈约 **8%**（此前只有 8.8% / 3.3%，肉眼几乎看不出）。
+    /// 「按下比悬停更深」的比例关系保持不变（inner 96/66 ≈ 1.45、outer 46/28 ≈ 1.64，
+    /// 与旧值的 1.44 / 1.67 一致）。半径 / 扩张 / 缩放 / 下沉一律未动，
+    /// [`GLOW_FLOOR_ALPHA`] 也未动（受 Q1 的 `[0x01, 0x06]` 硬上界约束）。
+    pub const GLOW_INNER_HOVER: u8 = 0x42;
+    pub const GLOW_INNER_PRESSED: u8 = 0x60;
     /// 外层「影 / 光」的 alpha 上限，恒显著淡于内层 —— 才是柔和光晕而非描边。
-    pub const GLOW_OUTER_HOVER: u8 = 0x0C;
-    pub const GLOW_OUTER_PRESSED: u8 = 0x14;
+    ///
+    /// v1.6.1：随内层同比上调（0x0C/0x14 → 0x1C/0x2E），保持「外层恒淡于内层」。
+    pub const GLOW_OUTER_HOVER: u8 = 0x1C;
+    pub const GLOW_OUTER_PRESSED: u8 = 0x2E;
     /// Q1 拍板：始终透明档（`hover_bg.a == 0`）下四 target 保留的极淡保底 alpha。
     ///
     /// 它是全窗 hover 强度曲线 `painter::glow_params()` 在 `hover_bg.a → 0` 处的

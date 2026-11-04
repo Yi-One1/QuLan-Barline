@@ -1406,13 +1406,19 @@ mod tests {
         assert_eq!(glow_params(false, true, 0), GlowParams::new(p, p, 0.5));
 
         // 普通档 70% → hover_bg.a = alpha_pct(70) = 0xB3 = 179
-        assert_eq!(glow_params(true, false, 0xB3), GlowParams::new(0x16, 0x08, 1.0));
-        assert_eq!(glow_params(true, true, 0xB3), GlowParams::new(0x20, 0x0E, 0.5));
+        //
+        // v1.6.1：用户拍板悬停强度由中等档提升，标称值 0x20/0x0C → 0x42/0x1C
+        // （按下 0x2E/0x14 → 0x60/0x2E），期望值按新常量重算：
+        // round(66*179/255)=46=0x2E / round(28*179/255)=20=0x14；
+        // round(96*179/255)=67=0x43 / round(46*179/255)=32=0x20。
+        assert_eq!(glow_params(true, false, 0xB3), GlowParams::new(0x2E, 0x14, 1.0));
+        assert_eq!(glow_params(true, true, 0xB3), GlowParams::new(0x43, 0x20, 0.5));
 
         // 满档：悬停 / 按下 / 按下但指针拖走仍按着
-        assert_eq!(glow_params(true, false, 0xFF), GlowParams::new(0x20, 0x0C, 1.0));
-        assert_eq!(glow_params(true, true, 0xFF), GlowParams::new(0x2E, 0x14, 0.5));
-        assert_eq!(glow_params(false, true, 0xFF), GlowParams::new(0x2E, 0x14, 0.5));
+        // v1.6.1：标称值上调后满档期望同步变为 0x42/0x1C（悬停）、0x60/0x2E（按下）。
+        assert_eq!(glow_params(true, false, 0xFF), GlowParams::new(0x42, 0x1C, 1.0));
+        assert_eq!(glow_params(true, true, 0xFF), GlowParams::new(0x60, 0x2E, 0.5));
+        assert_eq!(glow_params(false, true, 0xFF), GlowParams::new(0x60, 0x2E, 0.5));
         assert_eq!(
             glow_params(true, false, 0xFF),
             GlowParams::new(limits::GLOW_INNER_HOVER, limits::GLOW_OUTER_HOVER, 1.0)

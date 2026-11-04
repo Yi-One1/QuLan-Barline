@@ -2816,10 +2816,24 @@ impl App {
     fn dispatch(&mut self, inputs: Vec<WidgetInput>) {
         // v1.5.0（G3）：悬停目标变化本身不产生 `WidgetInput`，但它改变像素
         // （× 的悬停变亮）——所以在这里对比一次，变化就补一帧重绘。
+        //
+        // v1.6.1（真人验收 Bug 1）：**按下目标变化同样不产生 `WidgetInput`**。
+        // `Interaction::on_down` 设置 `pressed` 后返回空 `Vec`（按下那一刻没有
+        // 语义动作），而 `Interaction::animating()` 只看 `hover_alpha` 差值与
+        // `hud_left_ms` —— 按下不会让 16ms 定时器续命，于是「悬停淡入已结束
+        // （≈150ms 后）再按下」时一次重绘都不会发生，`draw_button_feedback` 的
+        // 按下分支根本没机会跑（用户看到的「按下反馈时而有一时而没有」）。
+        // `on_up` / `on_capture_lost` 同理：松手也要有帧，否则按下态会残留到
+        // 下一次无关重绘。判据统一走 [`interaction_needs_redraw`]。
+        //
+        // 注意：`prev_*` 必须在 `sync_interaction()` **之前**取（函数开头），
+        // 因为它才是把 `interact.pressed` / `interact.hover_target` 写进
+        // `state` 的那一步。
         let prev_hover_target = self.state.hover_target;
+        let prev_pressed = self.state.pressed;
         if inputs.is_empty() {
             self.sync_interaction();
-            if self.state.hover_target != prev_hover_target {
+            if interaction_needs_redraw(prev_hover_target, prev_pressed, &self.state) {
                 self.redraw();
             }
             return;
@@ -2836,7 +2850,7 @@ impl App {
             }
         }
         self.sync_interaction();
-        if needs_redraw || self.state.hover_target != prev_hover_target {
+        if needs_redraw || interaction_needs_redraw(prev_hover_target, prev_pressed, &self.state) {
             self.redraw();
         }
     }
@@ -3049,6 +3063,27 @@ impl App {
 }
 
 // ------------------------------------------------------------------ 自由函数
+
+/// 交互态（悬停目标 / 按下目标）变化是否**必须**补一帧重绘。
+///
+/// 这两类变化都**不产生** `WidgetInput`：悬停由 `WM_MOUSEMOVE` 的
+/// `Interaction::on_move` 直接改内部状态，按下 / 抬起由 `on_down` / `on_up`
+/// 改 `pressed` 后返回空 `Vec`。但两者都改变像素（双层光晕的 alpha、图标
+/// 下沉 `BUTTON_PRESSED_SINK`、等比缩放 `BUTTON_PRESSED_SCALE`），所以必须由
+/// App 层补帧 —— 重绘决策属于 App，`Interaction` 只负责纯状态机（v1.6.1）。
+///
+/// 抽成纯函数是为了可单测：`dispatch()` 的两条分支（空输入早退 / 正常 reduce）
+/// 共用同一份判据，避免两处条件各写一遍而漂移。
+///
+/// 只比较这两项、不比别的：`hover_alpha` / `hud_left_ms` 由 16ms 动画定时器
+/// 持续推进，不属于「无定时器也要重绘」的范畴；多比会让空闲态每帧无谓重绘。
+fn interaction_needs_redraw(
+    prev_hover: Option<HitTarget>,
+    prev_pressed: Option<HitTarget>,
+    state: &AppState,
+) -> bool {
+    prev_hover != state.hover_target || prev_pressed != state.pressed
+}
 
 /// 按当前配置探测几何。
 fn probe_geometry(config: &Config) -> Option<TaskbarGeometry> {
@@ -3370,6 +3405,140 @@ mod tests {
         assert!(
             !s.compute_visible(),
             "点 × 收起（配置仍为 widget_hidden=false）后必须不可见"
+        );
+    }
+
+    /// **Bug 1 回归**：按下 / 抬起本身不产生 `WidgetInput`，但必须补一帧重绘。
+    ///
+    /// 真值表钉死 [`interaction_needs_redraw`] 的五格：
+    /// ① 悬停不变、只有 `pressed` 由 `None` → `Some`（**本 Bug 的核心格**）；
+    /// ② 松手 `Some` → `None`（否则按下态残留到下一次无关重绘）；
+    /// ③ 两者都不变 → `false`（空闲态绝不每帧重绘，否则白烧 CPU）；
+    /// ④ `hover_target` 变化 → `true`（v1.5.0 既有行为不回退）；
+    /// ⑤ 四 target（Prev / Toggle / Next / Dismiss）逐个重跑 ①。
+    #[test]
+    fn pressed_change_requests_redraw() {
+        let targets = [
+            HitTarget::Prev,
+            HitTarget::Toggle,
+            HitTarget::Next,
+            HitTarget::Dismiss,
+        ];
+
+        // ① 核心格：悬停目标保持不变，只有按下目标出现
+        for &t in &targets {
+            let mut st = AppState::default();
+            st.hover_target = Some(t);
+            st.pressed = Some(t);
+            assert!(
+                interaction_needs_redraw(Some(t), None, &st),
+                "{t:?}：悬停不变、按下出现必须补一帧（Bug 1 核心格）"
+            );
+        }
+
+        // ② 松手：`Some` → `None` 也必须有帧
+        for &t in &targets {
+            let mut st = AppState::default();
+            st.hover_target = Some(t);
+            st.pressed = None;
+            assert!(
+                interaction_needs_redraw(Some(t), Some(t), &st),
+                "{t:?}：松手必须补一帧，否则按下态残留"
+            );
+        }
+
+        // ③ 两者都不变 → 不重绘（空闲态不得每帧重绘）
+        let mut st = AppState::default();
+        st.hover_target = Some(HitTarget::Toggle);
+        st.pressed = Some(HitTarget::Toggle);
+        assert!(
+            !interaction_needs_redraw(Some(HitTarget::Toggle), Some(HitTarget::Toggle), &st),
+            "交互态未变时不得重绘（影响空闲 CPU）"
+        );
+        // 全无态同样不重绘
+        let idle = AppState::default();
+        assert!(
+            !interaction_needs_redraw(None, None, &idle),
+            "全无态不得重绘"
+        );
+
+        // ④ 悬停目标变化 → 必须重绘（v1.5.0 行为不回退）
+        assert!(
+            interaction_needs_redraw(None, None, &st),
+            "悬停目标由 None → Some 必须重绘"
+        );
+        let mut back = AppState::default();
+        back.hover_target = None;
+        back.pressed = None;
+        assert!(
+            interaction_needs_redraw(Some(HitTarget::Next), None, &back),
+            "悬停目标由 Some → None 必须重绘"
+        );
+        // 悬停目标换格也重绘
+        let mut swapped = AppState::default();
+        swapped.hover_target = Some(HitTarget::Prev);
+        assert!(
+            interaction_needs_redraw(Some(HitTarget::Next), None, &swapped),
+            "悬停目标换格必须重绘"
+        );
+
+        // ⑤ 独立交叉：按下与悬停指向不同 target 时同样要重绘
+        let mut cross = AppState::default();
+        cross.hover_target = Some(HitTarget::Prev);
+        cross.pressed = Some(HitTarget::Toggle);
+        assert!(
+            interaction_needs_redraw(Some(HitTarget::Prev), None, &cross),
+            "按下目标与悬停目标不同也必须补帧"
+        );
+    }
+
+    /// **Bug 1 回归**：down → up 一次完整按压必须产生**两帧**，且不残留按下态。
+    ///
+    /// 复刻 `WM_LBUTTONDOWN` → `Interaction::on_down`（设 `pressed`、返回空
+    /// `Vec<WidgetInput>`）→ `dispatch(Vec::new())` 与随后 `WM_LBUTTONUP` →
+    /// `on_up`（清 `pressed`、同样返回空 `Vec`）→ `dispatch(Vec::new())`。
+    #[test]
+    fn press_release_cycle_never_leaves_stale_pressed() {
+        let target = HitTarget::Toggle;
+        let mut st = AppState::default();
+        // 指针已经停在该按钮上（悬停目标稳定，不参与变化）
+        st.hover_target = Some(target);
+        let prev_hover = st.hover_target;
+
+        // ---- 帧 1：按下 ----
+        let prev_pressed = st.pressed;
+        assert_eq!(prev_pressed, None, "按下之前必须没有按下态");
+        st.pressed = Some(target); // `on_down` 的效果
+        assert!(
+            interaction_needs_redraw(prev_hover, prev_pressed, &st),
+            "按下必须产生一帧，否则按下反馈不会显示"
+        );
+
+        // ---- 帧 2：松手 ----
+        let prev_pressed = st.pressed;
+        st.pressed = None; // `on_up` 的效果
+        assert!(
+            interaction_needs_redraw(prev_hover, prev_pressed, &st),
+            "松手必须再产生一帧，否则按下态残影留在屏上"
+        );
+        assert_eq!(st.pressed, None, "松手后不得残留按下态");
+
+        // ---- 帧 3：之后无任何变化 → 不再重绘 ----
+        assert!(
+            !interaction_needs_redraw(prev_hover, st.pressed, &st),
+            "按压结束后交互态稳定，不得继续重绘"
+        );
+
+        // 捕获丢失（`WM_CAPTURECHANGED` → `on_capture_lost`）同样要清态并补帧
+        st.pressed = Some(target);
+        assert!(
+            interaction_needs_redraw(prev_hover, None, &st),
+            "按下中丢捕获要有帧"
+        );
+        st.pressed = None;
+        assert!(
+            interaction_needs_redraw(prev_hover, Some(target), &st),
+            "丢捕获清掉按下态后必须再有帧"
         );
     }
 }
