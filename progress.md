@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-04 23:16 · **G3 全链闭环（v1.5.0~v1.5.4 已真人验收）** · **G3.5 全屏遮挡 v1.5.6 已真人验收 ✅** · G2 闭环 · **G4 悬停反馈 v1.6.1 已真人验收 ✅** · **G5 歌词落盘 v1.7.0 已出包（待真人验收）** · G7 黑名单待实现（v1.8.0） · 全量回归绿（494 测试：493 passed + 1 ignored）· 工作区干净（已单提交）。
+> **最后更新**：2026-11-05 02:50 · **G1~G7 全部真人验收通过，G 系列功能清单完成** · 当前 **v1.9.0**（556 测试：555 passed + 1 ignored，clippy 0 警告）· 工作区干净（main 领先远端 13 提交；push + 发 GitHub Release 的操作教学已交付用户自行操作）· 新对话从 §5 接手须知开始。
 
 ---
 
@@ -13,8 +13,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
 | 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
-| 当前版本 | **v1.4.4**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
-| 质量 | 测试 **390**（389 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1066 KB |
+| 当前版本 | **v1.9.0**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
+| 质量 | 测试 **556**（555 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1159 KB |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
 | 自测 | 根目录 **`启动曲栏.bat`**（增量构建 + 跑未打包 exe）；新包在 `deliverables/` |
 | 交付包 | `deliverables/曲栏_Barline_vX.Y.Z.exe`，**只增不删** |
@@ -64,6 +64,18 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 
 **验证**：测试 363 → **390**（389 passed / 1 ignored），clippy 0 警告；主理人独立复跑两轮；QA 两轮全 PASS，抓到并修掉「多显示器误伤」真实缺口。
 
+### 第五轮（2026-11-04 ~ 11-05）：G3.5 / G4 / G5 / G5.1 / G6 / G7 → v1.5.6 ~ v1.9.0（全部真人验收通过 ✅）
+
+- **G3 右上角 × → v1.5.0~v1.5.4**（逐轮微调定稿：6px 字形 / 14px 命中 / 1.2 笔画 / 与三键同墨色）✅
+- **G3.5 全屏遮挡 → v1.5.6**（方案 A：纯通知型 appbar + `HWND_BOTTOM` + 冻结不隐藏；v1.5.5 因 1s 延迟被用户否定后返工）✅
+- **G4 悬停/按下反馈 → v1.6.1**（柔和光晕 + 下沉；v1.6.0 出包后用户反馈两问题，主理人定位确定性重绘 Bug 并加强光晕参数）✅
+- **G5 歌词落盘 → v1.7.0**（新模块 `writeback.rs`：只新建不覆盖、行级 LRC、闭环断言防「写了搜不到」）✅
+- **G5.1 顺序开关 + 落盘三路径 + 缓存可见 → v1.8.0**（`lyrics.local_first`；根因 = v1.7.0 落盘只挂了在线一条路径）✅
+- **G6 清理 → v1.8.1**（死码 −345 行 / `AppEvent` 24→15 / `Effect` 15→9 / 81MB 截图 / 15 处失实注释；用用户真实 config.json 实证零配置丢失）✅
+- **G7 媒体会话黑名单 → v1.9.0**（进程名匹配、完全忽略语义、三处入口；QA 反向验证 ×2）✅
+- **测试 390 → 556**（中间 515 的低谷是 G6 删死码连带测试）；包体 1066 KB → 1159 KB；exe 24 → 37 个。
+- 全程专家团队 SOP（PM/架构/工程/QA 四角色，主理人编排），每轮出包 → 用户验收 → 才进下一组。**逐组细节与 QA 证据见 §3.2。**
+
 ---
 
 ## 2. 关键决策
@@ -89,6 +101,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 14. **单实例**：互斥体 `Local\Barline.SingleInstance.v1`。
 15. **性能口径（v1.4.4 更新）**：`perf::Span` 埋点仍在；默认 `smtc.*` **8ms**、`paint.frame/cover.decode/msg.mouse` 等**50ms**；`tick.capture/probe/ontop/backdrop` + `sampler.capture` 这 **5 段 16ms**（一帧 16.7ms，UI 线程上 16ms 已可感知，旧 50ms 口径会吃掉 20~40ms 尖峰）；**同段 60s 限流 ≤10 条**；统计日志每 60s 一条（段名 `smtc 轮询统计`，已追加 `capture=N 慢M capture最慢=Xms`）。
 16. **亮度采样降载（v1.4.4）**：静止态背景采样心跳 **3s**（原 1s），前台**同屏**全屏跳过；用户能感知的采样路径（悬停/换壁纸/几何变化/退出截图态）一律立即采样、不受影响。注意：3s 心跳下**边际**亮度变化最坏 6s 才翻（2 样本 × 3s），大幅跳变走快速通道仍是 1 样本（≤3s，换壁纸即时）。
+16a. **歌词层序与落盘（v1.8.0 起）**：`lyrics.local_first` 默认 false；`false → [Mem,Disk,Local]`、`true → [Local,Mem,Disk]`（本地在内存前，手改 `.lrc` 立即生效含正在播放那首）；一个 `Step` 数组 + 单循环表达两条顺序，**禁止两份逻辑**；落盘唯一收口 `maybe_write_back`（触发面 = 内存/磁盘/在线三条路径）；`Cache::get_mem/get_disk` 返回 `Hit{lyrics,source}`，磁盘回填内存必须带 source；落盘名 `歌名 - 歌手.lrc` 保留原始大小写；设置页缓存统计走 `SettingsService::post()`（**不是 `push()`**）。
+16b. **媒体会话黑名单（v1.9.0 起）**：判定三级回退「缓存 → 静态表 → AUMID 末段」**纯内存**；枚举只许「进入分区（`detectedLoaded` 守卫）+ 手点刷新」两处，零定时器；`execute()` 入口拦播控且**不发假成功 CommandResult**；ignored 轮次（`Cadence::consume`）**绝不清 parts/cadence/session_events、不污染退避状态机**（200 轮专测钉死）；`apply_blacklist` 是黑名单写入唯一入口（`apply_set` 显式拒绝 `media.blacklist*`）；`app_names` 上限 64 淘汰字典序最小键、`blacklist_clear` 不清它；`IVectorView` 用 `Size()`/`GetAt(i)`（需 `Foundation_Collections` feature，G7 已加回）。
 
 ### 2.3 已废弃 / 明确禁止（别重犯）
 
@@ -97,8 +111,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 19. 绘制守卫：任何「状态不满足就整帧跳过」的守卫，扩展新状态时必须重审。
 20. 改外观必须**即时生效**：`apply_bg_config` 就地同步 + Redraw。
 21. **调 SMTC 的节奏永远优先事件、其次降频轮询**：对第三方播放器的跨进程调用次数要当「预算」管（v1.4.2 教训）。
-22. `src/event.rs:201` 注释声称「保存配置带 300ms 去抖」实际是同步写盘——待修（**G6 一并处理**：真去抖或改注释）。
-23. `Effect::RequestBackdrop`（`event.rs:196`）与 `Effect::MoveWindow`（`app.rs:1919`）**全仓零发射点**，是死 effect/死分支，G6 清理候选。
+22. ~~`src/event.rs` 注释声称「保存配置带 300ms 去抖」~~（**G6 已修**：改为如实表述「同步写盘：tmp + 原子 rename，不做去抖」）。
+23. ~~`Effect::RequestBackdrop` / `Effect::MoveWindow` 死变体~~（**G6 已删**：`Effect` 从 15 → 9 变体；注意 `src/main.rs` 仍有全局 `#![allow(dead_code)]`，死码编译器不报，清理靠人工逐符号盘点 + `rg` 前先验证 `rg` 能跑）。
 
 ---
 
@@ -135,7 +149,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 **相关代码落点**：`src/platform/perf.rs`（`Span`/`SLOW_MS=50`/`UI_SLOW_MS=16`/`SMTC_SLOW_MS=8`/`RateLimiter`/`CaptureStats`）、`src/media/smtc.rs`（`Cadence` 分层 / `SessionSubscriptions` 事件 / `schedule` / `flush_if_due`）、`src/config/defaults.rs::limits`（`BACKDROP_IDLE_MS=3000` + 500/1000/2000/5000ms 常量）、`src/app.rs`（`sync_capture_freeze` / `relayout_with` 的 `widget_monitor` 刷新 / 心跳门控）、`src/render/sampler.rs`（埋点 2 段）。
 **埋点去留**：v1.4.4 已决定——**保留 `[perf]` 慢日志**（阈值 16/50/8ms）与 60s 统计行（含 capture 字段），只做限流；不删。
 
-### 3.2 待做组（G3~G7，按序执行；G3.5 为 2026-11-04 追加、G7 为 2026-11-03 追加）
+### 3.2 G 组清单（G3~G7 —— **2026-11-05 全部真人验收通过，本节为存档记录**）
 
 > ⚠️ 版本号已重排（按下表，覆盖旧 progress 里的 v1.5.1/v1.6.0/v1.6.1 写法）。
 
@@ -220,7 +234,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
   - **硬约束（性能红线）**：判定必须纯内存字符串比对；应用枚举只允许「进入黑名单分区」与「点刷新」两处，禁止定时器/后台轮询/切导航枚举；枚举只读会话列表 + AUMID，禁读元数据/时间线/controls。
   - **关键修正（架构核实）**：项目**没有 WASAPI 兜底媒体链路**（`wasapi.rs` 只有音量、`FallbackSession` 零发射点），只过滤 SMTC 单链路；`player_map::resolve()` 仅 22 条静态表、表外进程名为空，故需 U1=B 的缓存；`app.rs:1911` 是**同步写盘**（非 300ms 去抖）。
   - 任务分解 **T01~T05** 见 ARCH 文档，规模约 **9~10 人·天**（T01 数据层 M/偏重、T02 过滤链 L、T03 设置页 **XL**、T04 托盘+i18n M、T05 回归 S+）；**验收 10 条**（7 条功能 + W1「反查拿到真实名」/ W2「缓存跨重启仍命中」/ W2b「手改 json 不炸」/ W3「失败不静默三档对照」）；**另需注意 execute() 入口也要拦播控命令**（PRD 最初漏了，不拦热键仍能控制被拉黑应用）。
-  - **v1.9.0 实现实况（2026-11-05，已出包待验收）**：
+  - **v1.9.0 实现实况（2026-11-05，✅ 已真人验收通过）**：
     - **流程**：开工前先做两路核对（ARCH-G7 写于 v1.7.0 时代，中间隔了 v1.8.0/v1.8.1 两轮大改）——架构师对齐审计（`docs/ARCH-G7-对齐审计.md`，26 条偏差，**内容级失效仅 2 处**：Config 示例含已删的 `window` 字段、`GetSession(i)` 笔误应为 `GetAt(i)`，其余全是行号漂移，设计主体 95% 可用）+ PM 界面复核（`docs/PRD-G7-现状复核.md`，10 处调整：标题计数不挂 `data-i18n`、刷新按钮挪出 `h2`、行结构叠 `.label`/`.desc` 等）。**因限流，首轮审计由主理人亲自完成一半**（发现 feature 缺失与 `push_transient` 重复），再交架构师补全成文。
     - **前置 5 项（全部并入 T01–T03）**：① Cargo.toml **加回 `Foundation_Collections`**（枚举走 `GetSessions()` → `IVectorView::Size()`/`GetAt()`，G6 摘掉了它）；② 文档提议的 `SettingsService::push_transient()` **不做**——v1.8.0 的 `post()` 语义完全相同（不碰 `last_state`），直接复用；③ `blacklist.hint.match` 用 PRD 版文案；④ 清空确认用 `window.confirm()`（ARCH 专项分析：原生弹窗在 WebView2 STA 会嵌套消息泵）；⑤ 性能基线 v1.8.1。
     - **交付数据**：`556 个 #[test] / 555 passed / 0 failed / 1 ignored`（v1.8.1 基线 515 → **+41**，既有零放宽零删改）；check/clippy/test 全绿、clippy 0 警告；`+1944 / −68` 行；新文件 `src/media/blacklist.rs`（~700 行含 20 测试）；版本 5 处 + lock 1.9.0；包体 **1,159,680 B**；exe **37 个只增不删**。
@@ -241,9 +255,17 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 3.5 小尾巴与存量（不阻塞）
 - `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
 - M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- GitHub Release 发布、LICENSE 版权人实名（现为占位）、设置页标题栏明暗跟随、热键日志冗余清理。
+- ~~GitHub Release 发布~~（2026-11-05 教学已交付：push 13 提交 + Releases/new 发 v1.9.0 + 附 exe，用户自行操作）；LICENSE 版权人实名（现为占位）、设置页标题栏明暗跟随、热键日志冗余清理。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
+
+### 3.6 下一轮候选（2026-11-05 G7 收官盘点，均不阻塞、按需立项）
+1. **pre-existing 死码 30 项**（HEAD 就有，QA 用 `dead_code` 探针列出；非 G6 清单范围）：`app::sink/msg_hwnd/is_enabled`、`LOG_MAX_BYTES`、`TIMEOUT_GET`、`net::as_str/get/get_with`、`provider::{new,query,query_with_source}`、`media::LyricSource::Wasapi` + `Track.source`、`launch::ActivationTarget::Tray`、`smtc` 的 `props/playback/timeline`、`text::Hud` 变体 + `scale`、`stable::reset`、`theme::as_str`、`wide::from_wide`、`layout::{inset,lyric_w,edge}`、`d2d::len`、`cover_cache::{len,is_empty}`、`render::size` 等。
+2. **设置页改语言需重启才生效**：`general.language` 改后 `App::lang` 不更新、托盘菜单不刷新（`Lang::from_serde` 全仓只有 bootstrap 一处调用）；修复挂点 = `Effect::RefreshTrayMenu`（保留未删）。
+3. **D-6 两份进度实现**：`State::progress_fraction()`（`app.rs`，仅 2 条测试在调）与 `painter.rs:911-923` 的内联 `frac` 是同一公式两份副本，**屏幕上画的不是被测试的那个**——属行为重构（会改像素），不能混进清理轮。
+4. 「清空歌词缓存」一键按钮（v1.8.0 只给了「点击打开文件夹」）。
+5. G7 遗留 P3：D2 空身份会话不显示灰态行（PRD P0-04 要求灰态，实现选择不出现）；D6 `BlacklistOutcome::BadPath` 无专测；D5 媒体线程死亡时刷新按钮不复位。
+6. G2 卡顿续查路线与二分杠杆全在 §3.1（埋点仍在，别重搭）。
 
 ---
 
@@ -272,7 +294,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | `截图态` | 截图遮罩冻结生效范围 |
 
 ### 4.3 交付包现状（`deliverables/`，只增不删）
-现存 **24 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`（另有多余的 LICENSE/README 副本，G6 清理候选）。
+现存 **37 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
 ⚠️ `v1.0.0`、`v1.1.0` ~ `v1.1.9` 已不在磁盘（早前清理误删，目录在 `.gitignore` 内无法恢复）；如需补齐用 4.1 的 detached checkout 方式，不补也不影响使用。
 
 ### 4.4 测试与验收口径
@@ -285,9 +307,9 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ## 5. 接手须知（新对话从这里开始）
 
 1. `git status` / `git log --oneline -8` 确认干净与进度（以本文档头部「最后更新」为准）。
-2. 团队：`software-barline-14`（主理人 + `software-engineer` + `software-qa-engineer`）。新会话需 `TeamCreate` 重建；派发时 prompt **必须自包含**（工作目录、任务、§2.1 铁律、版本 bump 5 处、`build.ps1` 全链、单提交、汇报格式）。
+2. 团队按组重建：`TeamCreate` 建新团队（如 `software-barline-g8`），成员 = PM（`software-product-manager`）+ 架构师（`software-architect`）+ 工程师（`software-engineer`）+ QA（`software-qa-engineer`）四角色；派发 prompt **必须自包含**（工作目录、任务、§2.1 铁律、版本 bump 5 处、`build.ps1` 全链、单提交、汇报格式、`rg` 先验证可用）。开工前若设计文档隔了多轮代码变动，先做**对齐审计**再放工程师（G7 的做法）。
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态**：G3 右上角 × **已真人验收通过**（v1.5.4 定稿：字形 6px / 命中 14 / 笔画 1.2 / 与三键同墨色）。**G3.5 全屏冻结 v1.5.5 已出包，等用户真人验收**（重点：全屏进出、后台占用、热键切歌、退出不闪旧帧），详见 §3.2。**下一组是 G4 悬停/按下反馈统一（v1.6.0）**——含 v1.5.1 QA 遗留的 × 悬停底色口径（`theme.text@0x14` 与全窗 `hover_bg`/`on_light` 不同源，透明背景下全局悬停消失但 × 仍亮）。G5 歌词落盘、G6 清理、G7 黑名单依次排队，别提前开工。
+6. **当前状态**：**G1~G7 全部真人验收通过（2026-11-05），G 系列功能清单全部完成**，当前 v1.9.0。下一组等用户提需求；遗留候选见 §3.6（30 项 pre-existing 死码 / 语言切换需重启 / D-6 两份进度实现 / 清空缓存按钮 / G7 三个 P3）。push 与 GitHub Release 由用户按已交付的教学自行操作。
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。
