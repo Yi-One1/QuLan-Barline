@@ -470,6 +470,119 @@ fn anchor_of(
     prev.unwrap_or(now)
 }
 
+// ---------------------------------------------------------------- 歌词钟续接（G8-②）
+
+/// G8-②：一次快照发布前，对「歌词钟」（`position_ms` / `position_at`）的动作。
+///
+/// 全部是纯数据，不含 COM 句柄：`PollState::build_snapshot` 据此改写快照，
+/// 于是「暂停→继续不归零」的接线可以被确定性单测锁住。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LyricClockAction {
+    /// 维持 `parts` / [`anchor_of`] 的结果（正常播放器、首帧、稳态轮次）。
+    Keep,
+    /// 切歌：恒报 `(0,0)` 的播放器歌词钟归零，锚点仍交给 [`anchor_of`] 规则 2/3。
+    Reset,
+    /// 状态跃迁：从上一份已广播快照续接歌词钟，不归零、不重载歌词。
+    Carry,
+}
+
+/// G8-②：`tick()` 交给 [`PollState::build_snapshot`] 的**全部本轮输入**（纯数据）。
+///
+/// 把这些输入收拢成一个结构，是为了让「`tick()` 里怎么赋值 / 怎么传参」这段
+/// 无法用 COM 单测覆盖的接线只留**一个**入口：`build_snapshot` 只接受
+/// [`TickInputs`]，测试既可以用 [`tick_inputs`]（生产同款构造）也可以用字面量
+/// 直接构造（QA 的 RV-C3 教训：把 `state_jumped = true` 改成 `false` 后
+/// 592 条测试全绿 —— 输入散落成三个实参时无人锁定赋值与传参）。
+///
+/// `read_timeline_now` **由 `timeline_read.is_some()` 派生**（`tick_inputs` 是
+/// 唯一的生产构造入口），不再单独传递，避免「本轮读过时间线」出现两个来源。
+/// 字段设为 `pub` 只为测试能用字面量精确构造不一致组合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickInputs {
+    /// [`Cadence::note_playback`] 判出的播放状态跃迁。
+    pub state_jumped: bool,
+    /// 本轮时间线读数（`None` = 本轮没读中层）。
+    pub timeline_read: Option<(Ms, Ms)>,
+    /// 本轮是否读过时间线（`anchor_of` 规则 1 的依据）。恒等于
+    /// `timeline_read.is_some()`；由 [`tick_inputs`] 派生，测试可直接给。
+    pub read_timeline_now: bool,
+}
+
+/// G8-②：`TickInputs` 的**唯一生产构造入口**（纯函数）。
+///
+/// 生产代码只经这里构造，`read_timeline_now` 一律由 `timeline_read.is_some()`
+/// 派生 —— 真实读数与 `(0,0)` 都算「这轮读过时间线」（锚点规则 1 依赖它：
+/// 读过就以该次读取时刻为锚点，切歌则由规则 2 覆盖）。
+pub fn tick_inputs(state_jumped: bool, timeline_read: Option<(Ms, Ms)>) -> TickInputs {
+    TickInputs {
+        state_jumped,
+        timeline_read,
+        read_timeline_now: timeline_read.is_some(),
+    }
+}
+
+/// G8-②：本轮要不要改写新快照的 `(position_ms, position_at)`（**纯函数**）。
+///
+/// `timeline` = 本轮时间线读数（`None` = 本轮没读）；`zero_duration` =
+/// `parts.duration_ms == 0`（播放器从不报时长，网易云式特征）；`state_jumped` =
+/// [`Cadence::note_playback`] 判出的播放状态跃迁；`track_changed` = `track_id`
+/// 相对上一份快照变了；`has_prev` = 已有上一份已广播快照。
+///
+/// 「没拿到可信位置」= 本轮读到 `(0,0)`，或本轮压根没读时间线且播放器从不报
+/// 时长（5s 退避里由慢层发现切歌的场景）。后者若漏掉，换歌时会把上一首续接的
+/// 歌词钟带进新歌。
+///
+/// 优先级（背景：网易云恒报 `(0,0)`，那个读数**不是**有效位置，程序实际靠
+/// `position_at` 线性外推维持歌词钟。旧实现状态跃迁时立即补读时间线，把
+/// `position_ms` 写成 0、锚点挪到 `now`，新快照一发布歌词就跳回第一句）：
+/// 1. 拿到可信的真实位置读数 → [`LyricClockAction::Keep`]（汽水等原样）；
+/// 2. 切歌 → [`LyricClockAction::Reset`]（新歌从头走，绝不被续接误伤）；
+/// 3. 首帧无上一份快照 → [`LyricClockAction::Keep`]（沿用 `anchor_of` 兜底）；
+/// 4. 状态跃迁 → [`LyricClockAction::Carry`]；
+/// 5. 其余 → [`LyricClockAction::Keep`]。
+pub fn lyric_clock_action(
+    timeline: Option<(Ms, Ms)>,
+    zero_duration: bool,
+    state_jumped: bool,
+    track_changed: bool,
+    has_prev: bool,
+) -> LyricClockAction {
+    let no_usable_position = match timeline {
+        Some((0, 0)) => true,
+        Some(_) => false,
+        None => zero_duration,
+    };
+    if !no_usable_position {
+        return LyricClockAction::Keep;
+    }
+    if track_changed {
+        return LyricClockAction::Reset;
+    }
+    if !has_prev {
+        return LyricClockAction::Keep;
+    }
+    if state_jumped {
+        LyricClockAction::Carry
+    } else {
+        LyricClockAction::Keep
+    }
+}
+
+/// G8-②：上一份已广播快照在 `now` 时刻的歌词钟位置（**纯函数**，零 COM）。
+///
+/// 与 [`NowPlaying::position_now`] 同口径，但时间由参数注入，单测不需 sleep：
+/// - `Playing` → `position_ms + (now - position_at)`（线性外推）；
+/// - 其它态（暂停 / 兜底）→ 冻结的 `position_ms`（暂停期间歌词原地停住）。
+///
+/// `saturating_*` 保证时钟回拨 / 异常数值都不 panic。
+pub fn lyric_clock_at(prev: &NowPlaying, now: Instant) -> Ms {
+    if prev.state != PlaybackState::Playing {
+        return prev.position_ms;
+    }
+    let elapsed = now.saturating_duration_since(prev.position_at).as_millis() as Ms;
+    prev.position_ms.saturating_add(elapsed)
+}
+
 // ---------------------------------------------------------------- 分层读数缓存
 
 /// 各层最近一次读到的数据。
@@ -1048,6 +1161,76 @@ impl PollState {
         sink.send(AppEvent::IgnoredSession(None));
     }
 
+    /// G8-②：把一次时间线读数写进分层缓存（**无 COM，可单测**）。
+    ///
+    /// `(0,0)` 是「播放器根本没上报位置」，不是「位置等于 0」。网易云恒报它；
+    /// 若照旧把 `parts.position_ms` 盖成 0，那么状态跃迁（或播控标志变化）
+    /// 引发的任意一次发布都会把歌词钟归零。因此 `(0,0)` 只更新时长与读取
+    /// 时刻，**位置保持上一份有效值**；真实读数则原样写入（汽水等行为不变）。
+    /// 注意 `note_timeline()` 的退避状态机仍照常吃 `(0,0)`，语义未动。
+    fn apply_timeline_read(&mut self, position: Ms, duration: Ms, now: Instant) {
+        if position != 0 || duration != 0 {
+            self.parts.position_ms = position;
+        }
+        self.parts.duration_ms = duration;
+        // **只有这里**许更新 timeline_at（锚点规则 1 的依据）
+        self.parts.timeline_at = Some(now);
+    }
+
+    /// G8-②：按本轮读数、状态跃迁与切歌情况拼出待发布的快照（**无 COM，可单测**）。
+    ///
+    /// `anchor_of` 的三规则对**切歌**的语义逐字保留；本方法只在两种情况下改写
+    /// 歌词钟：切歌（含 5s 退避里没读时间线的换歌）归零，以及恒报 `(0,0)` 的
+    /// 播放器状态跃迁时把上一份快照外推到 `now` 的位置续接过去（不归零、不
+    /// 重载歌词），并把同样的基准写回 `parts`，避免下一次 `(0,0)` 读数让
+    /// `has_changed` 的「位置大幅回退」判据误判成 seek、再次发布归零快照。
+    fn build_snapshot(&mut self, inputs: TickInputs, now: Instant) -> NowPlaying {
+        // 只从 TickInputs 取值（单入口），下方 `anchor_of` / `lyric_clock_action`
+        // 的判定逻辑与调用形式逐字未改。
+        let TickInputs {
+            state_jumped,
+            timeline_read,
+            read_timeline_now,
+        } = inputs;
+        let track_id = parts_track_id(&self.parts);
+        let track_changed = self.last.as_ref().map(|p| p.track_id) != Some(track_id);
+        let anchor = anchor_of(
+            read_timeline_now,
+            self.parts.timeline_at,
+            track_changed,
+            now,
+            self.last.as_ref().map(|p| p.position_at),
+        );
+
+        let mut snapshot = self.parts.snapshot(anchor);
+        let action = lyric_clock_action(
+            timeline_read,
+            self.parts.duration_ms == 0,
+            state_jumped,
+            track_changed,
+            self.last.is_some(),
+        );
+        match action {
+            LyricClockAction::Keep => {}
+            LyricClockAction::Reset => {
+                // 新歌从头走；锚点仍是 anchor_of 的结果（规则 1/2）
+                snapshot.position_ms = 0;
+                self.parts.position_ms = 0;
+            }
+            LyricClockAction::Carry => {
+                // 先结束对 self.last 的不可变借用，再写回 parts
+                let carried = self.last.as_ref().map(|p| lyric_clock_at(p, now));
+                if let Some(carried) = carried {
+                    snapshot.position_ms = carried;
+                    snapshot.position_at = now;
+                    self.parts.position_ms = carried;
+                    self.parts.timeline_at = Some(now);
+                }
+            }
+        }
+        snapshot
+    }
+
     /// 按计划做一轮读取，diff 后决定是否广播。
     ///
     /// G8-①：本轮读的会话由 [`PollState::acquire_session`] 决定——常规路径仍是
@@ -1075,8 +1258,12 @@ impl PollState {
         };
 
         // ---- 快层：播放状态（最轻，必须即时）----
-        // `read_timeline_now` 供锚点规则 1 使用
-        let mut read_timeline_now = false;
+        // G8-②：本轮交给 `build_snapshot` 的纯数据输入——`state_jumped` 由
+        // `note_playback()` 的返回值赋值，`timeline_read` 由中层记录；两者最后
+        // 经 `tick_inputs()` 收拢成 `TickInputs`（`read_timeline_now` 由它派生，
+        // 不再单独立局部变量，避免「两个来源可能不一致」）。
+        let mut timeline_read: Option<(Ms, Ms)> = None;
+        let mut state_jumped = false;
         let mut playback_info = None;
         if plan.playback {
             let (info, ms) = timed("smtc.playback", || session.GetPlaybackInfo().ok());
@@ -1088,6 +1275,7 @@ impl PollState {
             if self.cadence.note_playback(now, state) {
                 plan.timeline = true;
                 plan.props = true;
+                state_jumped = true;
             }
             self.parts.state = state;
             playback_info = info;
@@ -1102,11 +1290,8 @@ impl PollState {
             if self.cadence.note_timeline(now, position, duration) {
                 plan.props = true;
             }
-            self.parts.position_ms = position;
-            self.parts.duration_ms = duration;
-            // **只有这里**许更新 timeline_at（锚点规则的依据，别处一律不碰）
-            self.parts.timeline_at = Some(now);
-            read_timeline_now = true;
+            timeline_read = Some((position, duration));
+            self.apply_timeline_read(position, duration, now);
         }
 
         // ---- 慢层：AUMID + 元数据 + 播控标志 + 封面 ----
@@ -1208,18 +1393,9 @@ impl PollState {
             return;
         }
 
-        // ---- 锚点（见 anchor_of 的三规则）----
-        let track_id = parts_track_id(&self.parts);
-        let track_changed = self.last.as_ref().map(|p| p.track_id) != Some(track_id);
-        let anchor = anchor_of(
-            read_timeline_now,
-            self.parts.timeline_at,
-            track_changed,
-            now,
-            self.last.as_ref().map(|p| p.position_at),
-        );
-
-        let snapshot = self.parts.snapshot(anchor);
+        // ---- 锚点 + G8-② 歌词钟续接（三规则与切歌语义见 anchor_of / build_snapshot）----
+        let inputs = tick_inputs(state_jumped, timeline_read);
+        let snapshot = self.build_snapshot(inputs, now);
         if let Some(prev) = self.last.as_ref() {
             if !has_changed(prev, &snapshot) {
                 return;
@@ -3097,5 +3273,577 @@ mod g8_multi_session {
         assert!(scan_gate(true, false) && session_scan_due(true, None, t0));
         assert!(!(scan_gate(true, false) && session_scan_due(true, Some(t0), at(t0, 50))));
         assert!(scan_gate(true, false) && session_scan_due(true, Some(t0), at(t0, 1_000)));
+    }
+}
+
+// ============================================================================
+// G8-②（v1.9.2）—— 网易云「暂停→继续」歌词钟不归零
+//
+// 全部测试跑在纯数据上：候选读数 / 状态跃迁标志 / 已广播快照 / 注入的时刻。
+// 其中 `apply_timeline_read` / `build_snapshot` 两条直接调用 PollState 的接线，
+// 保证「只改纯函数不改接线」也会被反向验证打红。
+// ============================================================================
+#[cfg(test)]
+mod g8_lyric_clock {
+    use super::*;
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// 全部时刻都取「过去」，`position_at.elapsed()` / `position_now()` 才有意义。
+    fn past_base() -> Instant {
+        Instant::now() - Duration::from_millis(200_000)
+    }
+
+    fn test_index() -> Arc<MediaIndex> {
+        MediaIndex::new(&crate::config::MediaConfig::default())
+    }
+
+    /// 网易云式 parts：有曲目、属性已成功读过、恒报 (0,0)、歌词钟从 t0 起走表。
+    fn zero_player(parts: &mut SessionParts, title: &str, t0: Instant) {
+        parts.track = Track {
+            title: title.to_string(),
+            artist: "周杰伦".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        parts.props_ok = true;
+        parts.state = PlaybackState::Playing;
+        parts.position_ms = 0;
+        parts.duration_ms = 0;
+        parts.timeline_at = Some(t0);
+    }
+
+    fn state_with(title: &str, t0: Instant) -> PollState {
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, title, t0);
+        st
+    }
+
+    /// 造一份「已广播」快照：track_id 与 parts 一致（不触发切歌）。
+    fn published(
+        parts: &SessionParts,
+        state: PlaybackState,
+        position: Ms,
+        position_at: Instant,
+    ) -> NowPlaying {
+        NowPlaying {
+            track_id: parts_track_id(parts),
+            track: Some(effective_track(parts)),
+            session: MediaSessionInfo {
+                aumid: parts.aumid.clone(),
+                app_name: parts.app_name.clone(),
+                process_name: parts.process_name.clone(),
+                ..Default::default()
+            },
+            state,
+            position_ms: position,
+            position_at,
+            ..Default::default()
+        }
+    }
+
+    /// 测试专用 `TickInputs` 构造：**三个字段全部显式给出**（含 `read_timeline_now`），
+    /// 不依赖被测的 [`tick_inputs`] 推导 —— `build_snapshot` 的单测与
+    /// `tick_inputs()` 的真值表因此互相独立，任一处写坏都能被单独抓出来。
+    fn ti(
+        state_jumped: bool,
+        timeline_read: Option<(Ms, Ms)>,
+        read_timeline_now: bool,
+    ) -> TickInputs {
+        TickInputs {
+            state_jumped,
+            timeline_read,
+            read_timeline_now,
+        }
+    }
+
+    // ------------------------------------------------ 纯判定 / 纯计算
+
+    /// 4 种时间线读数 × 零时长标志 × 状态跃迁 × 切歌 × 有无上一份 = 64 格真值表，
+    /// 逐格对照独立期望（可信读数一律 Keep、切歌 Reset、跃迁 Carry）。
+    #[test]
+    fn lyric_clock_action_truth_table() {
+        fn want(
+            timeline: Option<(Ms, Ms)>,
+            zero_duration: bool,
+            jumped: bool,
+            track_changed: bool,
+            has_prev: bool,
+        ) -> LyricClockAction {
+            let usable = match timeline {
+                Some((0, 0)) => false,
+                Some(_) => true,
+                None => !zero_duration,
+            };
+            if usable {
+                return LyricClockAction::Keep;
+            }
+            if track_changed {
+                return LyricClockAction::Reset;
+            }
+            if !has_prev {
+                return LyricClockAction::Keep;
+            }
+            if jumped {
+                LyricClockAction::Carry
+            } else {
+                LyricClockAction::Keep
+            }
+        }
+        let timelines = [
+            None,
+            Some((0, 0)),
+            Some((12_000, 180_000)),
+            Some((0, 180_000)),
+        ];
+        let mut cells = 0;
+        for timeline in timelines {
+            for zero_duration in [false, true] {
+                for jumped in [false, true] {
+                    for track_changed in [false, true] {
+                        for has_prev in [false, true] {
+                            assert_eq!(
+                                lyric_clock_action(
+                                    timeline,
+                                    zero_duration,
+                                    jumped,
+                                    track_changed,
+                                    has_prev
+                                ),
+                                want(timeline, zero_duration, jumped, track_changed, has_prev),
+                                "timeline={timeline:?} zero_duration={zero_duration} jumped={jumped} track_changed={track_changed} has_prev={has_prev}"
+                            );
+                            cells += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 64);
+    }
+
+    /// 真实位置播放器（汽水）无论状态是否跃迁都不该被续接逻辑改写。
+    #[test]
+    fn lyric_clock_action_never_carries_for_real_position_players() {
+        for timeline in [Some((30_000, 180_000)), Some((0, 180_000)), None] {
+            for jumped in [false, true] {
+                assert_eq!(
+                    lyric_clock_action(timeline, false, jumped, false, true),
+                    LyricClockAction::Keep
+                );
+            }
+        }
+    }
+
+    /// 5s 退避里没读时间线的零时长播放器，切歌也必须 Reset（不带旧歌词钟进新歌）。
+    #[test]
+    fn lyric_clock_action_resets_on_backoff_track_change_without_timeline_read() {
+        assert_eq!(
+            lyric_clock_action(None, true, false, true, true),
+            LyricClockAction::Reset
+        );
+        // 同样没读时间线但播放器报真实时长 → 汽水原样，不回归
+        assert_eq!(
+            lyric_clock_action(None, false, false, true, true),
+            LyricClockAction::Keep
+        );
+    }
+
+    /// `lyric_clock_at` 与 `position_now` 同口径；暂停冻结、播放线性外推。
+    #[test]
+    fn lyric_clock_at_extrapolates_playing_and_freezes_paused() {
+        let t0 = past_base();
+        let mut playing = NowPlaying::default();
+        playing.state = PlaybackState::Playing;
+        playing.position_ms = 5_000;
+        playing.position_at = t0;
+        assert_eq!(lyric_clock_at(&playing, t0), 5_000);
+        assert_eq!(lyric_clock_at(&playing, at(t0, 3_000)), 8_000);
+
+        let mut paused = playing.clone();
+        paused.state = PlaybackState::Paused;
+        paused.position_ms = 42_000;
+        assert_eq!(
+            lyric_clock_at(&paused, at(t0, 60_000)),
+            42_000,
+            "暂停期间歌词原地停住"
+        );
+        assert_eq!(paused.position_now(), 42_000, "暂停的 position_now 也冻结");
+    }
+
+    /// 时钟回拨 / 极端数值不许 panic、不许把位置倒推成负数。
+    #[test]
+    fn lyric_clock_at_is_clock_skew_safe() {
+        let t0 = past_base();
+        let mut s = NowPlaying::default();
+        s.state = PlaybackState::Playing;
+        s.position_ms = Ms::MAX - 10;
+        s.position_at = t0;
+        assert_eq!(lyric_clock_at(&s, t0 - Duration::from_millis(1_000)), Ms::MAX - 10);
+        assert_eq!(lyric_clock_at(&s, at(t0, 1_000)), Ms::MAX);
+    }
+
+    // ------------------------------------------------ 接线：时间线层
+
+    /// `(0,0)` 不是有效位置读数，不许把已续接的歌词钟盖回 0；真实读数照常写。
+    #[test]
+    fn apply_timeline_read_ignores_zero_zero_but_writes_real_position() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        st.parts.position_ms = 42_000;
+        st.apply_timeline_read(0, 0, at(t0, 1_000));
+        assert_eq!(st.parts.position_ms, 42_000, "(0,0) 不许把歌词钟归零");
+        assert_eq!(st.parts.timeline_at, Some(at(t0, 1_000)));
+        assert_eq!(st.parts.duration_ms, 0);
+
+        st.apply_timeline_read(30_000, 180_000, at(t0, 2_000));
+        assert_eq!(st.parts.position_ms, 30_000, "汽水式真实读数照常写入");
+        assert_eq!(st.parts.duration_ms, 180_000);
+    }
+
+    // ------------------------------------------------ 接线：发布层（核心）
+
+    /// ① 核心：`Playing→Paused→Playing` 两次状态跃迁 + `(0,0)` 读数，
+    /// 位置与锚点都不归零；暂停冻结在那一句，继续后接着外推。
+    #[test]
+    fn state_jump_on_zero_player_carries_lyric_clock_across_pause_and_resume() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+
+        // ---- 暂停（T1 = T0 + 42s）----
+        let t1 = at(t0, 42_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, t1);
+        let paused = st.build_snapshot(ti(true, Some((0, 0)), true), t1);
+        assert_eq!(paused.position_ms, 42_000, "暂停冻结在第 42s 那一句，不是 0");
+        assert_eq!(paused.position_at, t1);
+        assert_eq!(st.parts.position_ms, 42_000, "写回 parts 防下次 (0,0) 归零");
+        assert_eq!(st.parts.timeline_at, Some(t1));
+        assert_eq!(paused.position_now(), 42_000, "暂停期间歌词原地停住");
+
+        // ---- 继续（T2 = T1 + 10s）----
+        st.last = Some(paused);
+        let t2 = at(t0, 52_000);
+        st.parts.state = PlaybackState::Playing;
+        st.apply_timeline_read(0, 0, t2);
+        let resumed = st.build_snapshot(ti(true, Some((0, 0)), true), t2);
+        assert_eq!(resumed.position_ms, 42_000, "继续后从暂停那一句接着走");
+        assert_eq!(resumed.position_at, t2, "锚点取继续时刻，从冻结值重新外推");
+        assert_eq!(
+            lyric_clock_at(&resumed, at(t2, 2_000)),
+            44_000,
+            "继续后按继续时刻线性外推"
+        );
+    }
+
+    /// ② 暂停冻结用真实 `position_now()` 复核，继续后的续接值不等于 0。
+    #[test]
+    fn paused_snapshot_freezes_position_now_and_resume_continues() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+        let t1 = at(t0, 63_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, t1);
+        let paused = st.build_snapshot(ti(true, Some((0, 0)), true), t1);
+        assert_eq!(paused.position_now(), 63_000);
+        assert_ne!(paused.position_now(), 0, "暂停不许把歌词拨回第一句");
+
+        st.last = Some(paused);
+        let t2 = at(t0, 70_000);
+        st.parts.state = PlaybackState::Playing;
+        st.apply_timeline_read(0, 0, t2);
+        let resumed = st.build_snapshot(ti(true, Some((0, 0)), true), t2);
+        assert_eq!(resumed.position_ms, 63_000);
+        assert_eq!(lyric_clock_at(&resumed, at(t2, 1_000)), 64_000);
+    }
+
+    /// ③ 汽水式（真实 position/duration）状态跃迁仍采用播放器上报的真实位置。
+    #[test]
+    fn real_position_player_state_jump_keeps_reported_position() {
+        let t0 = past_base();
+        let mut st = state_with("汽水", t0);
+        st.parts.duration_ms = 180_000;
+        st.parts.position_ms = 0;
+        st.parts.timeline_at = Some(t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+
+        let t1 = at(t0, 30_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(30_000, 180_000, t1);
+        let paused = st.build_snapshot(ti(true, Some((30_000, 180_000)), true), t1);
+        assert_eq!(paused.position_ms, 30_000, "真实位置原样采用，不被续接改写");
+        assert_eq!(paused.position_at, t1);
+        assert_eq!(paused.position_now(), 30_000);
+        assert_eq!(st.parts.position_ms, 30_000);
+        // 播放器的真实时长参与 track_id，行为不变
+        assert_eq!(paused.track.as_ref().unwrap().duration_ms, 180_000);
+    }
+
+    /// ④ 切歌必须归零：即便同时发生状态跃迁、且已有 42s 歌词钟，也不许续接过去。
+    #[test]
+    fn zero_player_track_change_resets_position_even_with_state_jump() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+
+        let t1 = at(t0, 42_000);
+        st.parts.track.title = "七里香".to_string();
+        st.apply_timeline_read(0, 0, t1);
+        let new_song = st.build_snapshot(ti(true, Some((0, 0)), true), t1);
+        assert_eq!(new_song.position_ms, 0, "切歌归零，不被续接误伤");
+        assert_eq!(new_song.position_at, t1);
+        assert_eq!(st.parts.position_ms, 0, "写回 parts，下一首从 0 起走表");
+        assert_ne!(
+            new_song.track_id,
+            st.last.as_ref().unwrap().track_id,
+            "切歌必须换 track_id（触发歌词请求与代次守卫）"
+        );
+    }
+
+    /// ④ 切歌锚点规则 2 未被改动：本轮没读时间线时仍用检测时刻，
+    /// 不退回陈旧的 `timeline_at`（v1.4.2 漂移 bug 的回归守卫）。
+    #[test]
+    fn track_change_without_timeline_read_keeps_detection_anchor() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+        let detection = at(t0, 5_000);
+        st.parts.track.title = "七里香".to_string();
+        st.parts.timeline_at = Some(t0); // 陈旧锚点，绝不许被采用
+        let new_song = st.build_snapshot(ti(false, None, false), detection);
+        assert_eq!(new_song.position_at, detection, "锚点必须是检测时刻");
+        assert_ne!(
+            new_song.track_id,
+            st.last.as_ref().unwrap().track_id
+        );
+        assert!(has_changed(st.last.as_ref().unwrap(), &new_song));
+    }
+
+    /// ④ 5s 退避里由慢层发现切歌（本轮没读时间线）：即便 parts 里还留着
+    /// 上一首续接的 42s 歌词钟，新歌也必须归零，锚点仍是检测时刻。
+    #[test]
+    fn backoff_track_change_without_timeline_read_drops_carried_clock() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        let detection = at(t0, 5_000);
+        st.parts.track.title = "七里香".to_string();
+        let new_song = st.build_snapshot(ti(false, None, false), detection);
+        assert_eq!(new_song.position_ms, 0, "换歌不许把上一首的歌词钟带过来");
+        assert_eq!(new_song.position_at, detection);
+        assert_eq!(st.parts.position_ms, 0);
+    }
+
+    /// ⑤ 首帧 / 无上一份快照：沿用 `anchor_of` 的 now 兜底，位置取 parts 的值。
+    #[test]
+    fn first_frame_without_prev_uses_now_anchor_and_parts_position() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        st.last = None;
+        st.parts.timeline_at = None;
+        st.apply_timeline_read(0, 0, t0);
+        let first = st.build_snapshot(ti(false, Some((0, 0)), true), t0);
+        assert_eq!(first.position_ms, 0);
+        assert_eq!(first.position_at, t0);
+        assert_eq!(st.parts.position_ms, 0);
+    }
+
+    /// ⑥ + 约束 3：状态跃迁不改 `track_id`，app.rs 因此不会发 `Effect::Lyric`
+    /// / `LyricLoading`，歌词高亮连续、不重载、不闪一下。
+    #[test]
+    fn state_jump_keeps_track_id_so_ui_does_not_reload_lyrics() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        let prev_tid = s0.track_id;
+        st.last = Some(s0);
+        let t1 = at(t0, 20_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, t1);
+        let paused = st.build_snapshot(ti(true, Some((0, 0)), true), t1);
+        assert_eq!(paused.track_id, prev_tid);
+        // app.rs 的 `track_changed = state.playing.track_id != np.track_id` 必须为 false：
+        // 只有它为 true 才会 push(Effect::Lyric) → LyricLoading 覆盖态
+        assert_eq!(st.last.as_ref().unwrap().track_id, paused.track_id);
+        assert!(
+            has_changed(st.last.as_ref().unwrap(), &paused),
+            "只因 state 变化而发布，不需要重新加载歌词"
+        );
+    }
+
+    /// ⑥ 稳态回归：继续之后的常规 `(0,0)` 读数不得让 `has_changed` 的
+    /// 「位置大幅回退」判据误判成 seek，进而再发布一份归零快照。
+    #[test]
+    fn zero_player_steady_state_after_resume_never_publishes_a_reset() {
+        let t0 = past_base();
+        let mut st = state_with("晴天", t0);
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+
+        let t1 = at(t0, 42_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, t1);
+        let paused = st.build_snapshot(ti(true, Some((0, 0)), true), t1);
+        st.last = Some(paused);
+
+        let t2 = at(t0, 52_000);
+        st.parts.state = PlaybackState::Playing;
+        st.apply_timeline_read(0, 0, t2);
+        let resumed = st.build_snapshot(ti(true, Some((0, 0)), true), t2);
+        assert_eq!(resumed.position_ms, 42_000);
+        st.last = Some(resumed.clone());
+
+        // 继续后 1s 的稳态 (0,0) 读数
+        let t3 = at(t0, 53_000);
+        st.apply_timeline_read(0, 0, t3);
+        let steady = st.build_snapshot(ti(false, Some((0, 0)), true), t3);
+        assert_eq!(steady.position_ms, 42_000, "稳态不得归零");
+        assert!(
+            !has_changed(&resumed, &steady),
+            "稳态不该发布新快照，歌词高亮连续"
+        );
+    }
+
+    /// ⑥ 代次守卫：不同曲目仍有不同 `track_id`，`has_changed` 仍会触发换歌发布。
+    #[test]
+    fn generation_guard_still_distinguishes_tracks() {
+        let t0 = past_base();
+        let mut parts = SessionParts::default();
+        zero_player(&mut parts, "晴天", t0);
+        let a = parts_track_id(&parts);
+        parts.track.title = "七里香".to_string();
+        let b = parts_track_id(&parts);
+        assert_ne!(a, b);
+        let sa = published(&parts, PlaybackState::Playing, 0, t0);
+        let mut sb = sa.clone();
+        sb.track_id = a;
+        assert!(has_changed(&sa, &sb), "track_id 变化仍必须触发发布");
+    }
+
+    // ------------------------------------------------ TickInputs 收拢 + tick() 接线
+
+    /// `tick_inputs()` 真值表：两个输入原样带出，`read_timeline_now` 由
+    /// `timeline_read.is_some()` 派生 —— **`(0,0)` 也算「读过时间线」**
+    /// （锚点规则 1 以该次读取时刻为锚点，切歌再由规则 2 覆盖）。
+    #[test]
+    fn tick_inputs_truth_table() {
+        // (state_jumped, timeline_read, 期望的 read_timeline_now)
+        let cases: [(bool, Option<(Ms, Ms)>, bool); 4] = [
+            (false, None, false),
+            (false, Some((0, 0)), true),
+            (true, None, false),
+            (true, Some((0, 0)), true),
+        ];
+        for (jumped, timeline, want_read) in cases {
+            let got = tick_inputs(jumped, timeline);
+            assert_eq!(got.state_jumped, jumped, "state_jumped 必须原样带出");
+            assert_eq!(got.timeline_read, timeline, "timeline_read 必须原样带出");
+            assert_eq!(
+                got.read_timeline_now, want_read,
+                "read_timeline_now 由 timeline_read.is_some() 派生（(0,0) 也算读过）"
+            );
+        }
+        // 真实读数（非 (0,0)）同样算「读过时间线」
+        assert!(tick_inputs(false, Some((12_000, 180_000))).read_timeline_now);
+    }
+
+    /// 端到端：`build_snapshot` 必须真的读 `TickInputs.state_jumped`。
+    /// 同一组读数下，`state_jumped=true` 要走 `Carry`、`false` 要走 `Keep`；
+    /// RV-C3 同类改坏（让该字段恒 false）会让本用例变红。
+    #[test]
+    fn build_snapshot_reads_state_jumped_from_tick_inputs() {
+        let t0 = past_base();
+        let t1 = at(t0, 42_000);
+
+        // 上半：state_jumped = true → Carry
+        let mut jumped = state_with("晴天", t0);
+        let s0 = published(&jumped.parts, PlaybackState::Playing, 0, t0);
+        jumped.last = Some(s0);
+        jumped.parts.state = PlaybackState::Paused;
+        jumped.apply_timeline_read(0, 0, t1);
+        let carried = jumped.build_snapshot(
+            TickInputs {
+                state_jumped: true,
+                timeline_read: Some((0, 0)),
+                read_timeline_now: true,
+            },
+            t1,
+        );
+        assert_eq!(carried.position_ms, 42_000, "state_jumped=true 必须触发 Carry");
+        assert_eq!(carried.position_at, t1);
+        assert_eq!(jumped.parts.position_ms, 42_000, "Carry 基准必须写回 parts");
+
+        // 下半：只有 state_jumped 不同（false）→ Keep，证明确实读了该字段
+        let mut kept_state = state_with("晴天", t0);
+        let s0b = published(&kept_state.parts, PlaybackState::Playing, 0, t0);
+        kept_state.last = Some(s0b);
+        kept_state.parts.state = PlaybackState::Paused;
+        kept_state.apply_timeline_read(0, 0, t1);
+        let kept = kept_state.build_snapshot(
+            TickInputs {
+                state_jumped: false,
+                timeline_read: Some((0, 0)),
+                read_timeline_now: true,
+            },
+            t1,
+        );
+        assert_eq!(kept.position_ms, 0, "state_jumped=false → Keep，不续接");
+        assert_ne!(carried.position_ms, kept.position_ms, "两个分支必须可区分");
+    }
+
+    /// **静态结构断言**：`tick()` 必须把 `note_playback()` 判出的跃迁写进
+    /// `state_jumped`，并经 `tick_inputs()` 交给 `build_snapshot`。
+    ///
+    /// 这是唯一能抓住「赋值/传参被写死」的手段（无 COM 无法真正跑 `tick()`）：
+    /// QA 的 RV-C3 把 `state_jumped = true` 改成 `= false` 时，它必须变红。
+    #[test]
+    fn tick_wires_state_jump_into_snapshot_inputs() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/media/smtc.rs"
+        ))
+        .expect("必须能读到 smtc.rs 自身源码");
+        let start = src
+            .find("    fn tick(&mut self")
+            .expect("tick 函数必须存在");
+        let rest = &src[start..];
+        // `tick` 是 PollState 的最后一个方法，方法体语句在 8 空格缩进，
+        // 故第一个 4 空格缩进的 `}` 就是 tick 的收尾（已人工核对只有一处）。
+        let end = rest
+            .find("\n    }\n")
+            .map(|i| i + "\n    }\n".len())
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("state_jumped = true"),
+            "tick 必须在 note_playback() 判出跃迁的分支里置 state_jumped = true"
+        );
+        assert!(
+            body.contains("tick_inputs(state_jumped, timeline_read)"),
+            "tick 必须把真实输入交给 tick_inputs()，不许绕过"
+        );
+        assert!(
+            !body.contains("tick_inputs(false"),
+            "禁止把 state_jumped 写死成 false（G8-② 修复会静默失效）"
+        );
+        assert!(
+            !body.contains("read_timeline_now ="),
+            "read_timeline_now 必须由 tick_inputs() 派生，不许再立局部变量"
+        );
     }
 }

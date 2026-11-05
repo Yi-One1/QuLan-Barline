@@ -12,8 +12,8 @@
 // 任何头文件——rc.exe 的默认包含路径不保证可用，零 include 最稳。
 // FILEVERSION / PRODUCTVERSION 是逗号分隔的 4 个 16 位数，与 Cargo 版本同步改。
 1 VERSIONINFO
-FILEVERSION     1,9,1,0
-PRODUCTVERSION  1,9,1,0
+FILEVERSION     1,9,2,0
+PRODUCTVERSION  1,9,2,0
 FILEOS          0x40004L   // VOS_NT_WINDOWS32
 FILETYPE        0x1L       // VFT_APP
 FILESUBTYPE     0x0L       // VFT2_UNKNOWN
@@ -25,12 +25,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "Yi One"
       VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
-      VALUE "FileVersion",      "1.9.1"
+      VALUE "FileVersion",      "1.9.2"
       VALUE "InternalName",     "barline"
       VALUE "LegalCopyright",   "MIT License. Yi One."
       VALUE "OriginalFilename", "barline.exe"
       VALUE "ProductName",      "曲栏 Barline"
-      VALUE "ProductVersion",   "1.9.1"
+      VALUE "ProductVersion",   "1.9.2"
     END
   END
   BLOCK "VarFileInfo"
