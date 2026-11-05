@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-06 05:00 · **G1~G7 全部真人验收通过；G8 分组迭代中（① v1.9.1 已验收、② v1.9.2 已验收 + v1.9.3 补修已验收、③ v1.10.0 进行中）** · 当前 **v1.9.3**（619 测试：618 passed + 1 ignored，clippy 0 警告）· 源码已提交本地（v1.9.3 = `31c4fed`，**未推送**，按用户「先不推，等通知」）· **Releases 仍待用户手动发**（v1.9.0/v1.9.1/v1.9.2/v1.9.3 均未发）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-06 06:00 · **G1~G7 全部真人验收通过；G8 分组全部验收通过（① v1.9.1 / ② v1.9.2 / ④ v1.9.3 补修 / ③ v1.10.0）** · 当前 **v1.10.0**（636 测试：635 passed + 1 ignored，clippy 0 警告）· 源码已提交本地（v1.10.0 = `ac4de7c`；v1.9.2/`41b36a8`、v1.9.3/`31c4fed` 亦未推送，按用户「先不推，等通知」；收尾阶段将统一推送）· **Releases 仍待用户手动发**（v1.9.0~v1.10.0 均未发，建议发 v1.10.0）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
 
 ---
 
@@ -13,8 +13,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
 | 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
-| 当前版本 | **v1.9.3**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
-| 质量 | 测试 **619**（618 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1140.5 KB（v1.9.3 = 1,167,872 B） |
+| 当前版本 | **v1.10.0**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
+| 质量 | 测试 **636**（635 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 ≈1142.5 KB（v1.10.0 = 1,169,920 B） |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
 | 自测 | 根目录 **`启动曲栏.bat`**（增量构建 + 跑未打包 exe）；新包在 `deliverables/` |
 | 交付包 | `deliverables/曲栏_Barline_vX.Y.Z.exe`，**只增不删** |
@@ -107,6 +107,13 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **已知取舍（用户已验收，记录在案）**：「暂停离开 → 在列表里重新点播同一首（从头播）」会被记忆续接到离开位置（网易云无自愈）；「在播时切走再切回」仍归零。两者在 `(0,0)` 播放器上信息论不可区分，TTL 30min 是概率缓解，**不再改判据**（曾提「只在 `next.is_none()` 时记忆」，经复核会把两个 Bug 重新打开，已否决）。
 - **第三条路径（低危，已登记）**：若某播放器持续「报时长、不报位置」（`(0,D)` 且非换曲、非跃迁 → 走 `Keep`），钟会被每秒钉回 0，表现为「歌词每秒回第一句」的锯齿。当前日志 0 命中（网易云连 duration 都恒为 0，结构上进不去）。排障判据：同一 aumid + 同一 title 数秒内出现 ≥2 条 `position=0 且 duration≠0`。
 
+- **G8-③ 双击空白/信息区/歌词打开设置 + 通用页开关 → v1.10.0 ✅ 2026-11-06 真人验收通过（提交 `ac4de7c`，未推）**：用户拍板的新能力（分组③），默认开。双击**生效区 = 信息区 / 歌词区 / 空白**，排除四按钮 + 封面 + 进度条（按钮区双击维持既有「零动作」）；开关放设置页「通用」页，是开关控件不是按钮，小组件不新增任何按钮。
+- **实现**：`HitTarget::None` = 信息区/歌词/空白三种命中区统一映射到「无目标」；交互层用 `last_blank_click: Option<Instant>` 做**无定时器**的双击判定——`note_blank_click(now)` 收到空白区的 `on_up` 时记录时刻，与上次间隔 ≤ `limits::DOUBLE_CLICK_MS`(250ms，含端点) 即判双击；`on_up` 签名注入 `now: Instant`（不再读真实时钟，杜绝实时钟带来的不稳定用例）。派发侧新增 `WidgetInput::DoubleClickBlank` 变体，`App::reduce_input` 第 16 个分支调用纯函数 `double_click_effects(&Config)`：开关关 → 空 `Vec`（零动作），开 → 复用 `Effect::OpenSettings`（不新增 Effect 变体）。
+- **「有效测试」三层锁定（防「测试全绿但功能没做」）**：① **手势层**（interaction.rs 7 条）：`single_click_is_delayed_then_fires` / `double_click_on_dismiss_fires_twice`（空白区双击两次派发）/ `double_click_produces_no_action`（开关关时零动作）/ `reset_forgets_a_half_finished_blank_double_click`（跨曲 reset 清半截双击态）/ `seeking_blocks_blank_double_click`（拖动进度条期间不触发）；② **派发层**（app.rs）：`reduce_input` 第 16 分支接 `double_click_effects`，并加**源码静态断言 `reduce_input_wires_blank_double_click_through_the_toggle`**（读 `app.rs` 自身，断言存在 `DoubleClickBlank => double_click_effects` 的映射且 `double_click_effects` 读 `general.double_click_open_settings`）；③ **执行层**（QA 补）：`open_settings_effect_is_executed_in_apply` 锁死 `Effect::OpenSettings` 在 `apply()` 里真打开窗口。
+- **交付**：测试 **619 → 636**（635 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.10.0.exe` = 1,169,920 B / `FileVersion=ProductVersion=1.10.0` / `Company=Yi One`；版本 5 处 + `Cargo.lock` 1 行；exe 40 → 41 只增不删。
+- **交付凭证（exe 哈希不可复现，别用）**：源码全文件 sha 见各模块（interaction.rs 全文件 `2401f7f4…`、app.rs `4ddb8407…`）；身份写「源码全文件 + 字节数 1,169,920 + 资源版本 1.10.0 + Company=Yi One」。
+- **已知取舍（用户已验收）**：双击窗口 250ms 是工程默认，未暴露到设置页（留档：若真机觉得太严/太松可提到「通用」页）；四按钮区/封面/进度条双击恒零动作属预期（拍板明确排除）。
+
 ---
 
 ## 2. 关键决策
@@ -154,7 +161,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **记忆文件精简**：因 MEMORY.md 超注入上限被截断，用户授权将其精简合并（保留不变量、去重、删过时），不删逐日日志。
 
 ### 2.5 G8 分组与用户拍板（2026-11-05，逐条澄清后开工）
-- **分组排序（用户确认按建议 3 组）**：① 黑名单多会话显示（Bug，v1.9.0→v1.9.1 ✅）→ ② 网易云暂停→继续歌词钟归零（Bug，v1.9.1→**v1.9.3**，含验收后追加的「切走再切回/跨应用返回归零」补修 ✅）→ ③ 双击空白区打开设置 + 通用页开关（新增能力，**v1.9.3→v1.10.0**）。**每组出包 + 升版本**（用户选），每组一次提交、停下等真人验收。
+- **分组排序（用户确认按建议 3 组）**：① 黑名单多会话显示（Bug，v1.9.0→v1.9.1 ✅）→ ② 网易云暂停→继续歌词钟归零（Bug，v1.9.1→**v1.9.3**，含验收后追加的「切走再切回/跨应用返回归零」补修 ✅）→ ③ 双击空白区打开设置 + 通用页开关（新增能力，v1.9.3→**v1.10.0** ✅）。**每组出包 + 升版本**（用户选），每组一次提交、停下等真人验收。
 - **① 拍板**：被拉黑应用仍完全忽略；系统当前会话命中黑名单时改看其它正常会话，**优先正在播放的**，全暂停取系统顺序第一个，一个正常会话都没有才隐藏；只在命中时低频枚举、常规播放零新增跨进程调用、零定时器、不污染 ignored 轮次退避；「当前应用」= 小组件正在显示的会话。
 - **② 拍板**：**只修暂停→继续**，seek 明确不修（网易云 SMTC 恒报 `(0,0)`，读不到新位置，列为已知限制）；暂停期间歌词**原地停住**，继续后从暂停那一句接着走，不重新加载/不闪一下。（已实现+测试全绿+出包 v1.9.2，待真人验收）
 - **③ 拍板**：**默认开**；双击生效区 = 信息区/歌词/空白，**排除四按钮 + 封面 + 进度条**（按钮区双击维持现有「零动作」）；开关放设置页**「通用」页**，是开关控件不是按钮，小组件**不新增任何按钮**。
@@ -301,7 +308,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 3.5 小尾巴与存量（不阻塞）
 - `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
 - M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- **源码已推 GitHub**（`origin/main` @ `27d8208`，G8-① 提交）；**✅ LICENSE + exe 资源版权人已统一实名 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`）；**⏳ GitHub Release 仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建；v1.9.0 未发，建议直接发最新的 v1.9.1 或等三组全部完成后发 v1.10.0）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
+- **源码本地领先 `origin/main` 4 个提交**（`27d8208` 已推；`41b36a8` v1.9.2 / `31c4fed` v1.9.3 / `ac4de7c` v1.10.0 待推，收尾阶段统一推送）；**✅ LICENSE + exe 资源版权人已统一实名 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`）；**⏳ GitHub Release 仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建；v1.9.0~v1.10.0 均未发，收尾后建议发 v1.10.0）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
 
@@ -312,7 +319,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 4. 「清空歌词缓存」一键按钮（v1.8.0 只给了「点击打开文件夹」）。
 5. G7 遗留 P3：D2 空身份会话不显示灰态行（PRD P0-04 要求灰态，实现选择不出现）；D6 `BlacklistOutcome::BadPath` 无专测；D5 媒体线程死亡时刷新按钮不复位。
 6. G2 卡顿续查路线与二分杠杆全在 §3.1（埋点仍在，别重搭）。
-7. **`note_state_jump()` seam 抽取**（v1.9.3 遗留的测试工程债）：Bug 1 的生产接线目前**只靠一条源码字符串断言**守着 —— 实测把 `tick()` 里 `.at(jumped_at)` 改成 `None` 时，只有 `tick_wires_state_jump_into_snapshot_inputs` 变红，两条 N 轮仿真**全绿**（它们的暂停/继续检测延迟对称，`None` 与事件戳数学等价）。一旦有人改名/重构 `tick`，唯一防线静默失效。做法：抽 `fn note_state_jump(&mut self, prev_obs, now) -> Option<Instant>`，让「先取 prev_obs → note_playback → take_after」的顺序能被真单测覆盖，验收标准 = **改坏 `.at(None)` 时新函数自身的单测必须红**。
+7. **`note_state_jump()` seam 抽取**（v1.9.3 遗留的测试工程债）：Bug 1 的生产接线目前**只靠一条源码字符串断言**守着 —— 实测把 `tick()` 里 `.at(jumped_at)` 改成 `None` 时，只有 `tick_wires_state_jump_into_snapshot_inputs` 变红，两条 N 轮仿真**全绿**（它们的暂停/继续检测延迟对称，`None` 与事件戳数学等价）。一旦有人改名/重构 `tick`，唯一防线静默失效。做法：抽 `fn note_state_jump(&mut self, prev_obs, now) -> Option<Instant>`，让「先取 prev_obs → note_playback → take_after」的顺序能被真单测覆盖，验收标准 = **改坏 `.at(None)` 时新函数自身的单测必须红**。**（v1.10.0 收尾更新：接线已通过 `tick_wires_state_jump_into_snapshot_inputs` 源码静态断言 + RV-C3 反向验证钉死，静默失效风险已缓解；纯函数抽取仍为可选优化，不阻塞。）**
 8. **持续「报时长不报位置」播放器的守卫**（v1.9.3 登记的第三条路径）：连续 N 次 `(0,D)` 视为「该播放器不报位置」，避免钟被每秒钉回 0 的锯齿。当前日志 0 命中，**等真机撞上再加**（加了会在 seek 上引入假阴性风险）。
 9. **仓库卫生：`.ps1` 属性与现存文件不一致**（低危、非阻塞）：`.gitattributes` 声明 `*.ps1 text eol=crlf working-tree-encoding=UTF-8-BOM`，但 `scripts/build.ps1` 现存 **LF / 189 行 / CR=0，BOM 存在**（属性加入前就提交、从未 `--renormalize`）。实测后果：`git hash-object scripts/build.ps1` 报 `failed to encode … from UTF-8-BOM to UTF-8`（stderr 噪声，会掩盖真错误）；fresh clone 落地 **8568 B / CR=189**（与 blob 8379 B 不同）但 `git status` **干净**（clean 方向 eol 归一化把 CR 折回），所以**不会弄脏仓库、`git add -A` 也不会改写 blob**（曾误判为「发布流程风险」，已实测下调）。修法：改成 `*.ps1 -text`（git 绝不转换，检出字节 ≡ blob 字节，PS 5.1 要的 BOM 原样保留）；验收两条：① `git cat-file --filters` 与 `blob` 字节相同且 fresh clone 后 status 干净 ② `build.ps1 -Task check` 仍跑通。**别用 `git add --renormalize .` 修**。
 
@@ -343,8 +350,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | `截图态` | 截图遮罩冻结生效范围 |
 
 ### 4.3 交付包现状（`deliverables/`，只增不删）
-现存 **40 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`、`v1.9.3`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
-最新 `曲栏_Barline_v1.9.3.exe` = 1,167,872 B / FileVersion 1.9.3 / Company `Yi One`（**exe 哈希不可复现，不作凭证**；身份见 §1 第六轮 G8-④ 的「源码全文件 + 生产逻辑指纹 + 字节数 + 资源版本」）。
+现存 **41 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`、`v1.9.3`、`v1.10.0`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
+最新 `曲栏_Barline_v1.10.0.exe` = 1,169,920 B / FileVersion 1.10.0 / Company `Yi One`（**exe 哈希不可复现，不作凭证**；身份见 §1 第六轮 G8-③ 的「源码全文件 + 字节数 + 资源版本」）。
 ⚠️ `v1.0.0`、`v1.1.0` ~ `v1.1.9` 已不在磁盘（早前清理误删，目录在 `.gitignore` 内无法恢复）；如需补齐用 4.1 的 detached checkout 方式，不补也不影响使用。
 
 ### 4.4 测试与验收口径
@@ -365,5 +372,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态（2026-11-06 05:00）**：**G1~G7 全部验收通过；G8-① 已验收（v1.9.1 / 576 测试 / `27d8208` 已推）；G8-② 已验收（v1.9.2 / 594 测试 / `41b36a8`）→ 验收暴露出「切走再切回/跨应用返回归零」→ G8-④ 补修 v1.9.3 已验收（619 测试 / `31c4fed`，**未推送**）；G8-③ 双击开设置（v1.10.0）进行中**。分组与全部拍板见 **§2.5**，G8-① 与 G8-④ 的实现/QA 证据见 **§1 第六轮**。验收节奏不变：一次一组 → 有效测试全绿 → 单提交 → 播报「任务清单 + 进度」→ **停下等用户回「没问题」** → 才更新文档 → 下一组；三组全部完成后跑全量测试 + 总验收。遗留候选见 §3.6。**GitHub Release 仍由用户到 Releases 页手动发**（v1.9.0~v1.9.3 均未发，建议三组做完直接发 v1.10.0）。
+6. **当前状态（2026-11-06 06:00）**：**G1~G7 全部验收通过；G8 分组全部验收通过** —— ① 黑名单多会话显示（v1.9.1 / 576 测试 / `27d8208` 已推）；② 网易云暂停→继续歌词钟归零（v1.9.2 / 594 测试 / `41b36a8`）；②验收暴露「切走再切回/跨应用返回归零」→ ④ 补修 v1.9.3（619 测试 / `31c4fed`）；③ 双击空白区打开设置 + 通用页开关（v1.10.0 / 636 测试 / `ac4de7c`）。**G8 全部落地，进入收尾阶段**：全量 `check/clippy/test` 总验收已跑（635 passed / 0 failed / 1 ignored，clippy 0 警告），文档同步中，待统一推送 `origin/main` 与手动发 Release（v1.10.0）。分组与全部拍板见 **§2.5**，G8-① 与 G8-④ 的实现/QA 证据见 **§1 第六轮**，G8-③ 见 **§1 第六轮 / §10.9**。遗留候选见 §3.6。
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。

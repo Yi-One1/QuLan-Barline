@@ -2141,6 +2141,17 @@ TIMER_CLICK 到点 → 若 pending_click 且未收到第二次 DOWN → 执行�
 
 ---
 
+### 10.9 双击空白/信息区/歌词打开设置（v1.10.0）
+
+- 背景：G8-③ 用户能力。双击小组件的「空白区 / 信息区（歌名+歌手）/ 歌词区」打开设置页；封面、四按钮、进度条双击维持既有「零动作」。开关 `general.double_click_open_settings`（默认 true）放设置页「通用」页，是开关控件不是按钮，小组件不新增任何按钮。
+- 命中区模型：`HitTarget::None` 现在统一表示「信息区 / 歌词区 / 空白」三类非交互区（与 `Dismiss`/`Button`/`Cover`/`Progress` 并列）。`on_up` 在 `target == HitTarget::None` 时走空白双击分支。
+- 无定时器双击判定：`Interaction` 持 `last_blank_click: Option<Instant>`；`note_blank_click(now)` 收到空白区 `on_up` 时，与上次间隔 ≤ `limits::DOUBLE_CLICK_MS`(250ms，含端点) 即产生 `WidgetInput::DoubleClickBlank`，否则只更新时间戳。无 `SetTimer`、无实时钟轮询（与 §10.8 的 `TIMER_CLICK` 单击延迟判定并存但互不干扰——空白区永不产生单击动作，故双击与单击不会冲突）。
+- 真实时钟隔离：`on_up(&mut self, layout, now: Instant, x, y)` 注入 `now` 而非读 `Instant::now()`，使判定可在单测里用确定时间戳驱动（杜绝真实时钟带来的 flaky 用例）。
+- 派发与执行：`WidgetInput::DoubleClickBlank` → `App::reduce_input` 第 16 分支调用纯函数 `double_click_effects(&Config)`：开关关 → 空 `Vec`（零动作，且不放任何 Effect）；开关开 → 复用 `Effect::OpenSettings`（不新增 Effect 变体，第二开窗口复用现有路径）。
+- 三层测试锁定（防「测试全绿但功能没做」）：① 手势层 interaction.rs 7 条（含 `double_click_on_dismiss_fires_twice`、`double_click_produces_no_action`、`reset_forgets_a_half_finished_blank_double_click`、`seeking_blocks_blank_double_click`）；② 派发层 `reduce_input_wires_blank_double_click_through_the_toggle` 源码静态断言（读 `app.rs` 自身，断言 `DoubleClickBlank => double_click_effects` 映射存在且读 `general.double_click_open_settings`）；③ 执行层 QA 补 `open_settings_effect_is_executed_in_apply`（锁 `Effect::OpenSettings` 在 `apply()` 真打开窗口）。
+
+---
+
 ## 11. 渲染管线、亮度自适应与悬停模糊
 
 ### 11.1 渲染管线
