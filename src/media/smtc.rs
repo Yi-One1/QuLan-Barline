@@ -44,11 +44,25 @@
 //! `position_at` 是 UI 外推的基准，取错 = 歌词/进度漂移。v1.4.2 曾把它绑到
 //! `timeline_at`：对网易云（恒 0/0、时间线退避 5s、切歌由 2s 慢层发现）等于把
 //! 歌词钟拨快最多 5s。现在按 [`anchor_of`] 的三规则取值，细节见该函数注释。
+//!
+//! ## 歌词钟连续性（v1.9.3 / G8-④）
+//!
+//! 网易云恒报 `(position=0, duration=0)`，歌词钟完全靠「锚点 + 1:1 走表」
+//! 自维护，所以**钟的连续性**是这一层的核心不变量，三条铁律：
+//! 1. **位置与锚点严格配对**：`parts.timeline_at` 只能是
+//!    `parts.position_ms` 被采到的时刻。`(0,0)` 读数不许刷新它
+//!    （否则就是「陈旧位置 @ 新鲜时刻」，任一次并发发布都会把钟整段拽回去）；
+//! 2. **跃迁锚在跃迁时刻**，不是「检测到它的那一轮」（`TickInputs::jumped_at`
+//!    来自 `PlaybackInfoChanged` 的到达时刻，见 [`transition_at`]）——暂停与
+//!    继续两个方向同源，单轮偏差相等才能逐轮抵消；
+//! 3. **离开一首歌要把钟记下来**（[`LyricClockMemory`]）：跨应用 / 跨会话 /
+//!    同 App 换歌再换回来时，只要本轮拿不到可信位置就续接记忆里的位置，
+//!    而不是从 0 重唱；真正没听过的歌仍然 `Reset` 归零。
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::Result;
@@ -366,6 +380,14 @@ impl Cadence {
         jumped
     }
 
+    /// 上一次快层观测的时刻（G8-④：跃迁时刻的陈旧性判据）。
+    ///
+    /// 必须在调用 [`Cadence::note_playback`] **之前**取：`note_playback` 会把它
+    /// 推到 `now`，之后就拿不到「上一次确认旧状态是什么时候」了。
+    fn last_playback_obs(&self) -> Option<Instant> {
+        self.last_playback
+    }
+
     /// 记录一次时间线读取。返回「是否需要立即补读属性」（切歌 / 重播的信号）。
     fn note_timeline(&mut self, now: Instant, position: Ms, duration: Ms) -> bool {
         self.last_timeline = Some(now);
@@ -445,8 +467,11 @@ fn due(last: Option<Instant>, now: Instant, interval_ms: u64) -> bool {
 /// **锚点规则**：这份快照的 `position_at`（UI 外推的基准）取哪个时刻。
 ///
 /// 取错就是「歌词/进度与音频漂移」，三种情况（按顺序判）：
-/// 1. 本轮**读过时间线** → 用该次读取的时刻（`timeline_at`，恰好就是本轮 `now`）。
-///    位置是新鲜的，外推从读取时刻起算；
+/// 1. 本轮**读过时间线** → 用该位置**被采到的时刻**（`timeline_at`）。
+///    ⚠️ v1.9.3 起它不再等于「本轮 `now`」：`(0,0)` 读数不许刷新它
+///    （见 [`PollState::apply_timeline_read`]），所以它可能早于 `now`。
+///    规则本身没变，变的只是「它装的是什么」——现在它永远与
+///    `parts.position_ms` 严格配对，不会出现「陈旧位置 @ 新鲜时刻」；
 /// 2. 本轮没读时间线，但 `track_id` 相对上一份快照**变了**（切歌）→ 用**检测时刻**。
 ///    网易云恒报 `(0,0)`、时间线还在退避里，切歌只能由慢层发现——旧版歌词能同步，
 ///    靠的正是「位置恒 0、歌词钟从检测时刻起走表」，这条规则把它显式化了；
@@ -470,7 +495,7 @@ fn anchor_of(
     prev.unwrap_or(now)
 }
 
-// ---------------------------------------------------------------- 歌词钟续接（G8-②）
+// ---------------------------------------------------------------- 歌词钟续接（G8-②/G8-④）
 
 /// G8-②：一次快照发布前，对「歌词钟」（`position_ms` / `position_at`）的动作。
 ///
@@ -506,6 +531,9 @@ pub struct TickInputs {
     /// 本轮是否读过时间线（`anchor_of` 规则 1 的依据）。恒等于
     /// `timeline_read.is_some()`；由 [`tick_inputs`] 派生，测试可直接给。
     pub read_timeline_now: bool,
+    /// G8-④：本轮跃迁**真正发生**的时刻（见 [`transition_at`]）。
+    /// `None` = 不是跃迁轮次（或没有事件时刻可用，退回本轮 `now`）。
+    pub jumped_at: Option<Instant>,
 }
 
 /// G8-②：`TickInputs` 的**唯一生产构造入口**（纯函数）。
@@ -513,11 +541,27 @@ pub struct TickInputs {
 /// 生产代码只经这里构造，`read_timeline_now` 一律由 `timeline_read.is_some()`
 /// 派生 —— 真实读数与 `(0,0)` 都算「这轮读过时间线」（锚点规则 1 依赖它：
 /// 读过就以该次读取时刻为锚点，切歌则由规则 2 覆盖）。
+///
+/// G8-④：跃迁时刻另走 [`TickInputs::at`]，**不塞进这里的第二个实参**——
+/// `tick_wires_state_jump_into_snapshot_inputs` 逐字断言 `tick()` 里出现
+/// `tick_inputs(state_jumped, timeline_read)`，把 `jumped_at` 塞进签名会让那条
+/// 接线断言失效。
 pub fn tick_inputs(state_jumped: bool, timeline_read: Option<(Ms, Ms)>) -> TickInputs {
     TickInputs {
         state_jumped,
         timeline_read,
         read_timeline_now: timeline_read.is_some(),
+        jumped_at: None,
+    }
+}
+
+impl TickInputs {
+    /// G8-④：补上「跃迁真正发生的时刻」（唯一生产调用点在 `tick()` 里）。
+    ///
+    /// 传 `None` 等价于旧行为（用本轮 `now` 当跃迁时刻）。
+    pub fn at(mut self, jumped_at: Option<Instant>) -> Self {
+        self.jumped_at = jumped_at;
+        self
     }
 }
 
@@ -528,9 +572,10 @@ pub fn tick_inputs(state_jumped: bool, timeline_read: Option<(Ms, Ms)>) -> TickI
 /// [`Cadence::note_playback`] 判出的播放状态跃迁；`track_changed` = `track_id`
 /// 相对上一份快照变了；`has_prev` = 已有上一份已广播快照。
 ///
-/// 「没拿到可信位置」= 本轮读到 `(0,0)`，或本轮压根没读时间线且播放器从不报
-/// 时长（5s 退避里由慢层发现切歌的场景）。后者若漏掉，换歌时会把上一首续接的
-/// 歌词钟带进新歌。
+/// 「没拿到可信位置」= **本轮读到的位置是 0**（`(0,0)` 与 `(0,真实时长)` 都算：
+/// 时长有值不代表位置已上报，判据必须是位置本身），或本轮压根没读时间线且
+/// 播放器从不报时长（5s 退避里由慢层发现切歌的场景）。后者若漏掉，换歌时会把
+/// 上一首续接的歌词钟带进新歌。
 ///
 /// 优先级（背景：网易云恒报 `(0,0)`，那个读数**不是**有效位置，程序实际靠
 /// `position_at` 线性外推维持歌词钟。旧实现状态跃迁时立即补读时间线，把
@@ -548,8 +593,9 @@ pub fn lyric_clock_action(
     has_prev: bool,
 ) -> LyricClockAction {
     let no_usable_position = match timeline {
-        Some((0, 0)) => true,
-        Some(_) => false,
+        // v1.9.3 / G8-⑤：判据是「位置是否为 0」，不是「时长有没有值」——
+        // `(0, 真实时长)` 是「时长已知、位置还没上报」，不是可信位置。
+        Some((position, _)) => position == 0,
         None => zero_duration,
     };
     if !no_usable_position {
@@ -581,6 +627,225 @@ pub fn lyric_clock_at(prev: &NowPlaying, now: Instant) -> Ms {
     }
     let elapsed = now.saturating_duration_since(prev.position_at).as_millis() as Ms;
     prev.position_ms.saturating_add(elapsed)
+}
+
+// ------------------------------------------------- G8-④：跃迁时刻（v1.9.3）
+
+/// `PlaybackInfoChanged` 的**到达时刻**（媒体线程 ↔ WinRT 回调共享）。
+///
+/// 为什么需要它：歌词钟对「状态跃迁发生在何时」只能猜。旧实现用「检测到的那
+/// 一轮的 `now`」，于是
+/// - 暂停方向：时钟会**多走**「真暂停 → 被检测到」这一段（最多一个快层间隔
+///   500ms，实测事件驱动下约 60ms）；
+/// - 继续方向：时钟**丢掉**同样一段。
+///
+/// 两者用同一条规则、同一套延迟时逐轮精确抵消（`g8_lyric_clock` 的 N 轮仿真
+/// 与用户真机日志双向印证：d≈r≈60ms 时误差恒为 ±2ms）；但只要两个方向的延迟
+/// 不等（例如某一个方向的事件没到、只能等轮询），误差就会按 (d−r)/轮 **线性
+/// 累加**，表现为「暂停几次之后歌词越来越靠后」。
+///
+/// 解法是把两个方向都锚到**同一个来源**——事件到达时刻：它是真实的跃迁时刻
+/// 加上「事件延迟」，而事件延迟对暂停/继续是同一套回调、同一个量级，逐轮误差
+/// 相等 → 逐轮抵消，不再随轮询相位漂。
+///
+/// 实现代价：回调里只做一次 `Instant::now()` + 一次极短加锁（**零 COM、零
+/// 分配、零日志**）；拿不到就退回本轮 `now`，即与旧行为完全一致。
+#[derive(Clone, Default)]
+struct PlaybackEventClock {
+    at: Arc<Mutex<Option<Instant>>>,
+}
+
+impl PlaybackEventClock {
+    /// 回调侧：记下「此刻刚收到一次 `PlaybackInfoChanged`」。
+    fn stamp(&self) {
+        self.stamp_at(Instant::now());
+    }
+
+    /// 记下指定时刻（单测注入用；生产只经 [`PlaybackEventClock::stamp`]）。
+    fn stamp_at(&self, at: Instant) {
+        if let Ok(mut slot) = self.at.lock() {
+            *slot = Some(at);
+        }
+    }
+
+    /// 主循环侧：取走「上一次快层观测之后」的跃迁时刻。
+    ///
+    /// 早于 `after` 的时间戳一律丢弃（那是更早一次跃迁的残留，用它会把时钟
+    /// 往错误的方向挪）；无论取舍都消费掉，避免陈旧时间戳反复被误用。
+    fn take_after(&self, after: Option<Instant>) -> Option<Instant> {
+        let Ok(mut slot) = self.at.lock() else {
+            return None;
+        };
+        let taken = slot.take();
+        match (taken, after) {
+            // 严格早于上一次观测 = 更早一次跃迁的残留；「恰好相等」要收下：
+            // 事件触发的强制读本身会把 `last_playback` 推到自己这个时刻。
+            (Some(t), Some(a)) if t < a => None,
+            (t, _) => t,
+        }
+    }
+}
+
+/// G8-④：跃迁时刻的取值（**纯函数**）。
+///
+/// 有事件时刻且不晚于本轮 `now` → 用它；否则退回本轮 `now`（旧行为）。
+/// 晚于 `now` 的时间戳只可能来自时钟异常，直接丢弃，绝不让时钟倒退。
+fn transition_at(now: Instant, event_at: Option<Instant>) -> Instant {
+    match event_at {
+        Some(e) if e <= now => e,
+        _ => now,
+    }
+}
+
+// ------------------------------------------------- G8-④：歌词钟记忆（v1.9.3）
+
+/// 一条「这首歌离开时的歌词钟」。
+struct ClockMemoryEntry {
+    aumid: String,
+    track_id: TrackId,
+    /// 离开那一刻的歌词钟位置（已按离开时刻外推，**不再按离开时长续推**）
+    position_ms: Ms,
+    /// 记账时刻（TTL 判据；也是「淘汰最老一条」的判据）
+    sampled_at: Instant,
+    /// 离开那一刻的播放态：`Paused` = 原样续接；`Playing` = 只是**停车值**。
+    state: PlaybackState,
+}
+
+/// 这条记忆能不能用来续接（**纯函数**，v1.9.3 / G8-⑤）。
+///
+/// **只有「离开时暂停」才续接。** 判据来自「宁可落后，绝不超前」这条红线：
+///
+/// | 离开时 | 再出现最可能是什么 | 续接的后果 |
+/// |---|---|---|
+/// | `Paused` | 用户把这首歌停在那儿，回头接着听 | 精确（暂停值就是真值）→ **续接** |
+/// | `Playing` | ① 被别的应用顶掉 ② 用户切走后**在列表里重新点了这首歌**（网易云点列表 = 从头播）③ 顺序播完后再点（也是从头） | ②③ 会把歌词拨到**还没唱到**的句子，而网易云读不到真实位置、**没有任何自愈机会**，错误会持续整首 |
+///
+/// ②③ 与 ① 在 `(0,0)` 播放器上**无法区分**（没有任何位置信息），所以只能按
+/// 最坏情况处理：`Playing` 离开的记忆一律不续接，退回 `Reset 0`（落后）。
+/// 代价写在 `docs`/报告里：**「在播时切走、再切回同一首」这一类丢钟没有修复**
+/// （用户日志 02:21:26 那次就属于这一类）。
+///
+/// 另外 `NoSession` / `Fallback` 也不续接：那不是「这首歌被暂停」，是状态未知。
+fn restorable(leave_state: PlaybackState) -> bool {
+    leave_state == PlaybackState::Paused
+}
+
+/// 一次命中的记忆（只带出必要字段，保持纯数据、可单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredClock {
+    pub position_ms: Ms,
+    /// 离开时的播放态（决定「原样续接」还是「按停车值续接」，见 [`LyricClockMemory::restore`]）
+    pub leave_state: PlaybackState,
+}
+
+/// G8-④：**按 (aumid, track_id) 记住「这首歌离开时的歌词钟」**。
+///
+/// 恒报 `(0,0)` 的播放器（网易云）读不到真实位置，歌词钟完全靠
+/// `position_at` 线性自维护。身份一变（跨应用切走再切回 / 同 App 换歌再换回 /
+/// 会话被系统短暂丢弃），`track_changed` 就会走 `Reset` 把钟归零 ——
+/// 用户真机日志实证：02:25:19 暂停在 `position=141223`，切到汽水再切回来，
+/// 02:26:50 变成 `position=0`，歌词从第一句重唱。
+///
+/// 存取口径（保守优先，宁慢不快）：
+/// 1. **只在「本轮没有任何可信位置」时才被查**：真实上报位置的播放器（汽水）
+///    走 `Keep`，一个字节都不经过这里；
+/// 2. **绝不按离开时长向前外推，且只在「离开时暂停」时续接**（[`restorable`]）：
+///    歌曲被别的应用顶掉 / 用户切走后重新点播时它到底在哪，我们无从得知。
+///    宁可停在「离开时的位置」（歌词宁可慢一点点），也不把歌词往前拨——
+///    往前拨是「唱到还没播的句子」，比落后更刺眼，而且 `(0,0)` 播放器没有
+///    任何自愈机会；
+/// 3. 有时效与容量，过期/超容即视为不可信，退回 `Reset`（真新歌仍然从 0 开始）。
+#[derive(Default)]
+struct LyricClockMemory {
+    entries: Vec<ClockMemoryEntry>,
+}
+
+impl LyricClockMemory {
+    /// 记下 `snapshot`（**即将被替换或丢弃的那一份**）的歌词钟。
+    ///
+    /// 位置按 `now` 外推（`Playing` 的曲子「离开那一刻」就是 `now`），
+    /// 此后 **只读不推**。
+    fn remember(&mut self, snapshot: &NowPlaying, now: Instant) {
+        if snapshot.track_id == 0 || snapshot.session.aumid.is_empty() {
+            return;
+        }
+        let position_ms = lyric_clock_at(snapshot, now);
+        self.prune(now);
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.track_id == snapshot.track_id && e.aumid == snapshot.session.aumid)
+        {
+            e.position_ms = position_ms;
+            e.sampled_at = now;
+            e.state = snapshot.state;
+            return;
+        }
+        if self.entries.len() >= limits::LYRIC_CLOCK_MEMORY_CAP {
+            // 淘汰 sampled_at 最老的一条：确定性（同刻取靠前者），且不需要
+            // 额外维护 LRU 访问序——记住的语义本来就是「按时间新旧」。
+            let mut oldest = 0usize;
+            for (i, e) in self.entries.iter().enumerate() {
+                if e.sampled_at < self.entries[oldest].sampled_at {
+                    oldest = i;
+                }
+            }
+            self.entries.remove(oldest);
+        }
+        self.entries.push(ClockMemoryEntry {
+            aumid: snapshot.session.aumid.clone(),
+            track_id: snapshot.track_id,
+            position_ms,
+            sampled_at: now,
+            state: snapshot.state,
+        });
+    }
+
+    /// 查「这首歌离开时的钟」。`None` = 没记过 / 已过期 / 不可续接
+    /// （见 [`restorable`]）/ 位置无意义（≤0）。
+    ///
+    /// 命中时返回的值**原样使用**（不按 `now - sampled_at` 外推），理由见类型
+    /// 注释第 2 条。
+    fn restore(&self, aumid: &str, track_id: TrackId, now: Instant) -> Option<RestoredClock> {
+        if track_id == 0 || aumid.is_empty() {
+            return None;
+        }
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.track_id == track_id && e.aumid == aumid)?;
+        let age_ms = now.saturating_duration_since(e.sampled_at).as_millis() as u64;
+        if age_ms > limits::LYRIC_CLOCK_MEMORY_TTL_MS {
+            return None;
+        }
+        if e.position_ms <= 0 {
+            return None;
+        }
+        if !restorable(e.state) {
+            crate::log_debug!(
+                "歌词钟记忆不可续接：{} track={} 离开时在播（可能是重播/被顶掉）",
+                aumid,
+                track_id
+            );
+            return None;
+        }
+        Some(RestoredClock {
+            position_ms: e.position_ms,
+            leave_state: e.state,
+        })
+    }
+
+    /// 丢掉过期条目（只影响超时的那几条，不影响「刚离开」的记忆）。
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|e| {
+            let age_ms = now.saturating_duration_since(e.sampled_at).as_millis() as u64;
+            age_ms <= limits::LYRIC_CLOCK_MEMORY_TTL_MS
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // ---------------------------------------------------------------- 分层读数缓存
@@ -750,6 +1015,10 @@ struct PollState {
     /// 上次因黑名单命中而枚举会话的时刻；`None` = 从未枚举（首次命中立即枚举）。
     /// 与 `last_ignore_probe` 分开记，避免 G7 的身份重查闸被 G8 的枚举互相带偏。
     last_session_scan: Option<Instant>,
+    /// G8-④：`PlaybackInfoChanged` 的到达时刻（跨线程，回调只写不读）。
+    playback_events: PlaybackEventClock,
+    /// G8-④：按 (aumid, track_id) 记住的「离开时歌词钟」。
+    memory: LyricClockMemory,
 }
 
 impl PollState {
@@ -769,6 +1038,8 @@ impl PollState {
             last_hit: None,
             display_session: None,
             last_session_scan: None,
+            playback_events: PlaybackEventClock::default(),
+            memory: LyricClockMemory::default(),
         }
     }
 
@@ -835,6 +1106,7 @@ impl PollState {
             &self.dirty,
             sink,
             self.parts.aumid.clone(),
+            self.playback_events.clone(),
         ));
     }
 
@@ -871,6 +1143,8 @@ impl PollState {
     /// **绝不**清 `parts` / `cadence` / `session_events`——`parts` 是唯一身份来源。
     fn enter_ignored(&mut self, sink: &EventSink<AppEvent>, now: Instant) {
         // ① 丢弃上一份快照；G8-①：进入空态就不再锁定任何替代会话
+        // G8-④：先记住歌词钟（被拉黑的应用解绑后，同一首歌不该从 0 重唱）
+        self.remember_leaving(None, now);
         self.last = None;
         self.cover.done = false;
         self.display_session = None;
@@ -971,6 +1245,8 @@ impl PollState {
         sink: &EventSink<AppEvent>,
         now: Instant,
     ) {
+        // G8-④：切换前把旧会话的歌词钟记下来（切回来还能续上）
+        self.remember_leaving(None, now);
         self.parts = SessionParts::default();
         self.parts.aumid = c.aumid.clone();
         self.parts.process_name = c.process_name.clone();
@@ -993,9 +1269,11 @@ impl PollState {
     ///
     /// 抽成独立方法是为了让事件接线可用假 `EventSink` 单测（无 COM）：
     /// `rescan_sessions()` 的 Release 分支只调用它，不再内联这些副作用。
-    fn apply_release(&mut self, decision: ScanDecision, sink: &EventSink<AppEvent>) {
+    fn apply_release(&mut self, decision: ScanDecision, sink: &EventSink<AppEvent>, now: Instant) {
         // 黑名单独象已不成立：解绑回常规路径，并让缓存身份不再被误判为命中。
         self.display_session = None;
+        // G8-④：丢弃快照前先记住歌词钟（解绑后重新看到同一首歌不该从 0 起）
+        self.remember_leaving(None, now);
         self.parts = SessionParts::default();
         self.cadence = Cadence::default();
         self.session_events = None;
@@ -1048,7 +1326,7 @@ impl PollState {
             decision @ ScanDecision::Release => {
                 // P2-1：与 Switch 分支一致清掉残留忽略态，否则「A 退出 / B 接管」
                 // 后托盘仍显示「恢复 A」，用户点它会误把 A 从黑名单移除。
-                self.apply_release(decision, sink);
+                self.apply_release(decision, sink, now);
                 false
             }
             ScanDecision::Hide => {
@@ -1161,29 +1439,63 @@ impl PollState {
         sink.send(AppEvent::IgnoredSession(None));
     }
 
-    /// G8-②：把一次时间线读数写进分层缓存（**无 COM，可单测**）。
+    /// G8-②/G8-④：把一次时间线读数写进分层缓存（**无 COM，可单测**）。
+    ///
+    /// **判据是「位置是否为 0」，不是「时长有没有值」**（v1.9.3 / G8-⑤ 收紧）。
     ///
     /// `(0,0)` 是「播放器根本没上报位置」，不是「位置等于 0」。网易云恒报它；
     /// 若照旧把 `parts.position_ms` 盖成 0，那么状态跃迁（或播控标志变化）
-    /// 引发的任意一次发布都会把歌词钟归零。因此 `(0,0)` 只更新时长与读取
-    /// 时刻，**位置保持上一份有效值**；真实读数则原样写入（汽水等行为不变）。
+    /// 引发的任意一次发布都会把歌词钟归零。
+    ///
+    /// **写入条件 = 「这条读数里至少有一个字段是真值」**（`position != 0 ||
+    /// duration != 0`），且**位置与采样时刻永远成对写**。
+    ///
+    /// 为什么 `(0,D)` 要写：真实上报位置的播放器（汽水 / Edge）把进度**拖回 0**
+    /// 时读到的就是 `(0,D)`。若不写，`parts.position_ms` 会停在旧值，`Keep` 拼出
+    /// 旧位置、`has_changed` 判 `delta ≈ 0` 静默丢弃 ⇒ **连发布都不发生**，歌词与
+    /// 进度卡在旧位置。真机日志里 17 次 `(0,D)` 全部是换曲瞬间（真实位置确实 ≈0），
+    /// 而换曲路径由 `Reset` 覆写，两者结果相同，所以这条写入是安全且必要的。
+    ///
+    /// 为什么它不会把网易云的钟砸到 0（G8-⑤ 的另一半在 `lyric_clock_action`）：
+    /// 1. 网易云 `position` 与 `duration` **恒为 0** ⇒ 走不进这个分支（两个都 0）；
+    /// 2. 换曲瞬间的 `(0,D)` 会被下一步 `Reset` 无条件覆写成 0，写与不写等价；
+    /// 3. 状态跃迁那一拍的 `(0,D)`：判据层把「位置 == 0」判成**不可信位置** ⇒
+    ///    走 `Carry` 续接，覆盖掉这里写入的 0。**两处必须同时成立**：只改判据层、
+    ///    写入层仍一字不写 → 暂停态 seek 回 0 卡死在旧位置；只改写入层、判据层
+    ///    仍把 `Some(_)` 当可信 → 跃迁那一拍绕过 Carry，钟被砸到 0。
+    ///
+    /// `timeline_at` 的唯一语义是「`parts.position_ms` 是**什么时候**采到的」，是
+    /// `anchor_of` 规则 1 的外推基准。它必须与位置**同生同死**：以前它会随每条读数
+    /// 刷成 `now`、却保留旧位置，于是构造出「陈旧位置 @ 新鲜时刻」——只要同一轮里
+    /// 还有别的字段变化（播控标志 / 封面 / 标题 / 播放态）而真的广播出去，UI 就会
+    /// 把时钟按陈旧位置重新起表，**整段已播时间被悄悄吃掉**（旧实现全靠
+    /// `has_changed` 的 `delta == 0` 兜住，属侥幸）。现在写位置才写时刻；只有
+    /// 「首份读数两个字段都是 0」（0 就是此刻建立的基准）才补一次 `timeline_at`。
     /// 注意 `note_timeline()` 的退避状态机仍照常吃 `(0,0)`，语义未动。
     fn apply_timeline_read(&mut self, position: Ms, duration: Ms, now: Instant) {
         if position != 0 || duration != 0 {
             self.parts.position_ms = position;
+            // 位置与采样时刻**严格配对**（锚点规则 1 的依据）
+            self.parts.timeline_at = Some(now);
+        } else if self.parts.timeline_at.is_none() {
+            // 首份读数就是 (0,0)：位置 0 本来就是这个时刻建立的基准，补一次。
+            self.parts.timeline_at = Some(now);
         }
         self.parts.duration_ms = duration;
-        // **只有这里**许更新 timeline_at（锚点规则 1 的依据）
-        self.parts.timeline_at = Some(now);
     }
 
-    /// G8-②：按本轮读数、状态跃迁与切歌情况拼出待发布的快照（**无 COM，可单测**）。
+    /// G8-②/G8-④：按本轮读数、状态跃迁与切歌情况拼出待发布的快照（**无 COM，可单测**）。
     ///
     /// `anchor_of` 的三规则对**切歌**的语义逐字保留；本方法只在两种情况下改写
-    /// 歌词钟：切歌（含 5s 退避里没读时间线的换歌）归零，以及恒报 `(0,0)` 的
-    /// 播放器状态跃迁时把上一份快照外推到 `now` 的位置续接过去（不归零、不
-    /// 重载歌词），并把同样的基准写回 `parts`，避免下一次 `(0,0)` 读数让
-    /// `has_changed` 的「位置大幅回退」判据误判成 seek、再次发布归零快照。
+    /// 歌词钟：
+    /// - 切歌（含 5s 退避里没读时间线的换歌）：**先查 [`LyricClockMemory`]**
+    ///   —— 这首歌「离开时的钟」还在记忆里且新鲜就用它续接（跨应用 / 跨会话
+    ///   切回同一首歌不再从第一句重唱），查不到才是真正的 `Reset` 归零
+    ///   （新歌仍然从头走，切歌语义不破）；
+    /// - 状态跃迁：把上一份快照外推到**跃迁真正发生的时刻**
+    ///   （`inputs.jumped_at`，见 [`transition_at`]；拿不到就退回 `now`，
+    ///   与 v1.9.2 完全一致），并把同样的基准写回 `parts`，避免下一次 `(0,0)`
+    ///   读数让 `has_changed` 的「位置大幅回退」判据误判成 seek。
     fn build_snapshot(&mut self, inputs: TickInputs, now: Instant) -> NowPlaying {
         // 只从 TickInputs 取值（单入口），下方 `anchor_of` / `lyric_clock_action`
         // 的判定逻辑与调用形式逐字未改。
@@ -1191,6 +1503,7 @@ impl PollState {
             state_jumped,
             timeline_read,
             read_timeline_now,
+            jumped_at,
         } = inputs;
         let track_id = parts_track_id(&self.parts);
         let track_changed = self.last.as_ref().map(|p| p.track_id) != Some(track_id);
@@ -1213,22 +1526,84 @@ impl PollState {
         match action {
             LyricClockAction::Keep => {}
             LyricClockAction::Reset => {
-                // 新歌从头走；锚点仍是 anchor_of 的结果（规则 1/2）
-                snapshot.position_ms = 0;
-                self.parts.position_ms = 0;
+                // 新歌从头走；但**这首歌自己**离开时的钟还在记忆里就用它续接。
+                // 锚点一律是 now：钟是「此刻起表」的，与 anchor_of 的规则 1/2
+                // 在本分支给出的值等价（规则 1 的 timeline_at 现在可能早于 now
+                // —— 见 apply_timeline_read 的 G8-④ 修正，绝不能拿它当锚点）。
+                let restored = self
+                    .memory
+                    .restore(&self.parts.aumid, track_id, now);
+                let position_ms = restored.map(|r| r.position_ms).unwrap_or(0);
+                snapshot.position_ms = position_ms;
+                snapshot.position_at = now;
+                self.parts.position_ms = position_ms;
+                self.parts.timeline_at = Some(now);
+                if let Some(r) = restored {
+                    crate::log_info!(
+                        "歌词钟续接：{} track={} → {}ms（离开时状态={}）",
+                        snapshot.session.aumid,
+                        track_id,
+                        r.position_ms,
+                        r.leave_state.as_str()
+                    );
+                }
             }
             LyricClockAction::Carry => {
-                // 先结束对 self.last 的不可变借用，再写回 parts
-                let carried = self.last.as_ref().map(|p| lyric_clock_at(p, now));
-                if let Some(carried) = carried {
+                // G8-④：跃迁时刻优先用事件到达时刻（两个方向同源 → 逐轮抵消），
+                // 拿不到就是本轮 now（v1.9.2 行为）。先结束对 self.last 的
+                // 不可变借用，再写回 parts。
+                let at = transition_at(now, jumped_at);
+                let carried = self.last.as_ref().map(|p| {
+                    // 事件时刻理论上不会早于上一份快照的锚点；万一早于（跨会话
+                    // 陈旧时间戳），钳住它，绝不让钟倒退。
+                    let base = if at < p.position_at { p.position_at } else { at };
+                    (lyric_clock_at(p, base), base)
+                });
+                if let Some((carried, base)) = carried {
                     snapshot.position_ms = carried;
-                    snapshot.position_at = now;
+                    snapshot.position_at = base;
                     self.parts.position_ms = carried;
-                    self.parts.timeline_at = Some(now);
+                    self.parts.timeline_at = Some(base);
                 }
             }
         }
         snapshot
+    }
+
+    /// `tick()` 尾部「读完 → 这份快照值不值得广播」的**唯一判定点**（无 COM）。
+    ///
+    /// 抽成独立方法有两个理由：
+    /// 1. `tick()` 的前半段（跨进程读取）无法单测，但**发布判定**可以——
+    ///    歌词钟漂移是「每段都对、组合起来漂」，必须让多轮仿真跑在与生产
+    ///    完全相同的判定代码上（`g8_lyric_clock` 的 N 轮仿真就是这么驱动的）；
+    /// 2. 「先 `build_snapshot`、再 `has_changed` 门控、最后才推进 `last`」
+    ///    这个顺序只存在一份，避免以后有人把 `last` 提前推进。
+    fn publish_point(&mut self, inputs: TickInputs, now: Instant) -> Option<NowPlaying> {
+        let snapshot = self.build_snapshot(inputs, now);
+        if let Some(prev) = self.last.as_ref() {
+            if !has_changed(prev, &snapshot) {
+                return None;
+            }
+        }
+        Some(snapshot)
+    }
+
+    /// G8-④：`last` 即将被替换成 `next`（或整个丢弃）时，把它的歌词钟记进记忆。
+    ///
+    /// **只在「离开这首歌」时记**（`next == None` 或 aumid / track_id 变了）：
+    /// 同一首歌的稳态发布（播控标志翻转等）不刷新记忆的采样时刻，否则 TTL
+    /// 会被无限续期，陈旧位置永远不过期，反而会把歌词拨回很久以前。
+    fn remember_leaving(&mut self, next: Option<&NowPlaying>, now: Instant) {
+        let Some(prev) = self.last.as_ref() else {
+            return;
+        };
+        let leaving = match next {
+            None => true,
+            Some(n) => n.track_id != prev.track_id || n.session.aumid != prev.session.aumid,
+        };
+        if leaving {
+            self.memory.remember(prev, now);
+        }
     }
 
     /// 按计划做一轮读取，diff 后决定是否广播。
@@ -1243,6 +1618,9 @@ impl PollState {
             Err(_) => {
                 if self.last.is_some() {
                     crate::log_info!("session cleared");
+                    // G8-④：会话消失前先把这首歌的歌词钟记下来
+                    // （跨应用切走后切回来才能续上，而不是从第一句重唱）。
+                    self.remember_leaving(None, now);
                     self.last = None;
                     self.cover.done = false;
                     // 会话没了 → 分层缓存、节奏、会话级订阅全部作废，
@@ -1264,8 +1642,13 @@ impl PollState {
         // 不再单独立局部变量，避免「两个来源可能不一致」）。
         let mut timeline_read: Option<(Ms, Ms)> = None;
         let mut state_jumped = false;
+        let mut jumped_at: Option<Instant> = None;
         let mut playback_info = None;
         if plan.playback {
+            // G8-④：必须在 note_playback() **之前**取「上一次观测时刻」——
+            // 它是判定事件时间戳是否陈旧（早于上一次观测 = 更早的跃迁残留）
+            // 的唯一依据。
+            let prev_obs = self.cadence.last_playback_obs();
             let (info, ms) = timed("smtc.playback", || session.GetPlaybackInfo().ok());
             self.stats.playback += 1;
             self.stats.observe(ms);
@@ -1276,6 +1659,9 @@ impl PollState {
                 plan.timeline = true;
                 plan.props = true;
                 state_jumped = true;
+                // G8-④：跃迁时刻 = PlaybackInfoChanged 的到达时刻（暂停/继续
+                // 两个方向同源 → 逐轮误差相等 → 逐轮抵消）；拿不到退回 now。
+                jumped_at = Some(transition_at(now, self.playback_events.take_after(prev_obs)));
             }
             self.parts.state = state;
             playback_info = info;
@@ -1393,14 +1779,11 @@ impl PollState {
             return;
         }
 
-        // ---- 锚点 + G8-② 歌词钟续接（三规则与切歌语义见 anchor_of / build_snapshot）----
-        let inputs = tick_inputs(state_jumped, timeline_read);
-        let snapshot = self.build_snapshot(inputs, now);
-        if let Some(prev) = self.last.as_ref() {
-            if !has_changed(prev, &snapshot) {
-                return;
-            }
-        }
+        // ---- 锚点 + G8-②/G8-④ 歌词钟续接（三规则与切歌语义见 anchor_of / build_snapshot）----
+        let inputs = tick_inputs(state_jumped, timeline_read).at(jumped_at);
+        let Some(snapshot) = self.publish_point(inputs, now) else {
+            return;
+        };
 
         let (title, artist, duration) = match snapshot.track.as_ref() {
             Some(t) => (t.title.as_str(), t.artist.as_str(), t.duration_ms),
@@ -1417,6 +1800,9 @@ impl PollState {
             snapshot.position_ms
         );
 
+        // G8-④：先记下「即将被替换的那一份」的歌词钟（只在离开这首歌时记），
+        // 再推进 last —— 顺序反了就等于没记。
+        self.remember_leaving(Some(&snapshot), now);
         self.last = Some(snapshot.clone());
         sink.send(AppEvent::NowPlaying(Box::new(snapshot)));
     }
@@ -1673,11 +2059,16 @@ impl Drop for SessionSubscriptions {
 
 /// 给一个会话挂上三个事件。**回调里只许置脏位 + 唤醒**——
 /// 它们跑在 WinRT 线程池上，做 COM 重活会把线程池拖垮（风险与收益完全不对等）。
+///
+/// G8-④：`PlaybackInfoChanged` 额外写一次到达时刻（[`PlaybackEventClock`]）。
+/// 那是一次 `Instant::now()` + 一次极短加锁，**零 COM、零分配、零日志**，
+/// 与「只许置脏位」的纪律不冲突；拿到它，歌词钟才知道状态跃迁真正发生在何时。
 fn subscribe_session(
     session: &GlobalSystemMediaTransportControlsSession,
     dirty: &Arc<AtomicBool>,
     sink: &EventSink<AppEvent>,
     aumid: String,
+    events: PlaybackEventClock,
 ) -> SessionSubscriptions {
     let d1 = dirty.clone();
     let s1 = sink.clone();
@@ -1691,6 +2082,8 @@ fn subscribe_session(
     let s2 = sink.clone();
     let playback = TypedEventHandler::new(move |_sender, _args| {
         d2.store(true, Ordering::Relaxed);
+        // G8-④：状态跃迁的真实时刻（媒体线程据此锚定歌词钟）
+        events.stamp();
         s2.poke();
         Ok(())
     });
@@ -3208,7 +3601,7 @@ mod g8_multi_session {
         // 模拟 Release 之前的状态：还有快照 / 缓存身份
         st.parts.aumid = "NeteaseCloudMusic!App".to_string();
 
-        st.apply_release(ScanDecision::Release, &sink);
+        st.apply_release(ScanDecision::Release, &sink, Instant::now());
 
         assert!(st.last_ignored.is_none(), "UI 的 App.ignored 残留必须被清掉");
         assert!(st.display_session.is_none(), "回到常规 GetCurrentSession 路径");
@@ -3227,7 +3620,7 @@ mod g8_multi_session {
     fn release_without_stale_ignored_state_does_not_broadcast() {
         let (sink, rx) = fake_sink();
         let mut st = PollState::new(Arc::new(AtomicBool::new(false)), blacklist_index(&[]));
-        st.apply_release(ScanDecision::Release, &sink);
+        st.apply_release(ScanDecision::Release, &sink, Instant::now());
         assert!(st.last_ignored.is_none());
         assert!(
             rx.try_iter().next().is_none(),
@@ -3241,7 +3634,7 @@ mod g8_multi_session {
         let (sink, rx) = fake_sink();
         let mut st = PollState::new(Arc::new(AtomicBool::new(false)), blacklist_index(&[]));
         st.last_ignored = Some(stale_ignored());
-        st.apply_release(ScanDecision::Switch(1), &sink);
+        st.apply_release(ScanDecision::Switch(1), &sink, Instant::now());
         assert!(rx.try_iter().next().is_none());
     }
 
@@ -3344,18 +3737,32 @@ mod g8_lyric_clock {
         }
     }
 
-    /// 测试专用 `TickInputs` 构造：**三个字段全部显式给出**（含 `read_timeline_now`），
+    /// 测试专用 `TickInputs` 构造：**字段全部显式给出**（含 `read_timeline_now`），
     /// 不依赖被测的 [`tick_inputs`] 推导 —— `build_snapshot` 的单测与
     /// `tick_inputs()` 的真值表因此互相独立，任一处写坏都能被单独抓出来。
+    ///
+    /// G8-④：`jumped_at`（跃迁时刻）默认 `None` = 本轮的 `now`，即 v1.9.2 行为；
+    /// 要测「事件时刻」的用例用 [`ti_at`]。
     fn ti(
         state_jumped: bool,
         timeline_read: Option<(Ms, Ms)>,
         read_timeline_now: bool,
     ) -> TickInputs {
+        ti_at(state_jumped, timeline_read, read_timeline_now, None)
+    }
+
+    /// 带跃迁时刻的 `TickInputs`（G8-④）。
+    fn ti_at(
+        state_jumped: bool,
+        timeline_read: Option<(Ms, Ms)>,
+        read_timeline_now: bool,
+        jumped_at: Option<Instant>,
+    ) -> TickInputs {
         TickInputs {
             state_jumped,
             timeline_read,
             read_timeline_now,
+            jumped_at,
         }
     }
 
@@ -3372,9 +3779,11 @@ mod g8_lyric_clock {
             track_changed: bool,
             has_prev: bool,
         ) -> LyricClockAction {
+            // v1.9.3 / G8-⑤：`(0, D)` 同样不是可信位置（判据 = 位置是否为 0）。
+            // 旧版这里写的是 `Some(_) => true`，即「时长有值就算位置可信」——
+            // 那正是「状态跃迁那一拍撞上 (0,D) 就把钟砸到 0」的成因。
             let usable = match timeline {
-                Some((0, 0)) => false,
-                Some(_) => true,
+                Some((position, _)) => position != 0,
                 None => !zero_duration,
             };
             if usable {
@@ -3427,7 +3836,8 @@ mod g8_lyric_clock {
     /// 真实位置播放器（汽水）无论状态是否跃迁都不该被续接逻辑改写。
     #[test]
     fn lyric_clock_action_never_carries_for_real_position_players() {
-        for timeline in [Some((30_000, 180_000)), Some((0, 180_000)), None] {
+        // 真实位置读数（position > 0）→ 一律 Keep：汽水这类播放器的路径不许变。
+        for timeline in [Some((30_000, 180_000)), None] {
             for jumped in [false, true] {
                 assert_eq!(
                     lyric_clock_action(timeline, false, jumped, false, true),
@@ -3435,6 +3845,28 @@ mod g8_lyric_clock {
                 );
             }
         }
+        // `(0, 真实时长)` **不是**可信位置（v1.9.3 / G8-⑤），所以它和 `(0,0)`
+        // 同档：跃迁那一拍要走 Carry 受保护，不许 Keep 把位置盖成 0。
+        // ⚠️ 旧断言给的是 Keep —— 那正是「时长有值就当位置可信」的病因
+        // （真机日志 17 次 `(0,D)` 全在换曲瞬间，一旦撞上暂停/继续那一拍，
+        // 钟就被砸到 0）。这里按新契约改写，属收紧。
+        for timeline in [Some((0, 0)), Some((0, 180_000))] {
+            assert_eq!(
+                lyric_clock_action(timeline, false, false, false, true),
+                LyricClockAction::Keep,
+                "非跃迁轮次：保持现状（位置由上一份有效值继续外推）"
+            );
+            assert_eq!(
+                lyric_clock_action(timeline, false, true, false, true),
+                LyricClockAction::Carry,
+                "跃迁轮次必须 Carry 保护，不许把钟砸到 0"
+            );
+        }
+        // 首帧还没有上一份快照 → 仍然 Keep（`anchor_of` 兜底），不会凭空 Carry。
+        assert_eq!(
+            lyric_clock_action(Some((0, 180_000)), false, true, false, false),
+            LyricClockAction::Keep
+        );
     }
 
     /// 5s 退避里没读时间线的零时长播放器，切歌也必须 Reset（不带旧歌词钟进新歌）。
@@ -3487,7 +3919,16 @@ mod g8_lyric_clock {
 
     // ------------------------------------------------ 接线：时间线层
 
-    /// `(0,0)` 不是有效位置读数，不许把已续接的歌词钟盖回 0；真实读数照常写。
+    /// `(0,0)` 不是有效位置读数：不许把已续接的歌词钟盖回 0，**也不许刷新
+    /// `timeline_at`**（v1.9.3 / G8-④ 收紧）；真实读数照常写，且位置与采样
+    /// 时刻同进退（`anchor_of` 规则 1 的外推基准必须与位置**配对**）。
+    ///
+    /// ⚠️ v1.9.2 的这条断言写的是 `timeline_at == Some(at(t0, 1_000))`，即
+    /// **要求** `(0,0)` 刷新采样时刻——那正是本轮的病因：位置留在几秒前、
+    /// 基准却跳到此刻，只要同一轮里还有别的字段变化（播控标志 / 封面 / 标题 /
+    /// 播放态）而真的广播出去，UI 就把时钟按陈旧位置重新起表，整段已播时间
+    /// 被悄悄吃掉。旧实现只是靠 `has_changed` 的 `delta == 0` 侥幸没露头。
+    /// 这条断言因此按新契约改写（更严：位置与时刻必须配对），不是放宽。
     #[test]
     fn apply_timeline_read_ignores_zero_zero_but_writes_real_position() {
         let t0 = past_base();
@@ -3495,12 +3936,30 @@ mod g8_lyric_clock {
         st.parts.position_ms = 42_000;
         st.apply_timeline_read(0, 0, at(t0, 1_000));
         assert_eq!(st.parts.position_ms, 42_000, "(0,0) 不许把歌词钟归零");
-        assert_eq!(st.parts.timeline_at, Some(at(t0, 1_000)));
+        assert_eq!(
+            st.parts.timeline_at,
+            Some(t0),
+            "(0,0) 不许刷新采样时刻：位置与基准必须配对，否则陈旧位置配上新鲜锚点"
+        );
         assert_eq!(st.parts.duration_ms, 0);
 
         st.apply_timeline_read(30_000, 180_000, at(t0, 2_000));
         assert_eq!(st.parts.position_ms, 30_000, "汽水式真实读数照常写入");
+        assert_eq!(
+            st.parts.timeline_at,
+            Some(at(t0, 2_000)),
+            "真实读数必须把采样时刻一起推进"
+        );
         assert_eq!(st.parts.duration_ms, 180_000);
+
+        // 首份读数就是 (0,0)：位置 0 本来就是这个时刻建立的基准 → 补上采样时刻。
+        let mut fresh = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        assert_eq!(fresh.parts.timeline_at, None);
+        fresh.apply_timeline_read(0, 0, at(t0, 500));
+        assert_eq!(fresh.parts.timeline_at, Some(at(t0, 500)));
+        // 再来一次 (0,0) 就不许再往后续了
+        fresh.apply_timeline_read(0, 0, at(t0, 6_000));
+        assert_eq!(fresh.parts.timeline_at, Some(at(t0, 500)));
     }
 
     // ------------------------------------------------ 接线：发布层（核心）
@@ -3780,6 +4239,7 @@ mod g8_lyric_clock {
                 state_jumped: true,
                 timeline_read: Some((0, 0)),
                 read_timeline_now: true,
+                jumped_at: None,
             },
             t1,
         );
@@ -3798,6 +4258,7 @@ mod g8_lyric_clock {
                 state_jumped: false,
                 timeline_read: Some((0, 0)),
                 read_timeline_now: true,
+                jumped_at: None,
             },
             t1,
         );
@@ -3806,10 +4267,13 @@ mod g8_lyric_clock {
     }
 
     /// **静态结构断言**：`tick()` 必须把 `note_playback()` 判出的跃迁写进
-    /// `state_jumped`，并经 `tick_inputs()` 交给 `build_snapshot`。
+    /// `state_jumped`，并经 `tick_inputs()` 交给 `build_snapshot`；G8-④ 起还要
+    /// 把「跃迁真正发生的时刻」一起交进去，并在离开一首歌时把钟记进记忆。
     ///
     /// 这是唯一能抓住「赋值/传参被写死」的手段（无 COM 无法真正跑 `tick()`）：
     /// QA 的 RV-C3 把 `state_jumped = true` 改成 `= false` 时，它必须变红。
+    /// v1.9.3 同理：把 `.at(jumped_at)` 改成 `.at(None)`、或删掉
+    /// `remember_leaving(...)`，仿真测试全绿而线上修复静默失效 —— 必须由这里拦住。
     #[test]
     fn tick_wires_state_jump_into_snapshot_inputs() {
         let src = std::fs::read_to_string(concat!(
@@ -3821,8 +4285,8 @@ mod g8_lyric_clock {
             .find("    fn tick(&mut self")
             .expect("tick 函数必须存在");
         let rest = &src[start..];
-        // `tick` 是 PollState 的最后一个方法，方法体语句在 8 空格缩进，
-        // 故第一个 4 空格缩进的 `}` 就是 tick 的收尾（已人工核对只有一处）。
+        // 方法体语句在 8 空格缩进，故第一个 4 空格缩进的 `}` 就是 tick 的收尾
+        // （已人工核对：`tick` 内部没有 4 空格缩进的独立行）。
         let end = rest
             .find("\n    }\n")
             .map(|i| i + "\n    }\n".len())
@@ -3845,5 +4309,1607 @@ mod g8_lyric_clock {
             !body.contains("read_timeline_now ="),
             "read_timeline_now 必须由 tick_inputs() 派生，不许再立局部变量"
         );
+
+        // ---- G8-④（v1.9.3）：Bug 1 / Bug 2 的接线 ----
+        assert!(
+            body.contains("transition_at(now, self.playback_events.take_after"),
+            "跃迁时刻必须来自 PlaybackInfoChanged 的到达时刻（Bug 1 的抵消机制）"
+        );
+        assert!(
+            body.contains(".at(jumped_at)"),
+            "跃迁时刻必须交给 tick_inputs().at()，不许绕过（写死 None 会让 Bug 1 修复静默失效）"
+        );
+        assert!(
+            !body.contains(".at(None)"),
+            "禁止把跃迁时刻写死成 None"
+        );
+        assert!(
+            body.contains("self.remember_leaving(Some(&snapshot), now)"),
+            "tick 必须在推进 last 之前 remember_leaving（顺序反了等于没记，Bug 2 复发）"
+        );
+        assert!(
+            body.find("remember_leaving").unwrap() < body.find("self.last = Some").unwrap(),
+            "remember_leaving 必须排在 `self.last = Some(...)` 之前"
+        );
+
+        // `build_snapshot` 的 Reset 分支必须查记忆（否则切回同一首歌仍然归零）
+        let bs = src
+            .find("    fn build_snapshot(&mut self")
+            .expect("build_snapshot 必须存在");
+        let bs_rest = &src[bs..];
+        let bs_end = bs_rest
+            .find("\n    }\n")
+            .map(|i| i + "\n    }\n".len())
+            .unwrap_or(bs_rest.len());
+        let bs_body = &bs_rest[..bs_end];
+        assert!(
+            bs_body.contains(".restore(&self.parts.aumid, track_id, now)"),
+            "Reset 分支必须先查歌词钟记忆（跨应用/跨会话切回同一首歌不许归零）"
+        );
+        assert!(
+            bs_body.contains("self.parts.timeline_at = Some(now)"),
+            "Reset / Carry 写位置时必须同时写 timeline_at（位置与锚点严格配对）"
+        );
+        assert!(
+            bs_body.contains("transition_at(now, jumped_at)"),
+            "Carry 必须用 tick 交进来的跃迁时刻，不许自己退回 now"
+        );
+    }
+}
+
+// ============================================ G8-④（v1.9.3）歌词钟连续性回归
+//
+// 为什么单独立一个模块：这两个 bug 都是「**每个纯函数单看都对，串起来才漂**」
+// ——`anchor_of` / `lyric_clock_action` / `lyric_clock_at` 全部有单元测试且全绿，
+// 漂移是在「50ms 主循环 × 分层轮询 × 事件驱动 × 门控发布」组合出来时才出现的。
+// 所以这里不重测纯函数，而是搭一台**确定性仿真**：用**生产同款**的
+// `PollState::schedule` / `Cadence::note_*` / `apply_timeline_read` /
+// `publish_point` / `remember_leaving` / `PlaybackEventClock` 把主循环跑起来，
+// 时间全部注入（`Instant` 只做加法），**不 sleep、不碰 COM、不碰真实时钟**。
+// 只有「跨进程读」这一步被替换成场景闭包（`obs_state` / `props` / `timeline`）。
+//
+// 这样仿真与生产走的是同一份判定代码：把修复改坏（例如让 `tick()` 不再传
+// `jumped_at`、或让 `Reset` 不查记忆）时，这些测试会真正变红。
+#[cfg(test)]
+mod g8_lyric_clock_continuity {
+    use super::*;
+
+    const CLOUD: &str = "cloudmusic.exe";
+    const SODA: &str = "汽水音乐";
+
+    // ---- 本模块自带的脚手架（不跨模块借用别人模块里的私有 helper）----
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    fn test_index() -> Arc<MediaIndex> {
+        MediaIndex::new(&crate::config::MediaConfig::default())
+    }
+
+    /// 网易云式 parts：有曲目、属性已成功读过、恒报 (0,0)。
+    fn zero_player(parts: &mut SessionParts, title: &str, t0: Instant) {
+        parts.track = Track {
+            title: title.to_string(),
+            artist: "周杰伦".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        parts.aumid = CLOUD.to_string();
+        parts.process_name = CLOUD.to_string();
+        parts.app_name = CLOUD.to_string();
+        parts.props_ok = true;
+        parts.state = PlaybackState::Playing;
+        parts.position_ms = 0;
+        parts.duration_ms = 0;
+        parts.timeline_at = Some(t0);
+    }
+
+    /// 造一份「已广播」快照：`track_id` 与 parts 一致（不触发切歌）。
+    fn published(
+        parts: &SessionParts,
+        state: PlaybackState,
+        position: Ms,
+        position_at: Instant,
+    ) -> NowPlaying {
+        NowPlaying {
+            track_id: parts_track_id(parts),
+            track: Some(effective_track(parts)),
+            session: MediaSessionInfo {
+                aumid: parts.aumid.clone(),
+                app_name: parts.app_name.clone(),
+                process_name: parts.process_name.clone(),
+                ..Default::default()
+            },
+            state,
+            position_ms: position,
+            position_at,
+            ..Default::default()
+        }
+    }
+
+    /// `TickInputs` 构造（本模块内联，不跨模块借）。
+    fn ti(state_jumped: bool, timeline_read: Option<(Ms, Ms)>, read_timeline_now: bool) -> TickInputs {
+        TickInputs {
+            state_jumped,
+            timeline_read,
+            read_timeline_now,
+            jumped_at: None,
+        }
+    }
+
+    /// 带完整曲目的快照（曲目不同 → `track_id` 不同）。
+    fn snapshot(title: &str, state: PlaybackState, position: Ms) -> NowPlaying {
+        let track = Track {
+            title: title.to_string(),
+            artist: String::from("a"),
+            album: String::new(),
+            duration_ms: 180_000,
+        };
+        NowPlaying {
+            track_id: fnv1a64(track.key().as_bytes()),
+            track: Some(track),
+            session: MediaSessionInfo {
+                aumid: CLOUD.to_string(),
+                ..Default::default()
+            },
+            state,
+            position_ms: position,
+            ..Default::default()
+        }
+    }
+
+    /// 一轮真实节奏的**驱动输入**（全部是纯数据/闭包，零 IO）。
+    struct Scene<'a> {
+        /// 快层读到的播放状态（真实状态 + 检测链路都被场景吸收进这个函数）
+        obs_state: &'a dyn Fn(u64) -> PlaybackState,
+        /// 慢层读到的 (aumid, 标题, 时长)
+        props: &'a dyn Fn(u64) -> (&'static str, &'static str, Ms),
+        /// 中层读到的 (位置, 时长)。网易云恒 `(0, 0)`。
+        timeline: &'a dyn Fn(u64) -> (Ms, Ms),
+        /// `PlaybackInfoChanged` 的到达时刻（空表 = 这条链路发不出事件，
+        /// 退化为纯轮询；`u64::MAX` 之类的哨兵值一律不可达）。
+        events: Vec<u64>,
+        /// 播控标志（`can_next`）。翻它可以在**不换歌、不换状态**的前提下制造一次
+        /// 「只有播控标志变化」的发布——`has_changed` 会放行，于是 `Keep` 分支
+        /// 拼出来的位置/锚点会被真的送到 UI。这是「陈旧位置 @ 新鲜锚点」的唯一
+        /// 可观测入口（v1.9.3 之前它是条静默的整段回退路径）。
+        can_next: &'a dyn Fn(u64) -> bool,
+    }
+
+    /// 确定性主循环仿真（与 `run` + `tick` 的**同款顺序**，只省掉 COM 读）。
+    struct ClockSim {
+        st: PollState,
+        base: Instant,
+        /// 已推进到第几毫秒（50ms 节拍）
+        cursor: u64,
+        /// 已消费的事件下标
+        next_event: usize,
+        /// 本场景真实「累计播放时长」的积分器（真值，用来量误差）
+        truth: PlayingIntegral,
+    }
+
+    /// 真实累计播放时长（按场景的真实状态时间轴积分，与歌词钟无关）。
+    #[derive(Default)]
+    struct PlayingIntegral {
+        /// (时刻, 状态)：真实状态时间轴
+        marks: Vec<(u64, PlaybackState)>,
+    }
+
+    impl PlayingIntegral {
+        fn mark(&mut self, t: u64, state: PlaybackState) {
+            self.marks.push((t, state));
+        }
+        fn at(&self, t: u64) -> Ms {
+            let mut total = 0i64;
+            for i in 0..self.marks.len() {
+                let (start, state) = self.marks[i];
+                if start >= t {
+                    break;
+                }
+                let end = if i + 1 < self.marks.len() {
+                    self.marks[i + 1].0.min(t)
+                } else {
+                    t
+                };
+                if state == PlaybackState::Playing && end > start {
+                    total += (end - start) as i64;
+                }
+            }
+            total
+        }
+    }
+
+    impl ClockSim {
+        fn new(base: Instant) -> Self {
+            Self {
+                st: PollState::new(Arc::new(AtomicBool::new(false)), test_index()),
+                base,
+                cursor: 0,
+                next_event: 0,
+                truth: PlayingIntegral::default(),
+            }
+        }
+
+        fn now(&self, ms: u64) -> Instant {
+            self.base + Duration::from_millis(ms)
+        }
+
+        /// 换场景时重置事件游标（各场景的事件表是独立的，绝对时刻可能不连续）。
+        fn begin_scene(&mut self) {
+            self.next_event = 0;
+        }
+
+        /// 跑到 `to_ms`（含），每 50ms 一拍，**与 `run` 的循环体逐句对应**。
+        fn run_to(&mut self, to_ms: u64, scene: &Scene<'_>) {
+            while self.cursor + 50 <= to_ms {
+                self.cursor += 50;
+                let t = self.cursor;
+                let now = self.now(t);
+
+                // ---- 事件到达（真实回调：置脏位 + 记到达时刻）----
+                while let Some(&at) = scene.events.get(self.next_event) {
+                    if at > t {
+                        break;
+                    }
+                    self.st.playback_events.stamp_at(self.now(at));
+                    self.st.dirty.store(true, Ordering::Relaxed);
+                    self.next_event += 1;
+                }
+
+                let (plan, forced) =
+                    self.st
+                        .schedule(now, self.st.dirty.load(Ordering::Relaxed));
+                if forced {
+                    self.st.dirty.store(false, Ordering::Relaxed);
+                }
+                if plan.any() {
+                    self.tick_like(plan, now, t, scene);
+                }
+            }
+        }
+
+        /// `tick()` 去掉 COM 读之后的等价体（顺序逐句照抄）。
+        fn tick_like(&mut self, mut plan: Plan, now: Instant, t: u64, scene: &Scene<'_>) {
+            self.st.last_tick = now;
+
+            // ---- 快层 ----
+            let mut timeline_read: Option<(Ms, Ms)> = None;
+            let mut state_jumped = false;
+            let mut jumped_at: Option<Instant> = None;
+            if plan.playback {
+                let prev_obs = self.st.cadence.last_playback_obs();
+                let state = (scene.obs_state)(t);
+                if self.st.cadence.note_playback(now, state) {
+                    plan.timeline = true;
+                    plan.props = true;
+                    state_jumped = true;
+                    jumped_at =
+                        Some(transition_at(now, self.st.playback_events.take_after(prev_obs)));
+                }
+                self.st.parts.state = state;
+            }
+
+            // ---- 中层 ----
+            if plan.timeline {
+                let (position, duration) = (scene.timeline)(t);
+                self.st.cadence.note_timeline(now, position, duration);
+                self.st.apply_timeline_read(position, duration, now);
+                timeline_read = Some((position, duration));
+            }
+
+            // ---- 慢层 ----
+            if plan.props {
+                let (aumid, title, duration) = (scene.props)(t);
+                self.st.parts.aumid = aumid.to_string();
+                self.st.parts.app_name = aumid.to_string();
+                self.st.parts.process_name = aumid.to_string();
+                self.st.parts.track = Track {
+                    title: title.to_string(),
+                    artist: "a".to_string(),
+                    album: String::new(),
+                    duration_ms: 0,
+                };
+                self.st.parts.props_ok = true;
+                self.st.parts.can_next = (scene.can_next)(t);
+                self.st.cadence.note_props(now);
+                // 时长唯一来源是中层；场景里 props 的时长只用于「汽水式」场景
+                if duration > 0 {
+                    self.st.parts.duration_ms = duration;
+                }
+            }
+            if !self.st.parts.props_ok {
+                return;
+            }
+
+            // ---- 发布点（生产同一个函数）----
+            let inputs = tick_inputs(state_jumped, timeline_read).at(jumped_at);
+            if let Some(snapshot) = self.st.publish_point(inputs, now) {
+                self.st.remember_leaving(Some(&snapshot), now);
+                self.st.last = Some(snapshot);
+            }
+        }
+
+        /// UI 侧 `lyric_time()` 的口径：已发布快照外推到 `t`。
+        fn clock(&self, t: u64) -> Ms {
+            match self.st.last.as_ref() {
+                Some(last) => lyric_clock_at(last, self.now(t)),
+                None => 0,
+            }
+        }
+
+        /// 「会话被系统短暂丢弃」：与 `tick` 的 session-cleared 分支等价。
+        fn drop_session(&mut self, now: Instant) {
+            self.st.remember_leaving(None, now);
+            self.st.last = None;
+            self.st.parts = SessionParts::default();
+            self.st.cadence = Cadence::default();
+        }
+    }
+
+    // ------------------------------------------------------------ 场景辅助
+
+    /// 网易云式：恒 `(0,0)`、标题固定、aumid 固定。
+    fn cloud_props(_: u64) -> (&'static str, &'static str, Ms) {
+        (CLOUD, "晴天", 0)
+    }
+    fn cloud_timeline(_: u64) -> (Ms, Ms) {
+        (0, 0)
+    }
+
+    /// 由「真实状态时间轴 + 每条跃迁的检测延迟」生成快层读数闭包。
+    ///
+    /// `delays[i]` 是第 i 条跃迁的**检测延迟**（真实时刻 → 被快层读到的时刻），
+    /// 与真实世界的「事件驱动 ~60ms / 纯轮询最坏 500ms」对应。
+    fn observed_timeline(
+        marks: &[(u64, PlaybackState)],
+        delays: &[u64],
+    ) -> Vec<(u64, PlaybackState)> {
+        observed_timeline_from(marks[0].1, marks, delays)
+    }
+
+    /// 同上，但显式给出「本场景开始前播放器处于什么状态」——换场景时必须用，
+    /// 否则 `(0, Playing)` 会在场景起点凭空造出一次「暂停→播放」跃迁。
+    fn observed_timeline_from(
+        initial: PlaybackState,
+        marks: &[(u64, PlaybackState)],
+        delays: &[u64],
+    ) -> Vec<(u64, PlaybackState)> {
+        let mut out = vec![(0u64, initial)];
+        for (i, &(at, state)) in marks.iter().enumerate() {
+            out.push((at + delays.get(i).copied().unwrap_or(0), state));
+        }
+        out
+    }
+
+    fn state_of(timeline: &[(u64, PlaybackState)], t: u64) -> PlaybackState {
+        let mut s = timeline[0].1;
+        for (at, st) in timeline {
+            if *at <= t {
+                s = *st;
+            }
+        }
+        s
+    }
+
+    // ------------------------------------------------------------ Bug 1
+
+    /// **Bug 1：暂停/继续 N 轮之后，歌词钟的滞后不许随 N 累积。**
+    ///
+    /// 场景（用户真机节奏）：网易云恒 `(0,0)`；每轮「播一会 → 暂停 → 再播」，
+    /// 暂停时长逐轮不同（所以请求相位逐轮不同）。每轮的检测延迟**可参数化**，
+    /// 含最坏情况 500ms；同时每条跃迁都会产生一次 `PlaybackInfoChanged`（
+    /// 用户日志实证网易云会发，检测约 60ms），事件到达时刻随延迟一起给出。
+    ///
+    /// 断言：
+    /// 1. `|clock(end) - 真实累计播放时长| ≤ 一个轮询间隔`；
+    /// 2. N=10 与 N=20 的误差**同阶**（不许线性增长）。
+    fn run_pause_resume_rounds(rounds: usize, detect: u64, event_latency: u64) -> Ms {
+        let base = Instant::now() - Duration::from_millis(2_000_000);
+        let mut sim = ClockSim::new(base);
+        // 真实状态时间轴：先播 5s，然后每轮 7s 播 / 变长暂停
+        let pauses = [3_000u64, 1_000, 4_000, 2_000, 6_000, 1_500, 5_000, 800, 3_500, 2_500];
+        let mut marks: Vec<(u64, PlaybackState)> = vec![(0, PlaybackState::Playing)];
+        let mut events: Vec<u64> = vec![0];
+        let mut t = 5_000u64;
+        for i in 0..rounds {
+            let tp = t;
+            let tr = tp + pauses[i % pauses.len()];
+            marks.push((tp, PlaybackState::Paused));
+            marks.push((tr, PlaybackState::Playing));
+            // 事件到达 = 真实跃迁 + 事件延迟；dirty 位一律置上（用户日志：网易云会发）
+            events.push(tp.saturating_add(event_latency));
+            events.push(tr.saturating_add(event_latency));
+            t = tr + 7_000;
+        }
+        marks.push((t, PlaybackState::Paused));
+        events.push(t.saturating_add(event_latency));
+        for &(at, state) in marks.iter() {
+            sim.truth.mark(at, state);
+        }
+        let delays = vec![detect; marks.len() - 1];
+        let obs = observed_timeline(&marks, &delays);
+        let end = t + 3_000;
+        let scene = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events,
+            can_next: &|_| true,
+        };
+        sim.run_to(end, &scene);
+        sim.clock(end) - sim.truth.at(end)
+    }
+
+    /// ① 有事件（用户真机常态，检测 ~60ms）：误差恒定在 1 个检测延迟量级，
+    ///    **N=10 与 N=20 完全同阶**。
+    #[test]
+    fn pause_resume_lag_does_not_accumulate_with_events() {
+        // 事件延迟取最坏情况的 500ms 也不能让误差累积：两个方向都用同一个
+        // 事件时刻锚定，逐轮误差相等 → 逐轮抵消。
+        for &(detect, latency) in &[(60u64, 0u64), (60, 120), (500, 0), (500, 250)] {
+            let e10 = run_pause_resume_rounds(10, detect, latency);
+            let e20 = run_pause_resume_rounds(20, detect, latency);
+            assert!(
+                e10.abs() <= limits::MEDIA_POLL_MS as Ms,
+                "detect={detect} latency={latency}: N=10 误差 {} 超过一个轮询间隔",
+                e10
+            );
+            assert!(
+                e20.abs() <= limits::MEDIA_POLL_MS as Ms,
+                "detect={detect} latency={latency}: N=20 误差 {} 超过一个轮询间隔",
+                e20
+            );
+            assert!(
+                (e20 - e10).abs() <= 100,
+                "detect={detect} latency={latency}: 误差随轮数增长（N=10 {} → N=20 {}），\
+                 说明跃迁时刻没锚到事件上（Bug 1 复发）",
+                e10,
+                e20
+            );
+        }
+    }
+
+    /// ② 没有任何事件（纯轮询兜底）：单轮误差 ≤ 一个轮询间隔；这里让两个方向
+    ///    的检测延迟**相等**（同一条规则），误差必须逐轮抵消、绝不随 N 增长。
+    ///
+    /// 注：两个方向延迟**不等**时误差是 Σ(d−r)（信息论上限，未知道跃迁时刻
+    /// 时无法消除），这一项的处置见报告「风险与遗留」。
+    #[test]
+    fn pause_resume_lag_is_stable_without_events_when_delays_match() {
+        for &detect in &[0u64, 60, 250, 500] {
+            let e10 = run_pause_resume_rounds(10, detect, u64::MAX);
+            let e20 = run_pause_resume_rounds(20, detect, u64::MAX);
+            // 纯轮询下每一拍的检测相位都可能不同，单轮残差是零均值的随机量，
+            // 实测漂移落在「两个轮询间隔」以内且不随轮数增长
+            // （实测：detect=0 → 100/100ms，60 → 100/-400ms，250 → 600/100ms）。
+            assert!(
+                e10.abs() <= 2 * limits::MEDIA_POLL_MS as Ms
+                    && e20.abs() <= 2 * limits::MEDIA_POLL_MS as Ms,
+                "detect={detect}: 误差超过两个轮询间隔（{} / {}）",
+                e10,
+                e20
+            );
+            // 再多跑 10 轮也只许再漂一个轮询间隔；绝不允许 (d−r)×N 那种线性
+            // 增长（那会让 20 轮的误差是 10 轮的两倍以上，比如 -500 → -1000）。
+            assert!(
+                e20.abs() <= e10.abs() + limits::MEDIA_POLL_MS as Ms,
+                "detect={detect}: 误差随轮数线性增长（N=10 {} → N=20 {}）",
+                e10,
+                e20
+            );
+        }
+    }
+
+    /// ③ **Carry 必须锚在「跃迁真正发生的时刻」，不是「检测到它的那一刻」。**
+    ///
+    /// 这一格是 Bug 1 的记账核心：暂停/继续两个方向用**同一个**时刻来源时，
+    /// 「多算的检测延迟」与「少算的检测延迟」逐轮相等 → 逐轮抵消；用检测时刻
+    /// 则退化成「谁先被读到」，误差按 (d−r)/轮 累加。
+    #[test]
+    fn carry_anchors_at_the_transition_instant_not_the_detection_tick() {
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        st.last = Some(published(&st.parts, PlaybackState::Playing, 42_000, t0));
+
+        // 真暂停发生在 t0+42s，直到 t0+48s 才被读到（检测延迟 6s 的极端例子）
+        let jumped_at = at(t0, 42_000);
+        let now = at(t0, 48_000);
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, now);
+        let paused = st.build_snapshot(
+            TickInputs {
+                state_jumped: true,
+                timeline_read: Some((0, 0)),
+                read_timeline_now: true,
+                jumped_at: Some(jumped_at),
+            },
+            now,
+        );
+        assert_eq!(
+            paused.position_at, jumped_at,
+            "Carry 的锚点必须是跃迁时刻（暂停/继续同源才能逐轮抵消）"
+        );
+        assert_eq!(
+            paused.position_ms, 84_000,
+            "位置要外推到跃迁时刻（42s 起点 + 42s 播放），不是检测时刻的 90s"
+        );
+
+        // 恢复方向同理：锚在跃迁时刻，UI 从那一刻继续外推
+        st.last = Some(paused.clone());
+        let resume_at = at(t0, 50_000);
+        let detect = at(t0, 50_060);
+        st.parts.state = PlaybackState::Playing;
+        st.apply_timeline_read(0, 0, detect);
+        let resumed = st.build_snapshot(
+            TickInputs {
+                state_jumped: true,
+                timeline_read: Some((0, 0)),
+                read_timeline_now: true,
+                jumped_at: Some(resume_at),
+            },
+            detect,
+        );
+        assert_eq!(resumed.position_ms, 84_000);
+        assert_eq!(resumed.position_at, resume_at, "恢复锚点 = 跃迁时刻");
+        assert_eq!(
+            lyric_clock_at(&resumed, at(t0, 51_000)),
+            85_000,
+            "从跃迁时刻起算，检测延迟那 60ms 不再被丢掉"
+        );
+    }
+
+    /// ③ **Bug 1 的判定性测试（陈旧位置 @ 新鲜锚点）**。
+    ///
+    /// 播放中同一拍里既有 `(0,0)` 时间线读数、又有播控标志变化时，`Keep` 分支
+    /// 拼出来的快照必须让「位置 ↔ 锚点」严格配对：锚点只能是那个位置的采样
+    /// 时刻，**绝不能**被 `(0,0)` 读数刷成此刻。v1.9.2 会刷新它，于是
+    /// 「42s 的位置 @ 10s 后的锚点」被真的广播出去 —— UI 按 42s 重新起表，
+    /// 已播的 10s 被整段吃掉（`has_changed` 的 `delta == 0` 只是侥幸没让它
+    /// 常态复现）。每发生一次就永久少一段，累积起来正是「歌词越来越靠后」。
+    #[test]
+    fn stale_zero_read_cannot_rewind_the_clock() {
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        // 已续接到 42s：位置 42_000，采样时刻 t0，can_next = false
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        st.parts.can_next = false;
+        st.last = Some(published(&st.parts, PlaybackState::Playing, 42_000, t0));
+
+        // 10s 后的一次稳态 (0,0) 读数，同一拍里 can_next 翻成 true（只有它变了）
+        let t1 = at(t0, 10_000);
+        st.apply_timeline_read(0, 0, t1);
+        st.parts.can_next = true;
+        let snap = st
+            .publish_point(ti(false, Some((0, 0)), true), t1)
+            .expect("can_next 变了 → 必须发布（否则这条路径不可观测）");
+
+        assert_eq!(snap.position_ms, 42_000, "(0,0) 不许改位置");
+        assert_eq!(
+            snap.position_at, t0,
+            "锚点必须仍是 42_000 的采样时刻，不许被 (0,0) 读数刷成 t1"
+        );
+        assert_eq!(
+            lyric_clock_at(&snap, t1),
+            52_000,
+            "外推出的钟必须是 42s + 10s，任何回退都是 Bug 1"
+        );
+        // 下一拍真的发布出去（同一个锚点），钟继续前进
+        let t2 = at(t0, 11_000);
+        st.apply_timeline_read(0, 0, t2);
+        st.parts.can_next = false;
+        st.last = Some(snap);
+        let snap2 = st
+            .publish_point(ti(false, Some((0, 0)), true), t2)
+            .expect("can_next 再次变化 → 发布");
+        assert_eq!(
+            lyric_clock_at(&snap2, t2),
+            53_000,
+            "连续两次发布都不许吃掉时间"
+        );
+    }
+
+    /// ③ 跃迁时刻的选择本身：有事件用事件、没事件用 `now`、晚于 `now` 丢弃。
+    #[test]
+    fn transition_at_prefers_event_and_rejects_future() {
+        let t0 = Instant::now();
+        assert_eq!(
+            transition_at(at(t0, 1_000), Some(at(t0, 940))),
+            at(t0, 940),
+            "有事件时刻就必须用它（暂停/继续两个方向同源）"
+        );
+        assert_eq!(
+            transition_at(at(t0, 1_000), None),
+            at(t0, 1_000),
+            "没有事件时刻 → 退回本轮 now（v1.9.2 行为）"
+        );
+        assert_eq!(
+            transition_at(at(t0, 1_000), Some(at(t0, 1_050))),
+            at(t0, 1_000),
+            "晚于 now 的异常时间戳必须丢弃，绝不让钟倒退"
+        );
+    }
+
+    /// ④ 事件时钟：陈旧事件（早于上一次快层观测）必须被丢掉，且只消费一次。
+    #[test]
+    fn playback_event_clock_drops_stale_stamps_and_consumes_once() {
+        let clock = PlaybackEventClock::default();
+        let t0 = Instant::now();
+        assert!(clock.take_after(None).is_none(), "没事件时不许凭空造时刻");
+        clock.stamp_at(at(t0, 500));
+        assert_eq!(
+            clock.take_after(Some(at(t0, 600))),
+            None,
+            "早于上一次观测的时刻是更早一次跃迁的残留，必须丢弃"
+        );
+        assert!(clock.take_after(None).is_none(), "取走一次就必须消费掉");
+        clock.stamp_at(at(t0, 900));
+        assert_eq!(clock.take_after(Some(at(t0, 600))), Some(at(t0, 900)));
+    }
+
+    // ------------------------------------------------------------ Bug 2
+
+    /// **Bug 2：跨应用返回同一首歌，必须接着离开时的位置。**
+    ///
+    /// 完整 tick 序列（用户日志 02:25:19 → 02:26:50 的复刻）：
+    /// 网易云播到 63s → 暂停 → 切到汽水（真实上报位置）→ 汽水暂停 →
+    /// 切回网易云（时间线又是 `(0,0)`）。
+    #[test]
+    fn cross_app_return_restores_lyric_clock_instead_of_zero() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+
+        // 汽水：真实位置 = 从 40s 起按 1:1 走表（只在被读时给出）
+        let soda_timeline = |t: u64| -> (Ms, Ms) {
+            let pos = 40_000 + (t.saturating_sub(20_000)) as Ms;
+            (pos.min(220_000), 220_000)
+        };
+        let soda_props = |_: u64| -> (&'static str, &'static str, Ms) { (SODA, "月半", 220_000) };
+
+        // 阶段 1：网易云播放（恒 (0,0)）到 20s，然后暂停到 40s
+        let cloud_marks = vec![
+            (0u64, PlaybackState::Playing),
+            (20_000, PlaybackState::Paused),
+        ];
+        let cloud_obs = observed_timeline(&cloud_marks, &[60, 60]);
+        for &(at, st) in &cloud_marks {
+            sim.truth.mark(at, st);
+        }
+        let phase1 = Scene {
+            obs_state: &|x| state_of(&cloud_obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![0, 20_060],
+            can_next: &|_| true,
+        };
+        sim.run_to(20_500, &phase1);
+        let paused_at = sim.clock(20_500);
+        assert!(
+            (paused_at - 20_000).abs() <= 100,
+            "前置：网易云应暂停在 20s 附近，实际 {paused_at}"
+        );
+
+        // 阶段 2：汽水成为当前会话（真实位置），随后暂停
+        let soda_marks = vec![
+            (40_000u64, PlaybackState::Playing),
+            (50_000, PlaybackState::Paused),
+        ];
+        let soda_obs = observed_timeline_from(
+            PlaybackState::Paused,
+            &soda_marks,
+            &[60, 60],
+        );
+        for &(at, st) in &soda_marks {
+            sim.truth.mark(at, st);
+        }
+        let phase2 = Scene {
+            obs_state: &|x| state_of(&soda_obs, x),
+            props: &soda_props,
+            timeline: &soda_timeline,
+            events: vec![40_060, 50_060],
+            can_next: &|_| true,
+        };
+        // 汽水不参与「网易云那首歌」的真值积分，只跑时钟
+        sim.truth.mark(40_000, PlaybackState::Paused);
+        sim.begin_scene();
+        sim.run_to(50_500, &phase2);
+        assert_eq!(
+            sim.st.last.as_ref().unwrap().session.aumid,
+            SODA,
+            "前置：此刻显示的是汽水"
+        );
+
+        // 阶段 3：切回网易云继续播放（时间线回到 (0,0)）
+        let back_marks = vec![
+            (60_000u64, PlaybackState::Playing),
+            (100_000, PlaybackState::Paused),
+        ];
+        let back_obs = observed_timeline_from(
+            PlaybackState::Paused,
+            &back_marks,
+            &[60, 60],
+        );
+        sim.truth.mark(60_000, PlaybackState::Playing);
+        let phase3 = Scene {
+            obs_state: &|x| state_of(&back_obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![60_060, 100_060],
+            can_next: &|_| true,
+        };
+        sim.begin_scene();
+        sim.run_to(60_500, &phase3);
+        let resumed = sim.clock(60_500);
+        // 复原点是「切回来那一拍」，之后钟继续正常走表，所以允许一个轮询间隔的
+        // 正向偏差；但绝不许低于离开时的位置，更不许归零。
+        assert!(
+            resumed >= paused_at - 100,
+            "切回网易云不许比离开时的 {paused_at}ms 更靠后（归零 = Bug 2）：实际 {resumed}ms"
+        );
+        assert!(
+            resumed - paused_at <= limits::MEDIA_POLL_MS as Ms + 100,
+            "切回网易云必须接着离开时的 {paused_at}ms，实际 {resumed}ms（差了 {}ms）",
+            resumed - paused_at
+        );
+        assert!(resumed > 19_000, "绝不能回到 0（歌词从头开始）");
+
+        // 继续播 40s：钟必须在「离开时的位置」之上精确走 40s，
+        // 不许被记忆再拽回去，也不许多走。
+        sim.run_to(100_500, &phase3);
+        let after = sim.clock(100_500);
+        assert!(
+            (after - (paused_at + 40_000)).abs() <= 200,
+            "续接之后必须精确走表：期望 {}，实际 {after}",
+            paused_at + 40_000
+        );
+    }
+
+    /// **Bug 2 的另一半：真正的新歌仍然从 0 开始（Reset 语义不许被记忆破坏）。**
+    #[test]
+    fn brand_new_track_still_starts_at_zero() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let marks = vec![(0u64, PlaybackState::Playing)];
+        let obs = observed_timeline(&marks, &[]);
+        let p1 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![0],
+            can_next: &|_| true,
+        };
+        sim.run_to(30_000, &p1);
+        assert!((sim.clock(30_000) - 30_000).abs() <= 100);
+
+        // 同 App 内切到一首从没听过的歌（不在记忆里）→ 必须从 0 起
+        let other = |_: u64| -> (&'static str, &'static str, Ms) { (CLOUD, "七里香", 0) };
+        let p2 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &other,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.run_to(31_000, &p2);
+        assert_eq!(
+            sim.st.last.as_ref().unwrap().position_ms,
+            0,
+            "没听过的歌必须 Reset 归零（切歌语义不破）"
+        );
+        // 关键不变量：Reset 的锚点必须在「切歌被慢层发现」之后，
+        // 不许把切歌前的走表时间算进新歌（那正是「从第一句重唱」的反面——
+        // 时钟凭空领先）。
+        let reset = sim.st.last.as_ref().unwrap();
+        assert!(
+            reset.position_at >= sim.now(30_000),
+            "Reset 锚点不能早于切歌时刻"
+        );
+        assert!(
+            sim.clock(31_000) <= (31_000 - 30_000) as Ms,
+            "Reset 之后钟最多只走「切歌被发现的时刻 → 现在」这一段：实际 {}",
+            sim.clock(31_000)
+        );
+    }
+
+    /// 同 App 内「切走再切回**同一首**」：不许再丢掉之前的进度
+    /// （用户日志原始症状：141s 的曲子切回来变成 0，之后一直慢 141s）。
+    #[test]
+    fn returning_to_same_track_within_app_keeps_progress() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let marks = vec![(0u64, PlaybackState::Playing), (60_000, PlaybackState::Paused)];
+        let obs = observed_timeline(&marks, &[60, 60]);
+        let p1 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![0, 60_060],
+            can_next: &|_| true,
+        };
+        sim.run_to(61_000, &p1);
+        let left_at = sim.clock(61_000);
+        assert!((left_at - 60_000).abs() <= 100, "前置：暂停在 60s 附近");
+
+        // 之后全程「暂停」：时钟不再自走，读数就是复原值本身。
+        let frozen = |_: u64| PlaybackState::Paused;
+        // 切到另一首（同 App、同 (0,0)，读不到位置）→ 记进记忆后归零
+        let other = |_: u64| -> (&'static str, &'static str, Ms) { (CLOUD, "七里香", 0) };
+        let p2 = Scene {
+            obs_state: &frozen,
+            props: &other,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        // 窗口必须长过慢层（2s）才一定读得到新曲目
+        sim.run_to(64_000, &p2);
+        assert_eq!(
+            sim.st.last.as_ref().unwrap().position_ms,
+            0,
+            "前置：另一首没听过 → 归零"
+        );
+        // 切回同一首
+        let back = Scene {
+            obs_state: &frozen,
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.run_to(67_000, &back);
+        let restored = sim.st.last.as_ref().unwrap().position_ms;
+        assert!(
+            (restored - left_at).abs() <= 100,
+            "切回同一首歌必须复原 {left_at}ms，实际 {restored}ms"
+        );
+    }
+
+    /// 会话被系统短暂丢弃（`session cleared`）后重新出现：同样必须复原。
+    #[test]
+    fn session_drop_and_return_restores_lyric_clock() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let marks = vec![(0u64, PlaybackState::Playing), (40_000, PlaybackState::Paused)];
+        let obs = observed_timeline(&marks, &[60, 60]);
+        let scene = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![0, 40_060],
+            can_next: &|_| true,
+        };
+        sim.run_to(41_000, &scene);
+        let left_at = sim.clock(41_000);
+        assert!((left_at - 40_000).abs() <= 100);
+
+        sim.drop_session(sim.now(41_500));
+        assert!(sim.st.last.is_none(), "前置：会话确实被丢弃");
+        sim.run_to(44_000, &scene);
+        let restored = sim.st.last.as_ref().unwrap().position_ms;
+        assert!(
+            (restored - left_at).abs() <= 100,
+            "会话回来后必须复原 {left_at}ms，实际 {restored}ms（归零 = 歌词从头）"
+        );
+    }
+
+    // ------------------------------------------- G8-⑤：(0, 真实时长) 不是位置
+
+    /// **`(0, 真实时长)` 不是可信位置（真机日志实证 17 次）。**
+    ///
+    /// 时长有值只说明播放器知道这首歌多长，**不代表位置已经上报**。旧判据是
+    /// 「时长有没有值」（`Some(_) => false`），于是一条 `(0,D)` 读数撞在
+    /// **状态跃迁那一拍**就会绕过 Carry、把钟砸到 0。
+    ///
+    /// 真机统计（`session changed:` 行）：`position=0 && duration>0` 共 17 次
+    /// —— 汽水 15 次（`duration=60000` 11 次，其余 4 次）、Edge 2 次；
+    /// 网易云 716 次 `position=0` 的 duration **恒为 0**（0 次），本次没触发。
+    /// 那 17 次都发生在换曲瞬间（后续读数证明真实位置确实 ≈0），属合法场景，
+    /// 所以修复必须**不改变它们的最终结果**（下面第三段就锁这个）。
+    #[test]
+    fn zero_position_with_real_duration_is_not_a_trusted_position() {
+        // ① 缓存层：`(0,D)` 会写入位置 0（播放器说位置是 0，就得照写——真实位置
+        //    播放器把进度拖回开头时靠它把钟拉回 0），但**必须与采样时刻配对**：
+        //    绝不允许出现「旧位置 @ 新时刻」（G8-④ 的病）或「新位置 @ 旧时刻」。
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        let t9 = at(t0, 9_000);
+        st.apply_timeline_read(0, 180_000, t9);
+        assert_eq!(
+            st.parts.position_ms, 0,
+            "(0,D) 写 0：seek 回开头/重播到 0 必须能把钟拉回 0"
+        );
+        assert_eq!(
+            st.parts.timeline_at,
+            Some(t9),
+            "(0,D) 写位置就必须同时写采样时刻（严格配对）"
+        );
+        assert_eq!(st.parts.duration_ms, 180_000, "时长是真信息，必须收下");
+
+        // ② 判定层：跃迁那一拍必须 Carry（旧判据会走 Keep 把钟砸到 0）
+        assert_eq!(
+            lyric_clock_action(Some((0, 180_000)), false, true, false, true),
+            LyricClockAction::Carry
+        );
+        let mut jumped = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut jumped.parts, "晴天", t0);
+        // 时长先落定：`Track::key()` 含 duration/3000，时长一变 `track_id` 就变，
+        // 那会走 `Reset` 把本用例的意图（状态跃迁 Carry）掩盖掉。
+        jumped.parts.duration_ms = 180_000;
+        jumped.parts.position_ms = 42_000;
+        jumped.parts.timeline_at = Some(t0);
+        jumped.last = Some(published(&jumped.parts, PlaybackState::Playing, 42_000, t0));
+        jumped.parts.state = PlaybackState::Paused;
+        let t1 = at(t0, 10_000);
+        jumped.apply_timeline_read(0, 180_000, t1);
+        let snap = jumped
+            .publish_point(ti(true, Some((0, 180_000)), true), t1)
+            .expect("状态跃迁必须发布");
+        assert_eq!(
+            snap.position_ms, 52_000,
+            "(0,D) + 状态跃迁：必须续接到 42s+10s，绝不许砸到 0"
+        );
+
+        // ③ 合法场景不受影响：新曲目第一份读数就是 `(0, D)`（第一句在 0ms）
+        let mut fresh = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        fresh.parts.props_ok = true;
+        fresh.parts.aumid = CLOUD.to_string();
+        fresh.parts.process_name = CLOUD.to_string();
+        fresh.parts.app_name = CLOUD.to_string();
+        fresh.parts.track = Track {
+            title: "晴天".to_string(),
+            artist: "a".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        fresh.parts.state = PlaybackState::Playing;
+        fresh.apply_timeline_read(0, 180_000, t0);
+        let first = fresh
+            .publish_point(ti(false, Some((0, 180_000)), true), t0)
+            .expect("首帧必须发布");
+        assert_eq!(first.position_ms, 0, "新歌本来就该从 0 起表");
+        assert!(first.can_seek, "时长到了 → 进度条可拖（can_seek）");
+        // 紧接着的真实位置读数照常生效（稳步前进不发布，靠 UI 外推；
+        // 这里断言「外推出来的钟 == 真实位置」，这才是播放器真正的口径）
+        fresh.last = Some(first);
+        fresh.apply_timeline_read(600, 180_000, at(t0, 600));
+        let next = fresh.build_snapshot(ti(false, Some((600, 180_000)), true), at(t0, 600));
+        assert_eq!(next.position_ms, 600, "真实读数照常写入");
+        assert_eq!(
+            lyric_clock_at(&next, at(t0, 600)),
+            600,
+            "外推钟 == 真实位置"
+        );
+    }
+
+    /// 换曲瞬间的 `(0,D)`（真机那 17 次的形态）：新曲从 0 起表、后续读数正常接上，
+    /// 旧曲的位置绝不许被带进新曲。
+    #[test]
+    fn zero_duration_boundary_read_does_not_leak_old_position() {
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        st.last = Some(published(&st.parts, PlaybackState::Playing, 42_000, t0));
+
+        // 切到另一首（真实上报位置的播放器）：读数就是 (0, 180_000)
+        st.parts.track.title = "七里香".to_string();
+        st.parts.duration_ms = 180_000;
+        let t1 = at(t0, 43_000);
+        st.apply_timeline_read(0, 180_000, t1);
+        let snap = st
+            .publish_point(ti(false, Some((0, 180_000)), true), t1)
+            .expect("换曲必须发布");
+        assert_eq!(snap.position_ms, 0, "新曲必须从 0 起表");
+        assert_eq!(snap.position_at, t1, "锚点 = 新曲的采样时刻");
+
+        // 2.2s 后真实位置 2286（真机日志里就是这个形态）→ 正常跟上。
+        // 注意这里**不该发布**：位置稳步前进被刻意排除在 `has_changed` 之外
+        // （否则每秒重绘），所以断言 `build_snapshot` 的结果。
+        let t2 = at(t0, 45_200);
+        st.last = Some(snap);
+        st.apply_timeline_read(2_286, 180_000, t2);
+        assert!(
+            st.publish_point(ti(false, Some((2_286, 180_000)), true), t2)
+                .is_none(),
+            "稳步前进不许发布（每秒重绘）"
+        );
+        let next = st.build_snapshot(ti(false, Some((2_286, 180_000)), true), t2);
+        assert_eq!(next.position_ms, 2_286);
+        assert_eq!(lyric_clock_at(&next, t2), 2_286);
+    }
+
+    // ------------------------------------------- G8-⑤：重播保护
+
+    /// **反向场景：同一首歌真的从头重播，不许被旧记忆带偏。**
+    ///
+    /// 判据是 [`restorable`]：只有「离开时**暂停**」的记忆才续接。
+    #[test]
+    fn genuine_replay_is_not_dragged_by_memory() {
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        // ① 纯函数真值表：只有 Paused 可续接
+        for state in [
+            PlaybackState::Playing,
+            PlaybackState::Paused,
+            PlaybackState::NoSession,
+            PlaybackState::Fallback,
+        ] {
+            assert_eq!(
+                restorable(state),
+                state == PlaybackState::Paused,
+                "只有「离开时暂停」才可续接（{}）",
+                state.as_str()
+            );
+        }
+
+        // ② 记忆层：在播离开 → restore 必须拒绝
+        let mut mem = LyricClockMemory::default();
+        let mut playing = snapshot("晴天", PlaybackState::Playing, 60_000);
+        playing.session.aumid = CLOUD.to_string();
+        mem.remember(&playing, t0);
+        assert!(
+            mem.restore(CLOUD, playing.track_id, at(t0, 5_000)).is_none(),
+            "离开时在播 ⇒ 不续接（可能是在列表里重新点播 = 从头播）"
+        );
+        // 换成暂停离开 → 可续接
+        let mut paused = playing.clone();
+        paused.state = PlaybackState::Paused;
+        mem.remember(&paused, t0);
+        assert!(mem.restore(CLOUD, paused.track_id, at(t0, 5_000)).is_some());
+
+        // ③ 端到端：在播时切走、再切回来（用户可能点了重播）→ 必须归零，
+        //    绝不许被记忆拖到 60s（那会让歌词唱到还没播的句子）
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let marks = vec![(0u64, PlaybackState::Playing)];
+        let obs = observed_timeline(&marks, &[]);
+        let scene = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![0],
+            can_next: &|_| true,
+        };
+        sim.run_to(60_000, &scene);
+        assert!((sim.clock(60_000) - 60_000).abs() <= 100, "前置：播到 60s");
+        // 切走（此时仍在播 → last.state = Playing）
+        let other = |_: u64| -> (&'static str, &'static str, Ms) { (CLOUD, "七里香", 0) };
+        let away = Scene {
+            obs_state: &|_| PlaybackState::Playing,
+            props: &other,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.begin_scene();
+        sim.run_to(64_000, &away);
+        // 切回来
+        let back = Scene {
+            obs_state: &|_| PlaybackState::Playing,
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.begin_scene();
+        sim.run_to(67_000, &back);
+        let restored = sim.st.last.as_ref().unwrap().position_ms;
+        assert_eq!(
+            restored, 0,
+            "在播时切走的记忆不可续接 → 必须归零（宁可落后，绝不超前）"
+        );
+    }
+
+    // ------------------------------------------- G8-④：N 轮切走切回不丢钟
+
+    /// **N 轮「播放 → 暂停 →（会话被别的播放器接走）→ 切回继续」不许丢钟。**
+    ///
+    /// 这是 Bug 1 改口径后的判定性测试：真机上每轮丢掉的不是「几十毫秒的检测
+    /// 延迟」，而是**整首歌的进度**（日志实证 79,550ms / 141,223ms 两次）。
+    /// 断言用「每轮平均损失 ≤ 一个轮询间隔」表达「不丢钟」——旧实现每轮丢掉整首
+    /// 歌，平均损失 ~7000ms/轮，必红。
+    fn run_cutaway_rounds(rounds: usize) -> Ms {
+        let base = Instant::now() - Duration::from_millis(3_000_000);
+        let mut sim = ClockSim::new(base);
+        let play = 7_000u64;
+        let away = 1_000u64;
+        let soda_timeline = |t: u64| -> (Ms, Ms) { (t as Ms % 90_000 + 1, 200_000) };
+        let soda_props = |_: u64| -> (&'static str, &'static str, Ms) { (SODA, "月半", 200_000) };
+        let soda = Scene {
+            obs_state: &|_| PlaybackState::Playing,
+            props: &soda_props,
+            timeline: &soda_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        let mut t = 0u64;
+        for _ in 0..rounds {
+            // 网易云播 play ms → 用户按暂停（检测到之后才算数）
+            let pause_at = t + play;
+            let obs = move |x: u64| {
+                if x < pause_at {
+                    PlaybackState::Playing
+                } else {
+                    PlaybackState::Paused
+                }
+            };
+            let cloud = Scene {
+                obs_state: &obs,
+                props: &cloud_props,
+                timeline: &cloud_timeline,
+                events: vec![0],
+                can_next: &|_| true,
+            };
+            sim.run_to(pause_at + 500, &cloud);
+            // 会话被汽水接走 1s
+            sim.drop_session(sim.now(pause_at + 500));
+            sim.begin_scene();
+            sim.run_to(pause_at + 500 + away, &soda);
+            t = pause_at + 500 + away;
+            // 切回网易云（用户点了播放）—— 模拟 CurrentSessionChanged 脏位
+            sim.st.dirty.store(true, Ordering::Relaxed);
+            sim.begin_scene();
+        }
+        // 最后一段：切回网易云再播 play ms
+        let tail = Scene {
+            obs_state: &|_| PlaybackState::Playing,
+            props: &cloud_props,
+            timeline: &cloud_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.run_to(t + play, &tail);
+        sim.clock(t + play) - ((rounds + 1) as Ms * play as Ms)
+    }
+
+    #[test]
+    fn repeated_cutaways_do_not_lose_the_lyric_clock() {
+        for rounds in [10usize, 20] {
+            let err = run_cutaway_rounds(rounds);
+            let budget = rounds as Ms * limits::MEDIA_POLL_MS as Ms;
+            assert!(
+                err.abs() <= budget,
+                "N={rounds}：累计误差 {err}ms 超过「每轮一个轮询间隔」的预算 {budget}ms \
+                 （旧实现每轮丢掉整首歌 ⇒ 这里会是 -{}ms 量级）",
+                rounds as Ms * 7_000
+            );
+        }
+        // N=20 与 N=10 的误差都必须落在各自的预算内 ⇒ 不随 N 线性增长到整首歌
+        let e10 = run_cutaway_rounds(10);
+        let e20 = run_cutaway_rounds(20);
+        assert!(
+            e20.abs() <= e10.abs() + 10 * limits::MEDIA_POLL_MS as Ms,
+            "误差随轮数暴涨（N=10 {e10} → N=20 {e20}）：钟又被丢掉了"
+        );
+    }
+
+    /// 记忆的时效与容量：过期的记忆不许被使用（宁可从头），容量满则淘汰最老。
+    #[test]
+    fn clock_memory_respects_ttl_and_capacity() {
+        let t0 = Instant::now();
+        let mut mem = LyricClockMemory::default();
+        let mut np = snapshot("晴天", PlaybackState::Paused, 42_000);
+        np.session.aumid = CLOUD.to_string();
+        mem.remember(&np, t0);
+        assert_eq!(
+            mem.restore(CLOUD, np.track_id, at(t0, 1_000)),
+            Some(RestoredClock {
+                position_ms: 42_000,
+                leave_state: PlaybackState::Paused
+            })
+        );
+        // TTL 边界：不过期 / 刚过期
+        let ttl = limits::LYRIC_CLOCK_MEMORY_TTL_MS;
+        assert!(mem
+            .restore(CLOUD, np.track_id, at(t0, ttl.saturating_sub(1)))
+            .is_some());
+        assert!(
+            mem.restore(CLOUD, np.track_id, at(t0, ttl + 1)).is_none(),
+            "过期记忆必须被拒（不许把很久以前的位置硬塞回来）"
+        );
+        // 位置 0 的记忆没有意义（等同 Reset）
+        let mut zero = snapshot("雨天", PlaybackState::Paused, 0);
+        zero.session.aumid = CLOUD.to_string();
+        mem.remember(&zero, t0);
+        assert!(mem.restore(CLOUD, zero.track_id, t0).is_none());
+
+        // 容量上限：超过 CAP 之后淘汰最老的一条
+        for i in 0..(limits::LYRIC_CLOCK_MEMORY_CAP + 4) as u64 {
+            let mut s = snapshot(&format!("曲目{i}"), PlaybackState::Paused, 1_000 + i as Ms);
+            s.session.aumid = CLOUD.to_string();
+            mem.remember(&s, at(t0, i));
+        }
+        assert_eq!(mem.len(), limits::LYRIC_CLOCK_MEMORY_CAP);
+        // 最早那条（"晴天"）已被淘汰
+        assert!(mem.restore(CLOUD, np.track_id, at(t0, 10)).is_none());
+    }
+
+    /// 记忆只记「离开时」的那一份：同一首歌的稳态发布不许刷新它的时间戳，
+    /// 否则 TTL 会被无限续期。
+    #[test]
+    fn stable_publishes_do_not_refresh_memory_timestamp() {
+        let t0 = Instant::now();
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.aumid = CLOUD.to_string();
+        let s0 = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.last = Some(s0);
+        // 同一首歌、同一 aumid → 不算「离开」
+        st.remember_leaving(Some(&published(&st.parts, PlaybackState::Playing, 0, t0)), at(t0, 5_000));
+        assert_eq!(st.memory.len(), 0, "稳态发布不许写记忆");
+        // 换歌 → 才算离开
+        st.parts.track.title = "七里香".to_string();
+        let next = published(&st.parts, PlaybackState::Playing, 0, t0);
+        st.remember_leaving(Some(&next), at(t0, 5_000));
+        assert_eq!(st.memory.len(), 1, "离开这首歌必须写记忆");
+    }
+
+    // ------------------------------------------- 汽水这类真实上报位置的播放器
+
+    /// **守护测试：真实上报位置的播放器行为一个字节都不许变。**
+    ///
+    /// 汽水的读数一直是 `(position, duration)` 且 `position != 0` →
+    /// `no_usable_position == false` → 永远走 `Keep`：快照里的位置就是本轮读到
+    /// 的位置、锚点就是本轮读取时刻。记忆与 Carry 都不许插一脚。
+    #[test]
+    fn real_position_player_snapshot_is_untouched() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let soda_timeline = |t: u64| -> (Ms, Ms) {
+            let pos = 30_000 + t as Ms;
+            (pos, 300_000)
+        };
+        let soda_props = |_: u64| -> (&'static str, &'static str, Ms) { (SODA, "月半", 300_000) };
+        let marks = vec![(0u64, PlaybackState::Playing), (12_000, PlaybackState::Paused)];
+        let obs = observed_timeline(&marks, &[60, 60]);
+        let scene = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &soda_props,
+            timeline: &soda_timeline,
+            events: vec![0, 12_060],
+            can_next: &|_| true,
+        };
+        // 每一拍都检查：快照位置必须等于「本轮读到的位置」，不许被外推/记忆改写
+        let mut checked = 0usize;
+        while sim.cursor + 50 <= 20_000 {
+            sim.run_to(sim.cursor + 50, &scene);
+            let t = sim.cursor;
+            let last = sim.st.last.as_ref().expect("汽水必须一直有快照");
+            let reported = (soda_timeline)(t).0;
+            if last.state == PlaybackState::Playing {
+                // 播放中：UI 外推出的钟必须等于真实读数（采样值 + 线性外推 = 真值）
+                let clock = lyric_clock_at(last, sim.now(t));
+                assert!(
+                    (clock - reported).abs() <= 100,
+                    "t={t} 汽水的外推钟必须等于真实读数：钟 {clock}，读数 {reported}"
+                );
+            }
+            assert_eq!(last.session.aumid, SODA);
+            checked += 1;
+        }
+        assert!(checked > 100, "守护测试必须真的跑过足够多拍");
+        // 暂停轮次：位置就是暂停那一刻读到的真实值（不许被 Carry 外推改写）
+        sim.run_to(20_500, &scene);
+        let paused = sim.st.last.as_ref().unwrap();
+        assert_eq!(paused.state, PlaybackState::Paused);
+        let reported_at_pause = (soda_timeline)(12_060).0;
+        assert!(
+            (paused.position_ms - reported_at_pause).abs() <= 1_200,
+            "汽水暂停位置必须是真实读数（{}），实际 {}",
+            reported_at_pause,
+            paused.position_ms
+        );
+    }
+
+    /// 汽水切歌再切回（真实读数）：必须用**真实位置**，绝不许用记忆里的旧值。
+    #[test]
+    fn real_position_player_ignores_clock_memory_on_track_change() {
+        let base = Instant::now() - Duration::from_millis(1_000_000);
+        let mut sim = ClockSim::new(base);
+        let soda_timeline = |t: u64| -> (Ms, Ms) { (t as Ms + 1_000, 300_000) };
+        let marks = vec![(0u64, PlaybackState::Playing)];
+        let obs = observed_timeline(&marks, &[]);
+        let a = |_: u64| -> (&'static str, &'static str, Ms) { (SODA, "月半", 300_000) };
+        let p1 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &a,
+            timeline: &soda_timeline,
+            events: vec![0],
+            can_next: &|_| true,
+        };
+        sim.run_to(30_000, &p1);
+        // B 歌：真实位置 5s
+        let b = |_: u64| -> (&'static str, &'static str, Ms) { (SODA, "隔岸", 300_000) };
+        let b_timeline = |_: u64| -> (Ms, Ms) { (5_000, 300_000) };
+        let p2 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &b,
+            timeline: &b_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.run_to(31_000, &p2);
+        assert_eq!(
+            sim.st.last.as_ref().unwrap().position_ms,
+            5_000,
+            "真实读数优先：不许用记忆里的旧值覆盖它"
+        );
+        assert_eq!(
+            sim.st.last.as_ref().unwrap().state,
+            PlaybackState::Playing,
+            "切歌后仍在播放"
+        );
+        // 切回 A：真实读数（此刻 33s）仍然优先，不许用记忆里的 30s
+        let p3 = Scene {
+            obs_state: &|x| state_of(&obs, x),
+            props: &a,
+            timeline: &soda_timeline,
+            events: vec![],
+            can_next: &|_| true,
+        };
+        sim.run_to(33_000, &p3);
+        assert_eq!(
+            lyric_clock_at(sim.st.last.as_ref().unwrap(), sim.now(33_000)),
+            34_000,
+            "切回 A 必须用真实读数（此刻 34s），不许用记忆里的 30s"
+        );
+    }
+
+    // ================================================ QA 补测（v1.9.3 / G8-④）
+    //
+    // 下面 4 条是 QA 独立审计后补的**盲区覆盖**：把对应实现改坏时，原有 612 条
+    // 测试**全部仍然通过**（已实测），而用户会看到「暂停几次后歌词越来越靠后」
+    // 或「被拉黑/解绑后同一首歌从第一句重唱」。每条都已在改坏实验里验证过会变红。
+
+    /// **QA 补测①：主循环停顿（系统休眠 / UI 卡死）后恢复时，Carry 必须锚到
+    /// 事件到达时刻，而不是「醒来那一刻」。**
+    ///
+    /// 真机形态：合盖 25s 再打开（或主循环被卡住），期间 `PlaybackInfoChanged`
+    /// 已经到达并被 [`PlaybackEventClock`] 记下真实时刻。这时
+    /// - 锚到事件时刻 → 钟落在暂停真正发生的位置（42s + 5.06s）；
+    /// - 锚到本轮 `now`（`jumped_at = None`）→ 钟被多拨 25s，**永久超前**，
+    ///   歌词直接跳到还没播的句子，而 `(0,0)` 播放器没有任何自愈机会。
+    ///
+    /// 现有 N 轮仿真都是「50ms 连续跑」的形态，碰不到这一格；下面的接线三行与
+    /// `tick()` 逐字同款（`last_playback_obs` → `note_playback` → `take_after`）。
+    #[test]
+    fn carry_anchors_at_event_stamp_after_a_stalled_loop() {
+        let t0 = Instant::now() - Duration::from_millis(500_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.position_ms = 42_000;
+        st.parts.timeline_at = Some(t0);
+        st.last = Some(published(&st.parts, PlaybackState::Playing, 42_000, t0));
+        // 上一次快层观测就在 t0，此后主循环停了 25s
+        st.cadence.note_playback(t0, PlaybackState::Playing);
+        // 真实暂停在 t0+5s；PlaybackInfoChanged 在 t0+5.06s 到达
+        st.playback_events.stamp_at(at(t0, 5_060));
+
+        // ---- 以下 3 行与 `tick()` 的接线逐字同款 ----
+        let now = at(t0, 30_000);
+        let prev_obs = st.cadence.last_playback_obs();
+        let jumped = st.cadence.note_playback(now, PlaybackState::Paused);
+        let jumped_at = Some(transition_at(now, st.playback_events.take_after(prev_obs)));
+
+        st.parts.state = PlaybackState::Paused;
+        st.apply_timeline_read(0, 0, now);
+        let inputs = tick_inputs(jumped, Some((0, 0))).at(jumped_at);
+        let snap = st.publish_point(inputs, now).expect("状态跃迁必须发布");
+
+        assert!(jumped, "前置：必须判出状态跃迁");
+        assert_eq!(
+            snap.position_ms, 47_060,
+            "停摆 25s 后恢复，钟只许走「真实播放过的 5.06s」，不许把整段停摆算进去"
+        );
+        assert_eq!(
+            snap.position_at,
+            at(t0, 5_060),
+            "Carry 的锚点必须是事件到达时刻，不是醒来那一刻（否则永久超前 25s）"
+        );
+        assert_eq!(lyric_clock_at(&snap, now), 47_060, "暂停态钟原地停住");
+    }
+
+    /// **QA 补测②：事件时间戳恰好等于「上一次快层观测」时必须收下。**
+    ///
+    /// 边界方向写反（`t < a` → `t <= a`）时原有 612 条测试全绿（已实测 M5），
+    /// 后果是把「恰好落在上一次观测那一刻的这次跃迁」当成更早一次的残留丢掉，
+    /// Carry 退回 `now`，那一轮白白少算一个轮询间隔。
+    #[test]
+    fn event_stamp_exactly_at_the_last_observation_is_accepted() {
+        let clock = PlaybackEventClock::default();
+        let t0 = Instant::now();
+        clock.stamp_at(at(t0, 600));
+        assert_eq!(
+            clock.take_after(Some(at(t0, 600))),
+            Some(at(t0, 600)),
+            "「恰好相等」必须收下：那是本轮要检测的这次跃迁，不是更早一次的残留"
+        );
+        assert!(
+            clock.take_after(None).is_none(),
+            "时间戳只许被消费一次"
+        );
+    }
+
+    fn fake_sink() -> (EventSink<AppEvent>, std::sync::mpsc::Receiver<AppEvent>) {
+        use crate::platform::wake::WakeHwnd;
+        use windows::Win32::Foundation::HWND;
+        let hwnd = HWND(0x1234_usize as *mut core::ffi::c_void);
+        EventSink::new(WakeHwnd(hwnd))
+    }
+
+    /// 造一份「网易云暂停在 141.223s」的已广播状态（`last` 已就位）。
+    fn paused_cloud_state(t0: Instant) -> (PollState, NowPlaying) {
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        zero_player(&mut st.parts, "晴天", t0);
+        st.parts.position_ms = 141_223;
+        st.parts.timeline_at = Some(t0);
+        st.parts.state = PlaybackState::Paused;
+        let snap = published(&st.parts, PlaybackState::Paused, 141_223, t0);
+        st.last = Some(snap.clone());
+        (st, snap)
+    }
+
+    /// **QA 补测③：被拉黑 / 解绑释放这两条路径也必须记下歌词钟。**
+    ///
+    /// 真机场景：网易云暂停在 141s → 用户把它加进黑名单（或从黑名单移除）→
+    /// 小组件隐藏/恢复 → 同一首歌再出现。这两处漏挂 `remember_leaving` 时原有
+    /// 612 条测试全绿（已实测 M6a / M6b），而用户会看到歌词从第一句重唱。
+    #[test]
+    fn blacklist_paths_remember_the_lyric_clock() {
+        let t0 = Instant::now() - Duration::from_millis(200_000);
+        let expect = Some(RestoredClock {
+            position_ms: 141_223,
+            leave_state: PlaybackState::Paused,
+        });
+
+        // ① 进入忽略态（命中黑名单）：`tick` 的两个拦截点与 `rescan_sessions`
+        //    的 Hide 分支都走这里
+        let (mut st, snap) = paused_cloud_state(t0);
+        let (sink, _rx) = fake_sink();
+        st.enter_ignored(&sink, at(t0, 1_000));
+        assert!(st.last.is_none(), "前置：进入忽略态必须丢弃快照");
+        assert_eq!(st.memory.len(), 1, "进入忽略态必须先记住歌词钟");
+        assert_eq!(
+            st.memory.restore(CLOUD, snap.track_id, at(t0, 2_000)),
+            expect,
+            "记下来的必须是「141.223s + 暂停态」，否则续接会拿错值"
+        );
+
+        // ② 解绑释放（黑名单条件不再成立 → 回到常规路径）
+        let (mut st2, snap2) = paused_cloud_state(t0);
+        let (sink2, _rx2) = fake_sink();
+        st2.apply_release(ScanDecision::Release, &sink2, at(t0, 1_000));
+        assert!(st2.last.is_none(), "前置：释放必须丢弃快照");
+        assert_eq!(st2.memory.len(), 1, "解绑释放必须先记住歌词钟");
+        assert_eq!(st2.memory.restore(CLOUD, snap2.track_id, at(t0, 2_000)), expect);
+    }
+
+    /// **QA 补测⑤：真实播放器「换曲首帧就是 `(0, D)`」不许被上一首的旧位置污染。**
+    ///
+    /// G8-⑤ 的核心风险：`apply_timeline_read` 现在只在 `position != 0` 时写
+    /// `parts.position_ms`，所以 `(0,D)` 读完后 `parts.position_ms` **还是上一首的
+    /// 值**。这条用例证明它不会外泄：`track_id` 变了 → `lyric_clock_action` 判
+    /// `Reset`（因为 G8-⑤ 的判据是「位置是否为 0」）→ `Reset` 无条件把位置写成
+    /// 0 / 记忆值。**判据一旦退回 `Some(_) => false`，本用例立刻变红（钟残留 200s）。**
+    #[test]
+    fn zero_position_first_read_of_a_new_track_is_not_polluted_by_the_previous_track() {
+        let t0 = Instant::now() - Duration::from_millis(300_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        // 汽水 A 歌播到 200s 并已广播
+        st.parts.track = Track {
+            title: "月半".to_string(),
+            artist: "黄龄".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        st.parts.aumid = SODA.to_string();
+        st.parts.process_name = SODA.to_string();
+        st.parts.app_name = SODA.to_string();
+        st.parts.props_ok = true;
+        st.parts.state = PlaybackState::Playing;
+        st.parts.position_ms = 200_000;
+        st.parts.duration_ms = 200_000;
+        st.parts.timeline_at = Some(t0);
+        st.last = Some(published(&st.parts, PlaybackState::Playing, 200_000, t0));
+
+        // 换到 B 歌：真实播放器的首帧读数就是 `(0, 223_000)`
+        st.parts.track = Track {
+            title: "隔岸".to_string(),
+            artist: "x".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        let t1 = at(t0, 1_000);
+        st.apply_timeline_read(0, 223_000, t1);
+        let snap = st
+            .publish_point(ti(false, Some((0, 223_000)), true), t1)
+            .expect("换曲必须发布");
+        assert_eq!(
+            snap.position_ms, 0,
+            "换曲首帧 (0,D)：钟必须是 0，绝不许残留上一首的 200s"
+        );
+        assert_eq!(snap.position_at, t1, "锚点必须是这次采样的时刻");
+        assert_eq!(
+            st.parts.position_ms, 0,
+            "parts 也必须归零，否则下一轮 (0,D) 会继续沿用 200s"
+        );
+        assert_eq!(st.parts.timeline_at, Some(t1), "位置与锚点必须配对");
+    }
+
+    /// **QA 审判项（v1.9.3 已知回归，**故意留红时不得出包**）：真实播放器在
+    /// 暂停态把进度拖到最开头 / 单曲循环重播到 0 时，钟必须跟着回 0。**
+    ///
+    /// 现行实现里 `apply_timeline_read` 只在 `position != 0` 时写位置，于是
+    /// `(0, D)` 读完后 `parts.position_ms` 仍是旧值（120s），`Keep` 分支把这份
+    /// 旧值原样拼进快照，`has_changed` 又判成「没变化」→ **连发布都不发生**，
+    /// 进度/歌词卡在旧位置，直到播放器报出第一个非零位置（≤1 个时间线轮隔）。
+    #[test]
+    fn seeking_to_zero_on_a_real_position_player_pulls_the_clock_back_to_zero() {
+        let t0 = Instant::now() - Duration::from_millis(300_000);
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        st.parts.track = Track {
+            title: "月半".to_string(),
+            artist: "黄龄".to_string(),
+            album: String::new(),
+            duration_ms: 0,
+        };
+        st.parts.aumid = SODA.to_string();
+        st.parts.process_name = SODA.to_string();
+        st.parts.app_name = SODA.to_string();
+        st.parts.props_ok = true;
+        st.parts.state = PlaybackState::Paused;
+        st.parts.position_ms = 120_000;
+        st.parts.duration_ms = 200_000;
+        st.parts.timeline_at = Some(t0);
+        st.last = Some(published(&st.parts, PlaybackState::Paused, 120_000, t0));
+
+        // 用户在暂停态把进度拖到 0 → 真实读数 `(0, 200_000)`
+        let t1 = at(t0, 1_000);
+        st.apply_timeline_read(0, 200_000, t1);
+        let published_now = st.publish_point(ti(false, Some((0, 200_000)), true), t1);
+        let snap = published_now.expect("拖到 0 后必须发布（位置大幅回退，UI 要立刻跟上）");
+        assert_eq!(
+            snap.position_ms, 0,
+            "暂停态拖到 0：钟必须回 0，不许停在 120s"
+        );
+        assert_eq!(snap.position_at, t1);
+    }
+
+    /// **QA 补测④：五个丢弃点的接线静态锁。**
+    ///
+    /// `switch_display_session` 需要真实 COM 会话句柄，单测构造不出来；它漏挂
+    /// `remember_leaving` 时原有 612 条测试同样全绿（已实测 M6c），而「黑名单
+    /// 命中 → 改显示其它会话 → 切回来」正是 G8-① 引入的高频路径。这里按方法体
+    /// 逐个断言，把这条路径钉死。
+    #[test]
+    fn every_snapshot_discard_point_calls_remember_leaving() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/media/smtc.rs"
+        ))
+        .expect("必须能读到自己");
+        for sig in [
+            "fn enter_ignored(&mut self",
+            "fn switch_display_session(",
+            "fn apply_release(&mut self",
+            "fn tick(&mut self",
+        ] {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} 必须存在"));
+            let rest = &src[start..];
+            let end = rest.find("\n    }\n").map(|i| i + 7).unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("remember_leaving"),
+                "{sig} 丢弃快照前必须 remember_leaving（漏一处 = 这首歌的位置仍然被丢）"
+            );
+        }
     }
 }
