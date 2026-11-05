@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-05 03:10 · **G1~G7 全部真人验收通过，G 系列功能清单完成** · 当前 **v1.9.0**（556 测试：555 passed + 1 ignored，clippy 0 警告）· 源码已推 GitHub（`origin/main` @ `6bbf0e4`）· **v1.9.0 Release（tag + 附 exe）仍待用户到 Releases 页手动发** · LICENSE 版权人已实名 `Yi One`、README 已内嵌设置页/小组件截图、MEMORY.md 已精简合并 · 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-06 01:15 · **G1~G7 全部真人验收通过；G8 分组迭代中（① 已验收，② 进行中）** · 当前 **v1.9.1**（576 测试：575 passed + 1 ignored，clippy 0 警告）· 源码已推 GitHub（`origin/main` @ `27d8208`）· **Releases 仍待用户手动发**（v1.9.0 未发，现有 v1.9.1 包）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
 
 ---
 
@@ -13,8 +13,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
 | 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
-| 当前版本 | **v1.9.0**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
-| 质量 | 测试 **556**（555 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1159 KB |
+| 当前版本 | **v1.9.1**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
+| 质量 | 测试 **576**（575 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1136 KB（v1.9.1 = 1,163,776 B） |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
 | 自测 | 根目录 **`启动曲栏.bat`**（增量构建 + 跑未打包 exe）；新包在 `deliverables/` |
 | 交付包 | `deliverables/曲栏_Barline_vX.Y.Z.exe`，**只增不删** |
@@ -82,6 +82,15 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **源码推送 GitHub**：commit `6bbf0e4`，`git push origin main` 成功（`95b2a13..6bbf0e4`）；`gh` CLI 本机未装、无 GitHub token，故 v1.9.0 Release（tag + 附 exe）无法在此环境自动建，留待用户在 Releases 页手动发。
 - **MEMORY.md 精简合并**：`17914B → 5670B`（去重跨节重复坑、删过时项），保留全部保命级不变量；逐日细节仍在 `.workbuddy/memory/2026-11-0X.md`。
 
+### 第六轮（2026-11-05 ~ 11-06，用户 3 项）：G8-① / ② / ③ 分组迭代
+
+用户报 2 个 Bug + 1 个新功能，要求**分组排序 → 逐组：有效测试 → 全绿 → 一次提交 → 真人验收 → 更新文档 → 下一组 → 最后全量测试总验收**。分组与全部拍板见 §2.4。团队 `software-barline-g8`（BugFix 快捷路径：工程师 → QA → 主理人出包提交，QA 两轮制）。
+
+- **G8-① 黑名单多会话显示修复 → v1.9.1 ✅ 2026-11-06 真人验收通过**：根因 = `smtc.rs::tick()` 只取 `GetCurrentSession()` 一个会话，命中黑名单即 `enter_ignored()` → `SessionCleared` → 整个小组件隐藏，完全没看 `GetSessions()` 里其它正常播放器。修复 = 命中黑名单时过 1s 低频闸枚举其它会话，优先 Playing 的正常会话（全暂停取系统顺序第一个），锁定 `display_session` 显示；`switch_display_session()` 整体复位 parts/cadence/封面缓存/事件订阅/last 杜绝串歌；`execute()` 播控改打显示的会话；「当前应用」统一为正在显示的会话（`displayed_session_hit` 纯函数）。
+- **QA 两轮，非橡皮图章**：第 1 轮 `PASS-WITH-NOTES` 抓出 2 个必修问题 —— `ScanDecision::Release` 未清 `last_ignored`（被拉黑应用退出后托盘仍显示「恢复 A」，点它误删黑名单）、以及**性能闸无任何单测锁定**（把闸改恒 `true` 时 570 条测试全绿，属「测试全绿但功能没做」同类风险）。工程师定点修复：新增 `release_needs_ignored_clear()` + `apply_release()`（假 `EventSink` 可单测）、`scan_gate()` 纯函数 + 4 格真值表。第 2 轮复刻同样改坏**2 条变红**，覆盖缺口闭合；累计 6 条反向验证（含故意发 `SessionCleared` 冒充事件，测试打印「必须恰好一条 IgnoredSession(None)」），均 SHA256 字节级还原 + touch 强制重编。
+- **交付**：测试 **556 → 570 → 576**（575 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.9.1.exe` = 1,163,776 B / SHA256 `7b0f52b5…3403`；exe 37 → 38 个只增不删；提交 `27d8208` 已推 `origin/main`。
+- **已知限制（按用户拍板不修）**：网易云手动改进度后歌词不跟随（seek 不修）；`plan.props=false` 过渡轮次有 ≤2s 混合快照窗口（G7 分层轮询固有，稳态不复现）；隐藏态 ≤1 次/秒低频枚举用于动态恢复；UI 同帧隐藏有 ≤50ms 瞬时隐藏。
+
 ---
 
 ## 2. 关键决策
@@ -121,9 +130,16 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 23. ~~`Effect::RequestBackdrop` / `Effect::MoveWindow` 死变体~~（**G6 已删**：`Effect` 从 15 → 9 变体；注意 `src/main.rs` 仍有全局 `#![allow(dead_code)]`，死码编译器不报，清理靠人工逐符号盘点 + `rg` 前先验证 `rg` 能跑）。
 
 ### 2.4 收尾决策（2026-11-05）
-- **LICENSE 版权人**：占位 "The Barline Authors" 改为实名 **"Yi One"**（用户拍板）。
+- **LICENSE 版权人**：占位 "The Barline Authors" 改为实名 **"Yi One"**（用户拍板）。**2026-11-06 补齐**：`assets/barline.rc` 的 `CompanyName` / `LegalCopyright` 同步改为 `Yi One`（此前 exe 资源面板仍显示旧占位，与 LICENSE 不一致）。
 - **最终推送授权**：用户明确授权由助手完成收尾文档/许可改动的提交与推送，覆盖 §5.4「工程师不 commit」通则（仅限本次收尾，常态纪律不变）。
 - **记忆文件精简**：因 MEMORY.md 超注入上限被截断，用户授权将其精简合并（保留不变量、去重、删过时），不删逐日日志。
+
+### 2.5 G8 分组与用户拍板（2026-11-05，逐条澄清后开工）
+- **分组排序（用户确认按建议 3 组）**：① 黑名单多会话显示（Bug，v1.9.0→v1.9.1）→ ② 网易云暂停→继续歌词钟归零（Bug，v1.9.1→v1.9.2）→ ③ 双击空白区打开设置 + 通用页开关（新增能力，v1.9.2→v1.10.0）。**每组出包 + 升版本**（用户选），每组一次提交、停下等真人验收。
+- **① 拍板**：被拉黑应用仍完全忽略；系统当前会话命中黑名单时改看其它正常会话，**优先正在播放的**，全暂停取系统顺序第一个，一个正常会话都没有才隐藏；只在命中时低频枚举、常规播放零新增跨进程调用、零定时器、不污染 ignored 轮次退避；「当前应用」= 小组件正在显示的会话。
+- **② 拍板**：**只修暂停→继续**，seek 明确不修（网易云 SMTC 恒报 `(0,0)`，读不到新位置，列为已知限制）；暂停期间歌词**原地停住**，继续后从暂停那一句接着走，不重新加载/不闪一下。
+- **③ 拍板**：**默认开**；双击生效区 = 信息区/歌词/空白，**排除四按钮 + 封面 + 进度条**（按钮区双击维持现有「零动作」）；开关放设置页**「通用」页**，是开关控件不是按钮，小组件**不新增任何按钮**。
+- **主理人裁决（① 实现期）**：隐藏态保留 1s 低频枚举（覆盖「隐藏后又有正常播放器加入」）；UI 同帧隐藏保留（不破 G7「拉黑后不显示被拉黑内容」）；设置页「检测到的应用」不新增前端标注；QA 提的 P2-1/P2-2 必修，P2-3/P3 系列留档不修。
 
 ---
 
@@ -266,7 +282,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 3.5 小尾巴与存量（不阻塞）
 - `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
 - M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- **源码已推 GitHub**（2026-11-05，commit `6bbf0e4`，`git push origin main` 成功）；**✅ LICENSE 版权人已实名化 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`，替换原「截图归档至 git 历史」说明）；**⏳ v1.9.0 Release（GitHub tag `v1.9.0` + 附 `deliverables/曲栏_Barline_v1.9.0.exe`）仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
+- **源码已推 GitHub**（`origin/main` @ `27d8208`，G8-① 提交）；**✅ LICENSE + exe 资源版权人已统一实名 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`）；**⏳ GitHub Release 仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建；v1.9.0 未发，建议直接发最新的 v1.9.1 或等三组全部完成后发 v1.10.0）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
 
@@ -305,7 +321,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | `截图态` | 截图遮罩冻结生效范围 |
 
 ### 4.3 交付包现状（`deliverables/`，只增不删）
-现存 **37 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
+现存 **38 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
+最新 `曲栏_Barline_v1.9.1.exe` = 1,163,776 B / SHA256 `7b0f52b54cf64caff0f4f7bea6450b47f1c2c37e198dd8c1e8a2cb2ebb351403` / FileVersion 1.9.1。
 ⚠️ `v1.0.0`、`v1.1.0` ~ `v1.1.9` 已不在磁盘（早前清理误删，目录在 `.gitignore` 内无法恢复）；如需补齐用 4.1 的 detached checkout 方式，不补也不影响使用。
 
 ### 4.4 测试与验收口径
@@ -326,5 +343,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态**：**G1~G7 全部真人验收通过（2026-11-05），G 系列功能清单全部完成**，当前 v1.9.0。下一组等用户提需求；遗留候选见 §3.6（30 项 pre-existing 死码 / 语言切换需重启 / D-6 两份进度实现 / 清空缓存按钮 / G7 三个 P3）。**源码已推 GitHub（`origin/main` @ `6bbf0e4`）；v1.9.0 Release（tag + 附 exe）由用户到 Releases 页手动发。**
+6. **当前状态（2026-11-06 01:15）**：**G1~G7 全部验收通过；G8-① 已真人验收通过（v1.9.1 / 576 测试 / 提交 `27d8208` 已推 GitHub）；G8-② 进行中**，G8-③ 待办。分组与全部拍板见 **§2.5**，G8-① 实现与 QA 证据见 **§1 第六轮**。下一组的验收节奏不变：一次一组 → 有效测试全绿 → 单提交 → 播报「任务清单 + 进度」→ **停下等用户回「没问题」** → 才更新文档 → 下一组；三组全部完成后跑全量测试 + 总验收。遗留候选见 §3.6。**GitHub Release 仍由用户到 Releases 页手动发。**
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。

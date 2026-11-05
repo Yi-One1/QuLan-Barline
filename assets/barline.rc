@@ -23,11 +23,11 @@ BEGIN
     // 0x0804 = 简体中文，0x04B0 (1200) = Unicode
     BLOCK "080404b0"
     BEGIN
-      VALUE "CompanyName",      "The Barline Authors"
+      VALUE "CompanyName",      "Yi One"
       VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
       VALUE "FileVersion",      "1.9.1"
       VALUE "InternalName",     "barline"
-      VALUE "LegalCopyright",   "MIT License. The Barline Authors."
+      VALUE "LegalCopyright",   "MIT License. Yi One."
       VALUE "OriginalFilename", "barline.exe"
       VALUE "ProductName",      "曲栏 Barline"
       VALUE "ProductVersion",   "1.9.1"
