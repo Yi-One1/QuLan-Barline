@@ -148,6 +148,15 @@ pub struct GeneralConfig {
     pub language: LangSerde,
     /// 用户隐藏小组件（PRD 机器 B 门控 1，跨会话记忆）
     pub widget_hidden: bool,
+    /// **双击空白/信息区/歌词区 → 打开设置**（v1.10.0 / G8-③，设置页「通用」页开关）。
+    ///
+    /// 默认 `true`（用户裁决 R1）。**不覆盖**任何控件：三个播控键、右上角 ×、
+    /// 封面、进度条的双击语义完全不变（见 `docs/ARCHITECTURE.md` §G8-③）——
+    /// 小组件空白区的判定就是 `hit_test` 返回 [`HitTarget::None`]
+    /// (crate::ui::hit::HitTarget::None)，即「既不是按钮也不是封面/进度条」。
+    ///
+    /// 关掉后空白双击**零动作**，与 v1.9.3 及以前逐字节一致（连日志都不写）。
+    pub double_click_open_settings: bool,
 }
 
 /// 存储配置（v1.1.5 问题 3；v1.1.6 净搬 + A→B 切换）。
@@ -392,6 +401,52 @@ mod tests {
             .expect("只有 version 的旧配置必须仍能加载");
         assert!(!only_version.lyrics.local_first);
         assert!(only_version.lyrics.write_back, "同容器的其它默认值不受影响");
+    }
+
+    /// **v1.10.0 / G8-③ 向后兼容**：旧配置里没有 `general.double_click_open_settings`
+    /// → 反序列化不报错且落到 `true`（= 升级后开箱即用，用户不必去设置页打开）。
+    ///
+    /// 兜底机制与 `lyrics.write_back` 同款：`GeneralConfig` 上的 `#[serde(default)]`
+    /// 让 serde 用 `GeneralConfig::default()` 逐字段补齐缺失字段——所以默认值
+    /// **必须**写在 `impl Default for GeneralConfig` 里（`defaults.rs`），
+    /// 不能依赖 `derive(Default)` 的 `bool = false`。
+    #[test]
+    fn legacy_config_without_double_click_open_settings_defaults_true() {
+        let mut cfg = Config::default();
+        cfg.general.double_click_open_settings = false; // 写非默认值再删字段，验证走 serde default
+        let mut json = serde_json::to_value(&cfg).expect("序列化不应失败");
+        json["general"]
+            .as_object_mut()
+            .expect("general 必须是对象")
+            .remove("double_click_open_settings");
+        let back: Config = serde_json::from_value(json).expect("缺字段不应报错");
+        assert!(
+            back.general.double_click_open_settings,
+            "旧配置缺省 double_click_open_settings 必须为 true（默认开）"
+        );
+
+        // 更极端：整段 general 都没有 → 仍然落到默认值 true，不 panic
+        let only_version: Config = serde_json::from_slice(br#"{"version":1}"#)
+            .expect("只有 version 的旧配置必须仍能加载");
+        assert!(
+            only_version.general.double_click_open_settings,
+            "整段 general 缺失时也必须默认开"
+        );
+        // 同容器的既有字段默认值不受影响（防止有人顺手改坏 GeneralConfig::default）
+        assert!(!only_version.general.autostart);
+        assert!(!only_version.general.widget_hidden);
+    }
+
+    /// **v1.10.0 / G8-③ 序列化形状**：新字段必须真的进 `config.json`
+    /// （否则设置页开关回推后一重启就丢），且键名与设置页白名单**逐字符一致**。
+    #[test]
+    fn double_click_open_settings_is_persisted_under_the_documented_key() {
+        let cfg = Config::default();
+        let json = serde_json::to_value(&cfg).expect("序列化不应失败");
+        assert_eq!(
+            json["general"]["double_click_open_settings"], true,
+            "落盘键名必须是 general.double_click_open_settings，且默认 true"
+        );
     }
 
     /// **v1.2.2 旧配置兼容（删除 `ui_scale` 后最重要的回归保障）**：

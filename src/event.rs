@@ -172,6 +172,19 @@ pub enum WidgetInput {
     Wheel { delta: i32 },
     VolumeHudExpired,
     ToggleLyricsFromMenu,
+    /// **空白 / 信息区 / 歌词区的双击**（v1.10.0 / G8-③）。
+    ///
+    /// 产出者只有 [`crate::ui::interaction::Interaction`]：两下都落在
+    /// `hit_test == HitTarget::None` 的同一片空白上、且间隔 ≤
+    /// `limits::DOUBLE_CLICK_MS`。四个按钮（上一首 / 播放暂停 / 下一首 / ×）、
+    /// 封面、进度条**永不**产出它——它们的双击仍是「取消单击 = 零动作」。
+    ///
+    /// 这里只表达「用户双击了空白」这个事实；**要不要真的打开设置**
+    /// 由 `App::double_click_effects` 按开关
+    /// [`crate::config::GeneralConfig::double_click_open_settings`] 决定
+    /// （开关关掉 → 零动作）。判定留在 App 侧是为了让配置只有**一个**读点，
+    /// 不在 UI 状态机里存一份会漂移的镜像。
+    DoubleClickBlank,
 }
 
 /// 播控命令种类（用于 `CommandResult` 回滚）。v1.1.16 起没有 Shuffle/Repeat。

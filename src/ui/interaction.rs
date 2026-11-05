@@ -16,6 +16,16 @@
 //! 3. **双击不绑定动作**：单击动作延迟 250ms 才执行；这 250ms 内收到第二下
 //!    就取消，于是双击 = 零动作。
 //!
+//!    **v1.10.0（G8-③）唯一的例外**：`hit_test` 返回 `HitTarget::None` 的
+//!    「空白 / 信息区 / 歌词区」双击 → 派发 [`WidgetInput::DoubleClickBlank`]
+//!    （是否真去打开设置由 App 侧按开关决定）。四个按钮、封面、进度条的
+//!    双击语义**一个字都没变**，仍是零动作——见 [`Interaction::note_blank_click`]。
+//!
+//!    ⚠️ 空白区**不排队**（`on_up` 的第 ③ 步只给按钮与封面建 `PendingClick`），
+//!    所以空白双击判定不能复用 `pending`，走的是另一条更轻的路径：只记一个
+//!    上次空白单击的 `Instant`，**不申请任何定时器**（「无新增长效定时器」是
+//!    G8-③ 的硬约束）。
+//!
 //! ## 淡入淡出
 //!
 //! `hover_alpha` 0→1 用 120ms、1→0 用 200ms（PRD P0-07）。
@@ -61,6 +71,18 @@ pub struct Interaction {
     pub hover_target: Option<HitTarget>,
     down: Option<DownState>,
     pending: Option<PendingClick>,
+    /// **空白区（信息区 / 歌词区 / 真空白）最近一次「完整单击」的时刻**
+    /// （v1.10.0 / G8-③）。
+    ///
+    /// 为什么不能复用 `pending`：空白区根本不进 250ms 单击队列（`on_up` 第 ③
+    /// 步只为按钮与封面建 `PendingClick`），因为没有单击动作要延迟——这正是
+    /// 「空白单击零副作用」的实现方式。所以双击判定另走一条**无定时器**的路：
+    /// 上一次空白单击落下的时间戳 + 这一次的 `Instant::now()` 做差
+    /// （判据与按钮完全一致：`<= limits::DOUBLE_CLICK_MS`）。
+    ///
+    /// [`Interaction::reset`] 会清掉它——切歌 / 会话消失 / 隐藏小组件之后，
+    /// 「上一首里点的那一下」不该跟新出现的内容拼成一次双击。
+    last_blank_click: Option<Instant>,
     seeking: bool,
     /// 音量 HUD 剩余毫秒
     pub hud_left_ms: u32,
@@ -87,6 +109,7 @@ impl Interaction {
             hover_target: None,
             down: None,
             pending: None,
+            last_blank_click: None,
             seeking: false,
             hud_left_ms: 0,
             wheel_hooked: false,
@@ -103,6 +126,7 @@ impl Interaction {
         self.hover_target = None;
         self.down = None;
         self.pending = None;
+        self.last_blank_click = None;
         self.seeking = false;
         self.hud_left_ms = 0;
         self.animating = false;
@@ -235,7 +259,18 @@ impl Interaction {
     }
 
     /// `WM_LBUTTONUP`。返回 `(inputs, need_release_capture)`。
-    pub fn on_up(&mut self, layout: &WidgetLayout, x: f32, y: f32) -> (Vec<WidgetInput>, bool) {
+    ///
+    /// `now` 是**本次 up 的时刻**（v1.10.0 / G8-③ 起显式注入，与 v1.9.3 的
+    /// `.at()` 同一条纪律）：空白双击判定要拿它和上一次空白单击做差。
+    /// 时间不注入的话，测试里两次 `on_up` 之间被调度器拉开 >250ms 就会
+    /// 假阴性（实测出现过），而生产路径由 `App` 传 `Instant::now()`，行为不变。
+    pub fn on_up(
+        &mut self,
+        layout: &WidgetLayout,
+        now: Instant,
+        x: f32,
+        y: f32,
+    ) -> (Vec<WidgetInput>, bool) {
         let Some(d) = self.down.take() else {
             self.pressed = None;
             return (vec![], false);
@@ -274,18 +309,68 @@ impl Interaction {
             return (vec![WidgetInput::ClickDismiss], true);
         }
 
-        // ③ 只有按钮与封面产生点击
+        // ③ 空白 / 信息区 / 歌词区（v1.10.0 / G8-③）
+        //
+        // 走到这里的 `None` 已经是「一次完整、未移动的空白单击」（①②已在上面
+        // 把关：down/up 同一目标、位移不超过 `SEEK_DRAG_PX`；seeking 与 × 也都
+        // 提前 return 了）。单击本身**零副作用**，只落一个时间戳；250ms 内再来
+        // 一次才派发 `DoubleClickBlank`。
+        if d.target == HitTarget::None {
+            return (self.note_blank_click(now), true);
+        }
+
+        // ④ 只有按钮与封面产生点击
         if !(d.target.is_button() || d.target == HitTarget::Cover) {
             return (vec![], true);
         }
 
-        // ④ 排队等 250ms 判定（双击保护）
+        // ⑤ 排队等 250ms 判定（双击保护）
         self.pending = Some(PendingClick {
             target: d.target,
-            at: Instant::now(),
+            at: now,
         });
         self.click_timer_wanted = true;
         (vec![], true)
+    }
+
+    /// 空白区的一次**完整单击**落下时间戳；250ms 内的第二下 → 派发
+    /// [`WidgetInput::DoubleClickBlank`]（v1.10.0 / G8-③）。
+    ///
+    /// ## 为什么是「第二下的 up」而不是「第二下的 down」
+    ///
+    /// 按钮走的是「第二下 down 就取消 pending」——因为按钮**第一下**已经排了队，
+    /// down 只是来撤销。空白区第一下没有任何待办，第二下必须**完整按完**才算一次
+    /// 双击（按下→拖走→松手不算，见 `on_up` 的 ①）。这同时保证：手上按住不放
+    /// 不会突然弹出设置窗口。
+    ///
+    /// ## 判定窗口
+    ///
+    /// 与按钮**同一个常量** `limits::DOUBLE_CLICK_MS`（250ms）——两个判定窗口
+    /// 一旦分叉，用户双击同一块屏幕会出现"按钮上算双击、旁边不算"的割裂感。
+    ///
+    /// ## 无定时器
+    ///
+    /// 只存一个 `Instant`。过期不需要 `WM_TIMER` 去清：下一次单击做差自然失效
+    /// （「无新增长效定时器」是 G8-③ 硬约束，也保住"空闲 CPU ≈ 0"）。
+    ///
+    /// ## 开关不在这里
+    ///
+    /// 本方法**永远**如实上报"用户双击了空白"；要不要打开设置由 App 侧按
+    /// `general.double_click_open_settings` 决定。把开关塞进 UI 状态机意味着
+    /// 配置得有第二份镜像，设置页改完还得记得同步——多一个必然漂移的同步点。
+    fn note_blank_click(&mut self, now: Instant) -> Vec<WidgetInput> {
+        let is_double = self
+            .last_blank_click
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64 <= limits::DOUBLE_CLICK_MS)
+            .unwrap_or(false);
+        if is_double {
+            // 用掉就清：连点三下不该产生两次"双击"（第二次 down 与第三下才成对）
+            self.last_blank_click = None;
+            crate::log_debug!("双击空白区（信息 / 歌词 / 空白）→ 上报 G8-③ 输入");
+            return vec![WidgetInput::DoubleClickBlank];
+        }
+        self.last_blank_click = Some(now);
+        Vec::new()
     }
 
     /// 250ms 单击判定到点：把待判定单击转成语义化输入。
@@ -397,6 +482,15 @@ mod tests {
         compute_full(TaskbarEdge::Bottom, WidgetForm::Compact, 1.0, 48, 0.0, 0.0, WidgetForm::Compact.lyric_w())
     }
 
+    /// 测试时刻来源。既有用例（按钮 / 封面 / ×）沿用真实时钟——与它们
+    /// v1.9.3 之前的行为完全一致；**空白双击用例一律用合成时刻**
+    /// （见各用例内的 `t0`），因为它们要断言"250ms 窗口内/外"这个
+    /// 判定本身，靠真实时钟在负载下会假阴性（实测出现过两次点击被
+    /// 调度器拉开 >250ms）。
+    fn now() -> Instant {
+        Instant::now()
+    }
+
     #[test]
     fn enter_and_leave_toggle_hover_state() {
         let l = layout();
@@ -454,7 +548,7 @@ mod tests {
         let mut i = Interaction::new();
         let (cx, cy) = l.btn_toggle.center();
         i.on_down(&l, cx, cy);
-        i.on_up(&l, cx, cy);
+        i.on_up(&l, now(), cx, cy);
         assert!(i.has_pending_click());
         assert!(i.take_click_timer_wanted());
         assert_eq!(i.on_click_timer(), vec![WidgetInput::ClickPlayPause]);
@@ -468,14 +562,14 @@ mod tests {
         let (cx, cy) = l.btn_next.center();
 
         i.on_down(&l, cx, cy);
-        i.on_up(&l, cx, cy);
+        i.on_up(&l, now(), cx, cy);
         assert!(i.has_pending_click());
 
         // 第二下（250ms 内）
         let (inputs, _) = i.on_down(&l, cx, cy);
         assert!(inputs.is_empty());
         assert!(!i.has_pending_click(), "双击必须取消待判定单击");
-        let (inputs, _) = i.on_up(&l, cx, cy);
+        let (inputs, _) = i.on_up(&l, now(), cx, cy);
         assert!(inputs.is_empty());
         assert!(i.on_click_timer().is_empty());
     }
@@ -488,7 +582,7 @@ mod tests {
         let (px, py) = l.btn_prev.center();
         let (nx, ny) = l.btn_next.center();
         i.on_down(&l, px, py);
-        let (inputs, _) = i.on_up(&l, nx, ny);
+        let (inputs, _) = i.on_up(&l, now(), nx, ny);
         assert!(inputs.is_empty());
         assert!(!i.has_pending_click());
     }
@@ -516,7 +610,7 @@ mod tests {
             }
         }
 
-        let (inputs, _) = i.on_up(&l, l.btn_next.x + 5.0, py);
+        let (inputs, _) = i.on_up(&l, now(), l.btn_next.x + 5.0, py);
         assert_eq!(inputs.len(), 1);
         assert!(matches!(inputs[0], WidgetInput::SeekCommit(_)));
         assert!(!i.is_seeking());
@@ -632,7 +726,7 @@ mod tests {
         i.on_down(&l, cx, cy);
         assert_eq!(i.pressed, Some(HitTarget::Dismiss), "按下 × 必须进按下态");
 
-        let (inputs, release) = i.on_up(&l, cx, cy);
+        let (inputs, release) = i.on_up(&l, now(), cx, cy);
         assert_eq!(inputs, vec![WidgetInput::ClickDismiss]);
         assert!(release, "与 SetCapture 配对，必须释放捕获");
         assert!(
@@ -654,14 +748,14 @@ mod tests {
         // 拖到「上一首」上（远超 SEEK_DRAG_PX）
         let (px, py) = l.btn_prev.center();
         i.on_move(&l, px, py);
-        let (inputs, _) = i.on_up(&l, px, py);
+        let (inputs, _) = i.on_up(&l, now(), px, py);
         assert!(inputs.is_empty(), "拖走再松手不能收起小组件：{inputs:?}");
         assert_eq!(i.pressed, None);
 
         // 移动距离不足但目标未变的情形仍算点击（见上一条），这里补一条
         // 「原地小幅抖动」也必须是点击（不要过度敏感）
         i.on_down(&l, cx, cy);
-        let (inputs, _) = i.on_up(&l, cx + 1.0, cy + 1.0);
+        let (inputs, _) = i.on_up(&l, now(), cx + 1.0, cy + 1.0);
         assert_eq!(inputs, vec![WidgetInput::ClickDismiss]);
     }
 
@@ -680,14 +774,14 @@ mod tests {
         let (cx, cy) = l.hit_dismiss.center();
 
         i.on_down(&l, cx, cy);
-        let (first, _) = i.on_up(&l, cx, cy);
+        let (first, _) = i.on_up(&l, now(), cx, cy);
         assert_eq!(first, vec![WidgetInput::ClickDismiss], "第一次点击必须立即派发");
         assert!(!i.has_pending_click(), "× 不得进双击队列");
 
         // 250ms 内的第二下（真实场景第二下已落在已隐藏的窗口之外，这里验状态机本身）
         i.on_down(&l, cx, cy);
         assert_eq!(i.pressed, Some(HitTarget::Dismiss), "第二下同样要进按下态");
-        let (second, _) = i.on_up(&l, cx, cy);
+        let (second, _) = i.on_up(&l, now(), cx, cy);
         assert_eq!(second, vec![WidgetInput::ClickDismiss], "第二次点击同样必须派发");
         assert!(!i.has_pending_click(), "× 永远不进双击队列");
         assert!(i.on_click_timer().is_empty(), "不得派发任何播控 / 封面动作");
@@ -712,7 +806,7 @@ mod tests {
         assert!(!i.has_pending_click());
 
         // down 已被清空 → 后续 up 直接走「没有按下现场」分支
-        let (inputs, _) = i.on_up(&l, cx, cy);
+        let (inputs, _) = i.on_up(&l, now(), cx, cy);
         assert!(inputs.is_empty(), "捕获丢失后的 up 不得再派发：{inputs:?}");
     }
 
@@ -729,7 +823,7 @@ mod tests {
         let (nx, ny) = l.btn_next.center();
 
         i.on_down(&l, dx, dy);
-        let (inputs, _) = i.on_up(&l, nx, ny);
+        let (inputs, _) = i.on_up(&l, now(), nx, ny);
         assert!(
             inputs.is_empty(),
             "从 × 拖到 next 松手不得收起小组件，也不得触发下一首：{inputs:?}"
@@ -748,7 +842,7 @@ mod tests {
                 "× 拖动过程中的 mousemove 不得产生输入"
             );
         }
-        let (inputs, _) = i.on_up(&l, nx, ny);
+        let (inputs, _) = i.on_up(&l, now(), nx, ny);
         assert!(inputs.is_empty(), "再次确认：{inputs:?}");
     }
 
@@ -762,7 +856,7 @@ mod tests {
 
         i.on_down(&l, cx, cy);
         assert_eq!(i.pressed, Some(HitTarget::Dismiss), "× 必须有按下反馈");
-        i.on_up(&l, cx, cy);
+        i.on_up(&l, now(), cx, cy);
         assert_eq!(i.pressed, None);
 
         // 先在进度条上按下进入 seeking，再去 × 上按下：不得产生任何 Dismiss 动作
@@ -802,9 +896,216 @@ mod tests {
         assert_eq!(i.hover_target, None, "拖动中 × 是死区，不得高亮");
 
         // ③ 松手退出拖动后恢复正常（悬停重新生效）
-        i.on_up(&l, cx, cy);
+        i.on_up(&l, now(), cx, cy);
         assert!(!i.is_seeking());
         i.on_move(&l, cx, cy);
         assert_eq!(i.hover_target, Some(HitTarget::Dismiss));
+    }
+
+    // ============================================ v1.10.0（G8-③）双击空白 → 开设置
+
+    use std::time::Duration;
+
+    /// 空白区取样点：`hit_test` 明确返回 `None` 的那一点（与
+    /// `hit::tests::blank_area_returns_none` 同坐标，信息区/歌词区都在这一片里）。
+    const BLANK: (f32, f32) = (2.0, 2.0);
+
+    /// **G8-③ 的核心测试**：空白区两下 → 派发 `DoubleClickBlank`。
+    ///
+    /// **鉴别力**：把 `on_up` 里那条 `if d.target == HitTarget::None { return
+    /// (self.note_blank_click(..), true) }` 改成 `return (vec![], true)`
+    /// （即"双击分支 return 空"）→ 本用例立刻变红。这也是为什么它必须断言
+    /// **第二下返回的那一个具体输入**，而不是只断言"状态没坏"。
+    #[test]
+    fn blank_double_click_reports_open_request() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let t0 = Instant::now();
+
+        let (first, _) = {
+            i.on_down(&l, BLANK.0, BLANK.1);
+            i.on_up(&l, t0, BLANK.0, BLANK.1)
+        };
+        assert!(first.is_empty(), "第一下必须是零输入：{first:?}");
+
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (second, _) = i.on_up(&l, t0 + Duration::from_millis(100), BLANK.0, BLANK.1);
+        assert_eq!(
+            second,
+            vec![WidgetInput::DoubleClickBlank],
+            "250ms 内第二下必须派发打开设置请求"
+        );
+
+        // 用掉即清：第三下重新开始计时，不会连出两次"双击"
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (third, _) = i.on_up(&l, t0 + Duration::from_millis(200), BLANK.0, BLANK.1);
+        assert!(third.is_empty(), "第二次双击需要重新凑两下：{third:?}");
+    }
+
+    /// 空白**单击**必须零副作用（G8-③ 硬约束：不得有任何可见变化）。
+    ///
+    /// 除了"没有输入"，还断言没有排队、没有申请 250ms 定时器、没有点亮动画——
+    /// 这三样任何一项为真，用户都能看出"点一下空白好像发生了什么"。
+    #[test]
+    fn blank_single_click_stays_invisible() {
+        let l = layout();
+        let mut i = Interaction::new();
+
+        i.on_down(&l, BLANK.0, BLANK.1);
+        assert_eq!(i.pressed, None, "空白按下去不许有按下态");
+        let (inputs, _) = i.on_up(&l, Instant::now(), BLANK.0, BLANK.1);
+
+        assert!(inputs.is_empty(), "空白单击不许产生输入：{inputs:?}");
+        assert!(!i.has_pending_click(), "空白不进单击队列");
+        assert!(!i.take_click_timer_wanted(), "空白单击不得申请判定定时器");
+        assert!(!i.animating(), "空白单击不得触发重绘动画");
+        assert!(i.on_click_timer().is_empty(), "没有待判定单击可派发");
+    }
+
+    /// 判定窗口与按钮**同一个常量**（`limits::DOUBLE_CLICK_MS`），边界含等号。
+    ///
+    /// 这里直接喂时刻进去（`note_blank_click(now)`），不依赖真实耗时——
+    /// 「间隔 ≤ 250ms 算双击、> 250ms 不算」是**确定的**，不该靠 sleep 去撞。
+    #[test]
+    fn blank_double_click_window_matches_buttons() {
+        let t0 = Instant::now();
+
+        let mut at_edge = Interaction::new();
+        assert!(at_edge.note_blank_click(t0).is_empty());
+        assert_eq!(
+            at_edge.note_blank_click(t0 + Duration::from_millis(limits::DOUBLE_CLICK_MS)),
+            vec![WidgetInput::DoubleClickBlank],
+            "间隔正好 {}ms 必须算双击（与按钮的 `<=` 同口径）",
+            limits::DOUBLE_CLICK_MS
+        );
+
+        let mut over = Interaction::new();
+        assert!(over.note_blank_click(t0).is_empty());
+        assert!(
+            over.note_blank_click(t0 + Duration::from_millis(limits::DOUBLE_CLICK_MS + 1)).is_empty(),
+            "超过 {}ms 不算双击",
+            limits::DOUBLE_CLICK_MS
+        );
+    }
+
+    /// 按下在空白、松手在别处（按钮）→ **不**落时间戳，凑不成双击。
+    ///
+    /// 覆盖 `on_up` 的第 ① 步（down/up 必须同一元素）在空白路径上的效果：
+    /// 否则"在空白上按下随手一拖"会在 250ms 内被误判成双击的一半。
+    ///
+    /// 鉴别力（实测 RV-5a）：把 `on_up` 里的空白判定挪到 seeking / 同目标
+    /// 守卫**之前** → 跨目标松手被误记时间戳，第二段断言立刻变红。
+    #[test]
+    fn blank_press_released_elsewhere_cannot_arm_double_click() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let (nx, ny) = l.btn_next.center();
+        let t0 = Instant::now();
+
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (inputs, _) = i.on_up(&l, t0, nx, ny);
+        assert!(inputs.is_empty(), "跨目标松手必须零动作：{inputs:?}");
+
+        // 紧接着再点一次空白：若上一段错误地落了时间戳，这里就会误报双击
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (inputs, _) = i.on_up(&l, t0 + Duration::from_millis(10), BLANK.0, BLANK.1);
+        assert!(inputs.is_empty(), "被取消的按下不得算作双击的一半：{inputs:?}");
+    }
+
+    /// `reset()` 必须忘掉"空白第一下的时间戳"。
+    ///
+    /// 切歌 / 会话消失 / 隐藏小组件都会调 `reset()`（PRD §5.3 跨状态约束）。
+    /// 若时间戳被留下，用户"在上一首里点一下空白、切歌后在新区里再点一下"
+    /// 就会被判成一次双击——凭空弹出设置窗口，且没人能复现。
+    #[test]
+    fn reset_forgets_a_half_finished_blank_double_click() {
+        let t0 = Instant::now();
+        let mut i = Interaction::new();
+
+        assert!(i.note_blank_click(t0).is_empty());
+        i.reset();
+        assert!(
+            i.note_blank_click(t0 + Duration::from_millis(10)).is_empty(),
+            "reset() 之后必须重新计时，不得与 reset 前那一下拼成双击"
+        );
+    }
+
+    /// 拖动进度条期间（seeking）的鼠标事件**不许**喂进空白双击计数。
+    ///
+    /// 状态机推演：双击手势 = down,up,down,up，而空白/进度条上的第一次 up
+    /// 必然结束 seeking（`on_up` 的 seeking 分支发 `SeekCommit` 并退出拖动），
+    /// 所以"两下都发生在 seeking 窗口内的双击"物理上不存在——真正要钉的是
+    /// **seek 收尾那一下不许被当成空白单击**。否则用户"拖一下进度条松手，
+    /// 再点一下空白"就会被拼成双击、凭空弹出设置。
+    ///
+    /// 序列：进度条按下 → 空白处松手（seek 收尾）→ **一次**空白单击 → 零输入；
+    /// 最后再补一次完整双击，确认 seek 结束后功能本身照常。
+    ///
+    /// 鉴别力（实测 RV-5b）：把 `on_up` 的 seeking 早退分支**删掉** →
+    /// seek 收尾走不进 `SeekCommit`，第 ② 步断言变红（连带
+    /// `dragging_progress_never_triggers_buttons` 等 2 条既有用例一起红）。
+    /// 另一条相邻变异 RV-5a「把空白判定挪到 seeking / 同目标守卫**之前**」
+    /// 由 `blank_press_released_elsewhere_cannot_arm_double_click` 接住。
+    #[test]
+    fn seeking_blocks_blank_double_click() {
+        let l = layout();
+        let mut i = Interaction::new();
+        let py = l.hit_progress.y + l.hit_progress.h * 0.5;
+        let t0 = Instant::now();
+
+        // ① 进度条上按下 → 进入拖动
+        let (inputs, _) = i.on_down(&l, 40.0, py);
+        assert!(inputs.contains(&WidgetInput::SeekBegin));
+        assert!(i.is_seeking());
+
+        // ② 拖动中在空白处松手 = seek 收尾：只准有 SeekCommit，**不许**落
+        //    空白单击时间戳
+        let (up_seek, _) = i.on_up(&l, t0 + Duration::from_millis(10), BLANK.0, BLANK.1);
+        assert!(
+            matches!(up_seek.as_slice(), [WidgetInput::SeekCommit(_)]),
+            "seek 收尾必须恰好是一个 SeekCommit：{up_seek:?}"
+        );
+        assert!(!i.is_seeking());
+
+        // ③ 之后的**一次**空白单击必须是"第一下"：零输入
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (up_blank, _) = i.on_up(&l, t0 + Duration::from_millis(30), BLANK.0, BLANK.1);
+        assert!(
+            up_blank.is_empty(),
+            "seek 收尾不许算作空白双击的一半：{up_blank:?}"
+        );
+
+        // ④ 再补一次完整双击 → 功能本身照常（确认不是把计数器整个关了）
+        i.on_down(&l, BLANK.0, BLANK.1);
+        let (up_double, _) = i.on_up(&l, t0 + Duration::from_millis(50), BLANK.0, BLANK.1);
+        assert_eq!(
+            up_double,
+            vec![WidgetInput::DoubleClickBlank],
+            "seek 结束后的正常空白双击必须照常打开设置"
+        );
+    }
+
+    /// 四个按钮 + 封面：双击**永不**产生 `DoubleClickBlank`（语义零变化）。
+    ///
+    /// 这条守的是"新功能不许外溢到控件上"——尤其是 `Cover`（单击是激活播放器）
+    /// 与 `Dismiss`（单击立即派发），它们的双击必须和 v1.9.3 完全一样。
+    #[test]
+    fn controls_never_produce_blank_double_click() {
+        let l = layout();
+        for rect in [l.btn_prev, l.btn_toggle, l.btn_next, l.cover, l.hit_dismiss] {
+            let (cx, cy) = rect.center();
+            let mut i = Interaction::new();
+            i.on_down(&l, cx, cy);
+            i.on_up(&l, now(), cx, cy);
+            let (down, _) = i.on_down(&l, cx, cy);
+            let (up, _) = i.on_up(&l, now(), cx, cy);
+            for input in down.iter().chain(up.iter()) {
+                assert!(
+                    !matches!(input, WidgetInput::DoubleClickBlank),
+                    "控件 {:?} 上产生了空白双击：{input:?}",
+                    rect
+                );
+            }
+        }
     }
 }

@@ -259,6 +259,68 @@ mod tests {
 
     // ------------------------------------------------ v1.9.0（G7）黑名单分区
 
+    /// **v1.10.0 / G8-③**：设置页「通用」页的双击开关。
+    ///
+    /// 四条一次锁死：
+    /// ① 控件是**开关**（`class="switch"` + `type="checkbox"`），不是按钮——
+    ///    用户裁决 R2 明确要求与「开机自启动 / 显示小组件」同款；
+    /// ② 元素 id、配置路径、`render()` 回填三处**逐字符一致**（写错一处就是
+    ///    "拨了不生效"或"重开设置又跳回去"，页面上看不出来）；
+    /// ③ 中英词条都在（`data-i18n` 的两个键）；
+    /// ④ 这一行**不许带任何定时器**（页面唯一的 `setTimeout` 是 toast）。
+    #[test]
+    fn double_click_switch_row_matches_existing_switches() {
+        let at = INDEX_HTML
+            .find("id=\"double-click-settings\"")
+            .expect("设置页缺少 #double-click-settings");
+        // 往上取这一行的起点、往下取到下一行（不依赖换行符，CRLF 也不受影响）
+        let row_start = INDEX_HTML[..at].rfind("<div class=\"row\">").unwrap_or(0);
+        let row_end = INDEX_HTML[at..]
+            .find("<div class=\"row\">")
+            .map(|o| at + o)
+            .unwrap_or(INDEX_HTML.len());
+        let row = &INDEX_HTML[row_start..row_end];
+
+        // ① 与既有三个开关同款样式
+        assert!(
+            row.contains("class=\"switch\"") && row.contains("type=\"checkbox\""),
+            "双击开关必须复用既有 switch 控件样式（用户裁决 R2）"
+        );
+        assert!(
+            row.contains("class=\"desc\""),
+            "开关必须带一行说明（现有三个开关都有）"
+        );
+
+        // ② 路径 / 回填 / 绑定三处一致
+        for needle in [
+            "general.double_click_open_settings",
+            "c.general.double_click_open_settings",
+        ] {
+            assert!(INDEX_HTML.contains(needle), "页面缺少 {needle}");
+        }
+        assert!(
+            INDEX_HTML.contains("bind(\"double-click-settings\", \"general.double_click_open_settings\", \"bool\")"),
+            "开关必须用 bind(..., \"bool\") 绑定，否则发出去的是字符串"
+        );
+
+        // ③ 中英词条
+        assert!(INDEX_HTML.contains("\"general.dblclick\""), "缺中文标签词条");
+        assert!(
+            INDEX_HTML.contains("\"general.dblclick.desc\""),
+            "缺中文说明词条"
+        );
+        assert!(
+            INDEX_HTML.contains("Double-click to open settings"),
+            "缺英文标签词条"
+        );
+
+        // ④ 无定时器
+        assert!(
+            !row.contains("setTimeout") && !row.contains("setInterval"),
+            "这一行不得引入定时器（页面唯一的 setTimeout 属于 toast）"
+        );
+    }
+
     /// G7 契约一：黑名单分区的 7 个关键 id 必须存在，且配置路径三条都在页面里。
     #[test]
     fn blacklist_section_ids_and_paths_exist() {

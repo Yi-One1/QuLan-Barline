@@ -1196,7 +1196,7 @@ impl App {
             }
             wam::WM_LBUTTONUP => {
                 let (x, y) = client_xy(lparam);
-                let (inputs, release) = self.interact.on_up(&layout, x, y);
+                let (inputs, release) = self.interact.on_up(&layout, std::time::Instant::now(), x, y);
                 if release {
                     // SAFETY: 与 SetCapture 配对。
                     unsafe {
@@ -2336,7 +2336,7 @@ impl App {
         }
     }
 
-    /// `WidgetInput` 的 15 个分支。
+    /// `WidgetInput` 的 16 个分支。
     fn reduce_input(&mut self, input: WidgetInput) -> Vec<Effect> {
         match input {
             WidgetInput::HoverEnter => {
@@ -2403,6 +2403,19 @@ impl App {
                 self.config.lyrics.enabled = !self.config.lyrics.enabled;
                 self.animate_lyric_width();
                 self.commit_config()
+            }
+            WidgetInput::DoubleClickBlank => {
+                // v1.10.0 / G8-③：空白 / 信息区 / 歌词区双击 → 打开设置。
+                // 开关关掉时**零动作**（不发 Redraw、不写配置、不建窗口）。
+                let effects = double_click_effects(&self.config);
+                if effects.is_empty() {
+                    crate::log_debug!(
+                        "双击空白区：general.double_click_open_settings=false，零动作"
+                    );
+                } else {
+                    crate::log_info!("双击空白区 → 打开设置（G8-③）");
+                }
+                effects
             }
         }
     }
@@ -3309,6 +3322,28 @@ fn displayed_session_hit(index: &MediaIndex, playing: &NowPlaying) -> bool {
     !s.aumid.is_empty() && index.matches(&s.process_name, &s.aumid)
 }
 
+/// **G8-③（v1.10.0）：空白区双击要做的事**（纯函数，可单测）。
+///
+/// 开关 [`crate::config::GeneralConfig::double_click_open_settings`] 关掉 → 返回空 `Vec`
+/// = **零动作**（连 `Redraw` 都不给：v1.9.3 及以前的双击空白是完全无声的，
+/// 关掉开关就得逐字节回到那个状态）。
+///
+/// 打开 → 复用**唯一**的「打开设置」副作用 `Effect::OpenSettings`：
+/// 它的执行点（`App::apply`）已经包含两件必须共享的语义——
+/// ① 设置窗口已开着时只前置 + 抢前台（不建第二个窗口）；
+/// ② 当前无会话时顺带导航到「黑名单」分区（G7 P1-03）。
+/// 另立一个 "OpenSettingsFromDoubleClick" 会把这两条复制一份，早晚分叉。
+///
+/// 抽成纯函数是为了可单测：`App` 需要真实 Win32 句柄、无法在单测里构造，
+/// 而「开关关掉就是零动作」这条恰恰是用户能立刻感知的契约
+/// （`double_click_is_zero_action_when_disabled` 直接盯它）。
+fn double_click_effects(config: &Config) -> Vec<Effect> {
+    if !config.general.double_click_open_settings {
+        return Vec::new();
+    }
+    vec![Effect::OpenSettings]
+}
+
 /// 交互态（悬停目标 / 按下目标）变化是否**必须**补一帧重绘。
 ///
 /// 这两类变化都**不产生** `WidgetInput`：悬停由 `WM_MOUSEMOVE` 的
@@ -3536,6 +3571,152 @@ mod tests {
         playing.session.aumid = "NeteaseCloudMusic!App".to_string();
         playing.session.process_name = "cloudmusic.exe".to_string();
         assert!(!displayed_session_hit(&empty, &playing));
+    }
+
+    /// **G8-③（v1.10.0）**：空白 / 信息区 / 歌词区双击 → 打开设置（默认开）。
+    ///
+    /// 断言的是"**恰好**一个 `Effect::OpenSettings`"：多一个 `Redraw` 之类的
+    /// 副作用都算偏离（双击空白在 v1.9.3 是完全无声的，新功能不该顺带引入
+    /// 额外的重绘 / 配置写盘）。
+    #[test]
+    fn blank_double_click_opens_settings_by_default() {
+        let cfg = Config::default();
+        let effects = double_click_effects(&cfg);
+        assert!(
+            matches!(effects.as_slice(), [Effect::OpenSettings]),
+            "默认配置下空白双击必须恰好产生 OpenSettings：{effects:?}"
+        );
+    }
+
+    /// **G8-③ 开关关掉 ⇒ 零动作**（用户裁决 R2：关掉后与 v1.9.3 逐字节一致）。
+    ///
+    /// 鉴别力：把 `double_click_effects` 里的 `if !config...{ return Vec::new() }`
+    /// 整段删掉（或改成恒真），本用例立刻变红；反过来把函数体改成恒空，
+    /// 上一条 `blank_double_click_opens_settings_by_default` 变红。
+    #[test]
+    fn blank_double_click_is_zero_action_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.general.double_click_open_settings = false;
+        let effects = double_click_effects(&cfg);
+        assert!(
+            effects.is_empty(),
+            "开关关闭时必须是**零动作**（连 Redraw 都不给）：{effects:?}"
+        );
+    }
+
+    /// **G8-③ 接线静态断言**：`reduce_input` 的 `DoubleClickBlank` 臂**必须**
+    /// 经 `double_click_effects(&self.config)` 派发。
+    ///
+    /// 为什么必须有这条（v1.9.2「测试全绿但功能没做」同款陷阱）：主理人 RV 实测——
+    /// 把该臂改成 `Vec::new()` 后，633 条测试**仍然全绿**：`double_click_effects()`
+    /// 沦为死码（本 crate 无 `deny(dead_code)`，编译器不报），它自己的两条单测
+    /// 照常通过，而功能静默失效。单测锁的是"决策函数对不对"，这条锁的是
+    /// "**接线**还在不在"。
+    ///
+    /// 做法照搬 `smtc.rs` 的 `tick_wires_state_jump_into_snapshot_inputs`：
+    /// 读自身源码 → 锚定 `fn reduce_input` → 圈定函数体 → 定位目标臂。
+    /// 两个负向断言防两种绕法：
+    /// ① 臂内**不得**直接构造 `Effect::OpenSettings`（绕过开关，开关会静默失效）；
+    /// ② 臂内**不得**先 `return Vec::new()` 再留死调用（写死零动作）。
+    ///
+    /// 鉴别力（已实测）：把该臂整个改成 `Vec::new()` → 本断言红。
+    #[test]
+    fn reduce_input_wires_blank_double_click_through_the_toggle() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/app.rs"
+        ))
+        .expect("必须能读到 app.rs 自身源码");
+        let start = src
+            .find("    fn reduce_input(&mut self, input: WidgetInput) -> Vec<Effect> {")
+            .expect("reduce_input 函数必须存在");
+        let rest = &src[start..];
+        // 方法体语句在 8+ 空格缩进，第一个 4 空格缩进的 `}` 就是 reduce_input
+        // 的收尾（与 tick_wires... 同一启发式，已人工核对函数体内无 4 空格 `}`）。
+        let end = rest
+            .find("\n    }\n")
+            .map(|i| i + "\n    }\n".len())
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let arm_start = body
+            .find(concat!("WidgetInput::", "DoubleClickBlank =>"))
+            .unwrap_or_else(|| panic!("reduce_input 必须处理 DoubleClickBlank（G8-③ 接线被拆了）"));
+        // 臂体到第一个 12 空格缩进的 `}` 为止（臂内更深的块都是 16+ 缩进）
+        let arm_close = body[arm_start..]
+            .find("\n            }")
+            .map(|i| arm_start + i)
+            .unwrap_or(body.len());
+        let arm = &body[arm_start..arm_close];
+
+        assert!(
+            arm.contains(concat!("double_click_", "effects(&self.config)")),
+            "DoubleClickBlank 臂必须经 double_click_effects(&self.config) 派发，\
+             否则开关与设置打开的决策被绕过"
+        );
+        assert!(
+            !arm.contains("Effect::OpenSettings"),
+            "DoubleClickBlank 臂不得直接构造 Effect::OpenSettings（必须让开关说了算）"
+        );
+        assert!(
+            !arm.contains("return Vec::new()"),
+            "DoubleClickBlank 臂不得写死零动作（开关关掉的零动作由 double_click_effects 决定）"
+        );
+    }
+
+    /// **QA（G8-③ 独立验证补测）**：`Effect::OpenSettings` 必须在 `App::apply`
+    /// 里有**真实执行点**，且通往 `SettingsService::open`。
+    ///
+    /// 为什么需要这条：`reduce_input_wires_blank_double_click_through_the_toggle`
+    /// 只锁到「reduce_input 发出 Effect」为止——若有人把 `apply` 的
+    /// `OpenSettings` 臂改成 no-op，reduce_input 照常发 Effect、633 条测试
+    /// **照常全绿**，而双击空白静默失效（与 v1.9.2「功能没做」同款陷阱）。
+    /// 既有用例没有一条锁「Effect → 执行」这最后一环；本条补上后，链路
+    /// reduce_input → double_click_effects → Effect::OpenSettings → apply →
+    /// `SettingsService::open`（复用分支由
+    /// `settings::tests::second_open_reuses_the_existing_window` 盯）全部闭合。
+    ///
+    /// 做法：锚定 `pub fn apply(&mut self, effects: Vec<Effect>)`，在其函数体
+    /// 内（首个 8 空格缩进 `}` 之前）定位 `OpenSettings` 臂，断言它调用
+    /// `self.settings.open(`。`apply` 在文件前部、tests 模块在末尾，所以
+    /// 锚点之后的首个命中必是生产代码。
+    ///
+    /// 鉴别力（QA 实测）：把 `Effect::OpenSettings` 臂整个删掉 / 改成空块 →
+    /// 本用例红；`apply` 里换成别的（比如只打日志不 open）→ 本用例红。
+    #[test]
+    fn open_settings_effect_is_executed_in_apply() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/app.rs"
+        ))
+        .expect("必须能读到 app.rs 自身源码");
+        let start = src
+            .find("    pub fn apply(&mut self, effects: Vec<Effect>) {")
+            .expect("App::apply 必须存在");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .map(|i| i + "\n    }\n".len())
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let arm_start = body
+            .find(concat!("Effect::", "OpenSettings =>"))
+            .unwrap_or_else(|| {
+                panic!("App::apply 必须处理 Effect::OpenSettings（执行点被拆了）")
+            });
+        // 臂体到第一个 16 空格缩进的 `}` 为止（臂内更深的块都是 20+ 缩进）
+        let arm_close = body[arm_start..]
+            .find("\n                }")
+            .map(|i| arm_start + i)
+            .unwrap_or(body.len());
+        let arm = &body[arm_start..arm_close];
+
+        assert!(
+            arm.contains(concat!("self.settings.", "open(")),
+            "Effect::OpenSettings 必须通往 SettingsService::open，\
+             否则双击空白（以及托盘「设置」）会静默失效"
+        );
     }
 
     #[test]

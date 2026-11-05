@@ -416,6 +416,11 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
           <div class="right"><label class="switch"><input type="checkbox" id="widget-visible"><span class="track"></span><span class="knob"></span></label></div>
         </div>
         <div class="row">
+          <div><div class="label" data-i18n="general.dblclick">双击打开设置</div>
+            <div class="desc" data-i18n="general.dblclick.desc">双击小组件的空白处、歌曲信息或歌词区域即可打开本窗口；播放按钮、封面和进度条不受影响。</div></div>
+          <div class="right"><label class="switch"><input type="checkbox" id="double-click-settings"><span class="track"></span><span class="knob"></span></label></div>
+        </div>
+        <div class="row">
           <div><div class="label" data-i18n="storage.dir">数据目录</div>
             <div class="desc" data-i18n="storage.dir.desc">歌词缓存与应用文件的存放位置；更改后重启生效，可自选是否迁移文件、是否删除原目录（配置文件固定不动）；点击路径可打开目录。</div>
             <div class="desc link" id="storage-dir" style="user-select:text">—</div></div>
@@ -507,6 +512,8 @@ const I18N = {
     "general.autostart": "开机自启动", "general.autostart.desc": "写入当前用户注册表，不需要管理员权限。",
     "general.language": "界面语言", "general.lang.system": "跟随系统",
     "general.widget": "显示小组件", "general.widget.desc": "与托盘菜单里的「显示/隐藏小组件」同步。",
+    "general.dblclick": "双击打开设置",
+    "general.dblclick.desc": "双击小组件的空白处、歌曲信息或歌词区域即可打开本窗口；播放按钮、封面和进度条不受影响。",
     "about.sub": "曲栏 Barline —— Windows 11 任务栏媒体播控小组件。",
     "about.version": "版本", "about.lyrics": "歌词来源",
     "about.lyrics.netease": "网易云音乐",
@@ -572,6 +579,8 @@ const I18N = {
     "general.autostart": "Start with Windows", "general.autostart.desc": "HKCU only, no admin required.",
     "general.language": "Language", "general.lang.system": "System",
     "general.widget": "Show widget", "general.widget.desc": "Synced with the tray menu item.",
+    "general.dblclick": "Double-click to open settings",
+    "general.dblclick.desc": "Double-click the empty area, the track info or the lyrics to open this window. Playback buttons, cover art and the progress bar are unaffected.",
     "about.sub": "Barline — a Windows 11 taskbar media widget.",
     "about.version": "Version", "about.lyrics": "Lyrics",
     "about.lyrics.netease": "NetEase Cloud Music",
@@ -910,6 +919,9 @@ function render() {
   document.getElementById("autostart").checked = c.general.autostart;
   document.getElementById("language").value = c.general.language;
   document.getElementById("widget-visible").checked = !c.general.widget_hidden;
+  // v1.10.0（G8-③）：双击开设置开关。**直接读配置**，不做"缺字段兜底"——
+  // 缺字段时的默认值只有一处（Rust 的 GeneralConfig::default = true）。
+  document.getElementById("double-click-settings").checked = c.general.double_click_open_settings;
 
   // 存储（v1.1.5）：显示当前生效目录 + 已配置的自定义目录
   const configured = (c.storage && c.storage.data_dir) ? c.storage.data_dir : "";
@@ -1115,6 +1127,7 @@ bind("volume-hud", "volume.hud_ms", "int");
 bind("hotkeys-enabled", "hotkeys.enabled", "bool");
 bind("autostart", "general.autostart", "bool");
 bind("language", "general.language", "str");
+bind("double-click-settings", "general.double_click_open_settings", "bool");
 
 document.getElementById("widget-visible").addEventListener("change", (e) => {
   // 注意：配置里是 widget_hidden，UI 上是「显示」，取反

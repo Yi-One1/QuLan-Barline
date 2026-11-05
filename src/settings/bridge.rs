@@ -358,6 +358,16 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             cfg.general.widget_hidden = v;
             true
         }
+        // v1.10.0（G8-③）：双击小组件空白 / 信息区 / 歌词区 → 打开设置。
+        //
+        // 与 `autostart` 不同，这里**没有**外部世界要同步：开关只影响下一次
+        // 双击的判定，而判定处（`App::reduce_input`）每次都读当前 `cfg`，
+        // 不在 UI 状态机里存镜像，所以写完即生效、无需回滚。
+        "general.double_click_open_settings" => {
+            let Some(v) = value.as_bool() else { return false };
+            cfg.general.double_click_open_settings = v;
+            true
+        }
         // ---------------- 存储（v1.1.5 问题 3）----------------
         // 浏览对话框 / 恢复默认按钮送来的路径。规范化（剥引号、去尾分隔符、
         // 相对锚定）；等于默认根目录时存空串（配置干净，语义同默认）。
@@ -623,6 +633,41 @@ mod tests {
         let mut c = Config::default();
         assert!(!apply_set(&mut c, "general.something", &json!(1)));
         assert!(!apply_set(&mut c, "version", &json!(9)));
+    }
+
+    /// **v1.10.0 / G8-③**：设置页「通用」页的双击开关必须走白名单，
+    /// 且**类型不对就拒绝**（页面注入脚本发 `"true"` 这种字符串进来时
+    /// 不许把配置写成"看起来开了其实没开"）。
+    #[test]
+    fn apply_set_double_click_open_settings() {
+        let mut c = Config::default();
+        assert!(c.general.double_click_open_settings, "默认开");
+
+        assert!(apply_set(
+            &mut c,
+            "general.double_click_open_settings",
+            &json!(false)
+        ));
+        assert!(!c.general.double_click_open_settings, "关掉必须真的写进配置");
+
+        assert!(apply_set(
+            &mut c,
+            "general.double_click_open_settings",
+            &json!(true)
+        ));
+        assert!(c.general.double_click_open_settings, "再打开也必须写进去");
+
+        // 类型错误：拒绝且不改配置
+        for bad in [json!("yes"), json!(0), json!(1), json!(null)] {
+            assert!(
+                !apply_set(&mut c, "general.double_click_open_settings", &bad),
+                "非布尔值必须被拒绝：{bad}"
+            );
+            assert!(
+                c.general.double_click_open_settings,
+                "被拒绝的写入不得改动配置（{bad}）"
+            );
+        }
     }
 
     #[test]

@@ -618,6 +618,10 @@ impl Default for GeneralConfig {
             autostart: false,
             language: LangSerde::System,
             widget_hidden: false,
+            // v1.10.0 / G8-③（用户裁决 R1）：**默认开**。
+            // 默认值就写在这里（手写 `Default`，不靠 `#[derive(Default)]` 的
+            // `bool = false`），否则默认态会静默变成"关"。
+            double_click_open_settings: true,
         }
     }
 }
@@ -656,6 +660,23 @@ mod tests {
         assert!(limits::WIDGET_MIN_W < limits::WIDGET_MAX_W);
         assert!(limits::TRAY_GAP > 0.0);
         assert_eq!(limits::LOG_MAX_BYTES, crate::log::LOG_MAX_BYTES);
+    }
+
+    /// **v1.10.0 / G8-③（用户裁决 R1）**：双击开设置**默认开**。
+    ///
+    /// 这条钉的是「手写 `Default`」这个决定本身：`GeneralConfig: Default` 一旦
+    /// 被改回 `#[derive(Default)]`，`bool` 会落 `false`，用户升级后会觉得
+    /// 「新功能没做」——而配 `#[serde(default)]` 的旧配置兼容也会一起坏掉。
+    #[test]
+    fn double_click_open_settings_defaults_on() {
+        assert!(
+            GeneralConfig::default().double_click_open_settings,
+            "双击空白开设置必须默认开（G8-③ 用户裁决 R1）"
+        );
+        // 同容器既有默认值一并钉住（手写 Default 容易顺手改坏邻居）
+        let g = GeneralConfig::default();
+        assert!(!g.autostart);
+        assert!(!g.widget_hidden);
     }
 
     // ------------------------------------------------ v1.2.3（G4）快捷键体系

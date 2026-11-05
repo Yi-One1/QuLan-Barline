@@ -410,4 +410,54 @@ mod tests {
     fn visible_window_is_only_shown() {
         assert_eq!(reveal_action(false), Reveal::Show);
     }
+
+    /// **v1.10.0 / G8-③（用户裁决 R3）**：设置窗口已经开着时，再请求打开
+    /// **只前置、绝不建第二个窗口**。
+    ///
+    /// 为什么是源码结构断言而不是行为测试：`SettingsService::open` 需要
+    /// `HINSTANCE` + 真窗口 + WebView2，单测里造不出来（同 `app.rs` 里
+    /// `apply_fullscreen_occlusion` 的处理方式——那条也是盯委托出去的纯函数）。
+    /// 「不开第二个窗口」的**唯一**机制是 `open()` 开头那个**提前 return**
+    /// （`self.hwnd` 有效 → 还原/前置 + 补推 state → return），所以这里钉的是
+    /// 结构本身：
+    /// ① 复用分支必须存在，且**抢前台**（不是只 `SW_SHOW`，否则被别的窗口盖着
+    ///    时用户会以为"点了没反应"）；
+    /// ② 复用分支必须出现在 `CreateWindowExW` **之前**——只要它在前面，
+    ///    "已经开着"的路径就不可能走到创建。
+    #[test]
+    fn second_open_reuses_the_existing_window() {
+        const SRC: &str = include_str!("mod.rs");
+
+        // 只在 `open()` 那一段里找（文件开头有 `use ... CreateWindowExW`、
+        // 末尾有本用例自己的字面量，全文件 `find` 会找错地方）。
+        // 下面的 needle 用 `concat!` 拼，避免"测试自己的字符串"被当成被测代码。
+        let open = SRC.find("pub fn open(").expect("找不到 SettingsService::open");
+        let seg = &SRC[open..];
+
+        let reuse_needle = concat!("if let Some(h) = self.", "hwnd {");
+        let create_needle = concat!("CreateWindow", "ExW(");
+
+        let reuse = seg.find(reuse_needle).unwrap_or_else(|| {
+            panic!("open() 里的复用分支不见了：「已开着 → 只前置」是 G8-③ R3 的唯一实现点")
+        });
+        let create = seg
+            .find(create_needle)
+            .expect("open() 里找不到创建窗口的调用");
+        assert!(
+            reuse < create,
+            "复用分支必须在创建之前：否则第二次打开会建出第二个设置窗口"
+        );
+
+        // 复用分支里必须真的抢前台（R3 的原话是「置顶并聚焦」）
+        let branch = &seg[reuse..create];
+        assert!(
+            branch.contains(concat!("force_foreground", "(h)")),
+            "复用分支必须调用 force_foreground —— 只 ShowWindow 不会把窗口提到前台"
+        );
+        // 且必须把最新状态补推给页面（否则开关/配置停在旧值）
+        assert!(
+            branch.contains(concat!("self.", "push(&state_json)")),
+            "复用分支必须补推最新 state，否则页面显示的是旧配置"
+        );
+    }
 }
