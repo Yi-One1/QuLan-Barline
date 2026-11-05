@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-06 18:10 · **G1~G7 全部真人验收通过；G8 分组迭代中（① 已验收，② 已实现+测试全绿+出包待真人验收，③ 待办）** · 当前 **v1.9.2**（594 测试：593 passed + 1 ignored，clippy 0 警告）· 源码已提交本地（G8-② 提交见 §1）· **Releases 仍待用户手动发**（v1.9.0/v1.9.1 未发，现有 v1.9.2 包）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-06 05:00 · **G1~G7 全部真人验收通过；G8 分组迭代中（① v1.9.1 已验收、② v1.9.2 已验收 + v1.9.3 补修已验收、③ v1.10.0 进行中）** · 当前 **v1.9.3**（619 测试：618 passed + 1 ignored，clippy 0 警告）· 源码已提交本地（v1.9.3 = `31c4fed`，**未推送**，按用户「先不推，等通知」）· **Releases 仍待用户手动发**（v1.9.0/v1.9.1/v1.9.2/v1.9.3 均未发）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
 
 ---
 
@@ -13,8 +13,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
 | 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
-| 当前版本 | **v1.9.2**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
-| 质量 | 测试 **594**（593 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1138 KB（v1.9.2 = 1,164,800 B） |
+| 当前版本 | **v1.9.3**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
+| 质量 | 测试 **619**（618 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1140.5 KB（v1.9.3 = 1,167,872 B） |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
 | 自测 | 根目录 **`启动曲栏.bat`**（增量构建 + 跑未打包 exe）；新包在 `deliverables/` |
 | 交付包 | `deliverables/曲栏_Barline_vX.Y.Z.exe`，**只增不删** |
@@ -96,6 +96,17 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **交付**：测试 **576 → 594**（593 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.9.2.exe` = 1,164,800 B / SHA256 `8F76FAD4…EA9D`；Cargo.lock 同步 1 行；提交（本地，待真人验收后推；见 git log 最新 main：feat v1.9.2 — G8-② 网易云暂停→继续歌词钟归零修复）；exe 38 → 39 只增不删。
 - **已知限制（按用户拍板不修）**：seek 不修（网易云恒报 `(0,0)` 读不到新位置）；`plan.props=false` 过渡轮次 ≤2s 混合快照窗口（G7 固有）；隐藏态 ≤1 次/秒低频枚举；UI 同帧隐藏 ≤50ms 瞬时（G8-① 固有）。
 
+- **G8-④ 歌词钟连续性补修 → v1.9.3 ✅ 2026-11-06 真人验收通过（提交 `31c4fed`，未推）**：用户验收 v1.9.2 时报两例 —— ①「反复暂停/继续后歌词明显滞后」；②「网易云→汽水→网易云返回后歌词从头开始」。**日志定罪：两例同一根因**，不是逐轮漂移 —— `lyric_clock_action()` 把 `track_changed` 判在续接之前，网易云恒报 `(0,0)` ⇒ 每次身份变化 `Reset 0`。证据：`02:22:56 Paused 79550 → 02:22:57 切回同一首 Playing 0`（此后永久落后 79.5s）、`02:25:19 Paused 141223 → 02:26:50 跨应用返回 Playing 0`；而播放态记账**本身精确**（141223 vs 墙钟 141222ms）。
+- **修复三件套**：① `LyricClockMemory` 按 `(aumid,track_id)` 记离开时的钟（TTL 30min / CAP 16，满则淘汰 `sampled_at` 最老；挂在**全部 5 个** `self.last` 丢弃点：发布换曲 / `session cleared` / `switch_display_session` / `apply_release` / `enter_ignored`）；② `apply_timeline_read` **写位置必同写 `timeline_at`**（位置与采样时刻严格配对，杜绝「陈旧位置 @ 新鲜时刻」被别的字段变化一起广播出去、吃掉整段已播时间）；③ Carry 锚点改用 `PlaybackInfoChanged` **事件到达时刻**（`TickInputs.jumped_at` + `PlaybackEventClock` + `Cadence::last_playback_obs()` 弃陈旧戳），不再用「检测到它的那一轮」（那是检测窗口上界，系统性偏晚）。
+- **G8-⑤ 双层互补（缺一即回归）**：判据层 `Some((position,_)) => position == 0`（`(0,D)` 不算可信位置 → 状态跃迁走 Carry，覆盖掉写入的 0）**管跃迁**；写入口 `if position != 0 || duration != 0`（真实 0 写得进 → 同曲 seek/重播到 0 跟得上）**管 seek**。**只留判据层 → 暂停态 seek 到 0 卡死在旧值（QA 抓到的 v1.9.2→v1.9.3 回归，已修）；只留写入口 → 跃迁那一拍砸 0（实测 18 条红）**。
+- **`restorable()` 只放行「离开时 Paused」**：防「在播时切走→切回」被当成续听（无法与「列表里重新点播」区分，取「宁可落后绝不超前」）。
+- **「有效测试」**：+25 条（工程师 19 + QA 6），全部确定性多轮仿真（无 sleep、不碰 COM）；反向验证 10 组（M1~M8），每组可编译 + 按字节还原。关键几条：`cross_app_return_restores_lyric_clock_instead_of_zero`、`returning_to_same_track_within_app_keeps_progress`、`repeated_cutaways_do_not_lose_the_lyric_clock`、`stale_zero_read_cannot_rewind_the_clock`、`seeking_to_zero_on_a_real_position_player_pulls_the_clock_back_to_zero`、`genuine_replay_is_not_dragged_by_memory`。
+- **交付**：测试 **594 → 619**（618 passed + 1 ignored），clippy 0；`deliverables/曲栏_Barline_v1.9.3.exe` = 1,167,872 B / `FileVersion=ProductVersion=1.9.3` / `Company=Yi One`；版本 5 处 + `Cargo.lock` 1 行；exe 39 → 40 只增不删。
+- **交付凭证（exe 哈希不可复现，别用）**：`src/media/smtc.rs` 全文件 `7ba06dd4…8472`；**生产逻辑指纹**（剥纯注释，注释免疫）= `awk '/#\[cfg\(test\)\]/{exit} {print}' src/media/smtc.rs | grep -vE '^[[:space:]]*//' | sha256sum` → `fabab193…f573`（57,049 B；修复前基线同口径 `fd499bf8…`）。交付身份写「源码全文件 + 生产逻辑指纹 + 字节数 1,167,872 + 资源版本 1.9.3 + Company=Yi One」。
+- **本轮流程事故（必须记住）**：工程师**交报告后仍继续改 `src/`**，且把工作区留在改坏实验态（`// RV-5`）→ QA 读到 `609 passed / 3 failed`、报告里的测试数与 exe 全部过期（那个 exe 是从改坏源码构建的）。处置：`TaskStop` → 主理人手工还原那一处 → sha 逐字节回到基线 → 主理人自跑 check/clippy/test → 重建出包。**新纪律见 §2.1 第 6、7 条。**
+- **已知取舍（用户已验收，记录在案）**：「暂停离开 → 在列表里重新点播同一首（从头播）」会被记忆续接到离开位置（网易云无自愈）；「在播时切走再切回」仍归零。两者在 `(0,0)` 播放器上信息论不可区分，TTL 30min 是概率缓解，**不再改判据**（曾提「只在 `next.is_none()` 时记忆」，经复核会把两个 Bug 重新打开，已否决）。
+- **第三条路径（低危，已登记）**：若某播放器持续「报时长、不报位置」（`(0,D)` 且非换曲、非跃迁 → 走 `Keep`），钟会被每秒钉回 0，表现为「歌词每秒回第一句」的锯齿。当前日志 0 命中（网易云连 duration 都恒为 0，结构上进不去）。排障判据：同一 aumid + 同一 title 数秒内出现 ≥2 条 `position=0 且 duration≠0`。
+
 ---
 
 ## 2. 关键决策
@@ -107,6 +118,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. **本机安全约束**：禁 `reg.exe` / `Add-Type` / `cmd.exe`；注册表读取用 Rust API；结束进程用 `Stop-Process -Name barline -Force`；工程师不启动 exe、不截屏。
 4. **文档纪律**：每次验收通过后同步 `progress.md` + 受影响的 PRD / README / ARCHITECTURE。
 5. **验收纪律**：用户真人验收为准，工程师自测只是第一层；不要用「测试通过」代替「行为正确」。
+6. **交付即冻结**：成员发交付报告 = 那一刻的源码快照，报告之后**不许再改 `src/`**；要改必须先要写权窗口并声明「开始写 / 完成 + 新哈希」。**反向验证一律在副本里做**（`cp` 到临时目录改），禁止把工作区留在改坏态——否则任何人的构建都可能落进改坏窗口（v1.9.3 三方各踩一次）。
+7. **提交纪律**：**禁用 `git add -A` / `git add --renormalize`**，只显式 add 目标文件。原因：`.gitattributes` 的 `*.ps1 text eol=crlf working-tree-encoding=UTF-8-BOM` 与现存 `scripts/build.ps1`（LF+BOM）不一致，`hash-object` 会报 `failed to encode`；详见 §3.6 第 9 条。
 
 ### 2.2 架构不变量
 
@@ -123,6 +136,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 16. **亮度采样降载（v1.4.4）**：静止态背景采样心跳 **3s**（原 1s），前台**同屏**全屏跳过；用户能感知的采样路径（悬停/换壁纸/几何变化/退出截图态）一律立即采样、不受影响。注意：3s 心跳下**边际**亮度变化最坏 6s 才翻（2 样本 × 3s），大幅跳变走快速通道仍是 1 样本（≤3s，换壁纸即时）。
 16a. **歌词层序与落盘（v1.8.0 起）**：`lyrics.local_first` 默认 false；`false → [Mem,Disk,Local]`、`true → [Local,Mem,Disk]`（本地在内存前，手改 `.lrc` 立即生效含正在播放那首）；一个 `Step` 数组 + 单循环表达两条顺序，**禁止两份逻辑**；落盘唯一收口 `maybe_write_back`（触发面 = 内存/磁盘/在线三条路径）；`Cache::get_mem/get_disk` 返回 `Hit{lyrics,source}`，磁盘回填内存必须带 source；落盘名 `歌名 - 歌手.lrc` 保留原始大小写；设置页缓存统计走 `SettingsService::post()`（**不是 `push()`**）。
 16b. **媒体会话黑名单（v1.9.0 起）**：判定三级回退「缓存 → 静态表 → AUMID 末段」**纯内存**；枚举只许「进入分区（`detectedLoaded` 守卫）+ 手点刷新」两处，零定时器；`execute()` 入口拦播控且**不发假成功 CommandResult**；ignored 轮次（`Cadence::consume`）**绝不清 parts/cadence/session_events、不污染退避状态机**（200 轮专测钉死）；`apply_blacklist` 是黑名单写入唯一入口（`apply_set` 显式拒绝 `media.blacklist*`）；`app_names` 上限 64 淘汰字典序最小键、`blacklist_clear` 不清它；`IVectorView` 用 `Size()`/`GetAt(i)`（需 `Foundation_Collections` feature，G7 已加回）。
+16c. **歌词钟连续性（v1.9.3 起，两个 Bug 的根）**：① `timeline_at` 的唯一语义是「`parts.position_ms` 是**什么时候**采到的」，**写位置必同写时刻、不写位置不许刷时刻**（旧实现刷成 now 却保留旧位置 ⇒ 「陈旧位置 @ 新鲜时刻」）；② `LyricClockMemory` 按 `(aumid, track_id)` 记忆离开时的钟（纯内存、TTL 30min、CAP 16、**只在离开这首歌时写**，稳态发布不刷新 `sampled_at`），挂在**全部** `self.last` 丢弃点，漏一处就是「这首歌的钟仍会丢」；③ `Reset` 前必须先查记忆，查不到才是真新歌归零；④ Carry 锚点用 `PlaybackInfoChanged` **事件到达时刻**而非检测轮 `now`（检测轮是窗口上界，系统性偏晚）；⑤ G8-⑤ 判定层 `position == 0 ⇒ 不可信` 与写入口 `position != 0 || duration != 0` **缺一即回归**（见 §1 第六轮）；⑥ `restorable()` 只放行「离开时 Paused」。
 
 ### 2.3 已废弃 / 明确禁止（别重犯）
 
@@ -140,7 +154,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **记忆文件精简**：因 MEMORY.md 超注入上限被截断，用户授权将其精简合并（保留不变量、去重、删过时），不删逐日日志。
 
 ### 2.5 G8 分组与用户拍板（2026-11-05，逐条澄清后开工）
-- **分组排序（用户确认按建议 3 组）**：① 黑名单多会话显示（Bug，v1.9.0→v1.9.1）→ ② 网易云暂停→继续歌词钟归零（Bug，v1.9.1→v1.9.2）→ ③ 双击空白区打开设置 + 通用页开关（新增能力，v1.9.2→v1.10.0）。**每组出包 + 升版本**（用户选），每组一次提交、停下等真人验收。
+- **分组排序（用户确认按建议 3 组）**：① 黑名单多会话显示（Bug，v1.9.0→v1.9.1 ✅）→ ② 网易云暂停→继续歌词钟归零（Bug，v1.9.1→**v1.9.3**，含验收后追加的「切走再切回/跨应用返回归零」补修 ✅）→ ③ 双击空白区打开设置 + 通用页开关（新增能力，**v1.9.3→v1.10.0**）。**每组出包 + 升版本**（用户选），每组一次提交、停下等真人验收。
 - **① 拍板**：被拉黑应用仍完全忽略；系统当前会话命中黑名单时改看其它正常会话，**优先正在播放的**，全暂停取系统顺序第一个，一个正常会话都没有才隐藏；只在命中时低频枚举、常规播放零新增跨进程调用、零定时器、不污染 ignored 轮次退避；「当前应用」= 小组件正在显示的会话。
 - **② 拍板**：**只修暂停→继续**，seek 明确不修（网易云 SMTC 恒报 `(0,0)`，读不到新位置，列为已知限制）；暂停期间歌词**原地停住**，继续后从暂停那一句接着走，不重新加载/不闪一下。（已实现+测试全绿+出包 v1.9.2，待真人验收）
 - **③ 拍板**：**默认开**；双击生效区 = 信息区/歌词/空白，**排除四按钮 + 封面 + 进度条**（按钮区双击维持现有「零动作」）；开关放设置页**「通用」页**，是开关控件不是按钮，小组件**不新增任何按钮**。
@@ -298,6 +312,9 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 4. 「清空歌词缓存」一键按钮（v1.8.0 只给了「点击打开文件夹」）。
 5. G7 遗留 P3：D2 空身份会话不显示灰态行（PRD P0-04 要求灰态，实现选择不出现）；D6 `BlacklistOutcome::BadPath` 无专测；D5 媒体线程死亡时刷新按钮不复位。
 6. G2 卡顿续查路线与二分杠杆全在 §3.1（埋点仍在，别重搭）。
+7. **`note_state_jump()` seam 抽取**（v1.9.3 遗留的测试工程债）：Bug 1 的生产接线目前**只靠一条源码字符串断言**守着 —— 实测把 `tick()` 里 `.at(jumped_at)` 改成 `None` 时，只有 `tick_wires_state_jump_into_snapshot_inputs` 变红，两条 N 轮仿真**全绿**（它们的暂停/继续检测延迟对称，`None` 与事件戳数学等价）。一旦有人改名/重构 `tick`，唯一防线静默失效。做法：抽 `fn note_state_jump(&mut self, prev_obs, now) -> Option<Instant>`，让「先取 prev_obs → note_playback → take_after」的顺序能被真单测覆盖，验收标准 = **改坏 `.at(None)` 时新函数自身的单测必须红**。
+8. **持续「报时长不报位置」播放器的守卫**（v1.9.3 登记的第三条路径）：连续 N 次 `(0,D)` 视为「该播放器不报位置」，避免钟被每秒钉回 0 的锯齿。当前日志 0 命中，**等真机撞上再加**（加了会在 seek 上引入假阴性风险）。
+9. **仓库卫生：`.ps1` 属性与现存文件不一致**（低危、非阻塞）：`.gitattributes` 声明 `*.ps1 text eol=crlf working-tree-encoding=UTF-8-BOM`，但 `scripts/build.ps1` 现存 **LF / 189 行 / CR=0，BOM 存在**（属性加入前就提交、从未 `--renormalize`）。实测后果：`git hash-object scripts/build.ps1` 报 `failed to encode … from UTF-8-BOM to UTF-8`（stderr 噪声，会掩盖真错误）；fresh clone 落地 **8568 B / CR=189**（与 blob 8379 B 不同）但 `git status` **干净**（clean 方向 eol 归一化把 CR 折回），所以**不会弄脏仓库、`git add -A` 也不会改写 blob**（曾误判为「发布流程风险」，已实测下调）。修法：改成 `*.ps1 -text`（git 绝不转换，检出字节 ≡ blob 字节，PS 5.1 要的 BOM 原样保留）；验收两条：① `git cat-file --filters` 与 `blob` 字节相同且 fresh clone 后 status 干净 ② `build.ps1 -Task check` 仍跑通。**别用 `git add --renormalize .` 修**。
 
 ---
 
@@ -326,8 +343,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | `截图态` | 截图遮罩冻结生效范围 |
 
 ### 4.3 交付包现状（`deliverables/`，只增不删）
-现存 **39 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
-最新 `曲栏_Barline_v1.9.2.exe` = 1,164,800 B / SHA256 `8F76FAD456045B449AB1FDE6F80FEEC33526F596EF360D8216CDA9F27DA8EA9D` / FileVersion 1.9.2。
+现存 **40 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`、`v1.9.3`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
+最新 `曲栏_Barline_v1.9.3.exe` = 1,167,872 B / FileVersion 1.9.3 / Company `Yi One`（**exe 哈希不可复现，不作凭证**；身份见 §1 第六轮 G8-④ 的「源码全文件 + 生产逻辑指纹 + 字节数 + 资源版本」）。
 ⚠️ `v1.0.0`、`v1.1.0` ~ `v1.1.9` 已不在磁盘（早前清理误删，目录在 `.gitignore` 内无法恢复）；如需补齐用 4.1 的 detached checkout 方式，不补也不影响使用。
 
 ### 4.4 测试与验收口径
@@ -348,5 +365,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态（2026-11-06 18:10）**：**G1~G7 全部验收通过；G8-① 已真人验收通过（v1.9.1 / 576 测试 / 提交 `27d8208` 已推 GitHub）；G8-② 已实现+测试全绿+出包 v1.9.2（594 测试 / 待真人验收）**，G8-③ 待办。分组与全部拍板见 **§2.5**，G8-① 实现与 QA 证据见 **§1 第六轮**。下一组的验收节奏不变：一次一组 → 有效测试全绿 → 单提交 → 播报「任务清单 + 进度」→ **停下等用户回「没问题」** → 才更新文档 → 下一组；三组全部完成后跑全量测试 + 总验收。遗留候选见 §3.6。**GitHub Release 仍由用户到 Releases 页手动发。**
+6. **当前状态（2026-11-06 05:00）**：**G1~G7 全部验收通过；G8-① 已验收（v1.9.1 / 576 测试 / `27d8208` 已推）；G8-② 已验收（v1.9.2 / 594 测试 / `41b36a8`）→ 验收暴露出「切走再切回/跨应用返回归零」→ G8-④ 补修 v1.9.3 已验收（619 测试 / `31c4fed`，**未推送**）；G8-③ 双击开设置（v1.10.0）进行中**。分组与全部拍板见 **§2.5**，G8-① 与 G8-④ 的实现/QA 证据见 **§1 第六轮**。验收节奏不变：一次一组 → 有效测试全绿 → 单提交 → 播报「任务清单 + 进度」→ **停下等用户回「没问题」** → 才更新文档 → 下一组；三组全部完成后跑全量测试 + 总验收。遗留候选见 §3.6。**GitHub Release 仍由用户到 Releases 页手动发**（v1.9.0~v1.9.3 均未发，建议三组做完直接发 v1.10.0）。
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。

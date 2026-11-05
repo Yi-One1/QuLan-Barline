@@ -6,7 +6,7 @@ category: 曲栏Barline
 
 # 曲栏 Barline 长期记忆
 
-Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.9.1**，测试 576（575 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，@ `27d8208` 已推）。**G1~G7 全部闭环；G8 分组迭代中：① 已真人验收（v1.9.1）、② 进行中、③ 待办**。分组与全部拍板见 progress.md §2.5。
+Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.9.2**，测试 594（593 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，@ `27d8208` 已推；G8-② 提交 `41b36a8` 本地待推）。**G1~G7 全部闭环；G8 分组迭代中：① 已真人验收（v1.9.1）、② 已实现+测试全绿+出包待真人验收（v1.9.2）、③ 待办**。分组与全部拍板见 progress.md §2.5。
 
 ## 铁律
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（PowerShell 工具跑）；禁裸 cargo（Git Bash 抢 link.exe）；卡顿/陈旧锁告警设 `$env:CARGO_INCREMENTAL="0"`。
@@ -50,5 +50,6 @@ Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SM
 - 下一轮候选：① pre-existing 死码 30 项（HEAD 就有，QA 已列）；② **语言切换需重启**（`general.language` 改 `App::lang` 不更新、托盘不刷新，挂点 `Effect::RefreshTrayMenu`）；③ D-6 两份进度实现（`State::progress_fraction` 与 painter.rs 内联 frac，屏幕上画的不是被测那个）；④ 「清空歌词缓存」一键按钮；⑤ G2 残余卡顿续查路线在 progress.md §3.1。
 - v1.5.6 观察项：R2 退出抖动（AppbarClose 后 1s 心跳可能补冻）；R1 `AppbarOpen×fs=false` 完整冻结≤1s 可自愈；迟到/重复 TRUE 广播可补冻。首选项：`AppbarOpen` 遇 `fg/wm==RECT::default()` 回退 frozen_decision。
 - 小尾巴待办：设置页标题栏明暗跟随、热键日志冗余清理、「冲突一键换组」未做。
-- **版权人已统一实名 `Yi One`**：LICENSE + `assets/barline.rc` 的 `CompanyName`/`LegalCopyright`（2026-11-06 补齐，此前 exe 资源面板仍显示旧占位 `The Barline Authors`）。README 已内嵌设置页/小组件截图（assets/screenshots/）。GitHub Release（tag+exe）仍需用户到 Releases 页手动发（本机无 `gh` CLI / token）；v1.9.0 未发，现有 v1.9.1 包 38 个 exe。
+- **版权人已统一实名 `Yi One`**：LICENSE + `assets/barline.rc` 的 `CompanyName`/`LegalCopyright`（2026-11-06 补齐，此前 exe 资源面板仍显示旧占位 `The Barline Authors`）。README 已内嵌设置页/小组件截图（assets/screenshots/）。GitHub Release（tag+exe）仍需用户到 Releases 页手动发（本机无 `gh` CLI / token）；v1.9.0/v1.9.1 未发，现有 v1.9.2 包 39 个 exe。
 - **G8-② 技术前提（开工前必读）**：用户只修「网易云暂停→继续歌词跳回第一句」，seek 明确不修（网易云 SMTC 恒报 `(0,0)` 读不到新位置）。`NowPlaying::position_now()`（media/mod.rs:166）非 Playing 直接返回 `position_ms`（暂停冻结）；根因线索在 `smtc.rs` 的 `note_playback` 状态跃迁会置 `plan.timeline=true` → 读到 (0,0) + `read_timeline_now=true` → `anchor_of` 规则 1 把锚点重置为 now，`position_ms=0`。**歌词钟靠锚点外推，绝不能碰 G7/G8-① 的退避状态机与拦截点**。
+- **G8-② 已实现（v1.9.2）**：`LyricClockAction{Carry}` + `tick_inputs()/TickInputs` 单入口（派生 `read_timeline_now` 杜绝双来源），`apply_timeline_read()` 见 (0,0) 不覆盖 `parts.position_ms`，Carry 用 `lyric_clock_at(last,now)` 外推续接。**锁接线手段（防「测试全绿但功能没做」）**：`tick_wires_state_jump_into_snapshot_inputs` 源码静态断言（读 `smtc.rs` 自身，断言 `tick` 含 `state_jumped = true` 且经 `tick_inputs(...)` 收拢、无 `tick_inputs(false`、无 `read_timeline_now =`）；把 `state_jumped = true` 改 `= false` 必须恰好 1 条测试变红（RV-C3）。
