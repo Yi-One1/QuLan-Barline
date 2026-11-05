@@ -94,7 +94,149 @@ const FORCED_FLOOR_MS: u64 = 60;
 /// 被拉黑的应用通常还在放歌 → 会话级事件（MediaPropertiesChanged 等）持续置脏位 →
 /// `forced` 每 60ms 就来一次。若每次都重读 AUMID，忽略态反而比正常态更费。
 /// 1s 一次足够：解绑后 ≤1s 内发现，仍远优于验收要求的 3s。
+/// G8-① 起它也兼作「命中黑名单后的会话枚举」下限：同一把低频闸，零定时器。
 const IGNORE_RECHECK_MS: u64 = 1_000;
+
+// ---------------------------------------------------------------- 会话挑选（G8-①）
+
+/// 一次会话枚举里单个候选的**纯数据**画像（G8-① / 验收约束 6）。
+///
+/// 刻意不含任何 COM 句柄：媒体线程把 `GetSessions()` 的每个会话降维成它，
+/// 再交给 [`choose_session`]。于是挑选规则可写确定性单测，无需启动媒体线程或 COM。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCandidate {
+    /// SMTC 的 `SourceAppUserModelId`（身份）。
+    pub aumid: String,
+    /// `player_map::resolve()` 解析出的进程名（身份，可能为空串）。
+    pub process_name: String,
+    /// `GetPlaybackInfo()?.PlaybackStatus() == Playing`。
+    pub playing: bool,
+    /// `MediaIndex::matches()` 的结果；`true` = 被拉黑，必须完全忽略、永不选中。
+    pub ignored: bool,
+}
+
+/// 会话挑选结果（G8-①）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionChoice {
+    /// 显示候选切片里该下标的正常会话（调用方据此 `GetAt(i)` 取回 COM 会话）。
+    Show(usize),
+    /// 没有可显示的正常会话 → 保持隐藏（沿用现状空态）。
+    Hide,
+}
+
+/// 一次会话枚举结果的**状态动作**（G8-①）。
+///
+/// 把「候选画像」翻译成媒体线程要做的动作，刻意不含 COM 句柄：
+/// [`PollState::decide_scan`] 是纯逻辑，整个多会话状态机因此可确定性单测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDecision {
+    /// 改显示该下标的正常会话（调用方取回 COM 句柄并重置单会话缓存）。
+    Switch(usize),
+    /// 仍在显示同一个正常会话：只刷新句柄，缓存一律不动。
+    Keep(usize),
+    /// 一个正常会话都没有 → 保持隐藏（沿用现状空态）。
+    Hide,
+    /// 黑名单会话已全部消失 → 回到常规 `GetCurrentSession()` 路径，停止枚举。
+    Release,
+}
+
+/// **会话挑选的纯函数**（G8-① / 验收约束 6，可确定性单测、不依赖 COM）。
+///
+/// 系统「当前会话」命中黑名单时用它从全部候选里挑一个来显示，规则按优先级：
+/// 1. 命中黑名单的候选一律跳过（约束 1：被拉黑的应用仍完全忽略）；
+/// 2. 存在「正在播放（Playing）」的正常会话 → 取 `GetSessions()` 系统顺序里
+///    第一个 Playing 的正常会话；
+/// 3. 全都暂停 → 取系统顺序里第一个正常会话；
+/// 4. 全部被拉黑 / 没有候选 → [`SessionChoice::Hide`]（沿用现状空态）。
+///
+/// 返回的是**下标**，让调用方自己把纯数据映射回 COM 会话，函数体保持纯逻辑。
+pub fn choose_session(candidates: &[SessionCandidate]) -> SessionChoice {
+    if let Some(i) = candidates
+        .iter()
+        .position(|c| !c.ignored && c.playing)
+    {
+        return SessionChoice::Show(i);
+    }
+    match candidates.iter().position(|c| !c.ignored) {
+        Some(i) => SessionChoice::Show(i),
+        None => SessionChoice::Hide,
+    }
+}
+
+/// 是否该发起一次低频会话枚举（G8-① / 验收约束 4、6 的测试化）。
+///
+/// **性能红线**：常规播放路径（`blacklist_hit == false`）永远返回 `false`，
+/// 所以 `GetSessions()` 绝不会进入每 50ms 的常规 tick；只有命中黑名单时才按
+/// [`IGNORE_RECHECK_MS`] 节流。`last_scan = None`（从未枚举）时首次命中立即放行，
+/// 避免用户等 1s 才看到另一个正在播放的播放器。
+pub fn session_scan_due(
+    blacklist_hit: bool,
+    last_scan: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !blacklist_hit {
+        return false;
+    }
+    match last_scan {
+        None => true,
+        Some(t) => {
+            now.saturating_duration_since(t) >= Duration::from_millis(IGNORE_RECHECK_MS)
+        }
+    }
+}
+
+/// 一次会话枚举 → 媒体线程的状态动作（G8-①，**纯函数**，零 COM / 零 IO）。
+///
+/// `displayed_aumid` = 小组件当前锁定显示的那个会话（`None` = 常规路径）。
+/// - 黑名单会话已全部消失 → [`ScanDecision::Release`]：回到常规路径，枚举停止；
+/// - 仍有黑名单会话但没有正常候选 → [`ScanDecision::Hide`]：沿用现状空态；
+/// - 选中的正常会话正是当前显示的那一个 → [`ScanDecision::Keep`]：不乱清缓存；
+/// - 否则 → [`ScanDecision::Switch`]：换会话（调用方重置缓存防串歌）。
+pub fn scan_decision(
+    candidates: &[SessionCandidate],
+    displayed_aumid: Option<&str>,
+) -> ScanDecision {
+    if !candidates.iter().any(|c| c.ignored) {
+        return ScanDecision::Release;
+    }
+    match choose_session(candidates) {
+        SessionChoice::Hide => ScanDecision::Hide,
+        SessionChoice::Show(i) => {
+            let shown = displayed_aumid.filter(|s| !s.is_empty());
+            let same = candidates
+                .get(i)
+                .is_some_and(|c| Some(c.aumid.as_str()) == shown);
+            if same {
+                ScanDecision::Keep(i)
+            } else {
+                ScanDecision::Switch(i)
+            }
+        }
+    }
+}
+
+/// P2-1：回到常规路径（[`ScanDecision::Release`]）时，是否必须广播
+/// `AppEvent::IgnoredSession(None)` 清掉 UI 侧 `App.ignored` 的残留。
+///
+/// 纯数据判定：`decision` 必须是 Release，`had_ignored` 表示媒体线程上一次
+/// 广播过 `IgnoredSession(Some)`（托盘此刻还显示「恢复某应用」）。G7 基线靠
+/// `tick_ignored()` 的「忽略→正常」分支自愈，G8-① 的 Release 绕过了那条路径，
+/// 若不在这里清，就会出现「A 已退出、B 正常显示，托盘却还写着恢复 A」。
+/// 只有两者同时成立才发事件——不重复打扰 UI。
+pub fn release_needs_ignored_clear(decision: ScanDecision, had_ignored: bool) -> bool {
+    matches!(decision, ScanDecision::Release) && had_ignored
+}
+
+/// P2-2：**主循环的性能闸**（G8-① / 验收约束 4 的测试化）。
+///
+/// `ignored_now` = 缓存身份命中黑名单；`has_displayed_session` = 正锁定显示
+/// `GetSessions()` 挑出的替代会话。只有这两者之一成立才允许进入低频会话枚举；
+/// **`false, false`（常规播放路径）必须返回 `false`** —— 于是 `GetSessions()`
+/// 永不进每 50ms 的常规 tick，零新增跨进程调用。抽成纯函数是为了让这条红线
+/// 被单测锁住，而不是只靠代码走查。
+pub fn scan_gate(ignored_now: bool, has_displayed_session: bool) -> bool {
+    ignored_now || has_displayed_session
+}
 
 /// 封面解码记忆。
 ///
@@ -485,6 +627,16 @@ struct PollState {
     /// 命中日志限流（按进程名分桶；`perf::RateLimiter` 的 key 是 `&'static str`，
     /// 表达不了动态进程名，所以自己实现）
     last_hit: Option<(String, Instant)>,
+    /// G8-①：**小组件正在显示的那个会话**。
+    ///
+    /// `None` = 常规路径，每轮照旧用 `GetCurrentSession()`（与 G7 逐字节一致）；
+    /// `Some` = 系统「当前会话」命中黑名单后，从 `GetSessions()` 里挑出的正常会话。
+    /// 只要它在，`tick()` 与 `execute()` 都针对它——否则 `GetCurrentSession()` 会
+    /// 一直返回被拉黑的那个，小组件就永远看不到正常播放器。
+    display_session: Option<GlobalSystemMediaTransportControlsSession>,
+    /// 上次因黑名单命中而枚举会话的时刻；`None` = 从未枚举（首次命中立即枚举）。
+    /// 与 `last_ignore_probe` 分开记，避免 G7 的身份重查闸被 G8 的枚举互相带偏。
+    last_session_scan: Option<Instant>,
 }
 
 impl PollState {
@@ -502,6 +654,8 @@ impl PollState {
             last_ignored: None,
             last_ignore_probe: Instant::now(),
             last_hit: None,
+            display_session: None,
+            last_session_scan: None,
         }
     }
 
@@ -603,9 +757,10 @@ impl PollState {
     /// ③ 命中 INFO（按进程名 60s 限流）④ `IgnoredSession(Some)`。
     /// **绝不**清 `parts` / `cadence` / `session_events`——`parts` 是唯一身份来源。
     fn enter_ignored(&mut self, sink: &EventSink<AppEvent>, now: Instant) {
-        // ① 丢弃上一份快照
+        // ① 丢弃上一份快照；G8-①：进入空态就不再锁定任何替代会话
         self.last = None;
         self.cover.done = false;
+        self.display_session = None;
         // ② 复用既有 SessionCleared（UI 侧已会把 playing/lyrics 复位并隐藏小组件）
         sink.send(AppEvent::SessionCleared);
         // ③ 命中日志（限流）
@@ -626,6 +781,206 @@ impl PollState {
         };
         self.last_ignored = Some(info.clone());
         sink.send(AppEvent::IgnoredSession(Some(Box::new(info))));
+    }
+
+    // ------------------------------------------ 多会话挑选（v1.9.1 / G8-①）
+
+    /// 取本轮要读的会话：常规路径仍是**恰好 1 次** `GetCurrentSession()`，
+    /// 已锁定替代会话时直接复用句柄（零新增跨进程调用）。
+    fn acquire_session(
+        &self,
+        mgr: &Manager,
+    ) -> Result<GlobalSystemMediaTransportControlsSession> {
+        match &self.display_session {
+            Some(s) => Ok(s.clone()),
+            None => mgr.GetCurrentSession(),
+        }
+    }
+
+    /// 低频枚举一次 `GetSessions()`，把每个会话降维成 [`SessionCandidate`]。
+    ///
+    /// **只在「命中黑名单」且过闸时调用**；正常播放路径永不进入。读取白名单与
+    /// G7 的枚举一致：`GetSessions` / `Size` / `GetAt` / `SourceAppUserModelId` /
+    /// `GetPlaybackInfo`，绝不碰 `TryGetMediaPropertiesAsync` / 封面 / 时间线。
+    /// 返回的第二个 Vec 与候选**下标一一对应**，供调用方 `choose_session` 后取回句柄。
+    fn collect_candidates(
+        &self,
+        mgr: &Manager,
+    ) -> (
+        Vec<SessionCandidate>,
+        Vec<GlobalSystemMediaTransportControlsSession>,
+    ) {
+        let mut candidates: Vec<SessionCandidate> = Vec::new();
+        let mut sessions: Vec<GlobalSystemMediaTransportControlsSession> = Vec::new();
+        let Ok(view) = mgr.GetSessions() else {
+            crate::log_debug!("G8-①：枚举会话失败，保持现状");
+            return (candidates, sessions);
+        };
+        let count = view.Size().unwrap_or(0);
+        for i in 0..count {
+            let Ok(s) = view.GetAt(i) else {
+                continue;
+            };
+            let aumid = s
+                .SourceAppUserModelId()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            let process_name = player_map::resolve(&aumid).process_name.to_string();
+            // `MediaIndex::matches` 是纯内存三级回退（缓存 → 静态表 → AUMID 末段），
+            // 这里零 IO / 零 COM，与 G7 的判定口径完全同源。
+            let ignored = self.index.matches(&process_name, &aumid);
+            let playing = s
+                .GetPlaybackInfo()
+                .and_then(|p| p.PlaybackStatus())
+                .map(|st| st == PlaybackStatus::Playing)
+                .unwrap_or(false);
+            candidates.push(SessionCandidate {
+                aumid,
+                process_name,
+                playing,
+                ignored,
+            });
+            sessions.push(s);
+        }
+        (candidates, sessions)
+    }
+
+    /// **切换到另一个正常会话**：把单会话缓存整体作废，杜绝 A/B 会话串歌。
+    ///
+    /// `SessionParts`（歌名/歌词锚点/track_id）、`Cadence`（三层节奏与退避）、
+    /// `CoverMemo`、`SessionSubscriptions`（跟随 AUMID 的事件订阅）、`last`（快照）
+    /// 全部重置——下一轮必然按 `Plan::full()` 重新读新会话并重新广播 NowPlaying，
+    /// 旧会话的标题、进度基准、歌词代次一概不带过去。
+    fn switch_display_session(
+        &mut self,
+        session: GlobalSystemMediaTransportControlsSession,
+        c: &SessionCandidate,
+        sink: &EventSink<AppEvent>,
+        now: Instant,
+    ) {
+        self.parts = SessionParts::default();
+        self.parts.aumid = c.aumid.clone();
+        self.parts.process_name = c.process_name.clone();
+        self.parts.app_name = player_map::resolve(&c.aumid).display_name.to_string();
+        self.cadence = Cadence::default();
+        self.cover = CoverMemo::default();
+        self.session_events = None; // Drop 会反注册旧订阅；按新 AUMID 重新挂
+        self.last = None; // 强制下一轮重新广播新会话的快照
+        self.last_ignore_probe = now;
+        self.display_session = Some(session);
+        // 「当前应用」现在就是这个正在显示的会话 → 清掉托盘/设置页的忽略态，
+        // 与 app.rs 的 `state.playing.session` 单一口径对齐（G8-① 约束 5）。
+        if self.last_ignored.take().is_some() {
+            sink.send(AppEvent::IgnoredSession(None));
+        }
+    }
+
+    /// P2-1：执行 [`ScanDecision::Release`] —— 回到常规 `GetCurrentSession()`
+    /// 路径，并**与 Switch 分支一致**清掉 UI 侧残留的忽略态。
+    ///
+    /// 抽成独立方法是为了让事件接线可用假 `EventSink` 单测（无 COM）：
+    /// `rescan_sessions()` 的 Release 分支只调用它，不再内联这些副作用。
+    fn apply_release(&mut self, decision: ScanDecision, sink: &EventSink<AppEvent>) {
+        // 黑名单独象已不成立：解绑回常规路径，并让缓存身份不再被误判为命中。
+        self.display_session = None;
+        self.parts = SessionParts::default();
+        self.cadence = Cadence::default();
+        self.session_events = None;
+        self.last = None;
+        // 上一次广播过 IgnoredSession(Some) → UI 的 App.ignored 还指向旧应用，
+        // 必须发 None 让托盘/设置页口径切回「正在显示的会话」（约束 5）。
+        if release_needs_ignored_clear(decision, self.last_ignored.take().is_some()) {
+            sink.send(AppEvent::IgnoredSession(None));
+        }
+        crate::log_debug!("G8-①：黑名单会话已消失，回到系统当前会话");
+    }
+
+    /// **多会话状态机的纯决策**（G8-①，测试入口）。
+    ///
+    /// 输入只有候选画像与 `PollState` 自身的状态，**零 COM、零 IO**：
+    /// - 黑名单会话已全部消失 → [`ScanDecision::Release`]（回到常规路径，枚举停止）；
+    /// - 仍有黑名单会话且 [`choose_session`] 找不到正常候选 → [`ScanDecision::Hide`]；
+    /// - 选中的正常会话就是当前显示的那一个 → [`ScanDecision::Keep`]（不制造每秒重播）；
+    /// - 否则 → [`ScanDecision::Switch`]（换会话，调用方负责重置缓存防串歌）。
+    fn decide_scan(&self, candidates: &[SessionCandidate]) -> ScanDecision {
+        let displayed = if self.display_session.is_some() {
+            Some(self.parts.aumid.as_str()).filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        scan_decision(candidates, displayed)
+    }
+
+    /// 命中黑名单后的**一次低频会话枚举**（G8-① 核心）。
+    ///
+    /// 返回 `true` = 已切换到另一个正常会话（调用方本轮应全量读它并发布）；
+    /// `false` = 保持现状。动作一律由 [`PollState::decide_scan`] 给出，
+    /// 「命中即隐藏」不再是一句 `enter_ignored` 就能走到的捷径。
+    ///
+    /// 本方法只由 `tick()` 的两个拦截点或主循环在「命中黑名单 / 正显示替代会话」
+    /// 时调用；`tick_ignored()` 与 `Cadence::consume` 一行未改（G7 语义不污染）。
+    fn rescan_sessions(
+        &mut self,
+        mgr: &Manager,
+        sink: &EventSink<AppEvent>,
+        now: Instant,
+    ) -> bool {
+        if !session_scan_due(true, self.last_session_scan, now) {
+            return false;
+        }
+        self.last_session_scan = Some(now);
+        let (candidates, sessions) = self.collect_candidates(mgr);
+
+        match self.decide_scan(&candidates) {
+            decision @ ScanDecision::Release => {
+                // P2-1：与 Switch 分支一致清掉残留忽略态，否则「A 退出 / B 接管」
+                // 后托盘仍显示「恢复 A」，用户点它会误把 A 从黑名单移除。
+                self.apply_release(decision, sink);
+                false
+            }
+            ScanDecision::Hide => {
+                // 确实一个正常会话都没有 → 沿用现状空态（约束 2 后半句）。
+                // 用其中一个被拉黑候选的身份填 parts，让 ignored_now() 成立，
+                // 托盘/设置页的「恢复当前应用」仍指向造成隐藏的那个会话。
+                if let Some(c) = candidates.iter().find(|c| c.ignored) {
+                    self.parts.aumid = c.aumid.clone();
+                    self.parts.process_name = c.process_name.clone();
+                    self.parts.app_name = player_map::resolve(&c.aumid).display_name.to_string();
+                }
+                self.display_session = None;
+                // 1s 闸下会反复走到这里：只在「忽略身份真的变了 / 刚进入空态」
+                // 时广播事件，避免已经隐藏时每秒重复发 SessionCleared 打扰 UI。
+                let identity_changed = self
+                    .last_ignored
+                    .as_ref()
+                    .map(|p| p.aumid.as_str())
+                    != Some(self.parts.aumid.as_str());
+                if identity_changed {
+                    self.enter_ignored(sink, now);
+                }
+                false
+            }
+            ScanDecision::Keep(i) => {
+                // 同一会话：只更新 COM 句柄，避免每秒一次清空/重播。
+                if let Some(s) = sessions.get(i) {
+                    self.display_session = Some(s.clone());
+                }
+                false
+            }
+            ScanDecision::Switch(i) => {
+                let (Some(session), Some(c)) = (sessions.get(i), candidates.get(i)) else {
+                    return false;
+                };
+                crate::log_info!(
+                    "G8-①：系统当前会话被拉黑，改显示其它正常会话：index={} aumid={} playing={}",
+                    i,
+                    c.aumid,
+                    c.playing
+                );
+                self.switch_display_session(session.clone(), c, sink, now);
+                true
+            }
+        }
     }
 
     /// 忽略态轮次：不发 NowPlaying、不读时间线/属性/封面/controls。
@@ -694,10 +1049,13 @@ impl PollState {
     }
 
     /// 按计划做一轮读取，diff 后决定是否广播。
+    ///
+    /// G8-①：本轮读的会话由 [`PollState::acquire_session`] 决定——常规路径仍是
+    /// `GetCurrentSession()`，命中黑名单改选的正常会话则一直锁定到黑名单条件解除。
     fn tick(&mut self, mgr: &Manager, sink: &EventSink<AppEvent>, now: Instant, mut plan: Plan) {
         self.last_tick = now;
 
-        let session = match mgr.GetCurrentSession() {
+        let session = match self.acquire_session(mgr) {
             Ok(s) => s,
             Err(_) => {
                 if self.last.is_some() {
@@ -705,10 +1063,11 @@ impl PollState {
                     self.last = None;
                     self.cover.done = false;
                     // 会话没了 → 分层缓存、节奏、会话级订阅全部作废，
-                    // 下次会话从全量读开始
+                    // 下次会话从全量读开始（G8-①：替代会话句柄一并作废）
                     self.parts = SessionParts::default();
                     self.cadence = Cadence::default();
                     self.session_events = None;
+                    self.display_session = None;
                     sink.send(AppEvent::SessionCleared);
                 }
                 return;
@@ -766,7 +1125,15 @@ impl PollState {
                 self.parts.process_name = resolved.process_name.to_string();
                 // 刚读过一次 AUMID → 重查闸从现在起算
                 self.last_ignore_probe = now;
-                self.enter_ignored(sink, now);
+                // G8-①：命中黑名单**不再直接隐藏整个小组件**。低频枚举一次其它会话，
+                // 只要存在正常会话就改显示它；只有确实一个都没有时才由
+                // `rescan_sessions` 内部沿用现状空态（约束 2）。
+                // 切换成功则本轮立即全量读新会话并发布，不留 50ms 空窗、不串歌。
+                // 递归深度天然有界：rescan 已把 last_session_scan 推到 now，
+                // 1s 闸保证同一轮不可能再切第二次。
+                if self.rescan_sessions(mgr, sink, now) {
+                    return self.tick(mgr, sink, now, Plan::full());
+                }
                 return;
             }
             let (props, ms) = timed("smtc.props", || {
@@ -833,8 +1200,11 @@ impl PollState {
         // ---- G7 拦截点②（发布点，ARCH-G7 §4.2②）：命中则**不发** NowPlaying ----
         // 与①同时存在不是冗余：①省成本、②保证语义（防 AUMID 与 metadata
         // 在轮次间不同步的窗口；漏一处就是 bug）。
+        // G8-①：与①同一套处理——先低频找其它正常会话，找到了就改显示它。
         if self.index.matches(&self.parts.process_name, &self.parts.aumid) {
-            self.enter_ignored(sink, now);
+            if self.rescan_sessions(mgr, sink, now) {
+                return self.tick(mgr, sink, now, Plan::full());
+            }
             return;
         }
 
@@ -992,9 +1362,22 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>, index: Arc
             state.dirty.store(false, Ordering::Relaxed);
         }
         if plan.any() {
-            // G7：被拉黑的会话走专用轮次——不发 NowPlaying、不读时间线/属性/封面，
-            // 只按 IGNORE_RECHECK_MS 重查身份（判断「身份变了 / 已解绑」）。
-            if state.ignored_now() {
+            // G8-①：只有「命中黑名单」或「正在显示替代会话」时才可能低频枚举一次
+            // 会话。常规播放路径两者皆否 → 完全不进这段，零新增跨进程调用、零定时器。
+            // 两种情况都复用同一把 `IGNORE_RECHECK_MS` 闸（≤1 次/秒）。
+            // P2-2：性能闸抽成纯函数 `scan_gate`，由 4 格真值表单测锁住
+            // 「常规播放路径（false,false）绝不枚举」这条红线（约束 4）。
+            let blacklist_active =
+                scan_gate(state.ignored_now(), state.display_session.is_some());
+            let switched = blacklist_active
+                && session_scan_due(true, state.last_session_scan, now)
+                && state.rescan_sessions(&mgr, &sink, now);
+            if switched {
+                // 已切到另一个正常会话：本轮全量读它并发布（不留 50ms 空窗）。
+                state.tick(&mgr, &sink, now, Plan::full());
+            } else if state.ignored_now() {
+                // G7：确实一个正常会话都没有 → 沿用 ignored 专用轮次。
+                // 本分支一行未改：tick_ignored 与 Cadence::consume 语义原样保留。
                 state.tick_ignored(&mgr, &sink, now, plan, forced);
             } else {
                 state.tick(&mgr, &sink, now, plan);
@@ -1270,13 +1653,20 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
         MediaCommand::EnumerateApps => return,
     };
 
-    let session = match mgr.GetCurrentSession() {
-        Ok(s) => s,
-        Err(_) => {
-            crate::log_warn!("无活动会话，命令 {cmd:?} 丢弃");
-            sink.send(AppEvent::CommandResult { kind, ok: false });
-            return;
-        }
+    // G8-①：播控必须打到「小组件正在显示的那个会话」。系统当前会话命中黑名单
+    // 时，显示的其实是 `display_session` 里挑出的正常会话；若仍用
+    // `GetCurrentSession()`，热键会把命令误发到被拉黑的应用上，同时既没有
+    // 控制到显示中的播放器、也破坏「被拉黑应用完全忽略」的语义。
+    let session = match state.display_session.as_ref() {
+        Some(s) => s.clone(),
+        None => match mgr.GetCurrentSession() {
+            Ok(s) => s,
+            Err(_) => {
+                crate::log_warn!("无活动会话，命令 {cmd:?} 丢弃");
+                sink.send(AppEvent::CommandResult { kind, ok: false });
+                return;
+            }
+        },
     };
 
     let result: Result<bool> = match cmd {
@@ -1347,6 +1737,10 @@ pub struct MediaAppEntry {
 /// `launch::process_image_name` / `session_matches`（纯内存）。
 /// **禁止** `TryGetMediaPropertiesAsync` / `GetTimelineProperties` /
 /// `GetPlaybackInfo` / 封面读取 / `Manager::RequestAsync().join()` / 任何文件写。
+///
+/// G8-①：这里枚举的是**全部**会话，而不是只看 `GetCurrentSession()`——
+/// 与「黑名单应用是当前会话时改显示其它正常会话」的多会话口径一致；
+/// 设置页「检测到的应用」因此能列出所有候选，用户从列表加入最稳。
 fn enumerate_apps(mgr: &Manager, index: &MediaIndex) -> MediaAppsSnapshot {
     let start = Instant::now();
     let _sp = Span::with_threshold("smtc.enumerate", perf::SMTC_SLOW_MS);
@@ -2308,5 +2702,400 @@ mod g7_blacklist_regression {
         assert_eq!(limits::ENUM_TOTAL_BUDGET_MS, 200);
         assert_eq!(limits::ENUM_MAX_LOOKUPS, 16);
         assert_eq!(limits::ENUM_MAX_AUDIO_SESSIONS, 64);
+    }
+}
+
+// ============================================================================
+// G8-①（v1.9.1）—— 黑名单多会话：挑正常会话显示，而不是把整个小组件隐藏
+//
+// 全部测试都跑在纯数据上：候选画像 + 黑名单判定结果 + 播放状态，零 COM、
+// 零 WinRT、零定时器。挑选规则与状态机因此可确定性回归。
+// ============================================================================
+#[cfg(test)]
+mod g8_multi_session {
+    use super::*;
+
+    /// 造一个候选：身份（AUMID / 进程名）+ 播放状态 + 黑名单判定结果。
+    fn cand(aumid: &str, playing: bool, ignored: bool) -> SessionCandidate {
+        SessionCandidate {
+            aumid: aumid.to_string(),
+            process_name: player_map::resolve(aumid).process_name.to_string(),
+            playing,
+            ignored,
+        }
+    }
+
+    /// 带真实黑名单配置的索引：候选的 `ignored` 由 `MediaIndex::matches` 实算，
+    /// 保证测试用的是与生产完全同源的三级回退判定，不是手写布尔。
+    fn blacklist_index(entries: &[&str]) -> Arc<MediaIndex> {
+        let mut cfg = crate::config::MediaConfig::default();
+        cfg.blacklist = entries.iter().map(|s| s.to_string()).collect();
+        MediaIndex::new(&cfg)
+    }
+
+    fn measured_candidates(
+        index: &MediaIndex,
+        aumids: &[(&str, bool)],
+    ) -> Vec<SessionCandidate> {
+        aumids
+            .iter()
+            .map(|(aumid, playing)| {
+                let process = player_map::resolve(aumid).process_name;
+                SessionCandidate {
+                    aumid: (*aumid).to_string(),
+                    process_name: process.to_string(),
+                    playing: *playing,
+                    ignored: index.matches(process, aumid),
+                }
+            })
+            .collect()
+    }
+
+    fn at(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    // ------------------------------------------------ 会话挑选纯函数（约束 6）
+
+    /// ① 系统当前会话被拉黑、同时存在「正在播放」的正常会话 → 选中并显示它。
+    #[test]
+    fn choose_session_shows_playing_normal_when_current_is_blacklisted() {
+        let candidates = vec![
+            cand("NeteaseCloudMusic!App", true, true), // 系统当前会话：被拉黑、正在播放
+            cand("Spotify.exe", false, false),         // 正常但暂停
+            cand("QQMusic.exe", true, false),          // 正常且正在播放
+        ];
+        assert_eq!(choose_session(&candidates), SessionChoice::Show(2));
+        assert_eq!(
+            scan_decision(&candidates, None),
+            ScanDecision::Switch(2),
+            "状态机必须据此切换到那个正常会话"
+        );
+    }
+
+    /// ② 多个正常会话 → 优先正在播放（Playing）的那个。
+    #[test]
+    fn choose_session_prefers_playing_among_multiple_normal_sessions() {
+        let candidates = vec![
+            cand("Spotify.exe", false, false),
+            cand("QQMusic.exe", false, false),
+            cand("Kugou.exe", true, false),
+            cand("Foobar2000.exe", false, false),
+        ];
+        assert_eq!(choose_session(&candidates), SessionChoice::Show(2));
+
+        // 系统顺序里有两个 Playing 时取第一个（顺序可预测，不随 HashMap 漂移）
+        let two_playing = vec![
+            cand("Spotify.exe", true, false),
+            cand("QQMusic.exe", true, false),
+        ];
+        assert_eq!(choose_session(&two_playing), SessionChoice::Show(0));
+    }
+
+    /// ③ 全部暂停 → 按 `GetSessions()` 的系统返回顺序取第一个正常会话。
+    #[test]
+    fn choose_session_takes_first_in_system_order_when_all_paused() {
+        let candidates = vec![
+            cand("Spotify.exe", false, false),
+            cand("QQMusic.exe", false, false),
+            cand("Kugou.exe", false, false),
+        ];
+        assert_eq!(choose_session(&candidates), SessionChoice::Show(0));
+
+        // 第一个是暂停、后面也全暂停，但前面插了一个被拉黑的：跳过它
+        let with_blacklisted_first = vec![
+            cand("NeteaseCloudMusic!App", false, true),
+            cand("Spotify.exe", false, false),
+            cand("QQMusic.exe", false, false),
+        ];
+        assert_eq!(
+            choose_session(&with_blacklisted_first),
+            SessionChoice::Show(1)
+        );
+    }
+
+    /// ④ 全部候选都被拉黑 / 没有候选 → 保持隐藏（沿用现状空态）。
+    #[test]
+    fn choose_session_hides_when_all_candidates_blacklisted_or_empty() {
+        let all_blacklisted = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("Spotify.exe", false, true),
+        ];
+        assert_eq!(choose_session(&all_blacklisted), SessionChoice::Hide);
+        assert_eq!(choose_session(&[]), SessionChoice::Hide);
+        assert_eq!(
+            scan_decision(&all_blacklisted, None),
+            ScanDecision::Hide,
+            "确实一个正常会话都没有时才隐藏"
+        );
+    }
+
+    /// ⑤ 被拉黑的应用仍被完全忽略：即使它在播放、排在系统顺序第一位，
+    ///    也绝不会被选中（用真实 `MediaIndex::matches` 判定，不是手写布尔）。
+    #[test]
+    fn blacklisted_app_is_never_selected_even_while_playing() {
+        let index = blacklist_index(&["cloudmusic.exe"]);
+        let candidates = measured_candidates(
+            &index,
+            &[
+                ("NeteaseCloudMusic!App", true), // 被拉黑 + 正在播放
+                ("Spotify.exe", false),          // 正常 + 暂停
+            ],
+        );
+        assert!(candidates[0].ignored, "前置：网易云确实命中黑名单");
+        assert!(!candidates[1].ignored, "前置：Spotify 不在黑名单");
+        assert_eq!(choose_session(&candidates), SessionChoice::Show(1));
+        assert_ne!(choose_session(&candidates), SessionChoice::Show(0));
+
+        // 只留下被拉黑的应用 → 隐藏，绝不「退而求其次」显示它
+        let only_blacklisted = measured_candidates(&index, &[("NeteaseCloudMusic!App", true)]);
+        assert_eq!(choose_session(&only_blacklisted), SessionChoice::Hide);
+    }
+
+    // ------------------------------------------------ 性能红线（约束 4、6）
+
+    /// ⑥ 正常播放路径不触发枚举：`blacklist_hit == false` 时，无论距上次扫描
+    ///    多久、无论是否从未扫描过，都不允许发起 `GetSessions()`。
+    #[test]
+    fn normal_playback_path_never_triggers_session_enumeration() {
+        let t0 = Instant::now();
+        assert!(!session_scan_due(false, None, t0), "从未扫描过也不许扫");
+        assert!(!session_scan_due(false, Some(t0), at(t0, 999)));
+        assert!(!session_scan_due(false, Some(t0), at(t0, 1_000)));
+        assert!(!session_scan_due(false, Some(t0), at(t0, 60_000)));
+        assert!(!session_scan_due(false, None, at(t0, 3_600_000)));
+        // 对照：命中黑名单时首次立即放行
+        assert!(session_scan_due(true, None, t0));
+    }
+
+    /// 命中后的枚举被 1s 闸限流：每秒最多一次，绝不进每 50ms 的常规 tick。
+    #[test]
+    fn session_scan_due_throttles_rescans_to_one_second() {
+        let t0 = Instant::now();
+        let last = Some(t0);
+        assert!(!session_scan_due(true, last, at(t0, 50)));
+        assert!(!session_scan_due(true, last, at(t0, 999)));
+        assert!(session_scan_due(true, last, at(t0, 1_000)));
+        assert!(session_scan_due(true, last, at(t0, 5_000)));
+    }
+
+    // ------------------------------------------------ 多会话状态机
+
+    /// 命中黑名单 + 存在 Playing 的正常会话 → 状态机决定「切换」而非隐藏。
+    #[test]
+    fn decide_scan_switches_to_normal_session_instead_of_hiding() {
+        let candidates = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("Spotify.exe", false, false),
+            cand("QQMusic.exe", true, false),
+        ];
+        assert_eq!(scan_decision(&candidates, None), ScanDecision::Switch(2));
+        let st = PollState::new(
+            Arc::new(AtomicBool::new(false)),
+            blacklist_index(&["cloudmusic.exe"]),
+        );
+        assert_eq!(
+            st.decide_scan(&candidates),
+            ScanDecision::Switch(2),
+            "PollState 的接线必须走同一份纯决策"
+        );
+    }
+
+    /// 仍在显示同一个正常会话 → Keep：不清缓存、不制造每秒重播。
+    #[test]
+    fn decide_scan_keeps_the_same_displayed_session() {
+        let candidates = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("QQMusic.exe", true, false),
+        ];
+        assert_eq!(
+            scan_decision(&candidates, Some("QQMusic.exe")),
+            ScanDecision::Keep(1)
+        );
+        // 换成另一个正常会话 → 必须切（防串歌）
+        assert_eq!(
+            scan_decision(&candidates, Some("Spotify.exe")),
+            ScanDecision::Switch(1)
+        );
+    }
+
+    /// 只有确实一个正常会话都没有时才 Hide；有正常会话时绝不 Hide。
+    #[test]
+    fn decide_scan_hides_only_when_no_normal_session_exists() {
+        let all_blacklisted = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("Spotify.exe", false, true),
+        ];
+        assert_eq!(scan_decision(&all_blacklisted, None), ScanDecision::Hide);
+        assert_eq!(scan_decision(&[], Some("QQMusic.exe")), ScanDecision::Release);
+
+        let with_normal = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("Spotify.exe", false, false),
+        ];
+        assert_ne!(scan_decision(&with_normal, None), ScanDecision::Hide);
+    }
+
+    /// 黑名单会话全部消失 → Release：回到常规 `GetCurrentSession()` 路径，
+    /// 枚举彻底停止（正常播放路径零新增跨进程调用）。
+    #[test]
+    fn decide_scan_releases_to_normal_path_when_blacklisted_session_gone() {
+        let candidates = vec![
+            cand("QQMusic.exe", true, false),
+            cand("Spotify.exe", false, false),
+        ];
+        assert_eq!(scan_decision(&candidates, Some("QQMusic.exe")), ScanDecision::Release);
+        assert_eq!(scan_decision(&candidates, None), ScanDecision::Release);
+        // 与被拉黑会话共存的场景不会误判成 Release
+        let mixed = vec![
+            cand("NeteaseCloudMusic!App", true, true),
+            cand("QQMusic.exe", true, false),
+        ];
+        assert_ne!(scan_decision(&mixed, None), ScanDecision::Release);
+    }
+
+    /// 综合真值表：被拉黑应用 + 若干正常候选的组合下，挑选结果始终等于
+    /// 「跳过 ignored → 优先 Playing → 否则系统顺序第一个」这一独立期望。
+    #[test]
+    fn choose_session_matches_independent_reference_over_all_combinations() {
+        fn expected(cs: &[SessionCandidate]) -> Option<usize> {
+            cs.iter()
+                .position(|c| !c.ignored && c.playing)
+                .or_else(|| cs.iter().position(|c| !c.ignored))
+        }
+        let aumids = ["A!App", "B.exe", "C.exe", "D.exe"];
+        let mut cells = 0;
+        for mask in 0u8..16 {
+            for playing_mask in 0u8..16 {
+                let cs: Vec<SessionCandidate> = aumids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        cand(
+                            a,
+                            playing_mask & (1 << i) != 0,
+                            mask & (1 << i) != 0,
+                        )
+                    })
+                    .collect();
+                let want = match expected(&cs) {
+                    Some(i) => SessionChoice::Show(i),
+                    None => SessionChoice::Hide,
+                };
+                assert_eq!(choose_session(&cs), want, "mask={mask} playing={playing_mask}");
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, 256);
+    }
+
+    // ------------------------------------------------ P2-1：Release 清残留忽略态
+
+    /// 假 `EventSink`：句柄值不存在，`PostMessageW` 失败被忽略，但事件仍进
+    /// mpsc 通道，于是「到底广播了什么」可以在无 COM 的单测里直接断言。
+    fn fake_sink() -> (EventSink<AppEvent>, std::sync::mpsc::Receiver<AppEvent>) {
+        use crate::platform::wake::WakeHwnd;
+        use windows::Win32::Foundation::HWND;
+        let hwnd = HWND(0x1234_usize as *mut core::ffi::c_void);
+        EventSink::new(WakeHwnd(hwnd))
+    }
+
+    fn stale_ignored() -> IgnoredSessionInfo {
+        IgnoredSessionInfo {
+            process_name: "cloudmusic.exe".to_string(),
+            aumid: "NeteaseCloudMusic!App".to_string(),
+            app_name: "网易云音乐".to_string(),
+        }
+    }
+
+    /// 纯数据判定：只有「确实是 Release」且「确有残留忽略态」才需要广播清理；
+    /// 其它决策动作一律不许借 Release 的名义发 `IgnoredSession(None)`。
+    #[test]
+    fn release_needs_ignored_clear_truth_table() {
+        assert!(release_needs_ignored_clear(ScanDecision::Release, true));
+        assert!(!release_needs_ignored_clear(ScanDecision::Release, false));
+        assert!(!release_needs_ignored_clear(ScanDecision::Switch(0), true));
+        assert!(!release_needs_ignored_clear(ScanDecision::Keep(0), true));
+        assert!(!release_needs_ignored_clear(ScanDecision::Hide, true));
+    }
+
+    /// **P2-1 回归**：唯一被拉黑应用 A 退出、正常应用 B 接管 → Release 必须清
+    /// `last_ignored` 并广播 `IgnoredSession(None)`，让托盘口径立刻切回显示的 B。
+    #[test]
+    fn release_clears_stale_ignored_state_and_broadcasts_none() {
+        let (sink, rx) = fake_sink();
+        let mut st = PollState::new(
+            Arc::new(AtomicBool::new(false)),
+            blacklist_index(&["cloudmusic.exe"]),
+        );
+        st.last_ignored = Some(stale_ignored());
+        // 模拟 Release 之前的状态：还有快照 / 缓存身份
+        st.parts.aumid = "NeteaseCloudMusic!App".to_string();
+
+        st.apply_release(ScanDecision::Release, &sink);
+
+        assert!(st.last_ignored.is_none(), "UI 的 App.ignored 残留必须被清掉");
+        assert!(st.display_session.is_none(), "回到常规 GetCurrentSession 路径");
+        assert!(st.parts.aumid.is_empty(), "缓存身份不许再被误判为命中");
+        assert!(st.last.is_none());
+
+        let events: Vec<AppEvent> = rx.try_iter().collect();
+        assert!(
+            matches!(events.as_slice(), [AppEvent::IgnoredSession(None)]),
+            "必须恰好广播一条 IgnoredSession(None)，实际 {events:?}"
+        );
+    }
+
+    /// 无残留忽略态时不发事件：Release 每 1s 可能重复走到，不该刷 UI。
+    #[test]
+    fn release_without_stale_ignored_state_does_not_broadcast() {
+        let (sink, rx) = fake_sink();
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), blacklist_index(&[]));
+        st.apply_release(ScanDecision::Release, &sink);
+        assert!(st.last_ignored.is_none());
+        assert!(
+            rx.try_iter().next().is_none(),
+            "没有残留忽略态时不该广播任何事件"
+        );
+    }
+
+    /// 非 Release 决策即便有残留忽略态也不该由 Release 路径发清理事件。
+    #[test]
+    fn release_clear_guard_rejects_non_release_decisions() {
+        let (sink, rx) = fake_sink();
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), blacklist_index(&[]));
+        st.last_ignored = Some(stale_ignored());
+        st.apply_release(ScanDecision::Switch(1), &sink);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    // ------------------------------------------------ P2-2：常规播放性能闸
+
+    /// **P2-2 核心断言**：常规播放路径（`false,false`）绝不允许进入会话枚举。
+    /// 这格是 QA RV4 把闸改成恒 `true` 后唯一失守、却原本没有单测锁住的格子。
+    #[test]
+    fn scan_gate_truth_table_locks_normal_playback_path() {
+        assert!(
+            !scan_gate(false, false),
+            "常规播放路径必须零新增跨进程调用（约束 4）"
+        );
+        assert!(scan_gate(true, false), "命中黑名单 → 允许低频枚举");
+        assert!(scan_gate(false, true), "正显示替代会话 → 允许低频复核");
+        assert!(scan_gate(true, true));
+    }
+
+    /// 闸与 1s 时间闸的联动：常规播放永不枚举；首次命中立即放行；
+    /// 命中但 1s 内已扫过则被节流（不进每 50ms 常规 tick）。
+    #[test]
+    fn scan_gate_composes_with_session_scan_due() {
+        let t0 = Instant::now();
+        assert!(!(scan_gate(false, false) && session_scan_due(true, None, t0)));
+        assert!(
+            scan_gate(false, true) && session_scan_due(true, None, t0),
+            "锁定替代会话时允许首轮枚举复核"
+        );
+        assert!(scan_gate(true, false) && session_scan_due(true, None, t0));
+        assert!(!(scan_gate(true, false) && session_scan_due(true, Some(t0), at(t0, 50))));
+        assert!(scan_gate(true, false) && session_scan_due(true, Some(t0), at(t0, 1_000)));
     }
 }

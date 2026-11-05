@@ -2037,13 +2037,17 @@ impl App {
         }
     }
 
-    /// UI 线程的即时对账：命中当前播放 → 立即回落空态（小组件同帧隐藏）；
+    /// UI 线程的即时对账：只有**正在显示的会话**命中黑名单才立即回落空态；
     /// 忽略态对应的条目已不在黑名单 → 解除（媒体线程 ≤1s 内重发 NowPlaying）。
+    ///
+    /// G8-①：判据统一走 [`displayed_session_hit`]（`state.playing.session`），
+    /// 不再有第二套「系统当前会话」口径。媒体线程会在命中后低频枚举其它会话，
+    /// 只要还有正常会话就改显示它；这里同帧复位只是避免残留旧快照，
+    /// 随后的 NowPlaying 会立刻把小组件重新显示出来。
     /// 只改内存态与 `App.ignored`，不写盘、不向媒体线程额外发号施令。
     fn sync_blacklist_now(&mut self) {
         let s = self.state.playing.session.clone();
-        let hit = !s.aumid.is_empty() && self.index.matches(&s.process_name, &s.aumid);
-        if hit {
+        if displayed_session_hit(&self.index, &self.state.playing) {
             self.ignored = Some(IgnoredSessionInfo {
                 process_name: s.process_name.clone(),
                 aumid: s.aumid.clone(),
@@ -2061,6 +2065,11 @@ impl App {
 
     /// 托盘「拉黑 / 恢复当前应用」（G7 P1：拉黑/恢复共用一个菜单 id，
     /// 语义由 `App.ignored` 决定；已存在则移除 → 幂等 toggle）。
+    ///
+    /// G8-①「当前应用」口径：拉黑分支只用 `state.playing.session`（正在显示的
+    /// 会话）；`ignored` 仅在**小组件已隐藏**（无显示会话）时提供恢复入口，
+    /// 两者不会同时指向不同应用——媒体线程切到正常会话时会广播
+    /// `IgnoredSession(None)` 把它清掉。
     fn toggle_ignore_current(&mut self) -> Vec<Effect> {
         if let Some(ig) = self.ignored.clone() {
             // 恢复：把被忽略会话的身份键从黑名单移除
@@ -2121,6 +2130,8 @@ impl App {
     ///
     /// R1 的主要防线：**只要 `ignored.is_some()` 就 enabled=true**——用户把唯一的
     /// 播放器拉黑后小组件消失，托盘这一项是唯一常驻的恢复入口。
+    /// G8-①：非忽略态一律以 `state.playing.session`（正在显示的会话）为
+    /// 「当前应用」，与 `sync_blacklist_now` / `toggle_ignore_current` 同源。
     fn ignore_menu_item(&self) -> crate::ui::tray::IgnoreMenuItem {
         use crate::ui::tray::{clamp_label, IgnoreMenuItem};
         if let Some(ig) = self.ignored.as_ref() {
@@ -3283,6 +3294,21 @@ impl App {
 
 // ------------------------------------------------------------------ 自由函数
 
+/// G8-①：**「当前应用」= 小组件正在显示的那个会话**（`state.playing.session`）。
+///
+/// 托盘「拉黑 / 恢复当前应用」、设置页「检测到的应用」加黑后的即时对账、
+/// 以及托盘菜单文案，三处都只认这一个口径。系统「当前会话」命中黑名单时，
+/// 媒体线程会改显示 `GetSessions()` 里挑出的正常会话并广播新的 NowPlaying，
+/// 所以这里看到的一定是**显示中**的那个；绝不能拿 `GetCurrentSession()`
+/// （可能正指向被拉黑的应用）另立一套判据。
+///
+/// 抽成纯函数是为了可单测：只有显示的会话真的命中黑名单时才回落空态；
+/// 拉黑一个「没在显示」的应用不该让小组件消失（G8-① 的核心场景）。
+fn displayed_session_hit(index: &MediaIndex, playing: &NowPlaying) -> bool {
+    let s = &playing.session;
+    !s.aumid.is_empty() && index.matches(&s.process_name, &s.aumid)
+}
+
 /// 交互态（悬停目标 / 按下目标）变化是否**必须**补一帧重绘。
 ///
 /// 这两类变化都**不产生** `WidgetInput`：悬停由 `WM_MOUSEMOVE` 的
@@ -3471,6 +3497,46 @@ fn current_hinstance() -> HINSTANCE {
 mod tests {
     use super::*;
     use crate::render::layout::TaskbarEdge;
+
+    /// G8-①：「当前应用」= 小组件正在显示的那个会话。
+    /// 拉黑一个**没在显示**的应用（例如系统当前会话命中黑名单、但小组件
+    /// 正在显示另一个正常播放器）绝不该让小组件消失。
+    #[test]
+    fn displayed_session_hit_only_when_the_shown_app_is_blacklisted() {
+        let index = MediaIndex::new(&crate::config::MediaConfig {
+            blacklist: vec!["cloudmusic.exe".to_string()],
+            ..Default::default()
+        });
+        let mut playing = NowPlaying::default();
+        playing.session.aumid = "Spotify.exe".to_string();
+        playing.session.process_name = "spotify.exe".to_string();
+        playing.state = PlaybackState::Playing;
+        assert!(
+            !displayed_session_hit(&index, &playing),
+            "显示的 Spotify 没被拉黑 → 小组件必须保持显示"
+        );
+
+        // 显示的会话自己被拉黑 → 才回落空态
+        playing.session.aumid = "NeteaseCloudMusic!App".to_string();
+        playing.session.process_name = "cloudmusic.exe".to_string();
+        assert!(displayed_session_hit(&index, &playing));
+    }
+
+    /// 没有会话（空态）时不许把「空身份」误判成命中黑名单。
+    #[test]
+    fn displayed_session_hit_is_false_without_a_session() {
+        let index = MediaIndex::new(&crate::config::MediaConfig {
+            blacklist: vec!["cloudmusic.exe".to_string()],
+            ..Default::default()
+        });
+        assert!(!displayed_session_hit(&index, &NowPlaying::default()));
+        // 空黑名单下任何身份都不命中
+        let empty = MediaIndex::new(&crate::config::MediaConfig::default());
+        let mut playing = NowPlaying::default();
+        playing.session.aumid = "NeteaseCloudMusic!App".to_string();
+        playing.session.process_name = "cloudmusic.exe".to_string();
+        assert!(!displayed_session_hit(&empty, &playing));
+    }
 
     #[test]
     fn no_session_is_not_visible() {
