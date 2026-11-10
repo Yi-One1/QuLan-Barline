@@ -9,3 +9,7 @@
 
 # PowerShell 脚本需要 UTF-8 BOM 才能被 PS 5.1 正确解析，禁止转换
 *.ps1   text eol=crlf working-tree-encoding=UTF-8-BOM
+
+# 本实验脚本为纯 ASCII、无 BOM；*.ps1 的 working-tree-encoding=UTF-8-BOM 在本机 git 上 add 会 encode 失败（见 MEMORY.md）。
+# 仅对本文件关闭转换，原样入库；不影响根目录 scripts/build.ps1。
+scripts/g9_inject_probe/build.ps1 -text -working-tree-encoding
