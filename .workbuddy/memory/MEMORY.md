@@ -6,7 +6,7 @@ category: 曲栏Barline
 
 # 曲栏 Barline 长期记忆
 
-Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.10.0**，测试 636（635 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，**源码已全部推送 `origin/main`**，HEAD `ca39e7a`，本地与远端一致；G8 全部落地 v1.9.1/v1.9.2/v1.9.3/v1.10.0）。**G1~G7 闭环；G8 三组全部验收通过（① 多会话 v1.9.1、② 歌词钟归零 v1.9.2、④ 补修 v1.9.3、③ 双击开设置 v1.10.0）**。分组与全部拍板见 progress.md §2.5。
+Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.10.0**，测试 636（635 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，**源码已全部推送 `origin/main`**，本地与远端一致，当前 HEAD 以 `git log -1` 为准；G8 全部落地 v1.9.1/v1.9.2/v1.9.3/v1.10.0）。**G1~G7 闭环；G8 三组全部验收通过（① 多会话 v1.9.1、② 歌词钟归零 v1.9.2、④ 补修 v1.9.3、③ 双击开设置 v1.10.0）**。分组与全部拍板见 progress.md §2.5。
 
 ## 铁律
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（PowerShell 工具跑）；禁裸 cargo（Git Bash 抢 link.exe）；卡顿/陈旧锁告警设 `$env:CARGO_INCREMENTAL="0"`。
