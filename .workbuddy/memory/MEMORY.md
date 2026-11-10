@@ -6,7 +6,7 @@ category: 曲栏Barline
 
 # 曲栏 Barline 长期记忆
 
-Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.9.2**，测试 594（593 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，@ `27d8208` 已推；G8-② 提交 `41b36a8` 本地待推）。**G1~G7 全部闭环；G8 分组迭代中：① 已真人验收（v1.9.1）、② 已实现+测试全绿+出包待真人验收（v1.9.2）、③ 待办**。分组与全部拍板见 progress.md §2.5。
+Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SMTC + WebView2。当前 **v1.10.0**，测试 636（635 passed + 1 ignored 联网），clippy 0。仓库 github.com/Yi-One1/QuLan-Barline（main，**源码已全部推送 `origin/main`**，HEAD `ca39e7a`，本地与远端一致；G8 全部落地 v1.9.1/v1.9.2/v1.9.3/v1.10.0）。**G1~G7 闭环；G8 三组全部验收通过（① 多会话 v1.9.1、② 歌词钟归零 v1.9.2、④ 补修 v1.9.3、③ 双击开设置 v1.10.0）**。分组与全部拍板见 progress.md §2.5。
 
 ## 铁律
 - 构建只走 `scripts/build.ps1 -Task check|clippy|test|build`（PowerShell 工具跑）；禁裸 cargo（Git Bash 抢 link.exe）；卡顿/陈旧锁告警设 `$env:CARGO_INCREMENTAL="0"`。
@@ -49,7 +49,9 @@ Windows 任务栏媒体小组件：Rust(MSVC) + `windows` 0.62 + Direct2D/DWM/SM
 - 待办 A 会话音量（禁用，入口 `media/wasapi.rs::session_simple_volume`）；待办 D 汽水音乐托盘态激活（搁置：外部 ShowWindow 让 CEF 输入挂起）。
 - 下一轮候选：① pre-existing 死码 30 项（HEAD 就有，QA 已列）；② **语言切换需重启**（`general.language` 改 `App::lang` 不更新、托盘不刷新，挂点 `Effect::RefreshTrayMenu`）；③ D-6 两份进度实现（`State::progress_fraction` 与 painter.rs 内联 frac，屏幕上画的不是被测那个）；④ 「清空歌词缓存」一键按钮；⑤ G2 残余卡顿续查路线在 progress.md §3.1。
 - v1.5.6 观察项：R2 退出抖动（AppbarClose 后 1s 心跳可能补冻）；R1 `AppbarOpen×fs=false` 完整冻结≤1s 可自愈；迟到/重复 TRUE 广播可补冻。首选项：`AppbarOpen` 遇 `fg/wm==RECT::default()` 回退 frozen_decision。
-- 小尾巴待办：设置页标题栏明暗跟随、热键日志冗余清理、「冲突一键换组」未做。
-- **版权人已统一实名 `Yi One`**：LICENSE + `assets/barline.rc` 的 `CompanyName`/`LegalCopyright`（2026-11-06 补齐，此前 exe 资源面板仍显示旧占位 `The Barline Authors`）。README 已内嵌设置页/小组件截图（assets/screenshots/）。GitHub Release（tag+exe）仍需用户到 Releases 页手动发（本机无 `gh` CLI / token）；v1.9.0/v1.9.1 未发，现有 v1.9.2 包 39 个 exe。
+- 小尾巴待办：设置页标题栏明暗跟随、热键日志冗余清理。
+- **2026-11-10 用户裁决（不再做，见 progress.md §3.5「已裁决不再议」）**：自动隐藏滑出 ≤100ms 同步、竖排任务栏内容旋转、M2 八项真机补验 —— 从待办清单清除；相关史实仍保留在 `docs/ARCHITECTURE.md` §10.4/§10.6、`docs/PRD.md` P1-09 与 `src/app.rs` 注释。L2 保留 seek 不修 / G8-① 三条 / G8-⑤ 判据不再改；「冲突一键换组」「双击 250ms 不暴露设置」从清单删除。
+- **版权人已统一实名 `Yi One`**：LICENSE + `assets/barline.rc` 的 `CompanyName`/`LegalCopyright`（2026-11-06 补齐，此前 exe 资源面板仍显示旧占位 `The Barline Authors`）。README 已内嵌设置页/小组件截图（assets/screenshots/）。**GitHub Release 已发布 v1.9.0 与 v1.10.0**（v1.10.0 附件 `Barline_v1.10.0.exe` = 1,169,920 B；v1.9.1~v1.9.3 未单独发，由 v1.10.0 汇总）；README 下载说明已对齐附件实名；Release 正文仍写中文名、需用户手动改（本机无 `gh` CLI / token）。现有 v1.10.0 包 41 个 exe。
 - **G8-② 技术前提（开工前必读）**：用户只修「网易云暂停→继续歌词跳回第一句」，seek 明确不修（网易云 SMTC 恒报 `(0,0)` 读不到新位置）。`NowPlaying::position_now()`（media/mod.rs:166）非 Playing 直接返回 `position_ms`（暂停冻结）；根因线索在 `smtc.rs` 的 `note_playback` 状态跃迁会置 `plan.timeline=true` → 读到 (0,0) + `read_timeline_now=true` → `anchor_of` 规则 1 把锚点重置为 now，`position_ms=0`。**歌词钟靠锚点外推，绝不能碰 G7/G8-① 的退避状态机与拦截点**。
 - **G8-② 已实现（v1.9.2）**：`LyricClockAction{Carry}` + `tick_inputs()/TickInputs` 单入口（派生 `read_timeline_now` 杜绝双来源），`apply_timeline_read()` 见 (0,0) 不覆盖 `parts.position_ms`，Carry 用 `lyric_clock_at(last,now)` 外推续接。**锁接线手段（防「测试全绿但功能没做」）**：`tick_wires_state_jump_into_snapshot_inputs` 源码静态断言（读 `smtc.rs` 自身，断言 `tick` 含 `state_jumped = true` 且经 `tick_inputs(...)` 收拢、无 `tick_inputs(false`、无 `read_timeline_now =`）；把 `state_jumped = true` 改 `= false` 必须恰好 1 条测试变红（RV-C3）。
+- **G8-③ 双击空白开设置（v1.10.0）**：`HitTarget::None`=信息区/歌词/空白；`last_blank_click: Option<Instant>` 无定时器双击判定（`note_blank_click`，`limits::DOUBLE_CLICK_MS=250` 含端点）；`WidgetInput::DoubleClickBlank` + 纯函数 `double_click_effects(&Config)`（关→空 Vec，开→复用 `Effect::OpenSettings`）；`on_up` 注入 `now: Instant` 杀实时钟 flaky；三层测试锁（手势/派发静态断言 `reduce_input_wires_blank_double_click_through_the_toggle`/执行 `open_settings_effect_is_executed_in_apply`）。

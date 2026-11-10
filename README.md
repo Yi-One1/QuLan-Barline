@@ -8,7 +8,7 @@
 | --- | --- |
 | ![设置界面](assets/screenshots/settings.png) | ![任务栏小组件](assets/screenshots/widget.png) |
 
-**最新版本 [v1.10.0](https://github.com/Yi-One1/QuLan-Barline/releases/latest)** — 单文件绿色便携（约 1.1 MB，零运行时依赖），从 [Releases](https://github.com/Yi-One1/QuLan-Barline/releases) 下载 `曲栏_Barline_v1.10.0.exe` 直接运行即可。
+**最新版本 [v1.10.0](https://github.com/Yi-One1/QuLan-Barline/releases/latest)** — 单文件绿色便携（约 1.1 MB，零运行时依赖），从 [Releases](https://github.com/Yi-One1/QuLan-Barline/releases) 下载 `Barline_v1.10.0.exe` 直接运行即可。
 
 ## 功能
 

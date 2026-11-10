@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-06 06:00 · **G1~G7 全部真人验收通过；G8 分组全部验收通过（① v1.9.1 / ② v1.9.2 / ④ v1.9.3 补修 / ③ v1.10.0）** · 当前 **v1.10.0**（636 测试：635 passed + 1 ignored，clippy 0 警告）· 源码已提交本地（v1.10.0 = `ac4de7c`；v1.9.2/`41b36a8`、v1.9.3/`31c4fed` 亦未推送，按用户「先不推，等通知」；收尾阶段将统一推送）· **Releases 仍待用户手动发**（v1.9.0~v1.10.0 均未发，建议发 v1.10.0）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-10 21:00 · **G1~G7 全部真人验收通过；G8 分组全部验收通过（① v1.9.1 / ② v1.9.2 / ④ v1.9.3 补修 / ③ v1.10.0）** · 当前 **v1.10.0**（636 测试：635 passed + 1 ignored，clippy 0 警告）· **源码已全部推送 `origin/main`**（HEAD = `ca39e7a`，含 G8 全部提交与 2 个收尾提交，本地与远端一致）· **GitHub Release 已发布**：v1.9.0、v1.10.0（v1.10.0 附件 `Barline_v1.10.0.exe` = 1,169,920 B，与本地包同尺寸）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 清单口径见 §3.5「已裁决不再议」与 §3.6 候选池 · 新对话从 §5 接手须知开始。
 
 ---
 
@@ -79,7 +79,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 ### 收尾补遗（2026-11-05 03:10）—— 文档 / 许可 / 推送 / 记忆
 - **LICENSE 版权人实名化**：占位 "The Barline Authors" → **"Yi One"**（MIT 正文其余未动）。
 - **README 内嵌截图**：原「截图归档至 git 历史」说明换成两张内嵌图（设置页外观 + 任务栏小组件），存 `assets/screenshots/{settings,widget}.png`（36KB/31KB），GitHub 可直接渲染。
-- **源码推送 GitHub**：commit `6bbf0e4`，`git push origin main` 成功（`95b2a13..6bbf0e4`）；`gh` CLI 本机未装、无 GitHub token，故 v1.9.0 Release（tag + 附 exe）无法在此环境自动建，留待用户在 Releases 页手动发。
+- **源码推送 GitHub**：commit `6bbf0e4`，`git push origin main` 成功（`95b2a13..6bbf0e4`）；`gh` CLI 本机未装、无 GitHub token，故 v1.9.0 Release（tag + 附 exe）无法在此环境自动建，留待用户在 Releases 页手动发（**2026-11-05 已由用户手动发布 v1.9.0；v1.10.0 亦已发布**，现状见 §3.5）。
 - **MEMORY.md 精简合并**：`17914B → 5670B`（去重跨节重复坑、删过时项），保留全部保命级不变量；逐日细节仍在 `.workbuddy/memory/2026-11-0X.md`。
 
 ### 第六轮（2026-11-05 ~ 11-06，用户 3 项）：G8-① / ② / ③ 分组迭代
@@ -93,10 +93,10 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 
 - **G8-② 网易云暂停→继续歌词钟归零修复 → v1.9.2 ✅ 已实现+测试全绿+出包，待真人验收**：根因 = `position_now()` 在播放状态跃迁（暂停→继续）时由 `note_playback()` 置 `plan.timeline=true` 触发 `apply_timeline_read()`，而网易云 SMTC 恒报 `(0,0)` → `anchor_of` 规则 1 误把锚点重置为 now、`position_ms=0`，歌词钟从第一句重走；汽水音乐正常报位置故无此问题。修复 = 引入 `LyricClockAction{Keep,Reset,Carry}` + `lyric_clock_action()` 纯函数 + `TickInputs` 单入口（`tick_inputs()` 派生 `read_timeline_now`，杜绝双来源）+ `build_snapshot()` 统一消费；`apply_timeline_read()` 见 `(0,0)` 只更新 duration/timeline_at、不覆盖 `parts.position_ms`；Carry 用 `lyric_clock_at(last,now)` 外推续接——暂停原地停住、继续从暂停那一句接上。
 - **「有效测试」锁死接线（本组核心教训）**：把 `tick()` 里 `state_jumped = true` 改恒 `false` 时 **594 条测试全绿**（生产上 Carry 永不触发、修复静默失效），属「测试全绿但功能没做」同款陷阱。工程师补 `TickInputs` 结构 + `tick_inputs()` 纯函数 + 真值表 + 端到端（prev=42_000 → Carry 生效、position_ms==42_000、写回 parts）+ **`tick_wires_state_jump_into_snapshot_inputs` 源码静态断言**（读 `smtc.rs` 自身，断言 `tick` 体含 `state_jumped = true` 且经 `tick_inputs(state_jumped, timeline_read)` 收拢、且无 `tick_inputs(false`、无 `read_timeline_now =`）。主理人反向验证（RV-C3）：把 `state_jumped = true` 改回 `= false` → 该测试**恰好 1 条变红**（593 passed / 1 failed，panic「tick 必须在 note_playback() 判出跃迁的分支里置 state_jumped = true」），证明锁有效；改回后全绿。另 25 个相关函数 brace-match 逐字节 IDENTICAL。
-- **交付**：测试 **576 → 594**（593 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.9.2.exe` = 1,164,800 B / SHA256 `8F76FAD4…EA9D`；Cargo.lock 同步 1 行；提交（本地，待真人验收后推；见 git log 最新 main：feat v1.9.2 — G8-② 网易云暂停→继续歌词钟归零修复）；exe 38 → 39 只增不删。
+- **交付**：测试 **576 → 594**（593 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.9.2.exe` = 1,164,800 B / SHA256 `8F76FAD4…EA9D`；Cargo.lock 同步 1 行；提交 `41b36a8`（当时按用户「先不推，等通知」暂留本地，**2026-11-06 收尾已统一推送**）；exe 38 → 39 只增不删。
 - **已知限制（按用户拍板不修）**：seek 不修（网易云恒报 `(0,0)` 读不到新位置）；`plan.props=false` 过渡轮次 ≤2s 混合快照窗口（G7 固有）；隐藏态 ≤1 次/秒低频枚举；UI 同帧隐藏 ≤50ms 瞬时（G8-① 固有）。
 
-- **G8-④ 歌词钟连续性补修 → v1.9.3 ✅ 2026-11-06 真人验收通过（提交 `31c4fed`，未推）**：用户验收 v1.9.2 时报两例 —— ①「反复暂停/继续后歌词明显滞后」；②「网易云→汽水→网易云返回后歌词从头开始」。**日志定罪：两例同一根因**，不是逐轮漂移 —— `lyric_clock_action()` 把 `track_changed` 判在续接之前，网易云恒报 `(0,0)` ⇒ 每次身份变化 `Reset 0`。证据：`02:22:56 Paused 79550 → 02:22:57 切回同一首 Playing 0`（此后永久落后 79.5s）、`02:25:19 Paused 141223 → 02:26:50 跨应用返回 Playing 0`；而播放态记账**本身精确**（141223 vs 墙钟 141222ms）。
+- **G8-④ 歌词钟连续性补修 → v1.9.3 ✅ 2026-11-06 真人验收通过（提交 `31c4fed`，收尾已推）**：用户验收 v1.9.2 时报两例 —— ①「反复暂停/继续后歌词明显滞后」；②「网易云→汽水→网易云返回后歌词从头开始」。**日志定罪：两例同一根因**，不是逐轮漂移 —— `lyric_clock_action()` 把 `track_changed` 判在续接之前，网易云恒报 `(0,0)` ⇒ 每次身份变化 `Reset 0`。证据：`02:22:56 Paused 79550 → 02:22:57 切回同一首 Playing 0`（此后永久落后 79.5s）、`02:25:19 Paused 141223 → 02:26:50 跨应用返回 Playing 0`；而播放态记账**本身精确**（141223 vs 墙钟 141222ms）。
 - **修复三件套**：① `LyricClockMemory` 按 `(aumid,track_id)` 记离开时的钟（TTL 30min / CAP 16，满则淘汰 `sampled_at` 最老；挂在**全部 5 个** `self.last` 丢弃点：发布换曲 / `session cleared` / `switch_display_session` / `apply_release` / `enter_ignored`）；② `apply_timeline_read` **写位置必同写 `timeline_at`**（位置与采样时刻严格配对，杜绝「陈旧位置 @ 新鲜时刻」被别的字段变化一起广播出去、吃掉整段已播时间）；③ Carry 锚点改用 `PlaybackInfoChanged` **事件到达时刻**（`TickInputs.jumped_at` + `PlaybackEventClock` + `Cadence::last_playback_obs()` 弃陈旧戳），不再用「检测到它的那一轮」（那是检测窗口上界，系统性偏晚）。
 - **G8-⑤ 双层互补（缺一即回归）**：判据层 `Some((position,_)) => position == 0`（`(0,D)` 不算可信位置 → 状态跃迁走 Carry，覆盖掉写入的 0）**管跃迁**；写入口 `if position != 0 || duration != 0`（真实 0 写得进 → 同曲 seek/重播到 0 跟得上）**管 seek**。**只留判据层 → 暂停态 seek 到 0 卡死在旧值（QA 抓到的 v1.9.2→v1.9.3 回归，已修）；只留写入口 → 跃迁那一拍砸 0（实测 18 条红）**。
 - **`restorable()` 只放行「离开时 Paused」**：防「在播时切走→切回」被当成续听（无法与「列表里重新点播」区分，取「宁可落后绝不超前」）。
@@ -107,12 +107,12 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **已知取舍（用户已验收，记录在案）**：「暂停离开 → 在列表里重新点播同一首（从头播）」会被记忆续接到离开位置（网易云无自愈）；「在播时切走再切回」仍归零。两者在 `(0,0)` 播放器上信息论不可区分，TTL 30min 是概率缓解，**不再改判据**（曾提「只在 `next.is_none()` 时记忆」，经复核会把两个 Bug 重新打开，已否决）。
 - **第三条路径（低危，已登记）**：若某播放器持续「报时长、不报位置」（`(0,D)` 且非换曲、非跃迁 → 走 `Keep`），钟会被每秒钉回 0，表现为「歌词每秒回第一句」的锯齿。当前日志 0 命中（网易云连 duration 都恒为 0，结构上进不去）。排障判据：同一 aumid + 同一 title 数秒内出现 ≥2 条 `position=0 且 duration≠0`。
 
-- **G8-③ 双击空白/信息区/歌词打开设置 + 通用页开关 → v1.10.0 ✅ 2026-11-06 真人验收通过（提交 `ac4de7c`，未推）**：用户拍板的新能力（分组③），默认开。双击**生效区 = 信息区 / 歌词区 / 空白**，排除四按钮 + 封面 + 进度条（按钮区双击维持既有「零动作」）；开关放设置页「通用」页，是开关控件不是按钮，小组件不新增任何按钮。
+- **G8-③ 双击空白/信息区/歌词打开设置 + 通用页开关 → v1.10.0 ✅ 2026-11-06 真人验收通过（提交 `ac4de7c`，收尾已推）**：用户拍板的新能力（分组③），默认开。双击**生效区 = 信息区 / 歌词区 / 空白**，排除四按钮 + 封面 + 进度条（按钮区双击维持既有「零动作」）；开关放设置页「通用」页，是开关控件不是按钮，小组件不新增任何按钮。
 - **实现**：`HitTarget::None` = 信息区/歌词/空白三种命中区统一映射到「无目标」；交互层用 `last_blank_click: Option<Instant>` 做**无定时器**的双击判定——`note_blank_click(now)` 收到空白区的 `on_up` 时记录时刻，与上次间隔 ≤ `limits::DOUBLE_CLICK_MS`(250ms，含端点) 即判双击；`on_up` 签名注入 `now: Instant`（不再读真实时钟，杜绝实时钟带来的不稳定用例）。派发侧新增 `WidgetInput::DoubleClickBlank` 变体，`App::reduce_input` 第 16 个分支调用纯函数 `double_click_effects(&Config)`：开关关 → 空 `Vec`（零动作），开 → 复用 `Effect::OpenSettings`（不新增 Effect 变体）。
 - **「有效测试」三层锁定（防「测试全绿但功能没做」）**：① **手势层**（interaction.rs 7 条）：`single_click_is_delayed_then_fires` / `double_click_on_dismiss_fires_twice`（空白区双击两次派发）/ `double_click_produces_no_action`（开关关时零动作）/ `reset_forgets_a_half_finished_blank_double_click`（跨曲 reset 清半截双击态）/ `seeking_blocks_blank_double_click`（拖动进度条期间不触发）；② **派发层**（app.rs）：`reduce_input` 第 16 分支接 `double_click_effects`，并加**源码静态断言 `reduce_input_wires_blank_double_click_through_the_toggle`**（读 `app.rs` 自身，断言存在 `DoubleClickBlank => double_click_effects` 的映射且 `double_click_effects` 读 `general.double_click_open_settings`）；③ **执行层**（QA 补）：`open_settings_effect_is_executed_in_apply` 锁死 `Effect::OpenSettings` 在 `apply()` 里真打开窗口。
 - **交付**：测试 **619 → 636**（635 passed + 1 ignored），clippy 0 警告，debug/release 双档全绿；`deliverables/曲栏_Barline_v1.10.0.exe` = 1,169,920 B / `FileVersion=ProductVersion=1.10.0` / `Company=Yi One`；版本 5 处 + `Cargo.lock` 1 行；exe 40 → 41 只增不删。
 - **交付凭证（exe 哈希不可复现，别用）**：源码全文件 sha 见各模块（interaction.rs 全文件 `2401f7f4…`、app.rs `4ddb8407…`）；身份写「源码全文件 + 字节数 1,169,920 + 资源版本 1.10.0 + Company=Yi One」。
-- **已知取舍（用户已验收）**：双击窗口 250ms 是工程默认，未暴露到设置页（留档：若真机觉得太严/太松可提到「通用」页）；四按钮区/封面/进度条双击恒零动作属预期（拍板明确排除）。
+- **已知取舍（用户已验收）**：四按钮区/封面/进度条双击恒零动作属预期（拍板明确排除）。
 
 ---
 
@@ -306,11 +306,21 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - 入口 `src/media/launch.rs::tray_click_activate`（`#[allow(dead_code)]` 留档）；续修方向：PostMessage 逆向 NotifyIconHost / deep-link / 光标静止模拟点击。
 
 ### 3.5 小尾巴与存量（不阻塞）
-- `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。「冲突一键换组」未做（与用户决定冲突，倾向不做）。
-- M2 时代 8 项无真机证据（勿视为通过）：播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏。
-- **源码本地领先 `origin/main` 4 个提交**（`27d8208` 已推；`41b36a8` v1.9.2 / `31c4fed` v1.9.3 / `ac4de7c` v1.10.0 待推，收尾阶段统一推送）；**✅ LICENSE + exe 资源版权人已统一实名 `Yi One`**；**✅ README 已内嵌两张截图**（`assets/screenshots/{settings,widget}.png`）；**⏳ GitHub Release 仍待用户到 Releases 页手动发**（`gh` CLI 本机未装、无 GitHub token，无法自动建；v1.9.0~v1.10.0 均未发，收尾后建议发 v1.10.0）。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
+- `MIN_PICK_SCORE=60` 偏保守；若「明明有歌词却不显示」可降 40。剩余小尾巴：设置页标题栏明暗跟随、热键日志冗余清理。
+- **L0 已闭环（2026-11-10 核对，以下均为已完成、不再列为待办）**：源码已全部推送 `origin/main`（HEAD = `ca39e7a`，含 G8 全部提交 + 2 个收尾提交，`git ls-remote` 实测本地与远端一致）；GitHub Release 已发布 **v1.9.0** 与 **v1.10.0**（v1.10.0 附件 `Barline_v1.10.0.exe` = 1,169,920 B，与本地包同尺寸；v1.9.1~v1.9.3 未单独发，已由 v1.10.0 汇总说明）；全量 `check/clippy/test` 总验收已跑（635 passed / 0 failed / 1 ignored，clippy 0 警告）；LICENSE + exe 资源版权人实名 `Yi One`；README 已内嵌两张截图（`assets/screenshots/{settings,widget}.png`）且下载文件名已对齐 Release 附件实名。
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
+
+#### 已裁决不再议（L2 · 不是任务）
+
+> **清单口径（2026-11-10 起固定）**：**L0** 已闭环 → 只留结论、不列待办；**L1** 当轮待办（本轮状态对齐四项已全部完成，当前为空）；**L2** 已裁决不再议 → 保留裁决与理由，不排期、不重议；**L3** 候选池（§3.6）→ 需单独立项 + 真人验收。
+
+- **2026-11-10 用户裁决，不再做**：① 自动隐藏任务栏滑出 ≤100ms 同步（PRD P1-09，需 `SetWinEventHook`，未实现）；② 竖排任务栏内容旋转 90°（ARCH §10.4，未实现，现一律降级紧凑态）；③ M2 时代 8 项真机补验（播控真实改状态 / 拖动跳转 / 封面激活前台 / 滚轮 HUD / 多显示器 / DPI / 四方位 / 自动隐藏）。**相关史实仍保留在 `docs/ARCHITECTURE.md` §10.4/§10.6、`docs/PRD.md` P1-09 与 `src/app.rs` 注释中，只是不再作为待办。**
+- **seek 不修**：网易云 SMTC 恒报 `(0,0)`，手动拖进度后歌词不跟随；改判据会重新打开 G8-②/④ 两个已验收修复（G8-② 拍板；v1.10.0 Release 已公开列为已知限制）。
+- **G8-① 三条已知限制（压成一行）**：隐藏态 ≤1 次/秒低频枚举（用于动态恢复）、UI 同帧隐藏 ≤50ms 瞬时（不破 G7「拉黑后不显示被拉黑内容」强约束）、`plan.props=false` 过渡轮次 ≤2s 混合快照（G7 退避状态机固有，稳态不复现）——均按用户拍板不修。
+- **G8-⑤ 判据不再改**：v1.9.3 双层判据（判据层 `position == 0` 管跃迁 + 写入口 `if position != 0 || duration != 0` 管 seek）与 `restorable()` 已验收；「暂停离开 → 列表里重新点播同一首」被续接到离开位置、「在播时切走再切回」仍归零，两者在 `(0,0)` 播放器上信息论不可区分，TTL 30min 概率缓解。曾提「只在 `next.is_none()` 时记忆」经复核会重新打开两个 Bug，已否决。**红线：后人不得据此改判据。**
+
+> L1 本轮四项（修文档/记忆的待推与 Release 失实、清过时状态、统一 exe 名、收口未提交 memory 文件）已随 `docs: 收尾状态对齐` 提交完成。
 
 ### 3.6 下一轮候选（2026-11-05 G7 收官盘点，均不阻塞、按需立项）
 1. **pre-existing 死码 30 项**（HEAD 就有，QA 用 `dead_code` 探针列出；非 G6 清单范围）：`app::sink/msg_hwnd/is_enabled`、`LOG_MAX_BYTES`、`TIMEOUT_GET`、`net::as_str/get/get_with`、`provider::{new,query,query_with_source}`、`media::LyricSource::Wasapi` + `Track.source`、`launch::ActivationTarget::Tray`、`smtc` 的 `props/playback/timeline`、`text::Hud` 变体 + `scale`、`stable::reset`、`theme::as_str`、`wide::from_wide`、`layout::{inset,lyric_w,edge}`、`d2d::len`、`cover_cache::{len,is_empty}`、`render::size` 等。
@@ -361,7 +371,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 
 ### 4.5 记忆与项目数据
 - `.workbuddy/memory/MEMORY.md`：项目长期记忆总纲（本会话精简至 5.7KB，去重）；逐日细节在 `.workbuddy/memory/2026-11-0X.md`（2026-11-02 ~ 11-05）。
-- `.workbuddy/` 为项目数据目录（非临时缓存，勿删）；是否入库由用户定。本会话 LICENSE/README/截图已入库，MEMORY.md 精简未提交 git。
+- `.workbuddy/` 为项目数据目录（非临时缓存，勿删）；是否入库由用户定。本会话 LICENSE/README/截图已入库；`.workbuddy/memory/` 于 2026-11-10 随状态对齐一并提交。
 
 ---
 
@@ -372,5 +382,5 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 3. 每项完成：主理人抽验 diff → 出包 `deliverables/曲栏_Barline_vX.Y.Z.exe`（不删旧包）→ 播报「任务清单 + 进度」→ **停下等验收**。
 4. 工程师不启动 exe、不动 `deliverables/`、不 commit（提交与出包归主理人）；用户自测用 `启动曲栏.bat` 或包。
 5. 用户报「没反应/卡顿」类问题时：**先读日志**（§4.2）+ 设计对照实验，别先改代码；卡顿问题直接进 **§3.1 专档**。
-6. **当前状态（2026-11-06 06:00）**：**G1~G7 全部验收通过；G8 分组全部验收通过** —— ① 黑名单多会话显示（v1.9.1 / 576 测试 / `27d8208` 已推）；② 网易云暂停→继续歌词钟归零（v1.9.2 / 594 测试 / `41b36a8`）；②验收暴露「切走再切回/跨应用返回归零」→ ④ 补修 v1.9.3（619 测试 / `31c4fed`）；③ 双击空白区打开设置 + 通用页开关（v1.10.0 / 636 测试 / `ac4de7c`）。**G8 全部落地，进入收尾阶段**：全量 `check/clippy/test` 总验收已跑（635 passed / 0 failed / 1 ignored，clippy 0 警告），文档同步中，待统一推送 `origin/main` 与手动发 Release（v1.10.0）。分组与全部拍板见 **§2.5**，G8-① 与 G8-④ 的实现/QA 证据见 **§1 第六轮**，G8-③ 见 **§1 第六轮 / §10.9**。遗留候选见 §3.6。
+6. **当前状态（2026-11-10 21:00）**：**G1~G7 全部验收通过；G8 分组全部验收通过** —— ① 黑名单多会话显示（v1.9.1 / 576 测试 / `27d8208`）；② 网易云暂停→继续歌词钟归零（v1.9.2 / 594 测试 / `41b36a8`）；②验收暴露「切走再切回/跨应用返回归零」→ ④ 补修 v1.9.3（619 测试 / `31c4fed`）；③ 双击空白区打开设置 + 通用页开关（v1.10.0 / 636 测试 / `ac4de7c`）。**收尾已完成**：全量 `check/clippy/test` 总验收（635 passed / 0 failed / 1 ignored，clippy 0 警告）、源码全部推送 `origin/main`（HEAD `ca39e7a`）、GitHub Release v1.9.0 与 v1.10.0 已发布、文档与记忆状态已对齐。分组与全部拍板见 **§2.5**，G8-① 与 G8-④ 的实现/QA 证据见 **§1 第六轮**，G8-③ 见 **§1 第六轮 / §10.9**。**清单口径见 §3.5（L0 已闭环 / L2 已裁决不再议 / L3 候选池）**，候选见 §3.6。
 7. 收尾：全部完成后跑全量 `check/clippy/test`，同步文档，写一条记忆到 `.workbuddy/memory/`。
