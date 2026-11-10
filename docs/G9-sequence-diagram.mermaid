@@ -1,0 +1,87 @@
+sequenceDiagram
+    autonumber
+    actor U as 用户 / 壁纸切换
+    participant W as widget_wnd WndProc
+    participant A as App
+    participant C as ForegroundController
+    participant E as EnvProbe
+    participant D as DecisionEngine
+    participant S as LumaStabilizer
+    participant T as theme.rs
+    participant H as HookSet
+    participant F as ForegroundWriter
+    participant M as Monochrome
+    participant J as WriteJournal
+    participant L as ForegroundEvents
+    participant X as Explorer Shell_TrayWnd 子树
+
+    rect rgb(232, 243, 255)
+    Note over C,H: 【启动】fail-safe 探测必须先于任何 hook 安装
+    A->>C: bootstrap()
+    C->>E: probe(RealEnvSource) 纯读取 OS/方位/显示器/自动隐藏/TTB 档位
+    E->>X: FindWindowW + EnumChildWindows + GetWindowThreadProcessId 只读
+    X-->>E: EnvSnapshot build=26300 ubr=9711 edge=Bottom monitors=1 ttb=Clear
+    C->>E: evaluate(snap)
+    alt 任一项不匹配 / 超时 / 取不到值
+        E-->>C: Disabled(reason)
+        C->>L: log_disabled(reason, snap) 1 条 WARN
+        Note over C,H: 不 install、不子类化、不写任何前景；行为逐项等价于 v1.10.0
+    else 全部匹配
+        E-->>C: Supported + tray_hwnds 白名单
+        C->>H: reconcile_on_startup() 崩溃/强杀后的幂等自检还原
+        H-->>C: restored=N
+        C->>H: install(tray_hwnds)
+        H->>X: 仅白名单 HWND 安装子类化 / 保存原 WNDPROC
+        C->>L: log_reconcile(N)
+    end
+    end
+
+    rect rgb(238, 252, 238)
+    Note over U,L: 【壁纸切换】单一决策源 → 单一写入口 → 三类同步
+    U->>W: SPI_SETDESKWALLPAPER (WM_SETTINGCHANGE)
+    W->>A: request_backdrop() 立即采样
+    A->>C: on_sample(luma, epoch, wallpaper_change=true, t0)
+    C->>D: push(...)
+    D->>S: push(luma, epoch) 稳定后 on_light
+    S-->>D: on_light + seq
+    D->>T: pick_on_light(luma) + contrast_ratio(DARK_TEXT/LIGHT_TEXT, gray)
+    T-->>D: color 二值 + contrast >= 4.5
+    D-->>C: ForegroundDecision(seq, color, reason, elapsed_ms)
+    C->>L: log_decision(d) → foreground.decision
+    C->>F: apply(decision, hooks, journal)  ← 唯一写入口
+    F->>F: 校验 hwnd 在白名单；否则 foreign_write++
+    F->>M: to_monochrome(icon, color) 仅 target=tray
+    M-->>F: 黑白单色位图（无反色/无描边/无彩色）
+    F->>X: 三类写入 clock / tray / indicator，全部同色
+    F->>J: record × 3（每笔带可逆还原信息）
+    F-->>C: Vec~ApplyRecord~ (3 条，color 全等 decision.color)
+    C->>L: log_apply × 3 → foreground.apply(target, monochrome, elapsed_ms)
+    Note over C,L: V1 同源同色 / V2 序列 [白,黑,白] / V3 elapsed_ms <= 1500 / V5 对比度 / V6 单色 / V7 零背景写入
+    end
+
+    rect rgb(255, 245, 232)
+    Note over A,X: 【退出 / 停用 / 运行中变不匹配】完整回滚
+    A->>C: shutdown() 或 set_enabled(false) 或 on_env_changed() 判定 Disabled
+    C->>F: restore_all(journal, hooks) 按写入历史逆序逐笔还原
+    F->>X: 还原三类元素为系统原状
+    F->>J: 标记每条 restored=true
+    C->>H: uninstall_all() 还原原 WNDPROC
+    C->>L: log_reconcile(N)
+    Note over J: V11 断言「每一笔写入都有对应还原」
+    end
+
+    rect rgb(245, 238, 255)
+    Note over W,X: 【Explorer 重启】TaskbarCreated 重挂（Q9 裁定）
+    X->>W: WM_TASKBARCREATED (HWND_BROADCAST)
+    W->>A: on_taskbar_created()
+    A->>A: 既有：重建窗口 / Tray::add / relayout / appbar_reregister
+    A->>C: on_taskbar_created()
+    C->>E: probe() 重新做 fail-safe
+    E-->>C: Supported / Disabled
+    alt Supported
+        C->>H: reattach_on_taskbar_created() 重新枚举白名单并重挂
+        C->>C: 恢复匹配 → 自动重新启用（Q5 裁定）
+    else Disabled
+        C->>L: log_disabled(reason) 1 条 WARN
+    end
+    end
