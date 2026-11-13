@@ -840,6 +840,15 @@ function activateNav(group) {
   if (btn) btn.classList.add("active");
   const sec = document.getElementById(group);
   if (sec) sec.classList.add("active");
+  // v1.12.0 / G1：未知分组（典型是 Rust 侧传了错的 DOM id，例如 "blacklist"
+  // 而元素叫 "group-blacklist"）会让所有分区都被摘掉 active、没有任何一个补上，
+  // 于是侧栏正常、右侧整片空白。这里回退到第一个分区：宁可停在默认页，
+  // 也不给用户一个空窗口。`firstGroup !== group` 防自递归（首项也找不到时不再套）。
+  if (!btn || !sec) {
+    const first = document.querySelector("nav button");
+    const firstGroup = first && first.dataset.group;
+    if (firstGroup && firstGroup !== group) return activateNav(firstGroup);
+  }
   // v1.8.0 / R2：进入歌词分区时统计一次缓存占用（覆盖「首次进入」与
   // 「切走再切回」两种情形；分区内的开关改动**不**重扫）
   if (group === "group-lyrics") requestCacheStats();

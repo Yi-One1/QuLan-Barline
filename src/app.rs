@@ -370,6 +370,17 @@ pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
 /// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
 pub const LYRIC_SLIDE_PX: f32 = 6.0;
 
+/// 无会话时打开设置页要直达的分区（**必须与 `assets/ui/index.html` 的元素 id 一致**）。
+///
+/// v1.12.0 / G1 的教训：这里原先写的是 `"blacklist"`，而页面里的分区 id 是
+/// `"group-blacklist"`。前端 `activateNav()` 会先把所有分区的 `active` 摘掉，
+/// 再 `getElementById("blacklist")` 找不到目标 —— 于是**侧栏正常、右侧内容区全空**。
+/// 只在「无播放器时从托盘打开设置」这条路径上出现，所以平常看不出来。
+///
+/// 单独抽成常量是为了能被 `no_session_section_exists_in_settings_dom` 直接断言：
+/// 该测试拿这个值去 `index.html` 里核对 `id=` 与 `data-group=`，名字一改就红。
+const NO_SESSION_SECTION: &str = "group-blacklist";
+
 /// 全屏遮挡态对账的**来源**（v1.5.6 / G3.5-A）。
 ///
 /// `AppbarClose` 是唯一的强制解冻分支：Explorer 明确广播「全屏应用已关闭」时，
@@ -2544,9 +2555,11 @@ impl App {
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
                 Effect::OpenSettings => {
-                    // v1.9.0（G7 / P1-03）：当前无会话 → 打开后直达黑名单分区
+                    // v1.9.0（G7 / P1-03）：当前无会话 → 打开后直达黑名单分区。
+                    // v1.12.0 / G1：分区名必须是真实 DOM id（`group-blacklist`），
+                    // 见 `NO_SESSION_SECTION` 的说明——传错会让内容区整片空白。
                     let open_section = (self.state.playing.state == PlaybackState::NoSession)
-                        .then_some("blacklist");
+                        .then_some(NO_SESSION_SECTION);
                     let json = self.settings_state_json_with(open_section);
                     // 标题栏明暗必须与页面内容同源（QA-M4 缺陷 #3）：页面 CSS 跟随
                     // 系统 prefers-color-scheme，所以这里读系统设置而不是小组件的
@@ -3926,6 +3939,28 @@ mod tests {
         assert!(
             !body.contains("volume_hud.clamp"),
             "音量优先分支只许存在于 AppState::progress_fraction"
+        );
+    }
+
+    /// **v1.12.0 / G1**：无会话打开设置时的初始分区，必须是设置页里**真实存在**的分区。
+    ///
+    /// 回归的是「侧栏在、内容区全空」那个 bug：Rust 传 `"blacklist"`，页面元素却叫
+    /// `"group-blacklist"`；`activateNav()` 先把所有分区的 `active` 摘掉，再
+    /// `getElementById()` 找不到目标 → 一个分区都没激活。这条路径只在「无播放器时
+    /// 从托盘打开设置」触发，所以平常看不出来。
+    ///
+    /// 同时核对两样：`id=`（section 元素）与 `data-group=`（导航按钮）。缺任何一个，
+    /// 激活都会失败——只改常量名不改 HTML / 只改 HTML 不改常量，都会在这里变红。
+    #[test]
+    fn no_session_section_exists_in_settings_dom() {
+        let html = include_str!("../assets/ui/index.html");
+        assert!(
+            html.contains(&format!("id=\"{NO_SESSION_SECTION}\"")),
+            "初始分区 {NO_SESSION_SECTION:?} 在 index.html 里没有对应 id 的 <section>"
+        );
+        assert!(
+            html.contains(&format!("data-group=\"{NO_SESSION_SECTION}\"")),
+            "初始分区 {NO_SESSION_SECTION:?} 不是任何导航按钮的 data-group"
         );
     }
 
