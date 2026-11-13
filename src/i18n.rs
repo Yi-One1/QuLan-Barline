@@ -67,6 +67,21 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "menu.unblacklist_current") => "Stop ignoring this app",
         (Lang::Zh, "menu.unknown_app") => "未知应用",
         (Lang::En, "menu.unknown_app") => "Unknown app",
+        // v1.13.0：白名单模式下托盘那两项换成"白名单口径"——沿用「拉黑」会让人
+        // 以为它在改黑名单，而黑名单此刻并不参与判定。
+        (Lang::Zh, "menu.whitelist_add_current") => "加入白名单",
+        (Lang::En, "menu.whitelist_add_current") => "Add to whitelist",
+        (Lang::Zh, "menu.whitelist_remove_current") => "从白名单移除",
+        (Lang::En, "menu.whitelist_remove_current") => "Remove from whitelist",
+        // 模式切换提示：说清"现在哪一种规则在跑"，这是切换控件唯一的反馈渠道。
+        (Lang::Zh, "toast.filter.mode.blacklist") => "已切换为黑名单模式：名单内的应用不被接管",
+        (Lang::En, "toast.filter.mode.blacklist") => {
+            "Blacklist mode: apps on the list are ignored"
+        }
+        (Lang::Zh, "toast.filter.mode.whitelist") => "已切换为白名单模式：只接管名单内的应用",
+        (Lang::En, "toast.filter.mode.whitelist") => {
+            "Whitelist mode: only apps on the list are picked up"
+        }
         (Lang::Zh, "settings.webview_missing_title") => "需要 WebView2 运行时",
         (Lang::En, "settings.webview_missing_title") => "WebView2 Runtime required",
         (Lang::Zh, "settings.webview_missing_body") => "设置页需要 Microsoft Edge WebView2 运行时，小组件本身不受影响。\n\n是否现在打开下载页？",
@@ -155,9 +170,6 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "toast.blacklist.unverified") => "Added. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add in \"Detected apps\" instead.",
         (Lang::Zh, "toast.blacklist.enum_failed") => "未检测到正在播放的应用",
         (Lang::En, "toast.blacklist.enum_failed") => "No playing apps detected",
-        // v1.12.0：黑白名单互斥（加入时拒绝）
-        (Lang::Zh, "toast.blacklist.conflict") => "它在白名单里，请先从白名单移除",
-        (Lang::En, "toast.blacklist.conflict") => "It's in the whitelist — remove it there first",
         // ---------------- 白名单（v1.12.0）----------------
         // 语义：为空 = 不启用；非空 = 只接管名单内的应用。
         (Lang::Zh, "toast.whitelist.added") => "已加入白名单",
@@ -178,8 +190,6 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "toast.whitelist.cleared") => "Whitelist cleared",
         (Lang::Zh, "toast.whitelist.unverified") => "已加入白名单。这个进程名还没在这台机器上出现过；如果之后没生效，请到「检测到的应用」里点「加入白名单」。",
         (Lang::En, "toast.whitelist.unverified") => "Added to the whitelist. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add to whitelist in \"Detected apps\" instead.",
-        (Lang::Zh, "toast.whitelist.conflict") => "它在黑名单里，请先从黑名单移除",
-        (Lang::En, "toast.whitelist.conflict") => "It's in the blacklist — remove it there first",
         // v1.11.0：歌词缓存一键清空
         (Lang::Zh, "toast.cache.cleared") => "歌词缓存已清空，正在重新查找这首歌",
         (Lang::En, "toast.cache.cleared") => "Lyric cache cleared — looking this track up again",
@@ -212,6 +222,10 @@ mod tests {
             "menu.blacklist_current",
             "menu.unblacklist_current",
             "menu.unknown_app",
+            "menu.whitelist_add_current",
+            "menu.whitelist_remove_current",
+            "toast.filter.mode.blacklist",
+            "toast.filter.mode.whitelist",
             "toast.blacklist.added",
             "toast.blacklist.dup",
             "toast.blacklist.empty",
@@ -222,7 +236,6 @@ mod tests {
             "toast.blacklist.cleared",
             "toast.blacklist.unverified",
             "toast.blacklist.enum_failed",
-            "toast.blacklist.conflict",
             // v1.12.0 白名单
             "toast.whitelist.added",
             "toast.whitelist.dup",
@@ -233,7 +246,6 @@ mod tests {
             "toast.whitelist.removed",
             "toast.whitelist.cleared",
             "toast.whitelist.unverified",
-            "toast.whitelist.conflict",
         ] {
             for lang in [Lang::Zh, Lang::En] {
                 assert_ne!(t(lang, key), key, "{lang:?} 缺词条 {key}");

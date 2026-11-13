@@ -333,14 +333,11 @@ mod tests {
     /// G7 契约一：黑名单分区的 7 个关键 id 必须存在，且配置路径三条都在页面里。
     #[test]
     fn blacklist_section_ids_and_paths_exist() {
+        // v1.13.0：两张名单卡已合并进切换控件（名单相关的 id 由
+        // `filter_mode_switch_ids_paths_and_keys_exist` 负责），这里只剩
+        // 枚举候选的 datalist 与「检测到的应用」那张卡。
         for id in [
-            "blacklist-card",
-            "blacklist-title",
-            "blacklist-items",
-            "blacklist-input",
             "blacklist-candidates",
-            "blacklist-add",
-            "blacklist-clear",
             "detected-card",
             "detected-at",
             "detected-refresh",
@@ -365,18 +362,18 @@ mod tests {
     /// `[data-i18n-placeholder]` 循环必须补齐（否则 placeholder 永远中文）。
     #[test]
     fn blacklist_dynamic_title_has_no_data_i18n_and_keys_are_bilingual() {
-        // ① #blacklist-title 不带 data-i18n
-        let tag = tag_of(INDEX_HTML, "blacklist-title");
+        // ① #filter-title 不带 data-i18n（v1.13.0：它是两份名单共用的动态标题）
+        let tag = tag_of(INDEX_HTML, "filter-title");
         assert!(
             !tag.contains("data-i18n"),
-            "#blacklist-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
+            "#filter-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
         );
         // ② 关键词条中英都在（I18N.zh 与 I18N.en 各一份；needle = key + 文案前缀）
         for (key, zh, en) in [
             ("nav.blacklist", "媒体筛选", "Media filter"),
-            ("blacklist.detected.unverified", "进程名未能验证", "Name unverified"),
-            ("blacklist.hint.match", "只按进程名匹配", "Matched by process name only"),
-            ("blacklist.clear.confirm", "清空后所有应用", "Clearing the list"),
+            ("blacklist.detected.unverified", "进程名未能验证", "Process name unverified"),
+            ("filter.hint.match", "只按进程名匹配", "Matched by process name only"),
+            ("filter.clear.confirm", "清空当前这份名单", "Clear this list"),
         ] {
             let needle_zh = format!("\"{key}\": \"{zh}");
             assert!(INDEX_HTML.contains(&needle_zh), "zh 缺词条：{key}");
@@ -386,7 +383,7 @@ mod tests {
         // hint.match 的末句必须采用 PRD P0-06 版（指路「检测到的应用」）
         assert!(
             INDEX_HTML.contains("从「检测到的应用」里加入最稳"),
-            "blacklist.hint.match 缺 PRD 版末句"
+            "filter.hint.match 缺 PRD 版末句"
         );
         // ③ placeholder 属性与 JS 循环补齐
         assert!(
@@ -399,24 +396,31 @@ mod tests {
         );
     }
 
-    /// **v1.12.0 白名单 UI 契约**：锚点 / 配置路径 / 动态标题 / 中英词条。
-    ///
-    /// 与 G7 黑名单那三条同款断言——白名单是从既有卡片复制出来的，
-    /// 复制后最容易漏的是「动态标题挂了 data-i18n」（计数被 render() 打回模板串）
-    /// 和「只写了 zh 忘了 en」（界面直接显示裸键名）。
+    /// **v1.13.0 切换控件契约**：锚点 / 模式取值 / 两份名单的路径 / 中英词条，
+    /// 以及**「不同时出现」的机械保证**（旧的两张卡与两套控件必须已被删除）。
     #[test]
-    fn whitelist_section_ids_paths_and_keys_exist() {
+    fn filter_mode_switch_ids_paths_and_keys_exist() {
         for id in [
-            "whitelist-card",
-            "whitelist-title",
-            "whitelist-items",
-            "whitelist-input",
-            "whitelist-add",
-            "whitelist-clear",
+            "filter-mode-card",
+            "filter-mode-blacklist",
+            "filter-mode-whitelist",
+            "filter-mode-desc",
+            "filter-title",
+            "filter-items",
+            "filter-input",
+            "filter-add",
+            "filter-clear",
         ] {
             assert!(INDEX_HTML.contains(&format!("id=\"{id}\"")), "缺少 #{id}");
         }
+        // 切换按钮必须真的发 media.mode（值要与 Rust `FilterMode` 的 snake_case 一致）
+        for v in ["\"media.mode\", \"blacklist\"", "\"media.mode\", \"whitelist\""] {
+            assert!(INDEX_HTML.contains(v), "切换按钮没有发 {v}");
+        }
         for path in [
+            "media.blacklist_add",
+            "media.blacklist_remove",
+            "media.blacklist_clear",
             "media.whitelist_add",
             "media.whitelist_remove",
             "media.whitelist_clear",
@@ -424,68 +428,187 @@ mod tests {
             assert!(INDEX_HTML.contains(path), "页面没有接配置路径 {path}");
         }
 
-        // 动态标题不许带 data-i18n
-        let tag = tag_of(INDEX_HTML, "whitelist-title");
-        assert!(
-            !tag.contains("data-i18n"),
-            "#whitelist-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
-        );
+        // **不同时出现**（v1.13.0 的核心）：两张名单卡与两套控件必须已被合并掉。
+        // 只断言"新元素在"是不够的——旧卡留着也不会让上面任何一条变红，
+        // 而用户会同时看到两份列表，正是这次要消灭的形态。
+        for gone in [
+            "id=\"whitelist-card\"",
+            "id=\"blacklist-card\"",
+            "id=\"whitelist-items\"",
+            "id=\"blacklist-items\"",
+            "id=\"whitelist-input\"",
+            "id=\"blacklist-input\"",
+            "id=\"whitelist-add\"",
+            "id=\"blacklist-add\"",
+            "id=\"whitelist-clear\"",
+            "id=\"blacklist-clear\"",
+            "function renderWhitelist",
+            "function renderBlacklist",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(gone),
+                "旧的两张卡 / 两套控件应已合并进切换控件，仍残留：{gone}"
+            );
+        }
+
+        // 动态文本不许带 data-i18n（会被 render() 的 [data-i18n] 循环打回模板串）
+        for id in ["filter-title", "filter-mode-desc"] {
+            let tag = tag_of(INDEX_HTML, id);
+            assert!(
+                !tag.contains("data-i18n"),
+                "#{id} 带了 data-i18n，动态文本会被 render() 打回模板串：{tag}"
+            );
+        }
 
         // 中英词条各一份
         for (key, zh, en) in [
-            ("filter.sub", "白名单留空表示不启用", "An empty whitelist means the feature is off"),
-            ("filter.whitelist.add", "添加", "Add"),
-            ("filter.whitelist.clear", "清空白名单", "Clear whitelist"),
-            ("filter.whitelist.empty", "白名单为空", "The whitelist is empty"),
+            ("filter.sub", "一次只用一种筛选方式", "One filter at a time"),
+            ("filter.mode", "筛选方式", "Filter mode"),
+            ("filter.mode.blacklist", "黑名单", "Blacklist"),
+            ("filter.mode.whitelist", "白名单", "Whitelist"),
+            ("filter.mode.desc.blacklist", "黑名单里的应用不被接管", "Apps on the blacklist are ignored"),
+            ("filter.mode.desc.whitelist", "只接管白名单里的应用", "Only apps on the whitelist are picked up"),
+            ("filter.add", "添加", "Add"),
+            ("filter.clear", "清空", "Clear"),
+            ("filter.clear.confirm", "清空当前这份名单", "Clear this list"),
+            ("filter.empty.blacklist", "黑名单为空", "The blacklist is empty"),
+            ("filter.empty.whitelist", "白名单为空", "The whitelist is empty"),
             ("filter.detected.toWhitelist", "加入白名单", "Add to whitelist"),
             ("filter.detected.toBlacklist", "加入黑名单", "Add to blacklist"),
-            ("filter.detected.inWhitelist", "已在白名单", "Whitelisted"),
-            ("filter.detected.inBlacklist", "已拉黑", "Blacklisted"),
-            ("filter.detected.already.tip", "已经在这一侧了", "Already on this side"),
+            ("filter.detected.inList", "已在名单内", "Already on the list"),
+            ("filter.detected.already.tip", "已经在当前名单里了", "Already on the current list"),
         ] {
             assert!(INDEX_HTML.contains(&format!("\"{key}\": \"{zh}")), "zh 缺词条：{key}");
             assert!(INDEX_HTML.contains(&format!("\"{key}\": \"{en}")), "en 缺词条：{key}");
         }
     }
 
-    /// **v1.12.0 接线锁**：检测行必须同时看两张表，并给出两个动作按钮。
+    /// **v1.13.0 接线锁**：检测行的按钮必须跟着**当前模式**走。
     ///
-    /// 退回「只按黑名单过滤」时，白名单条目在检测列表里没有任何入口，
+    /// 退回「两个按钮 / 只认黑名单」时，白名单模式下用户看到的按钮仍是
+    /// 「加入黑名单」——点下去改的是此刻不生效的那张表，症状是「点了没反应」，
     /// 而所有 Rust 侧测试照样全绿（它们只测后端判定）。
     #[test]
-    fn detected_rows_consider_both_lists() {
+    fn detected_rows_follow_the_current_filter_mode() {
         let start = INDEX_HTML
             .find("function renderDetected()")
             .expect("找不到 renderDetected");
-        // 按**字符**截 4000 个（不能按字节切：HTML 是中文，切点会落在多字节字符中间 panic）
+        // 按**字符**截（不能按字节切：HTML 是中文，切点会落在多字节字符中间 panic）
         let body: String = INDEX_HTML[start..].chars().take(4000).collect();
-        // 必须断言**配置读取**本身，不能只查 "media.whitelist" 子串——
-        // 动作名 `"media.whitelist_add"` 里也有这六个字，会让断言被自己满足。
         assert!(
-            body.contains("const whitelist = media.whitelist"),
-            "检测行没有读白名单配置"
+            body.contains("const white = currentMode() === \"whitelist\""),
+            "检测行必须读当前筛选方式"
+        );
+        // 动作路径按模式二选一（不是写死黑名单）
+        assert!(
+            body.contains("media.whitelist_add") && body.contains("media.blacklist_add"),
+            "检测行的加入路径必须覆盖两张表"
+        );
+        // 只给一个按钮：两个按钮等于暗示另一份名单也在生效
+        assert!(
+            !body.contains("filter.detected.toBlacklist\")]"),
+            "检测行不得同时渲染两个动作按钮"
+        );
+        // 已在名单内 → 置灰并给提示，不再提供"换侧"路径（两张表允许重叠）
+        assert!(
+            body.contains("filter.detected.inList"),
+            "已在名单内的行必须标出来"
+        );
+    }
+
+    /// **v1.13.0 接线锁**：列表渲染必须按模式取配置，且只有**一份**实现。
+    ///
+    /// 两份 render 函数并存是这次要消灭的重复；只留一份却不看 `currentMode()`
+    /// 更糟——切模式后列表纹丝不动，而标题/高亮都变了。
+    #[test]
+    fn filter_list_renders_the_active_mode_only() {
+        assert!(
+            INDEX_HTML.contains("function currentMode()"),
+            "缺少 currentMode()——模式必须从 media.mode 单点读取"
+        );
+        // **必须切片到 renderFilterList 函数体**：`renderDetected` 里也写着同一句，
+        // 全文 contains 会被它满足——本轮变异测试实测过（只改列表取值仍然全绿）。
+        let fstart = INDEX_HTML
+            .find("function renderFilterList()")
+            .expect("找不到 renderFilterList");
+        let body: String = INDEX_HTML[fstart..].chars().take(2500).collect();
+        assert!(
+            body.contains("(white ? media.whitelist : media.blacklist)"),
+            "列表必须按模式二选一取配置"
         );
         assert!(
-            body.contains("const blacklist = media.blacklist"),
-            "检测行没有读黑名单配置"
+            body.contains("function renderFilterList"),
+            "切片起点必须真的落在函数上"
         );
-        assert!(body.contains("filter.detected.toWhitelist"), "缺「加入白名单」按钮");
-        assert!(body.contains("filter.detected.toBlacklist"), "缺「加入黑名单」按钮");
-        // 互斥下的换侧：对侧按钮必须先 remove 再 add，否则点了会被 Rust 拒绝（Conflict），
-        // 而检测行上也没有别的入口能把应用挪到另一侧。
+        // 切换控件的高亮同样由模式推导
         assert!(
-            body.contains("\"media.whitelist_add\", \"media.blacklist_remove\""),
-            "「加入白名单」在已拉黑时必须先移出黑名单"
+            INDEX_HTML.contains("bl.className = white ? \"btn\" : \"btn primary\""),
+            "切换控件必须把当前项高亮（复用 .btn.primary，零新增 CSS 类）"
         );
-        // 参数对还不够，必须真的调用——否则「换侧」只剩一串没用的实参
+        // 添加/清空按模式拼路径
         assert!(
-            body.contains("if (inOther) set(removePath, a.process);"),
-            "换侧前必须先移除对侧条目（否则 Rust 会返回 Conflict，点击无效果）"
+            INDEX_HTML.contains(
+                "currentMode() === \"whitelist\" ? \"media.whitelist_add\" : \"media.blacklist_add\""
+            ),
+            "添加按钮必须按当前模式拼路径"
         );
         assert!(
-            body.contains("\"media.blacklist_add\", \"media.whitelist_remove\""),
-            "「加入黑名单」已在白名单时必须先移出白名单"
+            INDEX_HTML.contains(
+                "currentMode() === \"whitelist\" ? \"media.whitelist_clear\" : \"media.blacklist_clear\""
+            ),
+            "清空按钮必须按当前模式拼路径"
         );
+    }
+
+    /// 收集 `prefix` 之后、下一个 `"` 之前的值（只收标识符形态，跳过动态参数）。
+    fn attr_values(html: &str, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(i) = rest.find(prefix) {
+            let after = &rest[i + prefix.len()..];
+            let Some(end) = after.find('"') else { break };
+            let v = &after[..end];
+            let ok = !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if ok {
+                out.push(v.to_string());
+            }
+            rest = &after[end..];
+        }
+        out
+    }
+
+    /// **v1.13.0**：JS 里每个 `getElementById("字面量")` 都必须在 HTML 里有对应 id。
+    ///
+    /// 这次改版把 `whitelist-input` / `blacklist-add` 等一批 id 改名成 `filter-*`，
+    /// 漏改一处就是 `null.addEventListener` —— 整段脚本从那一行起全部失效，
+    /// 而所有 Rust 测试照样全绿（它们只查"新 id 在不在"）。这条是补那个死角。
+    #[test]
+    fn every_get_element_by_id_literal_exists_in_dom() {
+        let used = attr_values(INDEX_HTML, "getElementById(\"");
+        assert!(!used.is_empty(), "没扫到任何 getElementById，前缀写错了？");
+        let defined: Vec<String> = attr_values(INDEX_HTML, "id=\"");
+        for id in &used {
+            assert!(
+                defined.iter().any(|d| d == id),
+                "JS 引用了不存在的 id：#{id}（改名时漏改了 JS）"
+            );
+        }
+    }
+
+    /// **v1.13.0**：每个 `data-i18n` / `data-i18n-placeholder` 的键都必须在字典里，
+    /// 且中文块与英文块各有一份。缺一侧的后果是界面直接显示裸键名。
+    #[test]
+    fn every_i18n_attribute_has_both_languages() {
+        let mut keys = attr_values(INDEX_HTML, "data-i18n=\"");
+        keys.extend(attr_values(INDEX_HTML, "data-i18n-placeholder=\""));
+        assert!(!keys.is_empty(), "没扫到 data-i18n");
+        for key in keys {
+            let zh = format!("\"{key}\": ");
+            let hits = INDEX_HTML.matches(&zh).count();
+            assert!(hits >= 2, "词条 {key} 只有 {hits} 份，中英必须各一份");
+        }
     }
 
     /// G7 契约三：枚举**只允许两处触发**（activateNav 守卫 + 刷新按钮）——
@@ -513,7 +636,7 @@ mod tests {
         assert_eq!(INDEX_HTML.matches("setInterval").count(), 0);
         // ③ 清空确认走 window.confirm()
         assert!(
-            INDEX_HTML.contains("confirm(t(\"blacklist.clear.confirm\"))"),
+            INDEX_HTML.contains("confirm(t(\"filter.clear.confirm\"))"),
             "清空黑名单必须用 window.confirm()"
         );
         // ④ P0-03：不新增 CSS——全页仍只有 1 个 <style> 块

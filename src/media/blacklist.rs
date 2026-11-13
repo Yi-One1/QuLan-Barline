@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::config::defaults::limits;
-use crate::config::MediaConfig;
+use crate::config::{FilterMode, MediaConfig};
 use crate::media::player_map;
 
 // ---------------------------------------------------------------- 错误与身份
@@ -134,27 +134,8 @@ pub fn normalize_list(raw: &[String]) -> Vec<String> {
     out
 }
 
-/// 黑白名单**成对**归一化（v1.12.0）。
-///
-/// 两张表各自过 [`normalize_list`]，然后执行**互斥**：出现在黑名单里的键
-/// 一律从白名单剔除（主干比较，`msedge` 与 `msedge.exe` 视为同一条）。
-///
-/// **为什么冲突时黑名单优先**：黑名单是"否决"，白名单是"允许"。否决权更高，
-/// 用户拉黑某个应用后，不该因为有旧的同名白名单条目就又冒出来。正常写入路径
-/// 根本不允许这种状态（`apply_blacklist` 直接拒绝），这里只兜手改 json 的情况。
-///
-/// 纯函数、幂等、永不失败——`Config::load` 的唯一调用点，写坏 json 也不炸。
-pub fn normalize_lists(
-    blacklist: &[String],
-    whitelist: &[String],
-) -> (Vec<String>, Vec<String>) {
-    let bl = normalize_list(blacklist);
-    let mut wl = normalize_list(whitelist);
-    wl.retain(|w| !bl.iter().any(|b| matches_entry(b, w)));
-    (bl, wl)
-}
-
-/// AUMID 归一化（**只给缓存的键用**，不参与用户输入）：/// `trim()` + 小写 + 剔控制字符 + 长度 ≤ `limits::BLACKLIST_MAX_LEN`；非法返回 `None`。
+/// AUMID 归一化（**只给缓存的键用**，不参与用户输入）：
+/// `trim()` + 小写 + 剔控制字符 + 长度 ≤ `limits::BLACKLIST_MAX_LEN`；非法返回 `None`。
 /// 不改结构（`!` `_` `.` 中文都保留），因为键只用于查表。
 pub fn normalize_aumid(raw: &str) -> Option<String> {
     let s = raw.trim();
@@ -282,9 +263,11 @@ pub fn matches_entry(entry: &str, key: &str) -> bool {
 /// **单读者（媒体线程）+ 写极少（配置变更）**，`Mutex` 足够。
 /// 实现铁律：先取快照（释放锁）→ 再算 → 绝不嵌套持锁。
 pub struct MediaIndex {
+    /// **当前生效的筛选方式**（v1.13.0）。切换后两份表都还在，只有这一档参与判定。
+    mode: Mutex<FilterMode>,
     blacklist: Mutex<Vec<String>>,
     /// 白名单（v1.12.0）。**空 = 不启用**；非空时只有名单内的应用会被接管。
-    /// 与 `blacklist` 互斥（写入路径拒绝冲突，`normalize_lists` 兜底）。
+    /// 只在 `mode == Whitelist` 时参与判定，否则原样保留但不生效。
     whitelist: Mutex<Vec<String>>,
     /// AUMID（小写）→ 真实进程名。数据源是 `Config.media.app_names`（落盘），
     /// 这里只是副本；`BTreeMap` 与配置侧同类型（迭代顺序确定，测试/日志可复现）。
@@ -294,26 +277,31 @@ pub struct MediaIndex {
 impl MediaIndex {
     /// 启动时从配置注入（App::bootstrap 唯一构造点）。
     ///
-    /// 两张表都先过同一套归一化（与 `Config::load` 同源）：内存副本里**只允许**
-    /// 存归一化后的值——「UI 显示 = 判定 = 用户手输」三者同源的另一半保证。
+    /// 三样都先过归一化（与 `Config::load` 同源）：内存副本里**只允许**存归一化后
+    /// 的值——「UI 显示 = 判定 = 用户手输」三者同源的另一半保证。
     pub fn new(cfg: &MediaConfig) -> Arc<Self> {
-        let (bl, wl) = normalize_lists(&cfg.blacklist, &cfg.whitelist);
         Arc::new(Self {
-            blacklist: Mutex::new(bl),
-            whitelist: Mutex::new(wl),
+            mode: Mutex::new(cfg.mode),
+            blacklist: Mutex::new(normalize_list(&cfg.blacklist)),
+            whitelist: Mutex::new(normalize_list(&cfg.whitelist)),
             app_names: Mutex::new(normalize_app_names(&cfg.app_names)),
         })
     }
 
-    /// **整组同步**（三张表一起替换），写路径只有 `Effect::SaveConfig` 一处。
+    /// **整组同步**（模式 + 三张表一起替换），写路径只有 `Effect::SaveConfig` 一处。
     /// ⚠️ 调用前必须先把 `merge_learned` 的结果写进 `cfg.media.app_names`，
     /// 否则会用旧表把刚学到的名字盖掉（ARCH-G7 §5.6 顺序陷阱）。
     /// 输入表同样先归一化（幂等：正常调用方传来的已是归一化值，无额外成本）。
     pub fn set(&self, cfg: &MediaConfig) {
-        let (bl, wl) = normalize_lists(&cfg.blacklist, &cfg.whitelist);
-        *self.blacklist.lock().unwrap() = bl;
-        *self.whitelist.lock().unwrap() = wl;
+        *self.mode.lock().unwrap() = cfg.mode;
+        *self.blacklist.lock().unwrap() = normalize_list(&cfg.blacklist);
+        *self.whitelist.lock().unwrap() = normalize_list(&cfg.whitelist);
         *self.app_names.lock().unwrap() = normalize_app_names(&cfg.app_names);
+    }
+
+    /// 当前生效的筛选方式。
+    pub fn mode(&self) -> FilterMode {
+        *self.mode.lock().unwrap()
     }
 
     /// 三级身份解析。**每轮 tick 都会调**。
@@ -323,62 +311,45 @@ impl MediaIndex {
         identity(&cache, process_name, aumid)
     }
 
-    /// **命中黑名单**（UI 语义：这个应用被用户明确拉黑了）。
-    ///
-    /// ⚠️ 只回答"是否在黑名单里"，**不是**过滤判据——白名单非空时，名单外的
-    /// 应用同样不该接管，但它并没有被拉黑。要判"要不要接管"请用 [`Self::is_filtered`]。
-    /// 纯内存 + 早退。
-    pub fn matches(&self, process_name: &str, aumid: &str) -> bool {
-        let id = self.identity(process_name, aumid);
-        if id.key.is_empty() {
-            return false;
-        }
-        let bl = self.blacklist.lock().unwrap();
-        bl.iter().any(|e| matches_entry(e, &id.key))
-    }
-
     /// **过滤判据（唯一出处）**：这个应用现在该不该被小组件接管。
     ///
-    /// `true` = 不接管（不渲染、不查歌词、不响应播控）。三条规则：
-    /// 1. 命中黑名单 → 过滤（无论白名单是否启用）；
-    /// 2. 白名单为空 → 不过滤（功能未启用，行为与 v1.11.0 完全一致）；
-    /// 3. 白名单非空 → **只放行名单内的**；名单外一律过滤。
+    /// `true` = 不接管（不渲染、不查歌词、不响应播控）。按**当前模式**二选一，
+    /// 另一份名单完全不参与——这正是「切换控件」的语义基础：
     ///
-    /// 身份解析失败（`key` 为空）时：黑名单不可能命中（用户填不进空键），
-    /// 但白名单非空意味着"只接管明确允许的"——无法证明它在名单内，按规则 3 过滤。
-    /// 这是白名单语义的自然结果，日志侧可由调用方的 `hit_log_due` 观察。
+    /// * `Blacklist`：命中黑名单 → 过滤；名单为空 → 谁都不排除。
+    /// * `Whitelist`：名单为空 → 功能未启用（全部放行）；非空 → **只放行名单内的**。
+    ///
+    /// 身份解析失败（`key` 为空）时：黑名单不可能命中（用户填不进空键）→ 放行；
+    /// 白名单非空时无法证明它在名单内 → 过滤（白名单语义的自然结果）。
+    ///
+    /// 「空名单」在两档下都是放行全部，所以**切换模式永远不会让小组件突然消失**，
+    /// 只有往白名单里加条目才会收窄范围。
     ///
     /// **媒体线程每轮 tick 都会调**：纯内存、无 IO、无 COM（本模块铁律）。
     pub fn is_filtered(&self, process_name: &str, aumid: &str) -> bool {
         let id = self.identity(process_name, aumid);
-        if id.key.is_empty() {
-            // 无法解析身份：黑名单永不可命中；白名单非空时按"名单外"处理
-            return !self.whitelist.lock().unwrap().is_empty();
+        match self.mode() {
+            FilterMode::Blacklist => {
+                if id.key.is_empty() {
+                    return false;
+                }
+                self.blacklist
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches_entry(e, &id.key))
+            }
+            FilterMode::Whitelist => {
+                let wl = self.whitelist.lock().unwrap();
+                if wl.is_empty() {
+                    return false;
+                }
+                if id.key.is_empty() {
+                    return true;
+                }
+                !wl.iter().any(|e| matches_entry(e, &id.key))
+            }
         }
-        if self
-            .blacklist
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|e| matches_entry(e, &id.key))
-        {
-            return true;
-        }
-        let wl = self.whitelist.lock().unwrap();
-        if wl.is_empty() {
-            return false;
-        }
-        !wl.iter().any(|e| matches_entry(e, &id.key))
-    }
-
-    /// 黑名单快照（设置页/托盘读）。
-    pub fn blacklist_snapshot(&self) -> Vec<String> {
-        self.blacklist.lock().unwrap().clone()
-    }
-
-    /// 黑名单条数。
-    pub fn blacklist_len(&self) -> usize {
-        self.blacklist.lock().unwrap().len()
     }
 
     /// 媒体线程在枚举阶段**立即**写入新学到的名字（内存副本先行，
@@ -693,8 +664,8 @@ mod tests {
         hit_cfg.app_names.insert("publisher.app!id".into(), "real.exe".into());
         hit_cfg.blacklist = vec!["real.exe".into()];
         let idx = MediaIndex::new(&hit_cfg);
-        assert!(idx.matches("", "Publisher.App!ID"));
-        assert!(!idx.matches("", "Other.App!ID"));
+        assert!(idx.is_filtered("", "Publisher.App!ID"));
+        assert!(!idx.is_filtered("", "Other.App!ID"));
 
         // ② 表级：网易云在静态表（真实调用路径里 process_name 来自 player_map::resolve）
         let resolved = player_map::resolve("NeteaseCloudMusic!App");
@@ -702,20 +673,20 @@ mod tests {
         cfg.blacklist = vec!["cloudmusic".into()];
         let idx = MediaIndex::new(&cfg);
         assert!(
-            idx.matches(&resolved.process_name.to_string(), "NeteaseCloudMusic!App"),
+            idx.is_filtered(&resolved.process_name.to_string(), "NeteaseCloudMusic!App"),
             "表级：player_map 给出 cloudmusic.exe → 主干命中"
         );
         // 表外应用：player_map 返回空 process_name → 只剩 AUMID 末段 "app"，
         // 与黑名单 "cloudmusic" 主干不等 → 不命中
-        assert!(!idx.matches("", "UnknownPlayer!App"));
+        assert!(!idx.is_filtered("", "UnknownPlayer!App"));
 
         // ③ 末段级：表外 win32，AUMID 就是 exe 名
         let mut cfg = MediaConfig::default();
         cfg.blacklist = vec!["foo.exe".into()];
         let idx = MediaIndex::new(&cfg);
-        assert!(idx.matches("", "Foo.exe"));
+        assert!(idx.is_filtered("", "Foo.exe"));
         // 空 parts（无 aumid 无进程名）永不命中
-        assert!(!idx.matches("", ""));
+        assert!(!idx.is_filtered("", ""));
     }
 
     /// set 整组替换两张表；learn 后 identity 变 Cache（R6：反查写缓存 → source 变 Cache）。
@@ -724,7 +695,7 @@ mod tests {
         let mut cfg = MediaConfig::default();
         cfg.blacklist = vec!["a.exe".into()];
         let idx = MediaIndex::new(&cfg);
-        assert_eq!(idx.blacklist_len(), 1);
+        assert!(idx.is_filtered("a.exe", "a.exe"), "set 后条目生效");
 
         // learn → identity 走缓存级
         idx.learn(&[("vendor.app!id".to_string(), "learned.exe".to_string())]);
@@ -733,7 +704,7 @@ mod tests {
 
         // set 用不含新条目的旧表整表替换 → 学到的名字被盖掉（§5.6 顺序陷阱的负面教材）
         idx.set(&MediaConfig::default());
-        assert_eq!(idx.blacklist_len(), 0);
+        assert!(!idx.is_filtered("a.exe", "a.exe"), "整表替换后旧条目失效");
         let id = idx.identity("", "Vendor.App!ID");
         assert_ne!(id.source, IdentitySource::Cache, "set 旧表会把刚学到的名字盖掉");
     }
@@ -753,14 +724,18 @@ mod tests {
         let idx = MediaIndex::new(&back);
         let id = idx.identity("", "Publisher.App_hash!AppId");
         assert_eq!(id, Identity { key: "learned.exe".into(), source: IdentitySource::Cache });
-        assert!(idx.matches("", "Publisher.App_hash!AppId"), "重启后仍命中");
+        assert!(idx.is_filtered("", "Publisher.App_hash!AppId"), "重启后仍命中");
     }
 
     // ---------------------------------------------- 白名单（v1.12.0）
 
-    /// 成对归一化：脏值丢弃 + 冲突从白名单剔除（黑名单优先）+ 去重保序 + 幂等。
+    /// 两张表各自归一化：脏值丢弃 + 去重保序 + 幂等；**互斥剔除已取消**（v1.13.0）。
+    ///
+    /// 取消的理由是语义而不是省事：两档模式永不同时生效，同一应用待在两张表里
+    /// 不会产生矛盾。若仍然剔除，「切回黑名单模式后少了一条」会变成难查的怪现象
+    /// （用户没删过它）。
     #[test]
-    fn normalize_lists_drops_conflicts_and_is_idempotent() {
+    fn normalize_list_per_table_keeps_overlap_and_is_idempotent() {
         let bl: Vec<String> = ["  CloudMusic  ", "a*b.exe"]
             .iter()
             .map(|s| s.to_string())
@@ -769,16 +744,21 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (b, w) = normalize_lists(&bl, &wl);
+        let b = normalize_list(&bl);
+        let w = normalize_list(&wl);
         assert_eq!(b, vec!["cloudmusic.exe".to_string()], "坏值被丢弃");
         assert_eq!(
             w,
-            vec!["spotify.exe".to_string(), "qqmusic.exe".to_string()],
-            "已在黑名单的条目从白名单剔除；重复项只留第一次"
+            vec![
+                "cloudmusic.exe".to_string(),
+                "spotify.exe".to_string(),
+                "qqmusic.exe".to_string()
+            ],
+            "去重只留第一次；**与黑名单重叠的条目保留**"
         );
 
-        let (b2, w2) = normalize_lists(&b, &w);
-        assert_eq!((b2, w2), (b, w), "归一化必须幂等（R12）");
+        assert_eq!(normalize_list(&b), b, "归一化必须幂等（R12）");
+        assert_eq!(normalize_list(&w), w, "归一化必须幂等（R12）");
     }
 
     /// **空白名单 = 功能不启用**：判定退化为「只看黑名单」，与 v1.11.0 完全一致。
@@ -792,14 +772,17 @@ mod tests {
             !idx.is_filtered("Spotify.exe", "Spotify.exe"),
             "白名单为空 → 名单外应用照常接管"
         );
-        assert!(idx.matches("cloudmusic.exe", "NeteaseCloudMusic!App"), "matches 仍是纯黑名单语义");
-        assert!(!idx.matches("Spotify.exe", "Spotify.exe"));
+        assert!(idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"), "黑名单模式下 is_filtered 等价于旧 matches");
+        assert!(!idx.is_filtered("Spotify.exe", "Spotify.exe"));
     }
 
     /// **非空白名单 = 只接管名单内**：名单外过滤、名单内放行、黑名单照样否决。
     #[test]
     fn is_filtered_with_whitelist_only_accepts_listed_apps() {
+        // v1.13.0：白名单**只在 mode == Whitelist 时**参与判定，所以这里必须显式设模式。
+        // 反过来也说明「填了白名单就自动生效」的旧语义已不存在。
         let mut cfg = MediaConfig::default();
+        cfg.mode = crate::config::FilterMode::Whitelist;
         cfg.whitelist = vec!["cloudmusic.exe".into(), "spotify".into()];
         let idx = MediaIndex::new(&cfg);
         assert!(
@@ -809,16 +792,34 @@ mod tests {
         assert!(!idx.is_filtered("Spotify.exe", "Spotify.exe"), "主干等价 → 放行");
         assert!(idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "名单外 → 过滤");
 
-        // 黑白都非空：白名单外过滤、黑名单命中过滤、白名单内放行
+        // 黑白都非空：白名单模式下**黑名单完全不参与**——名单外的应用一律过滤，
+        // 名单内的放行（即使它同时还在黑名单里，因为此刻黑名单不生效）。
         let mut cfg = MediaConfig::default();
+        cfg.mode = crate::config::FilterMode::Whitelist;
         cfg.whitelist = vec!["cloudmusic.exe".into()];
         cfg.blacklist = vec!["spotify.exe".into()];
         let idx = MediaIndex::new(&cfg);
-        assert!(idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "两边都不在 → 过滤");
-        assert!(idx.is_filtered("Spotify.exe", "Spotify.exe"), "黑名单命中 → 过滤");
+        assert!(idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "名单外 → 过滤");
+        assert!(
+            idx.is_filtered("Spotify.exe", "Spotify.exe"),
+            "名单外 → 过滤（不是「因为被拉黑」，而是白名单没放行它）"
+        );
         assert!(
             !idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"),
             "白名单内 → 放行"
+        );
+
+        // 切回黑名单模式：同一份配置里换成黑名单生效
+        cfg.mode = crate::config::FilterMode::Blacklist;
+        let idx = MediaIndex::new(&cfg);
+        assert!(idx.is_filtered("Spotify.exe", "Spotify.exe"), "黑名单命中 → 过滤");
+        assert!(
+            !idx.is_filtered("QQMusic.exe", "QQMusic.exe"),
+            "黑名单模式不看白名单 → 放行"
+        );
+        assert!(
+            !idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"),
+            "它在白名单里，但白名单此刻不生效 → 放行"
         );
     }
 
@@ -827,6 +828,7 @@ mod tests {
     #[test]
     fn is_filtered_treats_unresolvable_identity_as_outside_when_whitelist_active() {
         let mut cfg = MediaConfig::default();
+        cfg.mode = crate::config::FilterMode::Whitelist;
         cfg.whitelist = vec!["cloudmusic.exe".into()];
         let idx = MediaIndex::new(&cfg);
         assert!(idx.is_filtered("", ""), "白名单非空 + 身份不可解析 → 过滤");
@@ -837,26 +839,40 @@ mod tests {
 
     /// `set` 同步白名单（配置变更后媒体线程立即看到）；冲突项被剔除后功能自动关闭。
     #[test]
-    fn media_index_set_syncs_whitelist_and_drops_conflicts() {
+    fn media_index_set_syncs_mode_and_whitelist() {
         let idx = MediaIndex::new(&MediaConfig::default());
-        assert!(!idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "初始空白名单");
+        assert!(!idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "初始空名单 + 黑名单模式");
 
+        // 只填空名单但不切模式 → 仍然不生效（旧语义是"填了就生效"，v1.13.0 改了）
         let mut cfg = MediaConfig::default();
-        cfg.whitelist = vec!["cloudmusic.exe".into()];
-        idx.set(&cfg);
-        assert!(idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "set 后立即只接管名单内");
-        assert!(!idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"));
-
-        // 手改 json 造成同一应用两边都有 → 白名单项被剔除（黑名单优先）
-        let mut cfg = MediaConfig::default();
-        cfg.blacklist = vec!["cloudmusic.exe".into()];
         cfg.whitelist = vec!["cloudmusic.exe".into()];
         idx.set(&cfg);
         assert!(
             !idx.is_filtered("QQMusic.exe", "QQMusic.exe"),
-            "白名单被清空 → 功能关闭，只剩黑名单生效"
+            "白名单非空但 mode 仍是黑名单 → 白名单不参与判定"
         );
-        assert!(idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"));
+
+        // 切模式 → set 让媒体线程立即看到
+        cfg.mode = crate::config::FilterMode::Whitelist;
+        idx.set(&cfg);
+        assert!(idx.is_filtered("QQMusic.exe", "QQMusic.exe"), "切到白名单模式后只接管名单内");
+        assert!(!idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"));
+        assert_eq!(idx.mode(), crate::config::FilterMode::Whitelist);
+
+        // 手改 json 让同一应用两边都有 → **允许重叠**，按当前模式判定
+        let mut cfg = MediaConfig::default();
+        cfg.mode = crate::config::FilterMode::Whitelist;
+        cfg.blacklist = vec!["cloudmusic.exe".into()];
+        cfg.whitelist = vec!["cloudmusic.exe".into()];
+        idx.set(&cfg);
+        assert!(
+            !idx.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"),
+            "白名单模式：它在白名单里 → 放行（重叠不产生矛盾）"
+        );
+        assert!(
+            idx.is_filtered("QQMusic.exe", "QQMusic.exe"),
+            "白名单模式：名单外 → 过滤"
+        );
     }
 
     // ---------------------------------------------- knows_process

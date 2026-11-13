@@ -135,20 +135,19 @@ pub enum BlacklistOutcome {
     Removed,
     NotFound,
     Cleared,
-    /// **已存在于另一份名单**（v1.12.0）。黑白名单互斥：黑名单是"否决"，
-    /// 白名单是"允许"，同一条目同时存在会让判定语义自相矛盾，所以加入时直接拒绝。
-    Conflict,
     BadPath,
 }
 
 /// 黑白名单写入的**唯一**入口（`apply_set` 不走这条路）。
 ///
-/// v1.12.0：白名单与黑名单共用这一个入口——两条链路的写入校验（归一化、去重、
-/// 上限、`KeyRecognition`）逐字相同，唯一多出来的是**互斥检查**：加入时若该键
-/// 已在另一份名单里，返回 [`BlacklistOutcome::Conflict`]，两张表都不动。
+/// 白名单与黑名单共用这一个入口——两条链路的写入校验（归一化、去重、上限、
+/// `KeyRecognition`）逐字相同，只是落在不同的表上。
+///
+/// v1.13.0：**互斥已取消**。两份名单由 `media.mode` 二选一生效，永不同时参与判定，
+/// 所以同一应用可以同时待在两张表里（切模式即换规则），加入时不再检查另一份名单。
 ///
 /// 为什么不复用 `apply_set` 的 `bool`：这里要区分
-/// 「重复 / 冲突 / 非法 / 超长 / 已满 / **未能验证**」六种结果给不同 toast，`bool` 表达不了。
+/// 「重复 / 非法 / 超长 / 已满 / **未能验证**」五种结果给不同 toast，`bool` 表达不了。
 ///
 /// `index` 用于 `KeyRecognition` 判据（纯内存，UI 线程可直接算）：
 /// `Verified` ⟺ `index.knows_process(key)`——它同时查内存缓存值与
@@ -160,7 +159,7 @@ pub fn apply_blacklist(
     value: &Value,
     index: &crate::media::blacklist::MediaIndex,
 ) -> BlacklistOutcome {
-    use crate::media::blacklist::{matches_entry, normalize_entry, NormError};
+    use crate::media::blacklist::{normalize_entry, NormError};
 
     // 这次操作落在哪张表上。
     let to_white = match path {
@@ -200,24 +199,12 @@ pub fn apply_blacklist(
     };
 
     if is_add {
-        // 先只读地取三个判断，再动表——同一结构体的两个字段不能同时借可变/不可变。
-        let (duplicate, conflict, len) = {
-            let own = if to_white { &cfg.media.whitelist } else { &cfg.media.blacklist };
-            let other = if to_white { &cfg.media.blacklist } else { &cfg.media.whitelist };
-            (
-                own.contains(&key),
-                // 冲突按主干比较：`msedge` 与 `msedge.exe` 是同一条，不能漏
-                other.iter().any(|e| matches_entry(e, &key)),
-                own.len(),
-            )
-        };
-        if duplicate {
+        // 先只读地取两个判断，再动表——同一结构体的两个字段不能同时借可变/不可变。
+        let own = if to_white { &cfg.media.whitelist } else { &cfg.media.blacklist };
+        if own.contains(&key) {
             return BlacklistOutcome::Duplicate;
         }
-        if conflict {
-            return BlacklistOutcome::Conflict;
-        }
-        if len >= crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES {
+        if own.len() >= crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES {
             return BlacklistOutcome::Full;
         }
         let recognition = if index.knows_process(&key) {
@@ -443,9 +430,15 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
             crate::log_warn!("黑名单写入必须走 apply_blacklist，拒绝路径：{path}");
             false
         }
-        // v1.12.0：白名单共用同一个写入入口（互斥检查、归一化、分档 toast 都在那边）
+        // v1.12.0：白名单共用同一个写入入口（归一化、分档 toast 都在那边）
         "media.whitelist_add" | "media.whitelist_remove" | "media.whitelist_clear" => {
             crate::log_warn!("白名单写入必须走 apply_blacklist，拒绝路径：{path}");
+            false
+        }
+        // v1.13.0：筛选方式切换必须走 reduce_filter_mode（脏值丢弃 + 同步索引 + 即时对账）。
+        // 让它掉进 apply_set 的通用路径只会改配置、不同步索引，症状是「切了没反应」。
+        "media.mode" => {
+            crate::log_warn!("筛选方式切换必须走 reduce_filter_mode，拒绝路径：{path}");
             false
         }
         // ---------------- 快捷键 ----------------
@@ -1070,24 +1063,27 @@ mod tests {
         assert_eq!(cfg.media.app_names.len(), 1);
     }
 
-    /// **互斥（v1.12.0）**：同一应用不能同时在两张表里，双向加入都被拒绝，
-    /// 且**两张表都不许留下半条**（主干比较：`CloudMusic` 与 `cloudmusic.exe` 同一条）。
+    /// **两份名单可以重叠（v1.13.0 取消互斥）**：同一应用允许同时待在两张表里。
+    ///
+    /// 依据是语义而不是宽容：`media.mode` 一次只让一份生效，重叠不会产生矛盾；
+    /// 反过来强制互斥会让「用户在黑名单模式里也把常用播放器记一笔白名单」
+    /// 变得做不到——而这恰恰是切模式时的常见用法。
     #[test]
-    fn whitelist_and_blacklist_are_mutually_exclusive() {
+    fn whitelist_and_blacklist_may_overlap() {
         let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
         let mut cfg = Config::default();
 
-        // 黑 → 白
+        // 黑 → 白：同一应用（不同写法，归一化后同形）不该被拒
         assert_eq!(
             apply_blacklist(&mut cfg, "media.blacklist_add", &json!("cloudmusic.exe"), &idx),
             BlacklistOutcome::Added(KeyRecognition::Verified)
         );
         assert_eq!(
             apply_blacklist(&mut cfg, "media.whitelist_add", &json!("CloudMusic"), &idx),
-            BlacklistOutcome::Conflict
+            BlacklistOutcome::Added(KeyRecognition::Verified)
         );
-        assert!(cfg.media.whitelist.is_empty(), "冲突不许写进白名单");
         assert_eq!(cfg.media.blacklist, vec!["cloudmusic.exe".to_string()]);
+        assert_eq!(cfg.media.whitelist, vec!["cloudmusic.exe".to_string()], "两边各留一份");
 
         // 白 → 黑
         let mut cfg = Config::default();
@@ -1097,10 +1093,16 @@ mod tests {
         );
         assert_eq!(
             apply_blacklist(&mut cfg, "media.blacklist_add", &json!("Spotify"), &idx),
-            BlacklistOutcome::Conflict
+            BlacklistOutcome::Added(KeyRecognition::Verified)
         );
-        assert!(cfg.media.blacklist.is_empty(), "冲突不许写进黑名单");
         assert_eq!(cfg.media.whitelist, vec!["spotify.exe".to_string()]);
+        assert_eq!(cfg.media.blacklist, vec!["spotify.exe".to_string()]);
+
+        // 但**同一张表**里重复仍然拒绝（Duplicate 仍然有效）
+        assert_eq!(
+            apply_blacklist(&mut cfg, "media.blacklist_add", &json!("spotify"), &idx),
+            BlacklistOutcome::Duplicate
+        );
     }
 
     /// apply_set 同样拒绝白名单三条 path（纵深防御与黑名单完全对称）。

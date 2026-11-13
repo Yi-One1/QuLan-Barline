@@ -26,6 +26,50 @@ pub enum VolumeScope {
     CurrentPlayer,
 }
 
+/// 媒体源筛选方式（v1.13.0）。
+///
+/// **一次只有一种生效**：切到哪一档，就只有那一份名单参与判定，另一份原样保留
+/// （切回来还在），但完全不参与过滤。这是用户 2026-11-13 拍板的形态——
+/// 「切换控件 + 不同时出现」，目的是让「我现在在用哪种规则」变成界面上的一眼可见。
+///
+/// 由此**互斥被取消**：同一应用允许同时出现在两份名单里（比如黑名单里留着它、
+/// 白名单里也留一份），因为两者永不同时生效，不存在语义矛盾。
+/// `Config::load` 不再剔除冲突项，写入路径也不再返回 `Conflict`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterMode {
+    /// 黑名单模式（默认，向后兼容 v1.11.0 及更早）：名单内的应用被排除，
+    /// 名单为空 = 谁都不排除。
+    #[default]
+    Blacklist,
+    /// 白名单模式：**只**接管名单内的应用；名单为空 = 功能未启用（全部接管）。
+    ///
+    /// 注意「空」在两档下结局相同（都放行全部），所以**切换本身永不会让小组件
+    /// 突然消失**——只有往白名单里加条目才会收窄范围。这是切换能做成无损操作的前提。
+    Whitelist,
+}
+
+impl FilterMode {
+    /// 配置里的字符串（与 serde 的 `snake_case` 表示一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blacklist => "blacklist",
+            Self::Whitelist => "whitelist",
+        }
+    }
+
+    /// 从设置页传来的字符串解析。**脏值一律返回 `None`**（调用方原样丢弃），
+    /// 不猜、不 fallback——否则手滑写个 `"white"` 会静默变成黑名单模式，
+    /// 用户看到的现象是「切了没反应」。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "blacklist" => Some(Self::Blacklist),
+            "whitelist" => Some(Self::Whitelist),
+            _ => None,
+        }
+    }
+}
+
 /// 界面语言（含 `System`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,15 +232,20 @@ pub struct StorageConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
+    /// **当前生效的筛选方式**（v1.13.0）。默认 `Blacklist`——老配置没有这个字段时
+    /// 反序列化即为黑名单模式，行为与 v1.12.0 及更早逐字节一致（无迁移、无破坏）。
+    pub mode: FilterMode,
     /// 黑名单。上限 `limits::BLACKLIST_MAX_ENTRIES`，单条 ≤ `limits::BLACKLIST_MAX_LEN`。
     /// **只清这个表不清 `app_names`**（缓存是实测事实，与用户意图无关）。
+    ///
+    /// 只在 `mode == Blacklist` 时参与判定；切到白名单模式后原样保留但不生效。
     pub blacklist: Vec<String>,
     /// 白名单（v1.12.0）。语义：**空 = 不启用**；非空 = **只接管名单内的应用**，
     /// 名单外的一律按被拉黑处理（不渲染、不查歌词、不响应播控）。
     ///
-    /// 与 `blacklist` **互斥**：同一条目不允许同时存在于两张表。写入路径
-    /// （`apply_blacklist`）直接拒绝；手改 json 绕过时 `Config::load` 会把
-    /// 冲突项从白名单里剔除（**黑名单优先**，见 `normalize_lists`）。
+    /// 只在 `mode == Whitelist` 时参与判定。与 `blacklist` **可以重叠**
+    /// （v1.13.0 起取消互斥：两者永不同时生效，重叠不会产生矛盾），
+    /// 所以同一应用可以既在黑名单又在白名单里，切模式即换规则。
     pub whitelist: Vec<String>,
     /// AUMID（**小写**）→ 真实进程名（小写、含 `.exe`）。**落盘**，重启后仍有效。
     ///
@@ -269,11 +318,10 @@ impl Config {
                 // 坏值静默丢弃，不 panic、不弹窗。**顺序必须"先 normalize 后 save"**
                 // （反了会把未归一化的脏表写回磁盘，ARCH-G7 §3.3 / R12）。
                 // 归一化必须幂等（R12）：正常第二次启动不再判定为"有变化"。
-                // v1.12.0：白名单一起归一化，并执行互斥（冲突项从白名单剔除）。
-                let (bl, wl) = crate::media::blacklist::normalize_lists(
-                    &cfg.media.blacklist,
-                    &cfg.media.whitelist,
-                );
+                // v1.13.0：白名单一起归一化，但**不再做互斥剔除**——两档模式永不同时
+                // 生效，重叠不产生矛盾；剔除反而会让用户切回黑名单模式后莫名少一条。
+                let bl = crate::media::blacklist::normalize_list(&cfg.media.blacklist);
+                let wl = crate::media::blacklist::normalize_list(&cfg.media.whitelist);
                 let an = crate::media::blacklist::normalize_app_names(&cfg.media.app_names);
                 if bl != cfg.media.blacklist
                     || wl != cfg.media.whitelist
@@ -356,6 +404,43 @@ mod tests {
         assert_eq!(back.hotkeys.play_pause, cfg.hotkeys.play_pause);
         assert_eq!(back.hotkeys.toggle_widget, cfg.hotkeys.toggle_widget);
         assert_eq!(back.general.language, cfg.general.language);
+    }
+
+    /// **v1.13.0 向后兼容（关键）**：v1.12.0 及更早的 config.json 没有 `media.mode`。
+    ///
+    /// 默认必须是 `Blacklist` —— 老用户升级后行为逐字节不变（黑名单照样生效、
+    /// 白名单那半张表仍然不参与判定）。若默认成 `Whitelist`，一个空白名单等于
+    /// 「全部放行」，等于把老用户的拉黑全部悄悄作废。
+    #[test]
+    fn missing_media_mode_defaults_to_blacklist() {
+        let old = r#"{"media":{"blacklist":["cloudmusic.exe"],"whitelist":[],"app_names":{}}}"#;
+        let cfg: Config = serde_json::from_str(old).expect("老配置必须能反序列化");
+        assert_eq!(cfg.media.mode, FilterMode::Blacklist);
+        assert_eq!(cfg.media.blacklist, vec!["cloudmusic.exe".to_string()]);
+    }
+
+    /// `FilterMode` 在 JSON 里是 `snake_case` 字符串，与前端发的取值逐字一致；
+    /// 未知取值**整份配置**不变（serde 报错 → `load` 走备份+默认值），
+    /// 但单字段解析 `FilterMode::parse` 返回 `None` 由调用方丢弃。
+    #[test]
+    fn filter_mode_serde_and_parse_agree() {
+        assert_eq!(FilterMode::default(), FilterMode::Blacklist, "默认必须是黑名单");
+        for m in [FilterMode::Blacklist, FilterMode::Whitelist] {
+            let json = serde_json::to_string(&m).expect("序列化失败");
+            assert_eq!(json, format!("\"{}\"", m.as_str()));
+            assert_eq!(FilterMode::parse(m.as_str()), Some(m));
+            assert_eq!(
+                serde_json::from_str::<FilterMode>(&json).ok(),
+                Some(m),
+                "serde 与 as_str/parse 必须是同一套字面量"
+            );
+        }
+        // 脏值一律拒绝，不猜（猜错会让用户看到"切了没反应"）
+        // 注意 `"blacklist "`（带尾部空格）是**可接受**的：parse 会 trim，见下一条
+        for bad in ["", " ", "white", "Black", "whitelists", "0", "black list"] {
+            assert_eq!(FilterMode::parse(bad), None, "{bad:?} 不该被接受");
+        }
+        assert_eq!(FilterMode::parse(" blacklist "), Some(FilterMode::Blacklist), "首尾空白可容忍");
     }
 
     /// v1.1.2 向后兼容：旧配置没有 `lyrics.scroll` 字段 → 反序列化不报错且默认 true。

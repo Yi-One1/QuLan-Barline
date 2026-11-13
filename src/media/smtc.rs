@@ -3247,7 +3247,7 @@ mod g7_blacklist_regression {
         cfg.blacklist = vec!["cloudmusic.exe".into()];
         st.index.set(&cfg);
         assert!(st.filtered_now(), "拉黑后 cached parts 必须立即命中（纯内存）");
-        assert!(st.index.matches("cloudmusic.exe", "NeteaseCloudMusic!App"));
+        assert!(st.index.is_filtered("cloudmusic.exe", "NeteaseCloudMusic!App"));
         // 解绑（清空）→ 立即恢复
         st.index.set(&crate::config::MediaConfig::default());
         assert!(!st.filtered_now(), "解绑后必须立即不命中（≤1s 恢复的前提）");
@@ -3262,15 +3262,17 @@ mod g7_blacklist_regression {
         st.parts.process_name = "spotify.exe".into();
         assert!(!st.filtered_now(), "白名单为空（未启用）→ 放行");
 
-        // 启用白名单，名单里只有网易云 → 正在缓存的 Spotify 立刻变「不该接管」
+        // 切到白名单模式，名单里只有网易云 → 正在缓存的 Spotify 立刻变「不该接管」
         let mut cfg = crate::config::MediaConfig::default();
+        cfg.mode = crate::config::FilterMode::Whitelist;
         cfg.whitelist = vec!["cloudmusic.exe".into()];
         st.index.set(&cfg);
-        assert!(st.filtered_now(), "白名单非空 + 名单外 → 必须过滤");
-        assert!(
-            !st.index.matches("spotify.exe", "Spotify.exe"),
-            "它并没有被拉黑——UI 的'已拉黑'标记不该亮"
-        );
+        assert!(st.filtered_now(), "白名单模式 + 名单外 → 必须过滤");
+        // 它**并没有被拉黑**：切回黑名单模式就立刻放行。这个区分在 UI 上仍要用
+        // （设置页标的是「已在名单内」，不是「已拉黑」），所以单独钉一条。
+        st.index.set(&crate::config::MediaConfig::default());
+        assert!(!st.filtered_now(), "黑名单模式（空表）→ 放行，说明它没被拉黑");
+        st.index.set(&cfg); // 恢复白名单模式，继续验证"加入白名单后恢复"
 
         // 把 Spotify 加入白名单 → 恢复
         cfg.whitelist.push("spotify.exe".into());

@@ -1711,6 +1711,12 @@ impl App {
                 Vec::new()
             }
             Incoming::Set { path, value } => {
+                // v1.13.0：筛选方式切换走专属入口（解析失败丢弃 + 幂等 + 即时对账）。
+                // 必须在两条名单分流之前判——`media.mode` 与它们的判据不重叠，
+                // 但放在前面能让「什么 path 走哪条路」一眼看清。
+                if path == "media.mode" {
+                    return self.reduce_filter_mode(&value);
+                }
                 // v1.9.0（G7）：黑名单三条走专属入口（归一化 + 分档 toast + KeyRecognition），
                 // 不进 apply_set 的 bool 白名单。前置分流，防止旧页面/注入脚本绕过归一化。
                 if path.starts_with("media.blacklist") || path.starts_with("media.whitelist") {
@@ -2079,12 +2085,6 @@ impl App {
             O::Duplicate => {
                 return self.toast_info(k("toast.blacklist.dup", "toast.whitelist.dup"))
             }
-            O::Conflict => {
-                return self.toast_info(k(
-                    "toast.blacklist.conflict",
-                    "toast.whitelist.conflict",
-                ))
-            }
             O::Invalid(NormError::Empty) => {
                 return self.toast_info(k("toast.blacklist.empty", "toast.whitelist.empty"))
             }
@@ -2125,6 +2125,45 @@ impl App {
             Effect::SaveConfig(Box::new(self.config.clone())),
             Effect::Relayout,
             Effect::Media(MediaCommand::Refresh),
+        ]
+    }
+
+    /// **筛选方式切换**（v1.13.0）：`media.mode` 的唯一入口。
+    ///
+    /// 与名单写入同样是「改配置 → 同步索引 → 即时对账 → toast → 落盘 + 回推」，
+    /// 但**不需要** `MediaCommand::Refresh`：模式变化不改变任何会话的身份，
+    /// 媒体线程下一轮 tick 自己会按新判据重算；强制刷新反而会多打一轮 COM。
+    ///
+    /// 切换本身**不会让小组件消失**——两档下「空名单」都是放行全部，
+    /// 只有往白名单里加条目才收窄范围（见 `MediaIndex::is_filtered` 的说明）。
+    fn reduce_filter_mode(&mut self, value: &serde_json::Value) -> Vec<Effect> {
+        use crate::config::FilterMode;
+        let Some(raw) = value.as_str() else {
+            crate::log_debug!("media.mode 的值不是字符串，忽略");
+            return Vec::new();
+        };
+        let Some(mode) = FilterMode::parse(raw) else {
+            crate::log_debug!("media.mode 收到未知取值 {raw:?}，忽略");
+            return Vec::new();
+        };
+        if mode == self.config.media.mode {
+            // 幂等：连点同一个按钮不写盘、不重推
+            return Vec::new();
+        }
+        self.config.media.mode = mode;
+        self.index.set(&self.config.media);
+        self.sync_list_now();
+        let key = match mode {
+            FilterMode::Blacklist => "toast.filter.mode.blacklist",
+            FilterMode::Whitelist => "toast.filter.mode.whitelist",
+        };
+        let toast = crate::settings::bridge::toast_json("info", i18n::t(self.lang, key));
+        self.settings.push(&toast);
+        let json = self.settings_state_json();
+        self.settings.push(&json);
+        vec![
+            Effect::SaveConfig(Box::new(self.config.clone())),
+            Effect::Relayout,
         ]
     }
 
@@ -2190,71 +2229,93 @@ impl App {
     /// 两者不会同时指向不同应用——媒体线程切到正常会话时会广播
     /// `IgnoredSession(None)` 把它清掉。
     fn toggle_ignore_current(&mut self) -> Vec<Effect> {
+        use crate::config::FilterMode;
+        use crate::media::blacklist::matches_entry;
+
+        // **白名单模式下托盘动作整体对调**（v1.13.0）：
+        //   黑名单模式 = 「拉黑 / 恢复」，黑名单模式语义不变；
+        //   白名单模式 = 「从白名单移除（= 不再接管）/ 加入白名单（= 重新接管）」。
+        // 不按模式分派的话，白名单模式下点「拉黑」会去改黑名单——而黑名单此刻
+        // 根本不参与判定，用户看到的现象是「点了没反应」。
+        let white = self.config.media.mode == FilterMode::Whitelist;
+
+        // ① 媒体线程已判定「不该接管」→ 本次动作 = 放行
         if let Some(ig) = self.ignored.clone() {
             let key = self.index.identity(&ig.process_name, &ig.aumid).key;
             if key.is_empty() {
                 return Vec::new();
             }
-            // 恢复有两种原因（v1.12.0）：
-            // ① 被拉黑 → 从黑名单移除；
-            // ② 被白名单排除（白名单非空、它不在名单内）→ 把它加进白名单。
-            // 不区分原因就只删黑名单的话，②这种情况下点「恢复」毫无反应。
+            if white {
+                // 白名单模式：放行 = 加入白名单（此前它是"名单外"才被排除的）
+                if self
+                    .config
+                    .media
+                    .whitelist
+                    .iter()
+                    .any(|e| matches_entry(e, &key))
+                {
+                    return Vec::new(); // 竞态：已经在名单里了
+                }
+                self.config.media.whitelist.push(key);
+                return self.after_filter_change("toast.whitelist.added");
+            }
             let before = self.config.media.blacklist.len();
             self.config
                 .media
                 .blacklist
-                .retain(|e| !crate::media::blacklist::matches_entry(e, &key));
-            if self.config.media.blacklist.len() != before {
-                return self.after_blacklist_change("toast.blacklist.removed");
+                .retain(|e| !matches_entry(e, &key));
+            if self.config.media.blacklist.len() == before {
+                return Vec::new(); // 已不在黑名单（广播滞后）
             }
-            let in_white = self
-                .config
-                .media
-                .whitelist
-                .iter()
-                .any(|e| crate::media::blacklist::matches_entry(e, &key));
-            if !in_white && !self.config.media.whitelist.is_empty() {
-                self.config.media.whitelist.push(key);
-                return self.after_blacklist_change("toast.whitelist.added");
-            }
-            return Vec::new();
+            return self.after_filter_change("toast.blacklist.removed");
         }
-        // 拉黑：当前会话身份 → normalize → 追加
+
+        // ② 未被排除 → 本次动作 = 排除
         let s = &self.state.playing.session;
         let id = self.index.identity(&s.process_name, &s.aumid);
         if id.key.is_empty() {
-            crate::log_debug!("托盘拉黑：当前会话身份不可解析，忽略");
+            crate::log_debug!("托盘排除：当前会话身份不可解析，忽略");
             return Vec::new();
         }
+        if white {
+            // 白名单模式：排除 = 从白名单移除。名单为空时它本来就被放行，
+            // 没有"移除"可做——此时托盘那一项是置灰的（`ignore_menu_item` 同步判定），
+            // 这里再兜一次，避免快捷键/菜单竞态把它点进来。
+            let before = self.config.media.whitelist.len();
+            self.config
+                .media
+                .whitelist
+                .retain(|e| !matches_entry(e, &id.key));
+            if self.config.media.whitelist.len() == before {
+                crate::log_debug!("白名单模式下该应用不在名单里，无需移除");
+                return Vec::new();
+            }
+            return self.after_filter_change("toast.whitelist.removed");
+        }
+        // 黑名单模式：幂等 toggle（媒体线程广播滞后时点第二次 = 撤销）
         let existed = self
             .config
             .media
             .blacklist
             .iter()
-            .any(|e| crate::media::blacklist::matches_entry(e, &id.key));
+            .any(|e| matches_entry(e, &id.key));
         if existed {
-            // 幂等 toggle：已存在（媒体线程广播滞后）→ 移除
             self.config
                 .media
                 .blacklist
-                .retain(|e| !crate::media::blacklist::matches_entry(e, &id.key));
-            self.after_blacklist_change("toast.blacklist.removed")
+                .retain(|e| !matches_entry(e, &id.key));
+            self.after_filter_change("toast.blacklist.removed")
         } else {
-            // 互斥（v1.12.0）：它若还在白名单里，先移出再加入黑名单。
-            // 效果等价于「把这个应用从白名单移到黑名单」——注意白名单因此变空时
-            // 功能自动关闭，其余应用恢复接管，这正是用户拉黑单个应用时的预期。
-            self.config
-                .media
-                .whitelist
-                .retain(|e| !crate::media::blacklist::matches_entry(e, &id.key));
+            // v1.13.0：不再需要"先从白名单移除"——两份名单永不同时生效，
+            // 同一应用允许同时待在两边（切模式即换规则）。
             self.config.media.blacklist.push(id.key);
-            self.after_blacklist_change("toast.blacklist.added")
+            self.after_filter_change("toast.blacklist.added")
         }
     }
 
-    /// 托盘拉黑/恢复的共同收尾：同步索引 → 即时对账 → toast → 落盘 + 重排。
-    /// （v1.12.0 起黑白名单共用——`ok_key` 由调用方按实际动作选。）
-    fn after_blacklist_change(&mut self, ok_key: &'static str) -> Vec<Effect> {
+    /// 托盘「排除/恢复」与模式切换的共同收尾：同步索引 → 即时对账 → toast
+    /// → 落盘 + 重排。`ok_key` 由调用方按实际动作与当前模式选。
+    fn after_filter_change(&mut self, ok_key: &'static str) -> Vec<Effect> {
         self.index.set(&self.config.media);
         self.sync_list_now();
         let toast =
@@ -2266,47 +2327,69 @@ impl App {
         ]
     }
 
-    /// 托盘菜单「拉黑/恢复」项的文案与置灰（纯函数：App 状态 → (label, enabled)）。
+    /// 托盘菜单「排除/恢复」项的文案与置灰（纯函数：App 状态 → (label, enabled)）。
     ///
     /// R1 的主要防线：**只要 `ignored.is_some()` 就 enabled=true**——用户把唯一的
-    /// 播放器拉黑后小组件消失，托盘这一项是唯一常驻的恢复入口。
+    /// 播放器排除掉后小组件消失，托盘这一项是唯一常驻的恢复入口。
     /// G8-①：非忽略态一律以 `state.playing.session`（正在显示的会话）为
     /// 「当前应用」，与 `sync_list_now` / `toggle_ignore_current` 同源。
+    ///
+    /// **v1.13.0 按模式换文案**：白名单模式下"排除"实际是「从白名单移除」、
+    /// 「恢复」实际是「加入白名单」。沿用「拉黑」会让用户以为它在改黑名单，
+    /// 而黑名单此刻并不参与判定。
     fn ignore_menu_item(&self) -> crate::ui::tray::IgnoreMenuItem {
         use crate::ui::tray::{clamp_label, IgnoreMenuItem};
+        let white = self.config.media.mode == crate::config::FilterMode::Whitelist;
+        let fmt = |key: &'static str, name: &str| match self.lang {
+            Lang::Zh => format!("{}（{}）", i18n::t(self.lang, key), clamp_label(name, 40)),
+            Lang::En => format!("{} ({})", i18n::t(self.lang, key), clamp_label(name, 40)),
+        };
+
+        // ① 已被排除 → 这一项是「放行」
         if let Some(ig) = self.ignored.as_ref() {
-            let label = match self.lang {
-                Lang::Zh => format!("{}（{}）", i18n::t(self.lang, "menu.unblacklist_current"), clamp_label(&ig.app_name, 40)),
-                Lang::En => format!("{} ({})", i18n::t(self.lang, "menu.unblacklist_current"), clamp_label(&ig.app_name, 40)),
+            let key = if white {
+                "menu.whitelist_add_current"
+            } else {
+                "menu.unblacklist_current"
             };
-            return IgnoreMenuItem { label, enabled: true };
+            return IgnoreMenuItem {
+                label: fmt(key, &ig.app_name),
+                enabled: true,
+            };
         }
+
+        // ② 未被排除 → 这一项是「排除」
         let s = &self.state.playing.session;
         let name = if s.app_name.is_empty() {
             i18n::t(self.lang, "menu.unknown_app")
         } else {
             s.app_name.as_str()
         };
-        // 无会话或身份不可解析 → 置灰（点了也不会有身份可拉黑）
         let resolvable = !self.index.identity(&s.process_name, &s.aumid).key.is_empty();
-        let enabled = self.state.playing.state != PlaybackState::NoSession && resolvable;
-        let label = if enabled {
-            match self.lang {
-                Lang::Zh => format!(
-                    "{}（{}）",
-                    i18n::t(self.lang, "menu.blacklist_current"),
-                    clamp_label(name, 40)
-                ),
-                Lang::En => format!(
-                    "{} ({})",
-                    i18n::t(self.lang, "menu.blacklist_current"),
-                    clamp_label(name, 40)
-                ),
-            }
-        } else {
-            i18n::t(self.lang, "menu.blacklist_current").to_string()
-        };
-        IgnoreMenuItem { label, enabled }
+        let has_session = self.state.playing.state != PlaybackState::NoSession;
+        if white {
+            // 白名单模式下「排除」= 从白名单移除。名单为空时它本来就被放行，
+            // 没有可移除的 → 置灰（避免用户点了没反应却以为是 bug）。
+            let can_remove = !self.config.media.whitelist.is_empty();
+            let enabled = has_session && resolvable && can_remove;
+            return IgnoreMenuItem {
+                label: if enabled {
+                    fmt("menu.whitelist_remove_current", name)
+                } else {
+                    i18n::t(self.lang, "menu.whitelist_remove_current").to_string()
+                },
+                enabled,
+            };
+        }
+        let enabled = has_session && resolvable;
+        IgnoreMenuItem {
+            label: if enabled {
+                fmt("menu.blacklist_current", name)
+            } else {
+                i18n::t(self.lang, "menu.blacklist_current").to_string()
+            },
+            enabled,
+        }
     }
 
     /// 「迁移？删除原文件？」两个确认弹窗。返回 `(迁移, 删除)`——用户各自决定。
@@ -3700,6 +3783,8 @@ mod tests {
     #[test]
     fn displayed_session_hit_follows_whitelist_too() {
         let index = MediaIndex::new(&crate::config::MediaConfig {
+            // v1.13.0：白名单只在白名单模式下生效，必须显式设模式
+            mode: crate::config::FilterMode::Whitelist,
             whitelist: vec!["cloudmusic.exe".to_string()],
             ..Default::default()
         });
@@ -3736,6 +3821,86 @@ mod tests {
             arm.contains("self.reduce_filter_set(&path, &value)"),
             "两条名单都必须走 reduce_filter_set（唯一的名单写入入口）"
         );
+    }
+
+    /// **v1.13.0 接线锁**：`media.mode` 必须走自己的入口，且入口内四件事都在。
+    ///
+    /// 这四步少任何一步，症状都是"切了没反应"或"切了要等一秒"：
+    /// ① 脏值丢弃（不猜）；② 幂等（同值不写盘）；③ `index.set` 同步媒体线程；
+    /// ④ `sync_list_now` 立即回落（不等下一轮 tick）。
+    #[test]
+    fn settings_dispatch_routes_filter_mode_through_its_own_entry() {
+        let src = include_str!("app.rs");
+        let start = src.find("Incoming::Set { path, value } =>").expect("找不到 Set 分支");
+        let end = src[start..].find("bridge::apply_set(").expect("找不到 apply_set 调用");
+        let arm = &src[start..start + end];
+        assert!(
+            arm.contains("if path == \"media.mode\""),
+            "Incoming::Set 必须把 media.mode 单独分流"
+        );
+        assert!(
+            arm.contains("self.reduce_filter_mode(&value)"),
+            "media.mode 必须走 reduce_filter_mode"
+        );
+
+        // 入口函数体：切片到下一个 `fn ` 之前
+        let fstart = src.find("fn reduce_filter_mode(").expect("找不到 reduce_filter_mode");
+        let rest = &src[fstart + 1..];
+        let fend = rest.find("\n    fn ").expect("reduce_filter_mode 没有下一个函数");
+        let body = &rest[..fend];
+        for needle in [
+            "FilterMode::parse(raw)",
+            "if mode == self.config.media.mode",
+            "self.index.set(&self.config.media)",
+            "self.sync_list_now()",
+            "Effect::SaveConfig",
+        ] {
+            assert!(body.contains(needle), "reduce_filter_mode 缺少：{needle}");
+        }
+        // 模式变化不改变任何会话身份 → 不该强推一轮 COM 刷新
+        assert!(
+            !body.contains("MediaCommand::Refresh"),
+            "切模式不需要 Refresh；多推一轮 COM 只是白花时间"
+        );
+    }
+
+    /// **v1.13.0 接线锁**：托盘那两项必须按模式分派，否则白名单模式下
+    /// 「拉黑当前应用」会去改一张此刻不生效的表——用户看到的是「点了没反应」。
+    #[test]
+    fn tray_ignore_item_follows_the_filter_mode() {
+        let src = include_str!("app.rs");
+        for (fname, needles) in [
+            (
+                "fn ignore_menu_item(",
+                vec![
+                    "FilterMode::Whitelist",
+                    "menu.whitelist_add_current",
+                    "menu.whitelist_remove_current",
+                    "menu.unblacklist_current",
+                    "menu.blacklist_current",
+                    // 白名单模式下名单为空时"移除"无意义 → 置灰
+                    "!self.config.media.whitelist.is_empty()",
+                ],
+            ),
+            (
+                "fn toggle_ignore_current(",
+                vec![
+                    "self.config.media.mode == FilterMode::Whitelist",
+                    "self.config.media.whitelist.push(key)",
+                    // 移除路径是多行链式调用（clippy 的格式），分开断言
+                    ".whitelist\n                .retain(",
+                    "self.config.media.blacklist.push(id.key)",
+                ],
+            ),
+        ] {
+            let fstart = src.find(fname).unwrap_or_else(|| panic!("找不到 {fname}"));
+            let rest = &src[fstart + 1..];
+            let fend = rest.find("\n    fn ").expect("没有下一个函数");
+            let body = &rest[..fend];
+            for needle in needles {
+                assert!(body.contains(needle), "{fname} 缺少：{needle}");
+            }
+        }
     }
 
     /// 没有会话（空态）时不许把「空身份」误判成命中黑名单。

@@ -347,42 +347,41 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
       </div>
     </section>
 
-    <!-- ============ 媒体筛选（v1.9.0 / G7 黑名单 + v1.12.0 白名单）============
-         语义：白名单**为空 = 不启用**；非空 = 只接管名单内的应用（名单外一律按
-         被拉黑处理）。两份名单**互斥**，同一应用只能待在一侧——加入时由 Rust 拒绝。
-         纪律：不新增任何 CSS 类（P0-03）——灰态用 .dimmed、危险按钮用 .btn.danger、
-         等宽行用 .list .item；#whitelist-title / #blacklist-title 刻意不带
-         data-i18n（动态计数会被 render() 的 [data-i18n] 循环打回模板串，
-         先例 #lyrics-cache-usage）。
+    <!-- ============ 媒体筛选（v1.9.0 / G7 黑名单 + v1.12.0 白名单 + v1.13.0 模式切换）
+         语义：`media.mode` 二选一，**一次只有一种生效**，另一份名单原样保留但不参与
+         判定。两档下「空名单」都是放行全部，所以**切换本身永不会让小组件消失**——
+         只有往白名单里加条目才收窄范围。
+         纪律：不新增任何 CSS 类（P0-03）——切换控件复用 .btn / .btn.primary（当前项
+         高亮），灰态用 .dimmed、危险按钮用 .btn.danger、等宽行用 .list .item；
+         #filter-title / #filter-mode-desc 刻意不带 data-i18n（动态文本会被 render()
+         的 [data-i18n] 循环打回模板串，先例 #lyrics-cache-usage）。
          分区 id 仍是 `group-blacklist`：它是导航常量（Rust `SETTINGS_SECTIONS` /
          前端 activateNav）的锚点，改 id 只会引入「存了旧 id → 打开空白页」的风险。 -->
     <section id="group-blacklist">
       <h1 data-i18n="nav.blacklist">媒体筛选</h1>
-      <p class="sub" data-i18n="filter.sub">白名单留空表示不启用；一旦加入条目，就只有名单内的应用会被接管。黑名单里的应用一律不接管。两份名单互斥，同一个应用只能待在一侧。</p>
+      <p class="sub" data-i18n="filter.sub">一次只用一种筛选方式。另一份名单会原样保留，但不参与判定。</p>
 
-      <div class="card" id="whitelist-card">
-        <h2 id="whitelist-title">白名单</h2>
-        <div class="list" id="whitelist-items"></div>
+      <div class="card" id="filter-mode-card">
+        <div class="row">
+          <div class="label" data-i18n="filter.mode">筛选方式</div>
+          <div class="right">
+            <button class="btn" id="filter-mode-blacklist" data-i18n="filter.mode.blacklist">黑名单</button>
+            <button class="btn" id="filter-mode-whitelist" data-i18n="filter.mode.whitelist">白名单</button>
+          </div>
+        </div>
+        <div class="desc" id="filter-mode-desc"></div>
+      </div>
+
+      <div class="card" id="filter-card">
+        <h2 id="filter-title">黑名单</h2>
+        <div class="list" id="filter-items"></div>
         <div class="row" style="margin-top:8px">
           <div class="desc" data-i18n="filter.hint.match">只按进程名匹配，大小写不敏感；可不带 .exe；填完整路径只取文件名。从「检测到的应用」里加入最稳。</div>
           <div class="right">
-            <input type="text" id="whitelist-input" list="blacklist-candidates" data-i18n-placeholder="filter.whitelist.placeholder">
-            <button class="btn primary" id="whitelist-add" data-i18n="filter.whitelist.add">添加</button>
-            <button class="btn danger" id="whitelist-clear" data-i18n="filter.whitelist.clear">清空白名单</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="card" id="blacklist-card">
-        <h2 id="blacklist-title">黑名单</h2>
-        <div class="list" id="blacklist-items"></div>
-        <div class="row" style="margin-top:8px">
-          <div class="desc" data-i18n="blacklist.hint.match">只按进程名匹配，大小写不敏感；可不带 .exe；填完整路径只取文件名。从「检测到的应用」里加入最稳。</div>
-          <div class="right">
-            <input type="text" id="blacklist-input" list="blacklist-candidates" data-i18n-placeholder="blacklist.add.placeholder">
+            <input type="text" id="filter-input" list="blacklist-candidates" data-i18n-placeholder="filter.placeholder">
             <datalist id="blacklist-candidates"></datalist>
-            <button class="btn primary" id="blacklist-add" data-i18n="blacklist.add">添加</button>
-            <button class="btn danger" id="blacklist-clear" data-i18n="blacklist.clear">清空黑名单</button>
+            <button class="btn primary" id="filter-add" data-i18n="filter.add">添加</button>
+            <button class="btn danger" id="filter-clear" data-i18n="filter.clear">清空</button>
           </div>
         </div>
         <div class="desc" data-i18n="blacklist.hint.browser">提示：浏览器的进程名通常是 msedge.exe、chrome.exe，不是 edge.exe。</div>
@@ -398,7 +397,7 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
           </div>
         </div>
         <div class="list" id="detected-items"></div>
-        <div class="desc" data-i18n="blacklist.detected.note">只能列出正在播放或最近有媒体会话的应用；当前没在播的应用请在上方手动输入进程名。已在某一侧的应用，点另一侧的按钮即可移过去。</div>
+        <div class="desc" data-i18n="blacklist.detected.note">只能列出正在播放或最近有媒体会话的应用；当前没在播的应用请在上方手动输入进程名。按钮作用于当前选中的那份名单。</div>
       </div>
     </section>
 
@@ -511,28 +510,29 @@ const I18N = {
     "lyrics.cache.desc": "命中的歌词按歌曲缓存在这里，命中就不再联网。单条 30 天过期，总量超过 5 MB 时自动删最旧的。这个文件夹可以安全删除——删掉后下次播放会重新查找并缓存；配置文件与已经保存到本地歌词目录的 .lrc 都不受影响。",
     "lyrics.dirs": "本地歌词目录", "lyrics.dirs.add": "添加", "lyrics.dirs.change": "更改", "lyrics.dirs.desc": "扫描这些目录里的 .lrc 文件（含子目录）；点击路径可打开目录。", "lyrics.dirs.empty": "还没有添加目录",
     "nav.blacklist": "媒体筛选",
-    "filter.sub": "白名单留空表示不启用；一旦加入条目，就只有名单内的应用会被接管。黑名单里的应用一律不接管。两份名单互斥，同一个应用只能待在一侧。",
+    "filter.sub": "一次只用一种筛选方式：选哪一档，就只有那一份名单参与判定。另一份会原样保留，切回来还在。",
+    "filter.mode": "筛选方式",
+    "filter.mode.blacklist": "黑名单", "filter.mode.whitelist": "白名单",
+    "filter.mode.desc.blacklist": "黑名单里的应用不被接管：不显示信息、封面与进度，不查歌词，不响应播控。名单为空时，所有应用都会被接管。",
+    "filter.mode.desc.whitelist": "只接管白名单里的应用。名单为空 = 未启用（所有应用都会被接管）；一旦加入条目，名单外的应用会立刻被忽略。",
     "filter.hint.match": "只按进程名匹配，大小写不敏感；可不带 .exe；填完整路径只取文件名。从「检测到的应用」里加入最稳。",
-    "filter.whitelist.title": "白名单（{n}）", "filter.whitelist.title.empty": "白名单",
-    "filter.whitelist.empty": "白名单为空 —— 功能未启用，所有应用都会被识别为媒体源。",
-    "filter.whitelist.placeholder": "输入进程名，如 CloudMusic.exe",
-    "filter.whitelist.add": "添加", "filter.whitelist.clear": "清空白名单",
-    "filter.whitelist.clear.confirm": "清空白名单后功能即停用，所有应用都会重新被识别为媒体源。确定吗？",
+    "filter.title.blacklist": "黑名单（{n}）", "filter.title.blacklist.empty": "黑名单",
+    "filter.title.whitelist": "白名单（{n}）", "filter.title.whitelist.empty": "白名单",
+    "filter.empty.blacklist": "黑名单为空 —— 所有应用都会被接管。",
+    "filter.empty.whitelist": "白名单为空 —— 功能未启用，所有应用都会被接管。",
+    "filter.placeholder": "输入进程名，如 CloudMusic.exe",
+    "filter.add": "添加", "filter.clear": "清空",
+    "filter.clear.confirm": "清空当前这份名单？另一份名单不受影响。",
     "filter.detected.toWhitelist": "加入白名单", "filter.detected.toBlacklist": "加入黑名单",
-    "filter.detected.inWhitelist": "已在白名单", "filter.detected.inBlacklist": "已拉黑",
-    "filter.detected.already.tip": "已经在这一侧了。要换到另一侧，点那个按钮会自动移过去。",
-    "blacklist.card.title": "黑名单（{n}）", "blacklist.card.title.empty": "黑名单",
-    "blacklist.empty": "黑名单为空，所有应用都会被识别为媒体源。",
-    "blacklist.add": "添加", "blacklist.add.placeholder": "输入进程名，如 CloudMusic.exe",
-    "blacklist.remove": "移除", "blacklist.clear": "清空黑名单",
-    "blacklist.clear.confirm": "清空后所有应用都会重新被识别为媒体源，确定要清空吗？",
-    "blacklist.hint.match": "只按进程名匹配，大小写不敏感；可不带 .exe；填完整路径只取文件名。从「检测到的应用」里加入最稳。",
+    "filter.detected.inList": "已在名单内",
+    "filter.detected.already.tip": "已经在当前名单里了。要换到另一份，先切换筛选方式。",
+    "blacklist.remove": "移除",
     "blacklist.hint.browser": "提示：浏览器的进程名通常是 msedge.exe、chrome.exe，不是 edge.exe。",
     "blacklist.detected.title": "检测到的应用", "blacklist.detected.at": "上次检测：", "blacklist.detected.never": "尚未检测",
     "blacklist.detected.refresh": "刷新", "blacklist.detected.empty": "未检测到正在播放的应用。",
-    "blacklist.detected.note": "只能列出正在播放或最近有媒体会话的应用；当前没在播的应用请在上方手动输入进程名。已在某一侧的应用，点另一侧的按钮即可移过去。",
-    "blacklist.detected.add": "加入", "blacklist.detected.unparsed": "无法解析进程名",
-    "blacklist.detected.unparsed.title": "请在黑名单里手动输入进程名",
+    "blacklist.detected.note": "只能列出正在播放或最近有媒体会话的应用；当前没在播的应用请在上方手动输入进程名。按钮作用于当前选中的那份名单。",
+    "blacklist.detected.unparsed": "无法解析进程名",
+    "blacklist.detected.unparsed.title": "请在上方手动输入进程名",
     "blacklist.detected.unverified": "进程名未能验证（可能不是真实文件名，但加入后仍会按此匹配）",
     "blacklist.detected.unknown": "未知应用",
     "volume.sub": "滚轮在小组件上滚动即可调音量。",
@@ -589,29 +589,30 @@ const I18N = {
     "lyrics.cache.desc": "Matched lyrics are cached here per track, so a hit needs no network. Entries expire after 30 days, and the oldest are pruned beyond 5 MB. This folder is safe to delete — the next play simply looks up and caches again; your config and the .lrc files saved into your local lyric folder are unaffected.",
     "lyrics.dirs": "Local lyric folders", "lyrics.dirs.add": "Add", "lyrics.dirs.change": "Change", "lyrics.dirs.desc": "Scan these folders for .lrc files (recursively); click a path to open it.", "lyrics.dirs.empty": "No folders yet",
     "nav.blacklist": "Media filter",
-    "filter.sub": "An empty whitelist means the feature is off. Once you add entries, only those apps are picked up. Apps on the blacklist are never picked up. The two lists are mutually exclusive — an app can only sit on one side.",
+    "filter.sub": "One filter at a time: whichever side is selected is the only list that counts. The other list is kept as-is and comes back when you switch.",
+    "filter.mode": "Filter mode",
+    "filter.mode.blacklist": "Blacklist", "filter.mode.whitelist": "Whitelist",
+    "filter.mode.desc.blacklist": "Apps on the blacklist are ignored: no info, cover or progress, no lyrics, no playback control. When the list is empty, every app is picked up.",
+    "filter.mode.desc.whitelist": "Only apps on the whitelist are picked up. An empty list means the feature is off (every app is picked up); once you add an entry, everything else is ignored right away.",
     "filter.hint.match": "Matched by process name only, case-insensitive. The .exe suffix is optional; a full path keeps just the file name. Adding from \"Detected apps\" is the most reliable way.",
-    "filter.whitelist.title": "Whitelist ({n})", "filter.whitelist.title.empty": "Whitelist",
-    "filter.whitelist.empty": "The whitelist is empty — the feature is off, so every app is picked up.",
-    "filter.whitelist.placeholder": "Process name, e.g. CloudMusic.exe",
-    "filter.whitelist.add": "Add", "filter.whitelist.clear": "Clear whitelist",
-    "filter.whitelist.clear.confirm": "Clearing the whitelist turns the feature off and makes every app a media source again. Continue?",
+    "filter.title.blacklist": "Blacklist ({n})", "filter.title.blacklist.empty": "Blacklist",
+    "filter.title.whitelist": "Whitelist ({n})", "filter.title.whitelist.empty": "Whitelist",
+    "filter.empty.blacklist": "The blacklist is empty — every app is picked up.",
+    "filter.empty.whitelist": "The whitelist is empty — the feature is off, so every app is picked up.",
+    "filter.placeholder": "Process name, e.g. CloudMusic.exe",
+    "filter.add": "Add", "filter.clear": "Clear",
+    "filter.clear.confirm": "Clear this list? The other list is not affected.",
     "filter.detected.toWhitelist": "Add to whitelist", "filter.detected.toBlacklist": "Add to blacklist",
-    "filter.detected.inWhitelist": "Whitelisted", "filter.detected.inBlacklist": "Blacklisted",
-    "filter.detected.already.tip": "Already on this side — use the other button to move it.",
-    "blacklist.card.title": "Blacklist ({n})", "blacklist.card.title.empty": "Blacklist",
-    "blacklist.empty": "The list is empty — every app can be used as a media source.",
-    "blacklist.add": "Add", "blacklist.add.placeholder": "Process name, e.g. CloudMusic.exe",
-    "blacklist.remove": "Remove", "blacklist.clear": "Clear all",
-    "blacklist.clear.confirm": "Clearing the list makes every app a media source again. Continue?",
-    "blacklist.hint.match": "Matched by process name only, case-insensitive. The .exe suffix is optional; a full path keeps just the file name. Adding from \"Detected apps\" is the most reliable way.",
+    "filter.detected.inList": "Already on the list",
+    "filter.detected.already.tip": "Already on the current list. Switch the filter mode to use the other one.",
+    "blacklist.remove": "Remove",
     "blacklist.hint.browser": "Note: browsers are usually msedge.exe or chrome.exe — not edge.exe.",
     "blacklist.detected.title": "Detected apps", "blacklist.detected.at": "Last checked: ", "blacklist.detected.never": "Not checked yet",
     "blacklist.detected.refresh": "Refresh", "blacklist.detected.empty": "No playing apps detected.",
-    "blacklist.detected.note": "Only apps that are playing or recently had a media session can be listed. For others, type the process name above. If an app is already on one list, the other button moves it over.",
-    "blacklist.detected.add": "Add", "blacklist.detected.unparsed": "Process name unavailable",
-    "blacklist.detected.unparsed.title": "Type the process name manually in the blacklist",
-    "blacklist.detected.unverified": "Name unverified (may differ from the real file name; matching still uses this value)",
+    "blacklist.detected.note": "Only apps that are playing or recently had a media session can be listed. For others, type the process name above. Buttons apply to the list currently selected.",
+    "blacklist.detected.unparsed": "Cannot resolve process name",
+    "blacklist.detected.unparsed.title": "Type the process name above",
+    "blacklist.detected.unverified": "Process name unverified (may not be a real file name, but it will still be matched)",
     "blacklist.detected.unknown": "Unknown app",
     "volume.sub": "Scroll on the widget to change volume.",
     "volume.wheel": "Wheel control", "volume.wheel.desc": "Only while the pointer is over the widget.",
@@ -739,67 +740,57 @@ function requestDetect() {
   post({ type: "action", payload: "blacklistEnumerate" });
 }
 
-/* 卡片 A：黑名单列表。行结构照抄 renderDirs（.list > .item > span + .btn.danger）。 */
-function renderBlacklist(list) {
-  const box = document.getElementById("blacklist-items");
-  if (!box) return;
-  box.innerHTML = "";
-  // 标题计数不挂 data-i18n（会被 render() 的 [data-i18n] 循环打回模板串）：
-  // JS 用 t(...).replace("{n}", n)，n=0 时只显示「黑名单」
-  const title = document.getElementById("blacklist-title");
-  if (title) {
-    const n = (list || []).length;
-    title.textContent = n > 0
-      ? t("blacklist.card.title").replace("{n}", String(n))
-      : t("blacklist.card.title.empty");
-  }
-  if (!list || list.length === 0) {
-    const d = document.createElement("div");
-    d.className = "empty";
-    d.textContent = t("blacklist.empty");
-    box.appendChild(d);
-    return;
-  }
-  list.forEach((entry) => {
-    const row = document.createElement("div");
-    row.className = "item";
-    const span = document.createElement("span");
-    // 两行行结构 = span 内叠 .label / .desc（PRD 复核 §2-5）
-    const label = document.createElement("div");
-    label.className = "label";
-    label.textContent = entry;
-    span.appendChild(label);
-    const btn = document.createElement("button");
-    btn.className = "btn danger";
-    btn.textContent = "×";
-    btn.title = t("blacklist.remove");
-    btn.addEventListener("click", () => set("media.blacklist_remove", entry));
-    row.appendChild(span);
-    row.appendChild(btn);
-    box.appendChild(row);
-  });
+/* 当前生效的筛选方式（v1.13.0）。`media.mode` 是唯一来源：
+   Rust 侧 `FilterMode` 序列化成 "blacklist" / "whitelist"，脏值一律当黑名单
+   （与后端 `FilterMode::default()` 同向——后端也不会因为脏值崩）。 */
+function currentMode() {
+  const m = state && state.config && state.config.media && state.config.media.mode;
+  return m === "whitelist" ? "whitelist" : "blacklist";
 }
 
-/* 白名单卡渲染（v1.12.0）。行结构照抄 renderBlacklist：.list > .item > span + .btn.danger。
-   标题计数同样不挂 data-i18n（会被 render() 的 [data-i18n] 循环打回模板串）。 */
-function renderWhitelist(list) {
-  const box = document.getElementById("whitelist-items");
+/* 切换控件的高亮 + 模式说明（#filter-mode-desc 不挂 data-i18n，动态文本）。
+   当前项用 .btn.primary——复用既有样式，不新增 CSS 类（P0-03 纪律）。 */
+function renderFilterMode() {
+  const white = currentMode() === "whitelist";
+  const bl = document.getElementById("filter-mode-blacklist");
+  const wl = document.getElementById("filter-mode-whitelist");
+  if (bl) bl.className = white ? "btn" : "btn primary";
+  if (wl) wl.className = white ? "btn primary" : "btn";
+  const desc = document.getElementById("filter-mode-desc");
+  if (desc) {
+    desc.textContent = t(white ? "filter.mode.desc.whitelist" : "filter.mode.desc.blacklist");
+  }
+}
+
+/* 两份名单共用的列表渲染（v1.13.0）——此前 renderBlacklist 与 renderWhitelist
+   是逐字重复的两份，只有 id 与配置路径不同。合并后「行结构变了只改一处」。
+   标题计数不挂 data-i18n（会被 render() 的 [data-i18n] 循环打回模板串）。 */
+function renderFilterList() {
+  const white = currentMode() === "whitelist";
+  const media = (state && state.config && state.config.media) || {};
+  const list = (white ? media.whitelist : media.blacklist) || [];
+
+  renderFilterMode();
+
+  const title = document.getElementById("filter-title");
+  if (title) {
+    const base = white ? "filter.title.whitelist" : "filter.title.blacklist";
+    title.textContent = list.length > 0
+      ? t(base).replace("{n}", String(list.length))
+      : t(base + ".empty");
+  }
+
+  const box = document.getElementById("filter-items");
   if (!box) return;
   box.innerHTML = "";
-  const title = document.getElementById("whitelist-title");
-  if (title) {
-    const n = (list || []).length;
-    title.textContent = n > 0
-      ? t("filter.whitelist.title").replace("{n}", String(n))
-      : t("filter.whitelist.title.empty");
-  }
-  if (!list || list.length === 0) {
+  if (list.length === 0) {
     const d = document.createElement("div");
     d.className = "empty";
-    d.textContent = t("filter.whitelist.empty");
+    d.textContent = t(white ? "filter.empty.whitelist" : "filter.empty.blacklist");
     box.appendChild(d);
     return;
   }
+  const removePath = white ? "media.whitelist_remove" : "media.blacklist_remove";
   list.forEach((entry) => {
     const row = document.createElement("div");
     row.className = "item";
@@ -812,7 +803,7 @@ function renderWhitelist(list) {
     btn.className = "btn danger";
     btn.textContent = "×";
     btn.title = t("blacklist.remove");
-    btn.addEventListener("click", () => set("media.whitelist_remove", entry));
+    btn.addEventListener("click", () => set(removePath, entry));
     row.appendChild(span);
     row.appendChild(btn);
     box.appendChild(row);
@@ -829,18 +820,16 @@ function sameApp(entry, process) {
   return a !== "" && a === b;
 }
 
-/* 卡片 C：「检测到的应用」。**不再过滤已在一侧的行**（v1.12.0）——
-   过滤掉的话，用户没有任何入口把某个应用从黑名单挪到白名单。
-   现在每行给两个按钮（「移到白名单」/「移到黑名单」）：所在侧那个置灰，
-   对侧那个点击时先移除再加，跨名单换侧一步到位。
-   枚举本身仍由 Rust 侧 `is_filtered` 判接管资格，与这里的显示无关。 */
+/* 卡片 C：「检测到的应用」。
+   v1.13.0：切换控件上线后，行尾只给**一个**按钮——作用于当前选中的名单。
+   两个按钮的说法已经自相矛盾（另一份名单此刻不参与判定，给它一个按钮等于
+   暗示它也在生效）。已在名单内的行按钮置灰并标「已在名单内」；
+   想换到另一份名单，先切模式再点（因为两张表允许重叠，不需要"移过去"）。
+   枚举本身由 Rust 侧 `is_filtered` 判接管资格，与这里的显示无关。 */
 function renderDetected() {
   const box = document.getElementById("detected-items");
   if (!box) return;
   box.innerHTML = "";
-  const media = (state && state.config && state.config.media) || {};
-  const blacklist = media.blacklist || [];
-  const whitelist = media.whitelist || [];
   if (!detectedLoaded) {
     const d = document.createElement("div");
     d.className = "empty";
@@ -855,9 +844,14 @@ function renderDetected() {
     box.appendChild(d);
     return;
   }
+  const white = currentMode() === "whitelist";
+  const media = (state && state.config && state.config.media) || {};
+  const list = (white ? media.whitelist : media.blacklist) || [];
+  const addPath = white ? "media.whitelist_add" : "media.blacklist_add";
+  const addLabel = t(white ? "filter.detected.toWhitelist" : "filter.detected.toBlacklist");
+
   detectedApps.forEach((a) => {
-    const inB = !!(a.process && blacklist.some((e) => sameApp(e, a.process)));
-    const inW = !!(a.process && whitelist.some((e) => sameApp(e, a.process)));
+    const inList = !!(a.process && list.some((e) => sameApp(e, a.process)));
     const row = document.createElement("div");
     row.className = "item";
     if (!a.playable) row.classList.add("dimmed");
@@ -870,51 +864,33 @@ function renderDetected() {
     desc.className = "desc";
     desc.textContent = a.process ? a.process : t("blacklist.detected.unparsed");
     span.appendChild(desc);
-    // 行尾小字：解析不出来 → 提示手输；否则标出它当前在哪一侧
+    // 行尾小字：解析不出来 → 提示手输；已在当前名单 → 标出来
     if (a.playable && !a.resolved) {
       const note = document.createElement("div");
       note.className = "desc";
       note.textContent = t("blacklist.detected.unverified");
       span.appendChild(note);
-    } else if (inB) {
+    } else if (inList) {
       const note = document.createElement("div");
       note.className = "desc";
-      note.textContent = t("filter.detected.inBlacklist");
-      span.appendChild(note);
-    } else if (inW) {
-      const note = document.createElement("div");
-      note.className = "desc";
-      note.textContent = t("filter.detected.inWhitelist");
+      note.textContent = t("filter.detected.inList");
       span.appendChild(note);
     }
 
-    /* 两个按钮 = 「移到这一侧」：所在侧置灰（再点只会得到 Duplicate）；
-       在对侧时**先移除再加**（两次 set 保序，终态仍不共存，符合互斥裁决）。
-       不这样做的话，用户在检测行上没有任何办法把应用从一侧挪到另一侧，
-       只能滚上去在卡片里点 × —— 两处相距很远，实际没人会那么用。 */
-    const mkMove = (text, addPath, removePath, inThis, inOther) => {
-      const btn = document.createElement("button");
-      btn.className = "btn";
-      btn.textContent = text;
-      if (!a.playable) {
-        btn.disabled = true;
-        btn.title = t("blacklist.detected.unparsed.title");
-        return btn;
-      }
-      if (inThis) {
-        btn.disabled = true;
-        btn.title = t("filter.detected.already.tip");
-        return btn;
-      }
-      btn.addEventListener("click", () => {
-        if (inOther) set(removePath, a.process);
-        set(addPath, a.process);
-      });
-      return btn;
-    };
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.textContent = addLabel;
+    if (!a.playable) {
+      btn.disabled = true;
+      btn.title = t("blacklist.detected.unparsed.title");
+    } else if (inList) {
+      btn.disabled = true;
+      btn.title = t("filter.detected.already.tip");
+    } else {
+      btn.addEventListener("click", () => set(addPath, a.process));
+    }
     row.appendChild(span);
-    row.appendChild(mkMove(t("filter.detected.toWhitelist"), "media.whitelist_add", "media.blacklist_remove", inW, inB));
-    row.appendChild(mkMove(t("filter.detected.toBlacklist"), "media.blacklist_add", "media.whitelist_remove", inB, inW));
+    row.appendChild(btn);
     box.appendChild(row);
   });
 }
@@ -1048,10 +1024,9 @@ function render() {
   document.getElementById("volume-step").value = String(c.volume.step);
   document.getElementById("volume-hud").value = String(c.volume.hud_ms);
 
-  // 媒体筛选（v1.9.0 / G7 黑名单 + v1.12.0 白名单）：每次配置变更回推都重画，
-  // 「加入/移除」后列表与检测行状态立即跟着变
-  renderWhitelist((c.media && c.media.whitelist) || []);
-  renderBlacklist((c.media && c.media.blacklist) || []);
+  // 媒体筛选（v1.13.0）：切换控件 + 单卡。每次配置变更回推都重画，
+  // 「切模式 / 加入 / 移除」后列表与检测行状态立即跟着变
+  renderFilterList();
   renderDetected();
   refreshDetectedAt();
   renderCandidates();
@@ -1291,38 +1266,29 @@ document.getElementById("open-netease").addEventListener("click", () => post({ t
 document.getElementById("lyrics-cache-dir").addEventListener("click", () => post({ type: "action", payload: "openLyricsCacheDir" }));
 document.getElementById("lyrics-cache-open").addEventListener("click", () => post({ type: "action", payload: "openLyricsCacheDir" }));
 
-/* ---------------- 黑名单控件事件（v1.9.0 / G7） ----------------
+/* ---------------- 媒体筛选控件事件（v1.9.0 / G7 → v1.13.0 合并） ----------------
    前端**不做**归一化校验（归一化只在 Rust 一处，前端校验是第二套规则，必然漂移）；
-   输入错误由 Rust 的分档 toast 反馈。清空走 window.confirm()（裁决 A5）。 */
-function blacklistAddClicked() {
-  const input = document.getElementById("blacklist-input");
+   输入错误由 Rust 的分档 toast 反馈。清空走 window.confirm()（裁决 A5）。
+   名单路径按当前模式拼——这是"一份控件管两张表"的全部差异。 */
+function filterAddClicked() {
+  const input = document.getElementById("filter-input");
   if (!input) return;
   // 空输入也不做前端拦截：照发，Rust 归一化返回 Empty → toast「请输入进程名」
-  set("media.blacklist_add", input.value.trim());
+  set(currentMode() === "whitelist" ? "media.whitelist_add" : "media.blacklist_add", input.value.trim());
   input.value = "";
 }
-document.getElementById("blacklist-add").addEventListener("click", blacklistAddClicked);
-document.getElementById("blacklist-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") blacklistAddClicked();
+document.getElementById("filter-add").addEventListener("click", filterAddClicked);
+document.getElementById("filter-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") filterAddClicked();
 });
-document.getElementById("blacklist-clear").addEventListener("click", () => {
-  if (confirm(t("blacklist.clear.confirm"))) set("media.blacklist_clear", true);
+document.getElementById("filter-clear").addEventListener("click", () => {
+  if (!confirm(t("filter.clear.confirm"))) return;
+  set(currentMode() === "whitelist" ? "media.whitelist_clear" : "media.blacklist_clear", true);
 });
-/* v1.12.0：白名单控件。与黑名单同款——前端不做归一化校验，错误由 Rust 分档 toast 反馈；
-   清空同样走 window.confirm()（不新增弹窗样式）。 */
-function whitelistAddClicked() {
-  const input = document.getElementById("whitelist-input");
-  if (!input) return;
-  set("media.whitelist_add", input.value.trim());
-  input.value = "";
-}
-document.getElementById("whitelist-add").addEventListener("click", whitelistAddClicked);
-document.getElementById("whitelist-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") whitelistAddClicked();
-});
-document.getElementById("whitelist-clear").addEventListener("click", () => {
-  if (confirm(t("filter.whitelist.clear.confirm"))) set("media.whitelist_clear", true);
-});
+/* 切换控件：点击只发 media.mode，重推 state 后 renderFilterList() 整页重画
+   （高亮、标题、说明、列表、检测行的按钮文案全跟着变）。 */
+document.getElementById("filter-mode-blacklist").addEventListener("click", () => set("media.mode", "blacklist"));
+document.getElementById("filter-mode-whitelist").addEventListener("click", () => set("media.mode", "whitelist"));
 /* v1.11.0：清空歌词缓存。确认走 window.confirm（与黑名单清空同款，不新增弹窗样式）。
    清完由 Rust 回推 cacheStats 覆盖上面的统计数字，这里不做本地清零。 */
 document.getElementById("lyrics-cache-clear").addEventListener("click", () => {
