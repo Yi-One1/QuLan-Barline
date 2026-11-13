@@ -849,6 +849,10 @@ function activateNav(group) {
     const firstGroup = first && first.dataset.group;
     if (firstGroup && firstGroup !== group) return activateNav(firstGroup);
   }
+  // v1.12.0 / G1b：把当前分区告诉 Rust，关窗再开时恢复到这一页。
+  // 只在内存里记（不写 config）——进程重启后回到第一个分区。
+  // 未知分区会被 Rust 侧 accept_section() 丢弃，这里不必先校验。
+  post({ type: "action", payload: "navEntered:" + group });
   // v1.8.0 / R2：进入歌词分区时统计一次缓存占用（覆盖「首次进入」与
   // 「切走再切回」两种情形；分区内的开关改动**不**重扫）
   if (group === "group-lyrics") requestCacheStats();

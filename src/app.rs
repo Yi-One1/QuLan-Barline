@@ -252,6 +252,15 @@ pub struct App {
     hotkeys: crate::hotkey::Hotkeys,
     /// 设置页（T13）
     settings: crate::settings::SettingsService,
+    /// 设置页最后一次停留的分区（v1.12.0 / G1b）。
+    ///
+    /// **只在内存里**：进程退出即清空——用户要求「关窗再开停在上次分区，
+    /// 但进程重启后回到第一个分区」，所以它刻意不写 config.json。
+    ///
+    /// 类型是 `Option<&'static str>` 而不是 `String`：值只能来自
+    /// [`SETTINGS_SECTIONS`] 里的常量（经 [`accept_section`] 过滤），
+    /// 从类型上就杜绝了「存进一个不存在的 DOM id，下次打开把用户送进空白页」。
+    last_section: Option<&'static str>,
     /// 模块句柄（建设置窗口 / 加载图标用）
     hinstance: HINSTANCE,
     renderer: Option<Renderer>,
@@ -370,16 +379,36 @@ pub const LYRIC_FADE_OUT_SECS: f32 = 0.120;
 /// 转场里旧歌词的上移总位移（逻辑像素，随 DPI 缩放；ease-out cubic）。
 pub const LYRIC_SLIDE_PX: f32 = 6.0;
 
-/// 无会话时打开设置页要直达的分区（**必须与 `assets/ui/index.html` 的元素 id 一致**）。
+/// 进程内第一次打开设置页时停留的分区（用户裁决 2026-11-13：**一律第一个分区**，
+/// 不再因为「当前没有播放器」而特殊跳到黑名单）。
 ///
-/// v1.12.0 / G1 的教训：这里原先写的是 `"blacklist"`，而页面里的分区 id 是
-/// `"group-blacklist"`。前端 `activateNav()` 会先把所有分区的 `active` 摘掉，
-/// 再 `getElementById("blacklist")` 找不到目标 —— 于是**侧栏正常、右侧内容区全空**。
-/// 只在「无播放器时从托盘打开设置」这条路径上出现，所以平常看不出来。
+/// 必须与 `assets/ui/index.html` 里 `<section id="...">` 一致：
+/// v1.12.0 / G1 的空白页事故就是「Rust 传的分区名不是真实 DOM id」——
+/// `activateNav()` 先把所有分区的 `active` 摘掉，再找不到目标，于是一个分区都没激活。
+const FIRST_SECTION: &str = "group-appearance";
+
+/// 设置页的全部分区 id（与 `index.html` 的 nav `data-group` / `<section id>` 一一对应）。
 ///
-/// 单独抽成常量是为了能被 `no_session_section_exists_in_settings_dom` 直接断言：
-/// 该测试拿这个值去 `index.html` 里核对 `id=` 与 `data-group=`，名字一改就红。
-const NO_SESSION_SECTION: &str = "group-blacklist";
+/// 用途有二：① 校验前端上报的「当前分区」（脏值不落到 [`App::last_section`]）；
+/// ② 给 `settings_sections_all_exist_in_dom` 一份可枚举的清单，加分区忘了同步 HTML
+/// 会直接测试变红。新增分区时**必须**同时改这里和 HTML。
+const SETTINGS_SECTIONS: [&str; 7] = [
+    "group-appearance",
+    "group-lyrics",
+    "group-volume",
+    "group-blacklist",
+    "group-hotkeys",
+    "group-general",
+    "group-about",
+];
+
+/// 校验并归一化前端上报的分区名：只接受 [`SETTINGS_SECTIONS`] 里的值。
+///
+/// 抽成纯函数是为了能直接测：脏值（空串 / `"blacklist"` / `"group-unknown"`）
+/// 必须被拒绝，否则会被记进 `last_section`，下次打开就成了错误的初始分区。
+fn accept_section(group: &str) -> Option<&'static str> {
+    SETTINGS_SECTIONS.iter().copied().find(|s| *s == group)
+}
 
 /// 全屏遮挡态对账的**来源**（v1.5.6 / G3.5-A）。
 ///
@@ -504,6 +533,7 @@ impl App {
             lyric: None,
             index,
             ignored: None,
+            last_section: None,
             sampler,
             geometry,
             target_rect,
@@ -1752,6 +1782,18 @@ impl App {
             self.relocate_lyrics_dir(idx);
             return;
         }
+        // 设置页每次切换分区上报一次：`navEntered:<group-id>`（v1.12.0 / G1b）。
+        //
+        // 只记在内存里（不写 config）：用于「关窗再开恢复上次分区」，
+        // 进程重启后自然回到第一个分区。未知值直接丢弃——把它记下来，
+        // 下次打开就会拿它当初始分区，等于把用户送进空白页。
+        if let Some(group) = action.strip_prefix("navEntered:") {
+            match accept_section(group) {
+                Some(section) => self.last_section = Some(section),
+                None => crate::log_debug!("设置页上报了未知分区：{group}"),
+            }
+            return;
+        }
         // 歌词目录路径链接：openLyricsDir:<idx> → 资源管理器打开该目录
         if let Some(idx) = action
             .strip_prefix("openLyricsDir:")
@@ -2555,11 +2597,11 @@ impl App {
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
                 Effect::OpenSettings => {
-                    // v1.9.0（G7 / P1-03）：当前无会话 → 打开后直达黑名单分区。
-                    // v1.12.0 / G1：分区名必须是真实 DOM id（`group-blacklist`），
-                    // 见 `NO_SESSION_SECTION` 的说明——传错会让内容区整片空白。
-                    let open_section = (self.state.playing.state == PlaybackState::NoSession)
-                        .then_some(NO_SESSION_SECTION);
+                    // v1.12.0 / G1b（用户裁决）：窗口停在上次关窗时看的分区；
+                    // 本进程还没打开过设置（或记录被丢弃）→ 第一个分区。
+                    // 分区名一律来自 `SETTINGS_SECTIONS`，不会再把错误 id 送进
+                    // `activateNav()`（G1 的空白页事故）。
+                    let open_section = Some(self.last_section.unwrap_or(FIRST_SECTION));
                     let json = self.settings_state_json_with(open_section);
                     // 标题栏明暗必须与页面内容同源（QA-M4 缺陷 #3）：页面 CSS 跟随
                     // 系统 prefers-color-scheme，所以这里读系统设置而不是小组件的
@@ -3942,25 +3984,75 @@ mod tests {
         );
     }
 
-    /// **v1.12.0 / G1**：无会话打开设置时的初始分区，必须是设置页里**真实存在**的分区。
+    /// **v1.12.0 / G1b**：分区清单必须与设置页 DOM 一一对应。
     ///
-    /// 回归的是「侧栏在、内容区全空」那个 bug：Rust 传 `"blacklist"`，页面元素却叫
-    /// `"group-blacklist"`；`activateNav()` 先把所有分区的 `active` 摘掉，再
-    /// `getElementById()` 找不到目标 → 一个分区都没激活。这条路径只在「无播放器时
-    /// 从托盘打开设置」触发，所以平常看不出来。
-    ///
-    /// 同时核对两样：`id=`（section 元素）与 `data-group=`（导航按钮）。缺任何一个，
-    /// 激活都会失败——只改常量名不改 HTML / 只改 HTML 不改常量，都会在这里变红。
+    /// 这条同时守住两件事：① G1 那次空白页事故（Rust 传的分区名不是真实 DOM id）；
+    /// ② 以后加分区时改了 HTML 却忘了改 `SETTINGS_SECTIONS`（或反之）——
+    /// 前者会让 `navEntered` 上报被丢弃、关窗再开丢失分区；后者会让初始分区指空。
     #[test]
-    fn no_session_section_exists_in_settings_dom() {
+    fn settings_sections_all_exist_in_dom() {
         let html = include_str!("../assets/ui/index.html");
+        for section in SETTINGS_SECTIONS {
+            assert!(
+                html.contains(&format!("id=\"{section}\"")),
+                "index.html 里没有 id=\"{section}\" 的 <section>"
+            );
+            assert!(
+                html.contains(&format!("data-group=\"{section}\"")),
+                "index.html 里没有 data-group=\"{section}\" 的导航按钮"
+            );
+        }
         assert!(
-            html.contains(&format!("id=\"{NO_SESSION_SECTION}\"")),
-            "初始分区 {NO_SESSION_SECTION:?} 在 index.html 里没有对应 id 的 <section>"
+            SETTINGS_SECTIONS.contains(&FIRST_SECTION),
+            "初始分区 {FIRST_SECTION:?} 不在分区清单里"
         );
+    }
+
+    /// **v1.12.0 / G1b**：脏分区名必须被拒绝。
+    ///
+    /// `last_section` 存的是「下次打开时的初始分区」，一旦存进脏值，下次开窗就会
+    /// 拿它去 `activateNav()`，最坏情况是空白内容区（正是 G1 的现象）。
+    /// 所以只接受清单内的值，其余一律丢弃。
+    #[test]
+    fn accept_section_rejects_dirty_values() {
+        assert_eq!(accept_section("group-lyrics"), Some("group-lyrics"));
+        assert_eq!(accept_section("group-about"), Some("group-about"));
+        for bad in ["", "blacklist", "group-unknown", "group-lyrics ", "GROUP-LYRICS"] {
+            assert_eq!(accept_section(bad), None, "{bad:?} 必须被拒绝");
+        }
+    }
+
+    /// **v1.12.0 / G1b 接线锁**：写入侧与读取侧都必须真的接上。
+    ///
+    /// 只测 `accept_section()` 这种纯函数抓不到「记了但没用」——例如有人在
+    /// `OpenSettings` 里图省事直接写 `FIRST_SECTION`，功能就悄悄退化成「每次都第一页」，
+    /// 而所有单元测试依然全绿。所以这里读源码钉住两句话。
+    #[test]
+    fn last_section_is_written_and_read_back() {
+        let src = include_str!("app.rs");
+
+        // ① 前端上报 → 写进 last_section
+        let w = src
+            .find("if let Some(group) = action.strip_prefix(\"navEntered:\")")
+            .expect("必须处理 navEntered 上报");
+        let wbody = &src[w..(w + 500).min(src.len())];
         assert!(
-            html.contains(&format!("data-group=\"{NO_SESSION_SECTION}\"")),
-            "初始分区 {NO_SESSION_SECTION:?} 不是任何导航按钮的 data-group"
+            wbody.contains("self.last_section = Some(section)"),
+            "分区上报必须落进 last_section，否则关窗再开恢复不了"
+        );
+
+        // ② 打开设置 → 读 last_section，缺省 FIRST_SECTION
+        let o = src
+            .find("Effect::OpenSettings =>")
+            .expect("必须有打开设置分支");
+        let rest = &src[o..];
+        let end = rest
+            .find("self.settings.open(")
+            .expect("分支里必须真的开窗");
+        let obody = &rest[..end];
+        assert!(
+            obody.contains("self.last_section.unwrap_or(FIRST_SECTION)"),
+            "打开设置必须优先用 last_section，缺省才回第一个分区"
         );
     }
 
