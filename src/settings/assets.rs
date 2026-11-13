@@ -15,6 +15,20 @@ pub fn index_html() -> String {
 mod tests {
     use super::*;
 
+    /// 取 `id="xxx"` 所在的**整个开始标签**（`<` 到 `>`），用于检查属性。
+    ///
+    /// 坑：只切到 `id=` 之前是常见写法，但 `data-i18n` 几乎总写在 id 后面——
+    /// 那种写法无论怎么加属性都不会红，等于没有断言（v1.12.0 变异测试抓到）。
+    fn tag_of(html: &str, anchor: &str) -> String {
+        let at = html
+            .find(&format!("id=\"{anchor}\""))
+            .unwrap_or_else(|| panic!("找不到 #{anchor}"));
+        let start = html[..at].rfind('<').unwrap_or(0);
+        let rest = &html[start..];
+        let end = rest.find('>').map(|e| e + 1).unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
     #[test]
     fn html_is_embedded_and_has_charset() {
         assert!(INDEX_HTML.len() > 10_000, "HTML 太小，可能没内嵌进来");
@@ -202,12 +216,7 @@ mod tests {
         );
         // ② 两个锚点都必须是「无 data-i18n」的纯 JS 填充元素
         for anchor in ["lyrics-cache-dir", "lyrics-cache-usage"] {
-            let at = INDEX_HTML
-                .find(&format!("id=\"{anchor}\""))
-                .unwrap_or_else(|| panic!("找不到 #{anchor}"));
-            // 往前取到同一个标签的开始，检查这段属性里没有 data-i18n
-            let tag_start = INDEX_HTML[..at].rfind('<').unwrap_or(0);
-            let tag = &INDEX_HTML[tag_start..at];
+            let tag = tag_of(INDEX_HTML, anchor);
             assert!(
                 !tag.contains("data-i18n"),
                 "#{anchor} 的标签带了 data-i18n，动态文本会被 render() 打回模板串：{tag}"
@@ -357,16 +366,14 @@ mod tests {
     #[test]
     fn blacklist_dynamic_title_has_no_data_i18n_and_keys_are_bilingual() {
         // ① #blacklist-title 不带 data-i18n
-        let at = INDEX_HTML.find("id=\"blacklist-title\"").expect("找不到 #blacklist-title");
-        let tag_start = INDEX_HTML[..at].rfind('<').unwrap_or(0);
-        let tag = &INDEX_HTML[tag_start..at];
+        let tag = tag_of(INDEX_HTML, "blacklist-title");
         assert!(
             !tag.contains("data-i18n"),
             "#blacklist-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
         );
         // ② 关键词条中英都在（I18N.zh 与 I18N.en 各一份；needle = key + 文案前缀）
         for (key, zh, en) in [
-            ("nav.blacklist", "黑名单", "Blacklist"),
+            ("nav.blacklist", "媒体筛选", "Media filter"),
             ("blacklist.detected.unverified", "进程名未能验证", "Name unverified"),
             ("blacklist.hint.match", "只按进程名匹配", "Matched by process name only"),
             ("blacklist.clear.confirm", "清空后所有应用", "Clearing the list"),
@@ -389,6 +396,95 @@ mod tests {
         assert!(
             INDEX_HTML.contains("i18nPlaceholder"),
             "render() 缺 [data-i18n-placeholder] 循环（dataset 名是 i18nPlaceholder）"
+        );
+    }
+
+    /// **v1.12.0 白名单 UI 契约**：锚点 / 配置路径 / 动态标题 / 中英词条。
+    ///
+    /// 与 G7 黑名单那三条同款断言——白名单是从既有卡片复制出来的，
+    /// 复制后最容易漏的是「动态标题挂了 data-i18n」（计数被 render() 打回模板串）
+    /// 和「只写了 zh 忘了 en」（界面直接显示裸键名）。
+    #[test]
+    fn whitelist_section_ids_paths_and_keys_exist() {
+        for id in [
+            "whitelist-card",
+            "whitelist-title",
+            "whitelist-items",
+            "whitelist-input",
+            "whitelist-add",
+            "whitelist-clear",
+        ] {
+            assert!(INDEX_HTML.contains(&format!("id=\"{id}\"")), "缺少 #{id}");
+        }
+        for path in [
+            "media.whitelist_add",
+            "media.whitelist_remove",
+            "media.whitelist_clear",
+        ] {
+            assert!(INDEX_HTML.contains(path), "页面没有接配置路径 {path}");
+        }
+
+        // 动态标题不许带 data-i18n
+        let tag = tag_of(INDEX_HTML, "whitelist-title");
+        assert!(
+            !tag.contains("data-i18n"),
+            "#whitelist-title 带了 data-i18n，动态计数会被 render() 打回模板串：{tag}"
+        );
+
+        // 中英词条各一份
+        for (key, zh, en) in [
+            ("filter.sub", "白名单留空表示不启用", "An empty whitelist means the feature is off"),
+            ("filter.whitelist.add", "添加", "Add"),
+            ("filter.whitelist.clear", "清空白名单", "Clear whitelist"),
+            ("filter.whitelist.empty", "白名单为空", "The whitelist is empty"),
+            ("filter.detected.toWhitelist", "加入白名单", "Add to whitelist"),
+            ("filter.detected.toBlacklist", "加入黑名单", "Add to blacklist"),
+            ("filter.detected.inWhitelist", "已在白名单", "Whitelisted"),
+            ("filter.detected.inBlacklist", "已拉黑", "Blacklisted"),
+            ("filter.detected.already.tip", "已经在这一侧了", "Already on this side"),
+        ] {
+            assert!(INDEX_HTML.contains(&format!("\"{key}\": \"{zh}")), "zh 缺词条：{key}");
+            assert!(INDEX_HTML.contains(&format!("\"{key}\": \"{en}")), "en 缺词条：{key}");
+        }
+    }
+
+    /// **v1.12.0 接线锁**：检测行必须同时看两张表，并给出两个动作按钮。
+    ///
+    /// 退回「只按黑名单过滤」时，白名单条目在检测列表里没有任何入口，
+    /// 而所有 Rust 侧测试照样全绿（它们只测后端判定）。
+    #[test]
+    fn detected_rows_consider_both_lists() {
+        let start = INDEX_HTML
+            .find("function renderDetected()")
+            .expect("找不到 renderDetected");
+        // 按**字符**截 4000 个（不能按字节切：HTML 是中文，切点会落在多字节字符中间 panic）
+        let body: String = INDEX_HTML[start..].chars().take(4000).collect();
+        // 必须断言**配置读取**本身，不能只查 "media.whitelist" 子串——
+        // 动作名 `"media.whitelist_add"` 里也有这六个字，会让断言被自己满足。
+        assert!(
+            body.contains("const whitelist = media.whitelist"),
+            "检测行没有读白名单配置"
+        );
+        assert!(
+            body.contains("const blacklist = media.blacklist"),
+            "检测行没有读黑名单配置"
+        );
+        assert!(body.contains("filter.detected.toWhitelist"), "缺「加入白名单」按钮");
+        assert!(body.contains("filter.detected.toBlacklist"), "缺「加入黑名单」按钮");
+        // 互斥下的换侧：对侧按钮必须先 remove 再 add，否则点了会被 Rust 拒绝（Conflict），
+        // 而检测行上也没有别的入口能把应用挪到另一侧。
+        assert!(
+            body.contains("\"media.whitelist_add\", \"media.blacklist_remove\""),
+            "「加入白名单」在已拉黑时必须先移出黑名单"
+        );
+        // 参数对还不够，必须真的调用——否则「换侧」只剩一串没用的实参
+        assert!(
+            body.contains("if (inOther) set(removePath, a.process);"),
+            "换侧前必须先移除对侧条目（否则 Rust 会返回 Conflict，点击无效果）"
+        );
+        assert!(
+            body.contains("\"media.blacklist_add\", \"media.whitelist_remove\""),
+            "「加入黑名单」已在白名单时必须先移出白名单"
         );
     }
 
