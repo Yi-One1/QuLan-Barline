@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-10 21:00 · **G1~G7 全部真人验收通过；G8 分组全部验收通过（① v1.9.1 / ② v1.9.2 / ④ v1.9.3 补修 / ③ v1.10.0）** · 当前 **v1.10.0**（636 测试：635 passed + 1 ignored，clippy 0 警告）· **源码已全部推送 `origin/main`**（G8 全部提交与 2 个收尾提交均已入库，`git ls-remote` 实测本地与远端一致；当前 HEAD 以 `git log -1` 为准）· **GitHub Release 已发布**：v1.9.0、v1.10.0（v1.10.0 附件 `Barline_v1.10.0.exe` = 1,169,920 B，与本地包同尺寸）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 清单口径见 §3.5「已裁决不再议」与 §3.6 候选池 · 新对话从 §5 接手须知开始。
+> **最后更新**：2026-11-14 01:15 · **G1~G7 全部验收通过；G8 ①~④ + 白名单 / 媒体筛选 / 分区记忆 / 清空缓存 / 语言当窗生效 全部验收通过** · 当前 **v1.13.1**（673 测试：672 passed + 1 ignored，clippy 0 警告）· **GitHub Release 已发布**：v1.9.0、v1.10.0、v1.11.0、v1.12.0、v1.13.0（v1.13.1 包已出，Release 待用户手动发布；tag `v1.13.1` 应先建再建 Release，见 §2.7）· 版权人已统一实名 `Yi One`（LICENSE + exe 资源）· 清单口径见 §3.5「已裁决不再议」与 §3.6 候选池 · 新对话从 §5 接手须知开始。
 
 ---
 
@@ -13,12 +13,12 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
 | 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
-| 当前版本 | **v1.10.0**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
-| 质量 | 测试 **636**（635 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 ≈1142.5 KB（v1.10.0 = 1,169,920 B） |
+| 当前版本 | **v1.13.1**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
+| 质量 | 测试 **673**（672 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1,191,936 B（v1.13.1） |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
 | 自测 | 根目录 **`启动曲栏.bat`**（增量构建 + 跑未打包 exe）；新包在 `deliverables/` |
 | 交付包 | `deliverables/曲栏_Barline_vX.Y.Z.exe`，**只增不删** |
-| 版本策略 | 改可见行为/新增能力 → 升**第二**位；纯修正/文案/内部重构 → 升**第三**位 |
+| 版本策略 | **严格 SemVer 2.0.0**：不兼容 → MAJOR；向下兼容的**新能力** → MINOR；向下兼容的**问题修正（含用户可感知的 bug 修复）** → PATCH。不掺自定义条款，详见 §2.6 |
 | 节奏 | 一次一组 → 全绿测试 → 单提交 → 出包 → **用户真人验收** → 才更新文档 → 下一组 |
 
 ---
@@ -139,6 +139,22 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **G5 顺带新增两条长效锁**：`every_get_element_by_id_literal_exists_in_dom`（JS 里 `getElementById("字面量")` 必须在 DOM 里有对应 id —— id 批量改名时漏一处就是 `null.addEventListener`，整段脚本从那一行起失效）、`every_i18n_attribute_has_both_languages`（每个 `data-i18n` 键中英各一份，缺一侧界面显示裸键名）。
 - **G5 收尾 → v1.13.0**：升版 5 处 + `Cargo.lock`，出包 `deliverables/曲栏_Barline_v1.13.0.exe`（1,191,936 B）；测试 **666**、clippy 0。
 
+### 第八轮（2026-11-14，用户 1 项）：G8-⑥ 暂停不漂移 → v1.13.1
+
+团队 `gstack-soda-pause-sticky`（investigator 定位 + qa-lead 验证，实现由主理人承担）。报告：`deliverables/gstack/debug-soda-pause-session-drift-2026-11-14.md`。
+
+- **现象**：汽水音乐播放中、后台另有网易云（未播放）；暂停汽水 → 小组件跳到网易云（此时无任何播放）；再按播放键起不来汽水那首，非得打开汽水窗口。
+- **根因（日志铁证，不是推理）**：`scan_decision()` 的判定次序**缺一条优先级**。用户黑名单里有 `msedge.exe` ⇒ G8-① 锁定模式长期生效（`display_session.is_some()` ⇒ `scan_gate` 恒真 ⇒ 每 1s 枚举一次 `GetSessions()`）⇒ 暂停那一刻所有正常会话都 not playing ⇒ `choose_session()` 规则③「全都暂停 → 取系统顺序第一个」把 `index=1` 的幽灵 cloudmusic 顶上来 ⇒ `switch_display_session()` 整份作废缓存 ⇒ 漂移 + 播控错位。日志统计：673 次切换里 **642 次**目标是 `cloudmusic.exe playing=false`，三次暂停三次 0.5~1.0s 后复现；`00:15:47 命令 PlayPause 已下发` 之后紧接着是 `aumid=cloudmusic.exe state=Playing`。
+- **修法**：新增纯函数 `sticky_index(candidates, displayed)`（只认 `!c.ignored && aumid == shown`），`scan_decision()` 补中段优先级 → **`Release > 合法切换(Playing) > 粘性 > 系统顺序第一个/Hide`**，命中返回 `Keep(i)`（**只刷 COM 句柄，不清缓存、不重播、不动歌词钟**）。
+  - **为什么一箭双雕**：`display_session` 保住汽水 ⇒ `execute()` 自然把 PlayPause 打给汽水，播控路径**零改动**。
+  - **`choose_session()` 一行未改**，规则③降级为「冷启动兜底」（只在上次显示的会话已消失时才用到）。这条必须写进注释，否则下一个人会照旧改回去。
+  - 粘性三个边界：被拉黑的会话绝不许借粘性复活（`!c.ignored` 前置）；应用关掉后候选消失 ⇒ `sticky_index` 返回 `None` ⇒ 正常跟随离开；**有正常会话在播时粘性必须让路**（否则「用户真切到网易云」会被永久拒绝）。
+- **红线零改动**（QA 用 diff hunk 边界取证）：`scan_gate` / `session_scan_due` / `IGNORE_RECHECK_MS` / `tick_ignored` / `Cadence::consume|note_playback|note_timeline` / 三个黑名单拦截点 / `switch_display_session` / `collect_candidates` 全部逐字节未动；`GetCurrentSession` 3 处、`GetSessions` 2 处、`GetPlaybackInfo` 3 处与改前**同址同数** ⇒ 零新增跨进程调用；粘性判据只在**已枚举完的候选切片**上做纯内存比较。删除的 4 行全是 `///` 注释。
+- **测试 666 → 673**（672 passed + 1 ignored），clippy 0。7 条新测试：粘性核心回归 / 合法切换仍生效 / 不给黑名单开后门 / 会话消失仍跟随 / 优先级真值表 / `sticky_index` 空身份边界 / **`decide_scan_wires_displayed_aumid_into_scan_decision`（`include_str!` 源码静态锁，防「纯函数单测全绿但线上接线是常量」）**。
+- **反向验证 4 轮**（QA 独立做，每轮 cp 回 + `touch` 强制重编，deps exe mtime 每轮前进）：禁用粘性 ⇒ `keeps_displayed_session_when_it_pauses` + `priority_truth_table` 红（`Switch(1)` vs `Keep(2)`）；删 `!c.ignored` ⇒ `became_ignored` 红（`Keep(0)`）；`Keep`→`Switch` ⇒ 同前两条红；接线改成 `Some("")` ⇒ 静态锁红。
+- **新踩坑**：`src/main.rs:14` 是 `#![deny(warnings)]`，**反向验证的改坏点不能产生新警告**——把参数改成 `None` 会因 unused variable 直接编译失败，拿不到测试级证据。另 `clippy::doc_lazy_continuation` 会因「有序列表项后紧跟正文段」报错，列表后要空 `///` 行。
+- **收尾 → v1.13.1**：升版 5 处 + `Cargo.lock`，出包 `deliverables/曲栏_Barline_v1.13.1.exe`（1,191,936 B / SHA256 `01e62e2d…7d1b32` / FileVersion 1.13.1；字节数与 v1.13.0 相同属节对齐巧合——exe 大小按 4KB 跳变，三个连续版本的代码量落在同一档，哈希不同已核）。
+
 ---
 
 ## 2. 关键决策
@@ -194,9 +210,33 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 
 ### 2.6 第七轮拍板（2026-11-13，逐条澄清后开工）
 - **流程**：不再每组出包。每组 = 写码 → 有效测试并跑 → 全绿 → 单提交 → **真人验收** → 更新文档（单独 `docs:` 提交）→ 下一组；全部完成后跑全量测试再出一次包。预览一律 `启动曲栏.bat` 起 `target/release`（**禁 debug**：D2D + 逐像素透明在 debug 下慢一个量级，会伪造/掩盖卡顿类问题）。
-- **版本**：SemVer 2.0.0，一次发布只取最高位。桌面应用的「不兼容」按**契约**判：配置格式不兼容（如加 `deny_unknown_fields`）、数据目录布局变更、已验收交互契约改变、最低系统要求提升 → MAJOR；新增可开关能力 / 可感知行为修正 → MINOR；纯重构、死码、日志、测试 → PATCH。
+- **版本（2026-11-14 用户拍板，永久生效）**：**严格按 [SemVer 2.0.0](https://semver.org/lang/zh-CN/)**，一次发布只取最高位，**不掺杂自定义加严条款**。
+  - **PATCH**（x.y.**Z**）：只有**向下兼容的问题修正**，以及文案、死码、日志、内部重构、测试。**修 bug 一律是 PATCH——即使修正后的行为用户能感知**。原 §2.6 那条「可感知行为修正 → MINOR」**已作废**：它偏离标准，会让同一类修复在不同轮次跳到不同位（G8-⑥ 就是因此先在 1.13.1 / 1.14.0 之间来回改过两次）。
+  - **MINOR**（x.**Y**.0）：**向下兼容的功能性新增**——新增能力、新增可开关项、新增配置字段，且**默认行为不变**。
+  - **MAJOR**（**X**.0.0）：**不兼容变更**。桌面应用的「不兼容」按契约判：配置格式不兼容（如加 `deny_unknown_fields`）、数据目录布局变更、已验收的交互契约改变、最低系统要求提升。
+  - 预发布与构建元数据（`-rc.1` / `+build`）本项目不使用，发布即正式版。
 - **白名单四项裁决**：① 语义 = **空不启用、非空只接管名单内**（名单外一律按被拉黑处理：不渲染、不查歌词、不响应播控）；② 冲突 = **互斥，不允许同时存在**（加入时直接拒绝并提示）；③ 设置页 = **合并为一个「媒体筛选」分区、两张卡**（检测列表枚举一次，每行两个按钮）；④ 进程重启后第一次打开设置**一律停第一个分区**（覆盖 v1.9.0 的「无会话跳黑名单」）。
 - **已裁决不做**（本轮确认，不再议）：无播放时显示图标（成本 L，改的是「有媒体才出现」的存在性契约，会让 5 条既有断言变红）、`MIN_PICK_SCORE` 60→40、`widget_monitor` 漂移修补、(0,D) 守卫（日志 0 命中，加了反而可能把正常 seek 判成不报位置）、热键日志清理、设置页标题栏明暗跟随（已实现，仅「开窗期间切系统主题」不跟随，用户未察觉）。
+
+### 2.7 发 Release 的正确顺序（2026-11-14 踩坑后定）
+
+**必须先有 tag，再建 Release。** 网页 `/releases/new` 里输入一个新 tag 名时，GitHub 会把它打在你选的 target 分支**当前 HEAD** 上；如果你刚推完代码又没注意分支位置，tag 就会静默落到一个陈旧 commit 上。实测发生过：v1.11.0 与 v1.12.0 两个 tag 同时指向 `f73c369`（推送前的旧 HEAD），Release 页面点进去是「G9 迁出 ShadeBar」那条提交。
+
+正确顺序：
+```bash
+git tag v1.13.1 <确认过的 commit>          # 先本地打好 tag
+git push origin refs/tags/v1.13.1          # 推上去（不带 --force，同名已存在会拒绝 = 免费的错误闸门）
+# 再到网页 /releases/new 选「Existing tag」，GitHub 会直接显示该 tag 指向的 commit
+```
+
+已发布 Release 的 tag **指向错了只能靠移动 tag 修正**（网页改不了，"Edit release" 只能改标题/正文/附件/预发布标记）：
+```bash
+git tag -f v1.12.0 <正确 commit>
+git push --force origin refs/tags/v1.12.0   # 若写了 | tail，退出码是 tail 的，会被误判成功
+```
+移动后 Release 页面按 tag 名实时解析，会自动跟随，**附件不用重传**。2026-11-14 已用此法把 v1.11.0 → `3a9196f`、v1.12.0 → `3030cf0`、v1.13.0 → `2350a98` 修正到位（v1.10.0 = `ca39e7a` 本来就对；v1.9.0 仍指 `95b2a13` 的历史文档提交，未动）。
+
+**推送通道**：本机 HTTPS 走代理 `127.0.0.1:8216` 时常年 `CONNECT 502 / Empty reply from server`（连挂 8 次），而 `api.github.com` 一直稳、**SSH 一次就成**（`~/.ssh/id_ed25519` 已注册，`ssh://git@github.com/Yi-One1/QuLan-Barline.git`，22 与 443 都通；SSH 不吃 `http_proxy`）。校验远端状态**用 GitHub API 而不是 `git fetch`**（fetch 紧跟 push 后极易假失败）。
 
 ---
 
@@ -393,8 +433,8 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | `截图态` | 截图遮罩冻结生效范围 |
 
 ### 4.3 交付包现状（`deliverables/`，只增不删）
-现存 **41 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`、`v1.9.3`、`v1.10.0`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
-最新 `曲栏_Barline_v1.10.0.exe` = 1,169,920 B / FileVersion 1.10.0 / Company `Yi One`（**exe 哈希不可复现，不作凭证**；身份见 §1 第六轮 G8-③ 的「源码全文件 + 字节数 + 资源版本」）。
+现存 **45 个 exe**：`v1.1.10` ~ `v1.1.22`、`v1.2.0` ~ `v1.2.3`、`v1.3.0`、`v1.3.1`、`v1.4.0` ~ `v1.4.4`、`v1.5.0` ~ `v1.5.6`（含被否定的 v1.5.5）、`v1.6.0`/`v1.6.1`、`v1.7.0`、`v1.8.0`/`v1.8.1`、`v1.9.0`、`v1.9.1`、`v1.9.2`、`v1.9.3`、`v1.10.0`、`v1.11.0`、`v1.12.0`、`v1.13.0`、`v1.13.1`（G6 已清掉 LICENSE/README 副本；`deliverables/` 在 `.gitignore` 内不进 git）。
+最新 `曲栏_Barline_v1.13.1.exe` = 1,191,936 B / FileVersion 1.13.1 / Company `Yi One`（**exe 哈希不可复现，不作凭证**；身份见 §1 第八轮 G8-⑥ 的「源码全文件 + 字节数 + 资源版本」）。
 ⚠️ `v1.0.0`、`v1.1.0` ~ `v1.1.9` 已不在磁盘（早前清理误删，目录在 `.gitignore` 内无法恢复）；如需补齐用 4.1 的 detached checkout 方式，不补也不影响使用。
 
 ### 4.4 测试与验收口径
