@@ -123,7 +123,7 @@ pub enum KeyRecognition {
     Unverified,
 }
 
-/// 黑名单写入的结果分档（决定给用户哪条 toast）。
+/// 黑白名单写入的结果分档（决定给用户哪条 toast）。
 /// **带 payload，不是 `Copy`**（`Added` 携带 `KeyRecognition`），实现用 `Clone`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlacklistOutcome {
@@ -135,13 +135,20 @@ pub enum BlacklistOutcome {
     Removed,
     NotFound,
     Cleared,
+    /// **已存在于另一份名单**（v1.12.0）。黑白名单互斥：黑名单是"否决"，
+    /// 白名单是"允许"，同一条目同时存在会让判定语义自相矛盾，所以加入时直接拒绝。
+    Conflict,
     BadPath,
 }
 
-/// 黑名单写入的**唯一**入口（`apply_set` 不走这条路）。
+/// 黑白名单写入的**唯一**入口（`apply_set` 不走这条路）。
 ///
-/// 为什么不复用 `apply_set` 的 `bool`：黑名单要区分
-/// 「重复 / 非法 / 超长 / 已满 / **未能验证**」五种结果给不同 toast，`bool` 表达不了。
+/// v1.12.0：白名单与黑名单共用这一个入口——两条链路的写入校验（归一化、去重、
+/// 上限、`KeyRecognition`）逐字相同，唯一多出来的是**互斥检查**：加入时若该键
+/// 已在另一份名单里，返回 [`BlacklistOutcome::Conflict`]，两张表都不动。
+///
+/// 为什么不复用 `apply_set` 的 `bool`：这里要区分
+/// 「重复 / 冲突 / 非法 / 超长 / 已满 / **未能验证**」六种结果给不同 toast，`bool` 表达不了。
 ///
 /// `index` 用于 `KeyRecognition` 判据（纯内存，UI 线程可直接算）：
 /// `Verified` ⟺ `index.knows_process(key)`——它同时查内存缓存值与
@@ -153,54 +160,87 @@ pub fn apply_blacklist(
     value: &Value,
     index: &crate::media::blacklist::MediaIndex,
 ) -> BlacklistOutcome {
-    match path {
-        "media.blacklist_add" => {
-            let Some(s) = value.as_str() else {
-                return BlacklistOutcome::Invalid(crate::media::blacklist::NormError::Empty);
-            };
-            let key = match crate::media::blacklist::normalize_entry(s) {
-                Ok(k) => k,
-                Err(e) => return BlacklistOutcome::Invalid(e),
-            };
-            if cfg.media.blacklist.contains(&key) {
-                return BlacklistOutcome::Duplicate;
-            }
-            if cfg.media.blacklist.len()
-                >= crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES
-            {
-                return BlacklistOutcome::Full;
-            }
-            let recognition = if index.knows_process(&key) {
-                KeyRecognition::Verified
-            } else {
-                KeyRecognition::Unverified
-            };
-            cfg.media.blacklist.push(key);
-            BlacklistOutcome::Added(recognition)
-        }
-        "media.blacklist_remove" => {
-            let Some(s) = value.as_str() else {
-                return BlacklistOutcome::BadPath;
-            };
-            let key = match crate::media::blacklist::normalize_entry(s) {
-                Ok(k) => k,
-                Err(_) => return BlacklistOutcome::BadPath,
-            };
-            let before = cfg.media.blacklist.len();
-            cfg.media.blacklist.retain(|e| *e != key);
-            if cfg.media.blacklist.len() == before {
-                BlacklistOutcome::NotFound
-            } else {
-                BlacklistOutcome::Removed
-            }
-        }
-        "media.blacklist_clear" => {
-            // 只清 blacklist，**不动 app_names**（D12：缓存是"AUMID → 真实名"的
-            // 实测事实，与用户意图无关；清了只会让下次枚举白跑一遍反查）
+    use crate::media::blacklist::{matches_entry, normalize_entry, NormError};
+
+    // 这次操作落在哪张表上。
+    let to_white = match path {
+        "media.blacklist_add" | "media.blacklist_remove" | "media.blacklist_clear" => false,
+        "media.whitelist_add" | "media.whitelist_remove" | "media.whitelist_clear" => true,
+        _ => return BlacklistOutcome::BadPath,
+    };
+
+    // ``_clear`` 不需要 value：只清用户资产，**不动 app_names**
+    // （缓存是"AUMID → 真实名"的实测事实，与用户意图无关）。
+    if path.ends_with("_clear") {
+        if to_white {
+            cfg.media.whitelist.clear();
+        } else {
             cfg.media.blacklist.clear();
-            BlacklistOutcome::Cleared
         }
-        _ => BlacklistOutcome::BadPath,
+        return BlacklistOutcome::Cleared;
+    }
+
+    let is_add = path.ends_with("_add");
+    let Some(s) = value.as_str() else {
+        return if is_add {
+            BlacklistOutcome::Invalid(NormError::Empty)
+        } else {
+            BlacklistOutcome::BadPath
+        };
+    };
+    let key = match normalize_entry(s) {
+        Ok(k) => k,
+        Err(e) => {
+            return if is_add {
+                BlacklistOutcome::Invalid(e)
+            } else {
+                BlacklistOutcome::BadPath
+            }
+        }
+    };
+
+    if is_add {
+        // 先只读地取三个判断，再动表——同一结构体的两个字段不能同时借可变/不可变。
+        let (duplicate, conflict, len) = {
+            let own = if to_white { &cfg.media.whitelist } else { &cfg.media.blacklist };
+            let other = if to_white { &cfg.media.blacklist } else { &cfg.media.whitelist };
+            (
+                own.contains(&key),
+                // 冲突按主干比较：`msedge` 与 `msedge.exe` 是同一条，不能漏
+                other.iter().any(|e| matches_entry(e, &key)),
+                own.len(),
+            )
+        };
+        if duplicate {
+            return BlacklistOutcome::Duplicate;
+        }
+        if conflict {
+            return BlacklistOutcome::Conflict;
+        }
+        if len >= crate::config::defaults::limits::BLACKLIST_MAX_ENTRIES {
+            return BlacklistOutcome::Full;
+        }
+        let recognition = if index.knows_process(&key) {
+            KeyRecognition::Verified
+        } else {
+            KeyRecognition::Unverified
+        };
+        if to_white {
+            cfg.media.whitelist.push(key);
+        } else {
+            cfg.media.blacklist.push(key);
+        }
+        return BlacklistOutcome::Added(recognition);
+    }
+
+    // ---- remove ----
+    let list = if to_white { &mut cfg.media.whitelist } else { &mut cfg.media.blacklist };
+    let before = list.len();
+    list.retain(|e| *e != key);
+    if list.len() == before {
+        BlacklistOutcome::NotFound
+    } else {
+        BlacklistOutcome::Removed
     }
 }
 
@@ -401,6 +441,11 @@ pub fn apply_set(cfg: &mut Config, path: &str, value: &Value) -> bool {
         // 这里是纵深防御）：保证旧页面/注入脚本无法绕过归一化写入原始字符串。
         "media.blacklist_add" | "media.blacklist_remove" | "media.blacklist_clear" => {
             crate::log_warn!("黑名单写入必须走 apply_blacklist，拒绝路径：{path}");
+            false
+        }
+        // v1.12.0：白名单共用同一个写入入口（互斥检查、归一化、分档 toast 都在那边）
+        "media.whitelist_add" | "media.whitelist_remove" | "media.whitelist_clear" => {
+            crate::log_warn!("白名单写入必须走 apply_blacklist，拒绝路径：{path}");
             false
         }
         // ---------------- 快捷键 ----------------
@@ -988,6 +1033,88 @@ mod tests {
             assert!(!apply_set(&mut c, path, &json!("cloudmusic.exe")), "{path} 必须被拒绝");
         }
         assert!(c.media.blacklist.is_empty(), "被拒绝的写入不许改动配置");
+    }
+
+    /// **v1.12.0 白名单**：与黑名单共用同一入口——归一化、去重、删除、清空。
+    #[test]
+    fn apply_whitelist_add_remove_clear() {
+        let mut cfg = Config::default();
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+
+        // add：归一化 + Verified，只动白名单不动黑名单
+        let out = apply_blacklist(&mut cfg, "media.whitelist_add", &json!("  CloudMusic  "), &idx);
+        assert_eq!(out, BlacklistOutcome::Added(KeyRecognition::Verified));
+        assert_eq!(cfg.media.whitelist, vec!["cloudmusic.exe".to_string()]);
+        assert!(cfg.media.blacklist.is_empty(), "加白名单不许顺手写黑名单");
+
+        // 重复（其它形态）→ Duplicate
+        let out = apply_blacklist(&mut cfg, "media.whitelist_add", &json!("CLOUDMUSIC"), &idx);
+        assert_eq!(out, BlacklistOutcome::Duplicate);
+        assert_eq!(cfg.media.whitelist.len(), 1);
+
+        // remove：归一化后精确删除；再删 → NotFound
+        let out = apply_blacklist(&mut cfg, "media.whitelist_remove", &json!("C:////x////CloudMusic"), &idx);
+        assert_eq!(out, BlacklistOutcome::Removed);
+        assert!(cfg.media.whitelist.is_empty());
+        let out = apply_blacklist(&mut cfg, "media.whitelist_remove", &json!("cloudmusic.exe"), &idx);
+        assert_eq!(out, BlacklistOutcome::NotFound);
+
+        // clear：只清白名单，不影响黑名单与 app_names
+        cfg.media.whitelist.push("a.exe".into());
+        cfg.media.blacklist.push("b.exe".into());
+        cfg.media.app_names.insert("x!y".into(), "real.exe".into());
+        let out = apply_blacklist(&mut cfg, "media.whitelist_clear", &json!(null), &idx);
+        assert_eq!(out, BlacklistOutcome::Cleared);
+        assert!(cfg.media.whitelist.is_empty());
+        assert_eq!(cfg.media.blacklist, vec!["b.exe".to_string()], "清白的不能连带清黑的");
+        assert_eq!(cfg.media.app_names.len(), 1);
+    }
+
+    /// **互斥（v1.12.0）**：同一应用不能同时在两张表里，双向加入都被拒绝，
+    /// 且**两张表都不许留下半条**（主干比较：`CloudMusic` 与 `cloudmusic.exe` 同一条）。
+    #[test]
+    fn whitelist_and_blacklist_are_mutually_exclusive() {
+        let idx = crate::media::blacklist::MediaIndex::new(&crate::config::MediaConfig::default());
+        let mut cfg = Config::default();
+
+        // 黑 → 白
+        assert_eq!(
+            apply_blacklist(&mut cfg, "media.blacklist_add", &json!("cloudmusic.exe"), &idx),
+            BlacklistOutcome::Added(KeyRecognition::Verified)
+        );
+        assert_eq!(
+            apply_blacklist(&mut cfg, "media.whitelist_add", &json!("CloudMusic"), &idx),
+            BlacklistOutcome::Conflict
+        );
+        assert!(cfg.media.whitelist.is_empty(), "冲突不许写进白名单");
+        assert_eq!(cfg.media.blacklist, vec!["cloudmusic.exe".to_string()]);
+
+        // 白 → 黑
+        let mut cfg = Config::default();
+        assert_eq!(
+            apply_blacklist(&mut cfg, "media.whitelist_add", &json!("spotify.exe"), &idx),
+            BlacklistOutcome::Added(KeyRecognition::Verified)
+        );
+        assert_eq!(
+            apply_blacklist(&mut cfg, "media.blacklist_add", &json!("Spotify"), &idx),
+            BlacklistOutcome::Conflict
+        );
+        assert!(cfg.media.blacklist.is_empty(), "冲突不许写进黑名单");
+        assert_eq!(cfg.media.whitelist, vec!["spotify.exe".to_string()]);
+    }
+
+    /// apply_set 同样拒绝白名单三条 path（纵深防御与黑名单完全对称）。
+    #[test]
+    fn apply_set_rejects_media_whitelist_paths() {
+        let mut c = Config::default();
+        for path in [
+            "media.whitelist_add",
+            "media.whitelist_remove",
+            "media.whitelist_clear",
+        ] {
+            assert!(!apply_set(&mut c, path, &json!("cloudmusic.exe")), "{path} 必须被拒绝");
+        }
+        assert!(c.media.whitelist.is_empty(), "被拒绝的写入不许改动配置");
     }
 
     /// **v1.11.0 / D6**：`BlacklistOutcome::BadPath` 的三条产出路径各钉一条。

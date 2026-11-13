@@ -125,7 +125,8 @@ pub struct SessionCandidate {
     pub process_name: String,
     /// `GetPlaybackInfo()?.PlaybackStatus() == Playing`。
     pub playing: bool,
-    /// `MediaIndex::matches()` 的结果；`true` = 被拉黑，必须完全忽略、永不选中。
+    /// `MediaIndex::is_filtered()` 的结果；`true` = 不该接管（拉黑 **或** 白名单外），
+    /// 必须完全忽略、永不选中。
     pub ignored: bool,
 }
 
@@ -243,13 +244,13 @@ pub fn release_needs_ignored_clear(decision: ScanDecision, had_ignored: bool) ->
 
 /// P2-2：**主循环的性能闸**（G8-① / 验收约束 4 的测试化）。
 ///
-/// `ignored_now` = 缓存身份命中黑名单；`has_displayed_session` = 正锁定显示
+/// `filtered` = 缓存身份命中过滤判据（拉黑 ∪ 白名单外）；`has_displayed_session` = 正锁定显示
 /// `GetSessions()` 挑出的替代会话。只有这两者之一成立才允许进入低频会话枚举；
 /// **`false, false`（常规播放路径）必须返回 `false`** —— 于是 `GetSessions()`
 /// 永不进每 50ms 的常规 tick，零新增跨进程调用。抽成纯函数是为了让这条红线
 /// 被单测锁住，而不是只靠代码走查。
-pub fn scan_gate(ignored_now: bool, has_displayed_session: bool) -> bool {
-    ignored_now || has_displayed_session
+pub fn scan_gate(filtered: bool, has_displayed_session: bool) -> bool {
+    filtered || has_displayed_session
 }
 
 /// 封面解码记忆。
@@ -1112,10 +1113,14 @@ impl PollState {
 
     // ------------------------------------------ 忽略态（v1.9.0 / G7，ARCH-G7 §4.3）
 
-    /// 当前会话是否被拉黑。**纯内存**：用上一轮缓存的 `parts` 身份，零跨进程调用。
-    /// 每轮主循环（含 50ms 空转轮次）最多调 1 次。
-    fn ignored_now(&self) -> bool {
-        self.index.matches(&self.parts.process_name, &self.parts.aumid)
+    /// 当前会话是否**不该被接管**（拉黑 ∪ 白名单外）。**纯内存**：用上一轮缓存的
+    /// `parts` 身份，零跨进程调用。每轮主循环（含 50ms 空转轮次）最多调 1 次。
+    ///
+    /// v1.12.0：判据从「命中黑名单」改为 `MediaIndex::is_filtered()`——白名单非空时，
+    /// 名单外的应用同样不接管，但它并没有被拉黑（设置页的"已拉黑"标记仍走 `matches`）。
+    /// 下面所有「命中 → 进入忽略态」的路径共用这一处判据，不许各写一份。
+    fn filtered_now(&self) -> bool {
+        self.index.is_filtered(&self.parts.process_name, &self.parts.aumid)
     }
 
     /// 命中日志限流（按进程名 60s 窗口）。返回是否真的要打日志。
@@ -1215,7 +1220,9 @@ impl PollState {
             let process_name = player_map::resolve(&aumid).process_name.to_string();
             // `MediaIndex::matches` 是纯内存三级回退（缓存 → 静态表 → AUMID 末段），
             // 这里零 IO / 零 COM，与 G7 的判定口径完全同源。
-            let ignored = self.index.matches(&process_name, &aumid);
+            // v1.12.0：`ignored` 的语义是「永不选中」——白名单非空时名单外同样
+            // 不选中，所以走 `is_filtered()`（设置页的"已拉黑"标记仍走 `matches`）。
+            let ignored = self.index.is_filtered(&process_name, &aumid);
             let playing = s
                 .GetPlaybackInfo()
                 .and_then(|p| p.PlaybackStatus())
@@ -1331,7 +1338,7 @@ impl PollState {
             }
             ScanDecision::Hide => {
                 // 确实一个正常会话都没有 → 沿用现状空态（约束 2 后半句）。
-                // 用其中一个被拉黑候选的身份填 parts，让 ignored_now() 成立，
+                // 用其中一个被过滤候选的身份填 parts，让 filtered_now() 成立，
                 // 托盘/设置页的「恢复当前应用」仍指向造成隐藏的那个会话。
                 if let Some(c) = candidates.iter().find(|c| c.ignored) {
                     self.parts.aumid = c.aumid.clone();
@@ -1422,8 +1429,8 @@ impl PollState {
         self.parts.app_name = resolved.display_name.to_string();
         self.parts.process_name = resolved.process_name.to_string();
 
-        if self.index.matches(&self.parts.process_name, &self.parts.aumid) {
-            // 忽略 → 忽略（身份变了才再广播；进程名变了必然过限流）
+        if self.filtered_now() {
+            // 不该接管（拉黑 / 白名单外）→ 进入忽略态（身份变了才再广播）
             let changed = match &self.last_ignored {
                 Some(prev) => prev.aumid != self.parts.aumid,
                 None => true,
@@ -1689,7 +1696,10 @@ impl PollState {
                 .SourceAppUserModelId()
                 .map(|h| h.to_string())
                 .unwrap_or_default();
-            if self.index.matches(player_map::resolve(&aumid).process_name, &aumid) {
+            if self
+                .index
+                .is_filtered(player_map::resolve(&aumid).process_name, &aumid)
+            {
                 self.parts.aumid = aumid;
                 let resolved = player_map::resolve(&self.parts.aumid);
                 self.parts.app_name = resolved.display_name.to_string();
@@ -1772,7 +1782,7 @@ impl PollState {
         // 与①同时存在不是冗余：①省成本、②保证语义（防 AUMID 与 metadata
         // 在轮次间不同步的窗口；漏一处就是 bug）。
         // G8-①：与①同一套处理——先低频找其它正常会话，找到了就改显示它。
-        if self.index.matches(&self.parts.process_name, &self.parts.aumid) {
+        if self.filtered_now() {
             if self.rescan_sessions(mgr, sink, now) {
                 return self.tick(mgr, sink, now, Plan::full());
             }
@@ -1930,14 +1940,14 @@ pub fn run(sink: EventSink<AppEvent>, cmd_rx: Receiver<MediaCommand>, index: Arc
             // P2-2：性能闸抽成纯函数 `scan_gate`，由 4 格真值表单测锁住
             // 「常规播放路径（false,false）绝不枚举」这条红线（约束 4）。
             let blacklist_active =
-                scan_gate(state.ignored_now(), state.display_session.is_some());
+                scan_gate(state.filtered_now(), state.display_session.is_some());
             let switched = blacklist_active
                 && session_scan_due(true, state.last_session_scan, now)
                 && state.rescan_sessions(&mgr, &sink, now);
             if switched {
                 // 已切到另一个正常会话：本轮全量读它并发布（不留 50ms 空窗）。
                 state.tick(&mgr, &sink, now, Plan::full());
-            } else if state.ignored_now() {
+            } else if state.filtered_now() {
                 // G7：确实一个正常会话都没有 → 沿用 ignored 专用轮次。
                 // 本分支一行未改：tick_ignored 与 Cadence::consume 语义原样保留。
                 state.tick_ignored(&mgr, &sink, now, plan, forced);
@@ -2207,7 +2217,7 @@ fn execute(cmd: MediaCommand, mgr: &Manager, sink: &EventSink<AppEvent>, state: 
     // 会打「命令未被播放器接受，回滚乐观更新」，把"我们主动丢弃"说成"播放器拒绝"，
     // 会误导以后看日志的人。parts 里就有身份（process_name / aumid），零新增调用。
     // 若不拦，热键（Ctrl+Alt+P）会把 TryTogglePlayPauseAsync 打到被拉黑的应用上。
-    if state.ignored_now() {
+    if state.filtered_now() {
         crate::log_debug!("黑名单命中，播控命令 {cmd:?} 丢弃");
         return;
     }
@@ -3219,28 +3229,83 @@ mod g7_blacklist_regression {
         assert!(p.playback, "500ms 后快层照常到点（节奏推进是它唯一的职责）");
     }
 
-    /// `ignored_now` 在 parts 为空（无会话）时绝不命中；
+    /// `filtered_now` 在 parts 为空（无会话）时绝不命中；
     /// 黑名单配置变化（index.set）后同一份 parts 立即翻转。
     #[test]
-    fn ignored_now_is_empty_parts_safe_and_follows_config() {
+    fn filtered_now_is_empty_parts_safe_and_follows_config() {
         let idx = MediaIndex::new(&crate::config::MediaConfig::default());
         let mut st = PollState::new(Arc::new(AtomicBool::new(false)), idx);
-        assert!(!st.ignored_now(), "空 parts（无会话）不许命中");
+        assert!(!st.filtered_now(), "空 parts（无会话）不许命中");
 
         // 模拟「上一轮缓存的身份」是被拉黑应用
         st.parts.aumid = "NeteaseCloudMusic!App".into();
         st.parts.process_name = "cloudmusic.exe".into();
-        assert!(!st.ignored_now(), "黑名单为空 → 不命中");
+        assert!(!st.filtered_now(), "黑名单为空 → 不命中");
 
         // 托盘拉黑 → index.set 整组替换 → 下一轮主循环立即识别
         let mut cfg = crate::config::MediaConfig::default();
         cfg.blacklist = vec!["cloudmusic.exe".into()];
         st.index.set(&cfg);
-        assert!(st.ignored_now(), "拉黑后 cached parts 必须立即命中（纯内存）");
+        assert!(st.filtered_now(), "拉黑后 cached parts 必须立即命中（纯内存）");
         assert!(st.index.matches("cloudmusic.exe", "NeteaseCloudMusic!App"));
         // 解绑（清空）→ 立即恢复
         st.index.set(&crate::config::MediaConfig::default());
-        assert!(!st.ignored_now(), "解绑后必须立即不命中（≤1s 恢复的前提）");
+        assert!(!st.filtered_now(), "解绑后必须立即不命中（≤1s 恢复的前提）");
+    }
+
+    /// **v1.12.0**：白名单同样驱动 `filtered_now`——改配置后同一份 parts 立即翻转。
+    #[test]
+    fn filtered_now_follows_whitelist_config() {
+        let idx = MediaIndex::new(&crate::config::MediaConfig::default());
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), idx);
+        st.parts.aumid = "Spotify.exe".into();
+        st.parts.process_name = "spotify.exe".into();
+        assert!(!st.filtered_now(), "白名单为空（未启用）→ 放行");
+
+        // 启用白名单，名单里只有网易云 → 正在缓存的 Spotify 立刻变「不该接管」
+        let mut cfg = crate::config::MediaConfig::default();
+        cfg.whitelist = vec!["cloudmusic.exe".into()];
+        st.index.set(&cfg);
+        assert!(st.filtered_now(), "白名单非空 + 名单外 → 必须过滤");
+        assert!(
+            !st.index.matches("spotify.exe", "Spotify.exe"),
+            "它并没有被拉黑——UI 的'已拉黑'标记不该亮"
+        );
+
+        // 把 Spotify 加入白名单 → 恢复
+        cfg.whitelist.push("spotify.exe".into());
+        st.index.set(&cfg);
+        assert!(!st.filtered_now(), "加入白名单后立即恢复接管");
+    }
+
+    /// **v1.12.0 接线锁**：媒体主循环的「要不要接管」只能走 `is_filtered`
+    /// （拉黑 ∪ 白名单外）。谁把它改回只看黑名单，白名单就静默失效——
+    /// 而所有纯函数测试仍然全绿（`is_filtered` 自己测得过）。
+    #[test]
+    fn media_loop_filters_through_is_filtered_not_matches() {
+        let src = include_str!("smtc.rs");
+        // 只看**生产区**：这条测试自己就写着 `self.index.matches(&self.parts`，
+        // 全文扫描会被自身满足（假绿 → 真绿的反面：断言永远失败）。
+        let cut = src.find("#[cfg(test)]\nmod tests").expect("找不到测试模块起点");
+        let prod = &src[..cut];
+        // 判据函数体内部必须是 is_filtered，不许是 matches
+        let start = prod.find("fn filtered_now(&self) -> bool {").expect("找不到 filtered_now");
+        let body_end = prod[start..].find("\n    }").expect("filtered_now 没有闭合");
+        let body = &prod[start..start + body_end];
+        assert!(
+            body.contains("index.is_filtered"),
+            "filtered_now 必须调用 MediaIndex::is_filtered"
+        );
+        assert!(
+            !body.contains("index.matches("),
+            "matches 只回答'是否被拉黑'，不能当过滤判据"
+        );
+        // 生产代码里不许再出现直接的 parts 级 matches 判定（全部收拢到 filtered_now）
+        assert_eq!(
+            prod.matches("self.index.matches(&self.parts").count(),
+            0,
+            "parts 级判定必须统一走 filtered_now，否则会漏掉白名单"
+        );
     }
 
     /// 命中日志限流：同进程名 60s 内只打一条；进程名变了必然过限流。
@@ -3294,7 +3359,7 @@ mod g8_multi_session {
         }
     }
 
-    /// 带真实黑名单配置的索引：候选的 `ignored` 由 `MediaIndex::matches` 实算，
+    /// 带真实黑名单配置的索引：候选的 `ignored` 由 `MediaIndex::is_filtered` 实算，
     /// 保证测试用的是与生产完全同源的三级回退判定，不是手写布尔。
     fn blacklist_index(entries: &[&str]) -> Arc<MediaIndex> {
         let mut cfg = crate::config::MediaConfig::default();
@@ -3314,7 +3379,7 @@ mod g8_multi_session {
                     aumid: (*aumid).to_string(),
                     process_name: process.to_string(),
                     playing: *playing,
-                    ignored: index.matches(process, aumid),
+                    ignored: index.is_filtered(process, aumid),
                 }
             })
             .collect()

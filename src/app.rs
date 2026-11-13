@@ -1713,8 +1713,8 @@ impl App {
             Incoming::Set { path, value } => {
                 // v1.9.0（G7）：黑名单三条走专属入口（归一化 + 分档 toast + KeyRecognition），
                 // 不进 apply_set 的 bool 白名单。前置分流，防止旧页面/注入脚本绕过归一化。
-                if path.starts_with("media.blacklist") {
-                    return self.reduce_blacklist_set(&path, &value);
+                if path.starts_with("media.blacklist") || path.starts_with("media.whitelist") {
+                    return self.reduce_filter_set(&path, &value);
                 }
                 if !bridge::apply_set(&mut self.config, &path, &value) {
                     return Vec::new();
@@ -2056,64 +2056,66 @@ impl App {
 
     // ------------------------------------------------ 黑名单（v1.9.0 / G7）
 
-    /// 黑名单 set 消息的**唯一**入口（`apply_set` 显式拒绝这三条 path）。
+    /// 黑白名单 set 消息的**唯一**入口（`apply_set` 显式拒绝这六条 path）。
     ///
     /// 顺序（ARCH-G7 §6.4）：① `apply_blacklist` 归一化 + 改配置 → ② 失败只 toast
-    /// → ③ `index.set` 同步共享索引 → ④ `sync_blacklist_now` 命中当前播放立即回落
+    /// → ③ `index.set` 同步共享索引 → ④ `sync_list_now` 命中当前播放立即回落
     /// → ⑤ toast（`Added(Unverified)` 再补一条温和提示）→ ⑥ 落盘 + 回推 state。
-    fn reduce_blacklist_set(&mut self, path: &str, value: &serde_json::Value) -> Vec<Effect> {
+    ///
+    /// v1.12.0：白名单与黑名单共用这一条链路，唯一的差别是文案前缀与
+    /// 「冲突」结果（互斥，加入时直接拒绝）。
+    fn reduce_filter_set(&mut self, path: &str, value: &serde_json::Value) -> Vec<Effect> {
         use crate::media::blacklist::NormError;
         use crate::settings::bridge::{apply_blacklist, toast_json, BlacklistOutcome as O};
         let outcome = apply_blacklist(&mut self.config, path, value, &self.index);
+        // 文案键按目标表选：`t()` 只收 `&'static str`，所以这里不能拼字符串
+        let white = path.starts_with("media.whitelist");
+        let k = |black: &'static str, white_key: &'static str| if white { white_key } else { black };
+
         // ② 失败只 toast：不改状态、不写盘、不回推 state
         // （NotFound / BadPath 配置未变：静默记日志，不打扰用户）
         match &outcome {
             O::Added(_) | O::Removed | O::Cleared => {}
             O::Duplicate => {
-                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.dup"));
-                self.settings.push(&toast);
-                return Vec::new();
+                return self.toast_info(k("toast.blacklist.dup", "toast.whitelist.dup"))
+            }
+            O::Conflict => {
+                return self.toast_info(k(
+                    "toast.blacklist.conflict",
+                    "toast.whitelist.conflict",
+                ))
             }
             O::Invalid(NormError::Empty) => {
-                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.empty"));
-                self.settings.push(&toast);
-                return Vec::new();
+                return self.toast_info(k("toast.blacklist.empty", "toast.whitelist.empty"))
             }
             O::Invalid(NormError::InvalidChar) => {
-                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.invalid"));
-                self.settings.push(&toast);
-                return Vec::new();
+                return self.toast_info(k("toast.blacklist.invalid", "toast.whitelist.invalid"))
             }
             O::Invalid(NormError::TooLong) => {
-                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.too_long"));
-                self.settings.push(&toast);
-                return Vec::new();
+                return self.toast_info(k("toast.blacklist.too_long", "toast.whitelist.too_long"))
             }
-            O::Full => {
-                let toast = toast_json("info", i18n::t(self.lang, "toast.blacklist.full"));
-                self.settings.push(&toast);
-                return Vec::new();
-            }
+            O::Full => return self.toast_info(k("toast.blacklist.full", "toast.whitelist.full")),
             other => {
-                crate::log_debug!("黑名单请求无效果：{other:?}");
+                crate::log_debug!("名单请求无效果：{other:?}");
                 return Vec::new();
             }
         }
-        // ③ 同步共享索引（两张表一起替换，媒体线程立即看到）
+        // ③ 同步共享索引（三张表一起替换，媒体线程立即看到）
         self.index.set(&self.config.media);
-        // ④ 命中当前播放 → 立即回落空态（不必等媒体线程下一轮）
-        self.sync_blacklist_now();
+        // ④ 名单变化可能让当前显示的会话失去接管资格 → 立即回落空态
+        self.sync_list_now();
         // ⑤ toast：成功一条；Added(Unverified) 再补一条温和提示（U1=B 失败不静默）
         let ok_key = match outcome {
-            O::Added(_) => "toast.blacklist.added",
-            O::Removed => "toast.blacklist.removed",
-            O::Cleared => "toast.blacklist.cleared",
-            _ => "toast.blacklist.added",
+            O::Added(_) => k("toast.blacklist.added", "toast.whitelist.added"),
+            O::Removed => k("toast.blacklist.removed", "toast.whitelist.removed"),
+            O::Cleared => k("toast.blacklist.cleared", "toast.whitelist.cleared"),
+            _ => k("toast.blacklist.added", "toast.whitelist.added"),
         };
         let toast = toast_json("info", i18n::t(self.lang, ok_key));
         self.settings.push(&toast);
         if let O::Added(crate::settings::bridge::KeyRecognition::Unverified) = outcome {
-            let hint = toast_json("info", i18n::t(self.lang, "toast.blacklist.unverified"));
+            let hint_key = k("toast.blacklist.unverified", "toast.whitelist.unverified");
+            let hint = toast_json("info", i18n::t(self.lang, hint_key));
             self.settings.push(&hint);
         }
         // ⑥ 落盘 + 回推 state + 立即全量读一轮（解绑后媒体线程 ≤1s 内重新广播）
@@ -2124,6 +2126,13 @@ impl App {
             Effect::Relayout,
             Effect::Media(MediaCommand::Refresh),
         ]
+    }
+
+    /// 只弹一条提示、不做任何状态变更（名单写入校验失败时的统一出口）。
+    fn toast_info(&mut self, key: &'static str) -> Vec<Effect> {
+        let toast = crate::settings::bridge::toast_json("info", i18n::t(self.lang, key));
+        self.settings.push(&toast);
+        Vec::new()
     }
 
     /// 枚举结果落地（ARCH-G7 §5.6 三段式的 UI 线程侧 + §6.4）。
@@ -2155,7 +2164,7 @@ impl App {
     /// 只要还有正常会话就改显示它；这里同帧复位只是避免残留旧快照，
     /// 随后的 NowPlaying 会立刻把小组件重新显示出来。
     /// 只改内存态与 `App.ignored`，不写盘、不向媒体线程额外发号施令。
-    fn sync_blacklist_now(&mut self) {
+    fn sync_list_now(&mut self) {
         let s = self.state.playing.session.clone();
         if displayed_session_hit(&self.index, &self.state.playing) {
             self.ignored = Some(IgnoredSessionInfo {
@@ -2182,20 +2191,33 @@ impl App {
     /// `IgnoredSession(None)` 把它清掉。
     fn toggle_ignore_current(&mut self) -> Vec<Effect> {
         if let Some(ig) = self.ignored.clone() {
-            // 恢复：把被忽略会话的身份键从黑名单移除
             let key = self.index.identity(&ig.process_name, &ig.aumid).key;
             if key.is_empty() {
                 return Vec::new();
             }
+            // 恢复有两种原因（v1.12.0）：
+            // ① 被拉黑 → 从黑名单移除；
+            // ② 被白名单排除（白名单非空、它不在名单内）→ 把它加进白名单。
+            // 不区分原因就只删黑名单的话，②这种情况下点「恢复」毫无反应。
             let before = self.config.media.blacklist.len();
             self.config
                 .media
                 .blacklist
                 .retain(|e| !crate::media::blacklist::matches_entry(e, &key));
-            if self.config.media.blacklist.len() == before {
-                return Vec::new();
+            if self.config.media.blacklist.len() != before {
+                return self.after_blacklist_change("toast.blacklist.removed");
             }
-            return self.after_blacklist_change("toast.blacklist.removed");
+            let in_white = self
+                .config
+                .media
+                .whitelist
+                .iter()
+                .any(|e| crate::media::blacklist::matches_entry(e, &key));
+            if !in_white && !self.config.media.whitelist.is_empty() {
+                self.config.media.whitelist.push(key);
+                return self.after_blacklist_change("toast.whitelist.added");
+            }
+            return Vec::new();
         }
         // 拉黑：当前会话身份 → normalize → 追加
         let s = &self.state.playing.session;
@@ -2218,15 +2240,23 @@ impl App {
                 .retain(|e| !crate::media::blacklist::matches_entry(e, &id.key));
             self.after_blacklist_change("toast.blacklist.removed")
         } else {
+            // 互斥（v1.12.0）：它若还在白名单里，先移出再加入黑名单。
+            // 效果等价于「把这个应用从白名单移到黑名单」——注意白名单因此变空时
+            // 功能自动关闭，其余应用恢复接管，这正是用户拉黑单个应用时的预期。
+            self.config
+                .media
+                .whitelist
+                .retain(|e| !crate::media::blacklist::matches_entry(e, &id.key));
             self.config.media.blacklist.push(id.key);
             self.after_blacklist_change("toast.blacklist.added")
         }
     }
 
     /// 托盘拉黑/恢复的共同收尾：同步索引 → 即时对账 → toast → 落盘 + 重排。
+    /// （v1.12.0 起黑白名单共用——`ok_key` 由调用方按实际动作选。）
     fn after_blacklist_change(&mut self, ok_key: &'static str) -> Vec<Effect> {
         self.index.set(&self.config.media);
-        self.sync_blacklist_now();
+        self.sync_list_now();
         let toast =
             crate::settings::bridge::toast_json("info", i18n::t(self.lang, ok_key));
         self.settings.push(&toast);
@@ -2241,7 +2271,7 @@ impl App {
     /// R1 的主要防线：**只要 `ignored.is_some()` 就 enabled=true**——用户把唯一的
     /// 播放器拉黑后小组件消失，托盘这一项是唯一常驻的恢复入口。
     /// G8-①：非忽略态一律以 `state.playing.session`（正在显示的会话）为
-    /// 「当前应用」，与 `sync_blacklist_now` / `toggle_ignore_current` 同源。
+    /// 「当前应用」，与 `sync_list_now` / `toggle_ignore_current` 同源。
     fn ignore_menu_item(&self) -> crate::ui::tray::IgnoreMenuItem {
         use crate::ui::tray::{clamp_label, IgnoreMenuItem};
         if let Some(ig) = self.ignored.as_ref() {
@@ -3425,7 +3455,9 @@ impl App {
 /// 拉黑一个「没在显示」的应用不该让小组件消失（G8-① 的核心场景）。
 fn displayed_session_hit(index: &MediaIndex, playing: &NowPlaying) -> bool {
     let s = &playing.session;
-    !s.aumid.is_empty() && index.matches(&s.process_name, &s.aumid)
+    // v1.12.0：判据统一为 `is_filtered`（拉黑 ∪ 白名单外）——白名单变更后同样要
+    // 立即回落空态，不能只认"被拉黑"。
+    !s.aumid.is_empty() && index.is_filtered(&s.process_name, &s.aumid)
 }
 
 /// **G8-③（v1.10.0）：空白区双击要做的事**（纯函数，可单测）。
@@ -3661,6 +3693,49 @@ mod tests {
         playing.session.aumid = "NeteaseCloudMusic!App".to_string();
         playing.session.process_name = "cloudmusic.exe".to_string();
         assert!(displayed_session_hit(&index, &playing));
+    }
+
+    /// **v1.12.0**：白名单同样是「立即回落」的理由——显示的会话在名单外时，
+    /// 改完配置那一拍小组件就该消失，不能等媒体线程下一轮（≤1s 的可见残留）。
+    #[test]
+    fn displayed_session_hit_follows_whitelist_too() {
+        let index = MediaIndex::new(&crate::config::MediaConfig {
+            whitelist: vec!["cloudmusic.exe".to_string()],
+            ..Default::default()
+        });
+        let mut playing = NowPlaying::default();
+        playing.session.aumid = "Spotify.exe".to_string();
+        playing.session.process_name = "spotify.exe".to_string();
+        playing.state = PlaybackState::Playing;
+        assert!(
+            displayed_session_hit(&index, &playing),
+            "白名单非空 + 显示的 Spotify 不在名单内 → 必须立即回落空态"
+        );
+
+        playing.session.aumid = "NeteaseCloudMusic!App".to_string();
+        playing.session.process_name = "cloudmusic.exe".to_string();
+        assert!(!displayed_session_hit(&index, &playing), "名单内 → 继续显示");
+    }
+
+    /// **v1.12.0 接线锁**：`media.whitelist*` 必须和 `media.blacklist*` 走同一条
+    /// 专属入口。漏了这条分流，写入会掉进 `apply_set` 被纵深防御拒绝——症状是
+    /// 「点按钮毫无反应、连 toast 都没有」，而所有纯函数测试照样全绿。
+    #[test]
+    fn settings_dispatch_routes_whitelist_through_the_filter_entry() {
+        let src = include_str!("app.rs");
+        // **必须切片到 `Incoming::Set` 臂内**：整份文件里也包含这条测试自己写的
+        // 那些字符串，全文 `contains` 会被自身满足（假绿）。
+        let start = src.find("Incoming::Set { path, value } =>").expect("找不到 Set 分支");
+        let end = src[start..].find("bridge::apply_set(").expect("找不到 apply_set 调用");
+        let arm = &src[start..start + end];
+        assert!(
+            arm.contains("media.whitelist"),
+            "Incoming::Set 的分流必须同时覆盖 media.whitelist*"
+        );
+        assert!(
+            arm.contains("self.reduce_filter_set(&path, &value)"),
+            "两条名单都必须走 reduce_filter_set（唯一的名单写入入口）"
+        );
     }
 
     /// 没有会话（空态）时不许把「空身份」误判成命中黑名单。

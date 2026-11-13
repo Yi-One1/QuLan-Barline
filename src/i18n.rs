@@ -155,6 +155,31 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "toast.blacklist.unverified") => "Added. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add in \"Detected apps\" instead.",
         (Lang::Zh, "toast.blacklist.enum_failed") => "未检测到正在播放的应用",
         (Lang::En, "toast.blacklist.enum_failed") => "No playing apps detected",
+        // v1.12.0：黑白名单互斥（加入时拒绝）
+        (Lang::Zh, "toast.blacklist.conflict") => "它在白名单里，请先从白名单移除",
+        (Lang::En, "toast.blacklist.conflict") => "It's in the whitelist — remove it there first",
+        // ---------------- 白名单（v1.12.0）----------------
+        // 语义：为空 = 不启用；非空 = 只接管名单内的应用。
+        (Lang::Zh, "toast.whitelist.added") => "已加入白名单",
+        (Lang::En, "toast.whitelist.added") => "Added to the whitelist",
+        (Lang::Zh, "toast.whitelist.dup") => "已在白名单中",
+        (Lang::En, "toast.whitelist.dup") => "Already in the whitelist",
+        (Lang::Zh, "toast.whitelist.empty") => "请输入进程名",
+        (Lang::En, "toast.whitelist.empty") => "Enter a process name",
+        (Lang::Zh, "toast.whitelist.invalid") => "进程名不支持通配符或路径之外的特殊字符",
+        (Lang::En, "toast.whitelist.invalid") => "Process name cannot contain wildcards or special characters",
+        (Lang::Zh, "toast.whitelist.too_long") => "进程名过长（最多 260 字符）",
+        (Lang::En, "toast.whitelist.too_long") => "Process name too long (max 260)",
+        (Lang::Zh, "toast.whitelist.full") => "白名单已满（上限 200 条）",
+        (Lang::En, "toast.whitelist.full") => "The whitelist is full (max 200)",
+        (Lang::Zh, "toast.whitelist.removed") => "已从白名单移除",
+        (Lang::En, "toast.whitelist.removed") => "Removed from the whitelist",
+        (Lang::Zh, "toast.whitelist.cleared") => "白名单已清空",
+        (Lang::En, "toast.whitelist.cleared") => "Whitelist cleared",
+        (Lang::Zh, "toast.whitelist.unverified") => "已加入白名单。这个进程名还没在这台机器上出现过；如果之后没生效，请到「检测到的应用」里点「加入白名单」。",
+        (Lang::En, "toast.whitelist.unverified") => "Added to the whitelist. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add to whitelist in \"Detected apps\" instead.",
+        (Lang::Zh, "toast.whitelist.conflict") => "它在黑名单里，请先从黑名单移除",
+        (Lang::En, "toast.whitelist.conflict") => "It's in the blacklist — remove it there first",
         // v1.11.0：歌词缓存一键清空
         (Lang::Zh, "toast.cache.cleared") => "歌词缓存已清空，正在重新查找这首歌",
         (Lang::En, "toast.cache.cleared") => "Lyric cache cleared — looking this track up again",
@@ -197,6 +222,18 @@ mod tests {
             "toast.blacklist.cleared",
             "toast.blacklist.unverified",
             "toast.blacklist.enum_failed",
+            "toast.blacklist.conflict",
+            // v1.12.0 白名单
+            "toast.whitelist.added",
+            "toast.whitelist.dup",
+            "toast.whitelist.empty",
+            "toast.whitelist.invalid",
+            "toast.whitelist.too_long",
+            "toast.whitelist.full",
+            "toast.whitelist.removed",
+            "toast.whitelist.cleared",
+            "toast.whitelist.unverified",
+            "toast.whitelist.conflict",
         ] {
             for lang in [Lang::Zh, Lang::En] {
                 assert_ne!(t(lang, key), key, "{lang:?} 缺词条 {key}");

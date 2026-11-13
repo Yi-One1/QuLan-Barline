@@ -191,6 +191,13 @@ pub struct MediaConfig {
     /// 黑名单。上限 `limits::BLACKLIST_MAX_ENTRIES`，单条 ≤ `limits::BLACKLIST_MAX_LEN`。
     /// **只清这个表不清 `app_names`**（缓存是实测事实，与用户意图无关）。
     pub blacklist: Vec<String>,
+    /// 白名单（v1.12.0）。语义：**空 = 不启用**；非空 = **只接管名单内的应用**，
+    /// 名单外的一律按被拉黑处理（不渲染、不查歌词、不响应播控）。
+    ///
+    /// 与 `blacklist` **互斥**：同一条目不允许同时存在于两张表。写入路径
+    /// （`apply_blacklist`）直接拒绝；手改 json 绕过时 `Config::load` 会把
+    /// 冲突项从白名单里剔除（**黑名单优先**，见 `normalize_lists`）。
+    pub whitelist: Vec<String>,
     /// AUMID（**小写**）→ 真实进程名（小写、含 `.exe`）。**落盘**，重启后仍有效。
     ///
     /// 来源：设置页枚举时的 WASAPI 反查（ARCH-G7 §5）。用途：`identity()` 的**第①级**。
@@ -262,17 +269,27 @@ impl Config {
                 // 坏值静默丢弃，不 panic、不弹窗。**顺序必须"先 normalize 后 save"**
                 // （反了会把未归一化的脏表写回磁盘，ARCH-G7 §3.3 / R12）。
                 // 归一化必须幂等（R12）：正常第二次启动不再判定为"有变化"。
-                let bl = crate::media::blacklist::normalize_list(&cfg.media.blacklist);
+                // v1.12.0：白名单一起归一化，并执行互斥（冲突项从白名单剔除）。
+                let (bl, wl) = crate::media::blacklist::normalize_lists(
+                    &cfg.media.blacklist,
+                    &cfg.media.whitelist,
+                );
                 let an = crate::media::blacklist::normalize_app_names(&cfg.media.app_names);
-                if bl != cfg.media.blacklist || an != cfg.media.app_names {
+                if bl != cfg.media.blacklist
+                    || wl != cfg.media.whitelist
+                    || an != cfg.media.app_names
+                {
                     crate::log_info!(
-                        "media 已归一化：blacklist {} → {} 条，app_names {} → {} 条",
+                        "media 已归一化：blacklist {} → {} 条，whitelist {} → {} 条，app_names {} → {} 条",
                         cfg.media.blacklist.len(),
                         bl.len(),
+                        cfg.media.whitelist.len(),
+                        wl.len(),
                         cfg.media.app_names.len(),
                         an.len()
                     );
                     cfg.media.blacklist = bl;
+                    cfg.media.whitelist = wl;
                     cfg.media.app_names = an;
                     // 归一化结果立刻落盘，避免每次启动重复清洗
                     if let Err(e) = cfg.save() {
