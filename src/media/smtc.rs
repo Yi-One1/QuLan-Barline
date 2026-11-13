@@ -164,6 +164,11 @@ pub enum ScanDecision {
 /// 3. 全都暂停 → 取系统顺序里第一个正常会话；
 /// 4. 全部被拉黑 / 没有候选 → [`SessionChoice::Hide`]（沿用现状空态）。
 ///
+/// **规则 3 只是冷启动兜底**（G8-⑥）：真正调用本函数的 [`scan_decision`] 会在
+/// 进入规则 3 之前先用 [`sticky_index`] 粘住上次显示的会话——否则「用户按下暂停」
+/// 会被误判成「全都暂停，随便挑一个」，小组件漂移到别的应用上。所以本函数的规则 3
+/// 只在上次显示的会话**已经消失**（应用退出 / 会话注销）时才会被用到。
+///
 /// 返回的是**下标**，让调用方自己把纯数据映射回 COM 会话，函数体保持纯逻辑。
 pub fn choose_session(candidates: &[SessionCandidate]) -> SessionChoice {
     if let Some(i) = candidates
@@ -200,19 +205,56 @@ pub fn session_scan_due(
     }
 }
 
+/// 平局时「粘住上次显示的那个正常会话」的下标（G8-⑥ / v1.14.0）。
+///
+/// **为什么必须有**：`choose_session` 的规则③在「全都暂停」时取 `GetSessions()`
+/// 系统顺序里第一个正常会话，而它**无法区分**「用户刚按下暂停」和「这首歌早就播完
+/// 了、只是会话还挂着」。暂停当前播放器的那一刻恰好落进规则③，于是小组件漂移到
+/// 一个从未播放的应用上（真机日志：汽水暂停后 0.5s 切到 `index=1` 的网易云，
+/// `playing=false`），连播控也跟着错位——按播放键恢复不了刚才暂停的那首歌。
+///
+/// 判据只认「同一 AUMID **且未被过滤**」：
+/// - `!c.ignored` 前置不可省——否则等于给黑名单开后门（被拉黑的会话绝不许借粘性复活）；
+/// - 上次显示的会话已消失 → 返回 `None`，由 `choose_session` 兜底，
+///   于是「关掉汽水」仍然会正常跟随离开，不会粘在幽灵上。
+pub fn sticky_index(
+    candidates: &[SessionCandidate],
+    displayed_aumid: Option<&str>,
+) -> Option<usize> {
+    let shown = displayed_aumid.filter(|s| !s.is_empty())?;
+    candidates
+        .iter()
+        .position(|c| !c.ignored && c.aumid == shown)
+}
+
 /// 一次会话枚举 → 媒体线程的状态动作（G8-①，**纯函数**，零 COM / 零 IO）。
 ///
 /// `displayed_aumid` = 小组件当前锁定显示的那个会话（`None` = 常规路径）。
-/// - 黑名单会话已全部消失 → [`ScanDecision::Release`]：回到常规路径，枚举停止；
-/// - 仍有黑名单会话但没有正常候选 → [`ScanDecision::Hide`]：沿用现状空态；
-/// - 选中的正常会话正是当前显示的那一个 → [`ScanDecision::Keep`]：不乱清缓存；
-/// - 否则 → [`ScanDecision::Switch`]：换会话（调用方重置缓存防串歌）。
+///
+/// **优先级次序**（G8-⑥ 修正，本身就是这个 bug 的本质——原来缺了第 3 条）：
+/// 1. 黑名单会话已全部消失 → [`ScanDecision::Release`]：回到常规路径，枚举停止；
+/// 2. 存在正常会话正在播放 → 走 [`choose_session`] 的规则②（合法切换必须保留：
+///    用户真在网易云点了播放，就该切过去）；
+/// 3. **没有正常会话在播 + 上次显示的那个仍在候选里 → [`ScanDecision::Keep`]**：
+///    平局不漂移，`Keep` 只刷新 COM 句柄，不清缓存、不重播、不动歌词钟；
+/// 4. 否则 → 走 [`choose_session`] 剩下的规则（系统顺序第一个正常会话 /
+///    全被过滤则 [`ScanDecision::Hide`]）。规则③退化为**冷启动兜底**：
+///    只在上次显示的会话已经消失时才会用到。
 pub fn scan_decision(
     candidates: &[SessionCandidate],
     displayed_aumid: Option<&str>,
 ) -> ScanDecision {
     if !candidates.iter().any(|c| c.ignored) {
         return ScanDecision::Release;
+    }
+    // 优先级的**中段**：没有正常会话在播时，不许离开上次显示的那个。
+    // 有正常会话在播时一律放行给 `choose_session`（规则②），
+    // 否则「用户真的切到另一个播放器」会被粘性永久拒绝。
+    let has_playing_normal = candidates.iter().any(|c| !c.ignored && c.playing);
+    if !has_playing_normal {
+        if let Some(i) = sticky_index(candidates, displayed_aumid) {
+            return ScanDecision::Keep(i);
+        }
     }
     match choose_session(candidates) {
         SessionChoice::Hide => ScanDecision::Hide,
@@ -1295,11 +1337,17 @@ impl PollState {
 
     /// **多会话状态机的纯决策**（G8-①，测试入口）。
     ///
-    /// 输入只有候选画像与 `PollState` 自身的状态，**零 COM、零 IO**：
-    /// - 黑名单会话已全部消失 → [`ScanDecision::Release`]（回到常规路径，枚举停止）；
-    /// - 仍有黑名单会话且 [`choose_session`] 找不到正常候选 → [`ScanDecision::Hide`]；
-    /// - 选中的正常会话就是当前显示的那一个 → [`ScanDecision::Keep`]（不制造每秒重播）；
-    /// - 否则 → [`ScanDecision::Switch`]（换会话，调用方负责重置缓存防串歌）。
+    /// 输入只有候选画像与 `PollState` 自身的状态，**零 COM、零 IO**。
+    /// 真正的判定次序在 [`scan_decision`]（G8-⑥ 补齐了第 3 条），这里只负责
+    /// 把「当前显示的是谁」从状态里取出来交过去：
+    /// `displayed = display_session.is_some() ? parts.aumid（非空） : None`。
+    ///
+    /// 于是 `Keep` 有**两个来源**，别把它们混成一件事：
+    /// 1. **粘性**：没有正常会话在播、且上次显示的会话仍在候选里 → 平局不漂移
+    ///    （暂停不是换人）；
+    /// 2. **判同**：`choose_session` 选中的正是当前显示的那个 → 不制造每秒重播。
+    ///
+    /// 两者的共同点是「只刷新 COM 句柄、不清缓存」；`Switch` 才会整份作废。
     fn decide_scan(&self, candidates: &[SessionCandidate]) -> ScanDecision {
         let displayed = if self.display_session.is_some() {
             Some(self.parts.aumid.as_str()).filter(|s| !s.is_empty())
@@ -3588,6 +3636,196 @@ mod g8_multi_session {
             cand("QQMusic.exe", true, false),
         ];
         assert_ne!(scan_decision(&mixed, None), ScanDecision::Release);
+    }
+
+    // ------------------------------------------------ G8-⑥ 平局不漂移（v1.14.0）
+
+    /// 复刻真机现场（2026-11-14 日志）：黑名单里有 `msedge.exe`，所以锁定模式
+    /// 长期生效、每 1s 枚举一次；用户暂停汽水的那一刻，候选画像变成
+    /// `[Edge(ignored), 网易云(暂停, 幽灵会话), 汽水(暂停)]`。
+    ///
+    /// 修复前 → `Switch(1)`：小组件漂到一个从未播放的网易云上，连播控都错位；
+    /// 修复后 → `Keep(2)`：停在用户刚暂停的汽水上，按播放能直接恢复。
+    #[test]
+    fn scan_decision_keeps_displayed_session_when_it_pauses() {
+        let index = blacklist_index(&["msedge.exe"]);
+        let candidates = measured_candidates(
+            &index,
+            &[
+                ("MSEdge", false),         // [0] 被拉黑（用户黑名单里的 Edge）
+                ("cloudmusic.exe", false), // [1] 正常但暂停：启动过、没播、会话还挂着
+                ("汽水音乐", false),        // [2] 正常、用户刚按下暂停
+            ],
+        );
+        assert!(candidates[0].ignored, "前置：Edge 确实命中黑名单");
+        assert_eq!(
+            sticky_index(&candidates, Some("汽水音乐")),
+            Some(2),
+            "前置：上次显示的汽水仍在候选里且未被过滤"
+        );
+        // 修复前这里是 Switch(1)（漂到网易云），删掉粘性分支必须变红
+        assert_eq!(
+            scan_decision(&candidates, Some("汽水音乐")),
+            ScanDecision::Keep(2),
+            "暂停不是换人：必须停在用户刚暂停的那个会话上"
+        );
+    }
+
+    /// 反向：用户真的在另一个播放器点了播放 → 必须切过去。
+    /// 防「过度粘性把合法切换也拒了」（这是粘性最危险的副作用）。
+    #[test]
+    fn scan_decision_still_switches_to_a_playing_session() {
+        let index = blacklist_index(&["msedge.exe"]);
+        let candidates = measured_candidates(
+            &index,
+            &[
+                ("MSEdge", false),
+                ("cloudmusic.exe", true), // 用户真的在网易云点了播放
+                ("汽水音乐", false),
+            ],
+        );
+        assert_eq!(
+            scan_decision(&candidates, Some("汽水音乐")),
+            ScanDecision::Switch(1),
+            "有正常会话在播时，粘性必须让路"
+        );
+    }
+
+    /// 粘性绝不能给黑名单开后门：上次「显示」的会话若已被拉黑，不许 Keep。
+    /// （锁定模式只在系统当前会话被拉黑时才有 `display_session`，但用户可能在
+    /// 显示期间把该应用加进黑名单，这条边界必须守住 G7 语义。）
+    #[test]
+    fn scan_decision_does_not_keep_a_displayed_session_that_became_ignored() {
+        let index = blacklist_index(&["msedge.exe"]);
+        let candidates = measured_candidates(
+            &index,
+            &[("MSEdge", true), ("cloudmusic.exe", false)],
+        );
+        assert!(candidates[0].ignored);
+        let decision = scan_decision(&candidates, Some("MSEdge"));
+        assert_ne!(
+            decision,
+            ScanDecision::Keep(0),
+            "被拉黑的会话绝不许借粘性复活"
+        );
+        assert_eq!(decision, ScanDecision::Switch(1), "应改显示唯一正常的会话");
+        // 纯函数层面也不许为 ignored 候选给出下标
+        assert_eq!(sticky_index(&candidates, Some("MSEdge")), None);
+    }
+
+    /// 上次显示的会话已消失（用户关掉汽水）→ 不粘幽灵，顺着系统顺序走。
+    #[test]
+    fn scan_decision_falls_back_to_first_normal_when_displayed_vanished() {
+        let index = blacklist_index(&["msedge.exe"]);
+        let candidates = measured_candidates(
+            &index,
+            &[("MSEdge", false), ("cloudmusic.exe", false)],
+        );
+        assert_eq!(
+            sticky_index(&candidates, Some("汽水音乐")),
+            None,
+            "汽水已经不在候选里，没有可粘的对象"
+        );
+        assert_eq!(
+            scan_decision(&candidates, Some("汽水音乐")),
+            ScanDecision::Switch(1),
+            "应用关掉后必须正常跟随，不能停在幽灵上"
+        );
+    }
+
+    /// 优先级真值表：`Release > 合法切换(Playing) > 粘性 > 系统顺序第一个/Hide`。
+    ///
+    /// 本次事故的本质是**次序缺失**，单点断言守不住，所以把四个维度的组合钉死：
+    /// `has_ignored × has_playing_normal × displayed_present × displayed_playing`。
+    #[test]
+    fn scan_decision_priority_truth_table() {
+        // ① 没有 ignored 候选 → Release（最高优先级，压过一切）
+        let no_ignored = vec![cand("Spotify.exe", false, false)];
+        assert_eq!(
+            scan_decision(&no_ignored, Some("Spotify.exe")),
+            ScanDecision::Release
+        );
+
+        // ② 有 ignored + 有正常会话在播 → Switch 到在播的那个，即使上次显示的
+        //    是另一个也照样切（合法切换优先于粘性）
+        let playing_wins = vec![
+            cand("MSEdge", false, true),
+            cand("cloudmusic.exe", false, false),
+            cand("汽水音乐", true, false),
+        ];
+        assert_eq!(
+            scan_decision(&playing_wins, Some("cloudmusic.exe")),
+            ScanDecision::Switch(2)
+        );
+
+        // ③ 有 ignored + 全暂停 + 上次显示的仍在 → Keep（平局不漂移）
+        //    这两种子情形（上次显示的是 playing 还是 paused）都必须 Keep
+        let all_paused = vec![
+            cand("MSEdge", false, true),
+            cand("cloudmusic.exe", false, false),
+            cand("汽水音乐", false, false),
+        ];
+        assert_eq!(
+            scan_decision(&all_paused, Some("汽水音乐")),
+            ScanDecision::Keep(2)
+        );
+        assert_eq!(
+            scan_decision(&all_paused, Some("cloudmusic.exe")),
+            ScanDecision::Keep(1),
+            "粘的是上次显示的那个，不是系统顺序第一个"
+        );
+
+        // ④ 有 ignored + 全暂停 + 上次显示的缺失 → 系统顺序第一个正常会话
+        assert_eq!(
+            scan_decision(&all_paused, None),
+            ScanDecision::Switch(1),
+            "冷启动没有任何历史 → 仍按系统顺序兜底"
+        );
+        assert_eq!(scan_decision(&all_paused, Some("")), ScanDecision::Switch(1));
+
+        // ⑤ 有 ignored + 无正常候选 → Hide（不管有没有 displayed）
+        let only_ignored = vec![cand("MSEdge", true, true)];
+        assert_eq!(scan_decision(&only_ignored, Some("汽水音乐")), ScanDecision::Hide);
+    }
+
+    /// `sticky_index` 的边界：空串与 `None` 一视同仁，绝不把空身份当成匹配。
+    #[test]
+    fn sticky_index_ignores_empty_identity() {
+        let candidates = vec![
+            cand("", false, false),
+            cand("汽水音乐", false, false),
+        ];
+        assert_eq!(sticky_index(&candidates, None), None);
+        assert_eq!(sticky_index(&candidates, Some("")), None, "空串不是身份");
+        assert_eq!(sticky_index(&candidates, Some("汽水音乐")), Some(1));
+        assert_eq!(sticky_index(&candidates, Some("不存在的应用")), None);
+    }
+
+    /// **接线锁**：粘性能生效的前提是 `decide_scan` 确实把
+    /// `display_session.is_some()` 时的 `parts.aumid` 交给 `scan_decision`。
+    /// 若有人把它改成常量 `None`，纯函数单测仍会全绿，但线上粘性完全不生效
+    /// ——「测试全绿但功能没做」的经典坑，所以直接对源码做静态断言。
+    #[test]
+    fn decide_scan_wires_displayed_aumid_into_scan_decision() {
+        const SRC: &str = include_str!("smtc.rs");
+        let start = SRC
+            .find("    fn decide_scan(&self, candidates: &[SessionCandidate])")
+            .expect("decide_scan 必须存在");
+        let body = &SRC[start..];
+        let end = body.find("\n    }\n").expect("decide_scan 函数体必须闭合");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.display_session.is_some()"),
+            "displayed 必须来自 display_session 状态，不能是常量"
+        );
+        assert!(
+            body.contains("self.parts.aumid.as_str()"),
+            "displayed 必须是当前显示会话的 AUMID"
+        );
+        assert!(
+            body.contains("scan_decision(candidates, displayed)"),
+            "必须把 displayed 交给纯函数，否则粘性永远拿不到身份"
+        );
     }
 
     /// 综合真值表：被拉黑应用 + 若干正常候选的组合下，挑选结果始终等于
