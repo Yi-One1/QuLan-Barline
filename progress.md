@@ -128,6 +128,16 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 - **G3 白名单 UI → ✅ 2026-11-13 真人验收通过**（提交 `2e46c9f`，另 `ade68e3` 按用户要求把黑名单卡标题从「已加入黑名单（n）」改为「黑名单（n）」）。侧栏「黑名单」→ **「媒体筛选」**（`nav.blacklist` 改值；**分区 id 仍 `group-blacklist`**，它是 `SETTINGS_SECTIONS` 与 activateNav 的锚点）。分区内三张卡：白名单 / 黑名单 / 检测到的应用。**检测列表不再隐藏已在一侧的行**（G7 是加入后消失，那样用户没有任何入口把应用从黑名单挪到白名单）——每行两个按钮，所在侧置灰，对侧点击时**先 remove 再 add**（两次 set 保序）一步换侧，行尾小字标「已拉黑 / 已在白名单」。测试 657 → 659（+2）。
 - **G3 期间抓到的既有假断言（重要）**：HTML 契约测试取标签属性时写的是 `&INDEX_HTML[tag_start..at]`（切到 `id=` **之前**），而 `data-i18n` 总写在 id 后面——**怎么加属性都不会红**。`blacklist-title`、`lyrics-cache-dir`、`lyrics-cache-usage` 三处同病，已抽 `tag_of()` 统一切整个开始标签 `<...>`，并用变异验证「加 data-i18n 必红」。另两条坑：断言 `contains("media.whitelist")` 会被动作名 `"media.whitelist_add"` 满足（必须断言 `const whitelist = media.whitelist`）；按字节切中文 HTML 会 panic（改 `chars().take(n)`）。
 - **G4 收尾 → v1.12.0**：升版 5 处 + `Cargo.lock`，出包 `deliverables/曲栏_Barline_v1.12.0.exe`；测试 **659（658 passed + 1 ignored）**、clippy 0。
+- **G5 白名单/黑名单改切换控件（v1.13.0）→ ✅ 2026-11-13 真人验收通过**（提交 `4983662`）。用户拍板三件事：① 形态用**两个胶囊按钮**（不是下拉框/开关）；② 切换后**只有当前模式生效**，另一份原样保留但不参与判定；③ 检测行**只显示当前模式的按钮**。
+  - **必然连带**：既然不同时生效，「互斥」就失去意义 → 删掉 `BlacklistOutcome::Conflict` 与 `normalize_lists()` 的剔除逻辑，两表允许重叠（切模式即换规则）。这推翻了 G2 时「互斥不允许共存」的裁决，理由是新形态下重叠不产生矛盾，而强制互斥会让「切回黑名单模式后莫名少一条」变成难查的怪现象。
+  - **新增 `media.mode: FilterMode { Blacklist | Whitelist }`，默认 `Blacklist`**：老 config 没有该字段 → 反序列化即黑名单模式，行为与 v1.12.0 逐字节一致（`missing_media_mode_defaults_to_blacklist` 锁死）。这条是本次最需要守的兼容点——默认若成白名单，空白名单等于「全部放行」，会把老用户的拉黑悄悄作废。
+  - `MediaIndex::is_filtered()` 改为**按模式二选一**；**空名单在两档下都是放行全部**，所以**切换本身永不会让小组件消失**，只有往白名单加条目才收窄范围——这是切换能做成无损操作的前提。
+  - `media.mode` 走专属入口 `reduce_filter_mode()`（脏值丢弃 / 同值幂等 / `index.set` / `sync_list_now` / 落盘+回推），**不推 `MediaCommand::Refresh`**（模式不改任何会话身份，多打一轮 COM 是白花的）。`apply_set` 对 `media.mode` 纵深拒绝。
+  - 托盘按模式分派：黑名单模式文案不变；白名单模式换成「加入白名单 / 从白名单移除」，空白名单时后者置灰。
+  - 清掉一批死 API：`matches`（语义被 `is_filtered` 覆盖）、`blacklist_snapshot` / `blacklist_len` / `whitelist_len`（零引用或仅测试引用）、`normalize_lists`。测试 659 → **666（665 passed + 1 ignored）**，clippy 0，反向验证 6 组。
+- **G5 期间第二次踩到同一类假绿**：断言 `INDEX_HTML.contains("(white ? media.whitelist : media.blacklist)")` 被 `renderDetected` 里同一句满足 → 只改列表取值的变异**仍然全绿**。已改为切片到 `renderFilterList` 函数体。**规矩：凡「某表达式必须出现在某函数里」，一律切片到函数体再断言，全文 contains 只配用于「全仓唯一」的字面量。** 另：大段 python 替换吞掉了一条 `#[test]` 属性（测试静默不跑），靠 `--list` 数条数才发现——**大改测试后必须跑一次 `--list` 核对总数**。
+- **G5 顺带新增两条长效锁**：`every_get_element_by_id_literal_exists_in_dom`（JS 里 `getElementById("字面量")` 必须在 DOM 里有对应 id —— id 批量改名时漏一处就是 `null.addEventListener`，整段脚本从那一行起失效）、`every_i18n_attribute_has_both_languages`（每个 `data-i18n` 键中英各一份，缺一侧界面显示裸键名）。
+- **G5 收尾 → v1.13.0**：升版 5 处 + `Cargo.lock`，出包 `deliverables/曲栏_Barline_v1.13.0.exe`（1,191,936 B）；测试 **666**、clippy 0。
 
 ---
 
