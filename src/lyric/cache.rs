@@ -286,6 +286,39 @@ impl Cache {
         cache
     }
 
+    /// v1.11.0：**清空缓存**——内存 LRU + 磁盘顶层文件（正缓存与负缓存都算）。
+    ///
+    /// 返回 `(删掉的文件数, 释放字节数)`。
+    ///
+    /// 三条纪律：
+    /// 1. **只删 `self.dir` 顶层文件**，不递归、不碰用户自己的 `.lrc` 目录
+    ///    （`lyrics.local_dirs` 是另一套东西，清缓存不该动用户文件）；
+    /// 2. **内存必须一起清**（`map` / `order` / `mem_bytes`）：只删磁盘的话，
+    ///    正在播放的歌仍会内存命中，用户会觉得「清了个寂寞」；
+    /// 3. 只能在歌词线程调用（`Cache` 单线程独占）——UI 线程直接删文件会和
+    ///    正在进行的落盘/读取抢同一批路径。
+    pub fn clear_all(&mut self) -> (u64, u64) {
+        self.order.clear();
+        self.map.clear();
+        self.mem_bytes = 0;
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return (0, 0);
+        };
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            if std::fs::remove_file(e.path()).is_ok() {
+                files += 1;
+                bytes += meta.len();
+            }
+        }
+        (files, bytes)
+    }
+
     /// 只查内存。
     pub fn get_mem(&mut self, key: &str) -> Option<Hit> {
         let hit = self.map.get(key).map(|e| Hit {
@@ -600,8 +633,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c.dir);
     }
 
-    // ------------------------------------------------ v1.8.0：来源透传（C1–C3）
+    /// **v1.11.0**：「清空缓存」必须**三样一起清**——内存条目、磁盘正缓存、负缓存。
+    ///
+    /// 只清磁盘的后果：正在播放的歌仍会内存命中，用户觉得按钮没生效；
+    /// 只清内存的后果：下一首又从磁盘读回来，等于没清。目录本身要留着
+    /// （`Cache::new` 会建它，删目录反而让下次启动多一次失败）。
+    #[test]
+    fn clear_all_drops_memory_disk_and_miss_records() {
+        let mut c = tmp_cache("clear_all");
+        c.put("k1", &sample(), "test");
+        c.put_miss("k2", LyricMissReason::NotFound);
+        assert!(c.get_mem("k1").is_some(), "前置：内存应有条目");
+        assert!(c.miss_reason("k2").is_some(), "前置：负缓存应命中");
 
+        let (files, bytes) = c.clear_all();
+        assert!(files >= 2, "正缓存与负缓存文件都应删掉，实际 {files}");
+        assert!(bytes > 0, "删掉的字节数应为正数");
+
+        assert!(c.get_mem("k1").is_none(), "内存 LRU 必须一起清");
+        assert!(c.get_disk("k1").is_none(), "磁盘正缓存必须清");
+        assert!(
+            c.miss_reason("k2").is_none(),
+            "负缓存必须清，否则 24 小时内不会再查这首歌"
+        );
+        assert!(c.dir.is_dir(), "只删文件，不删缓存目录本身");
+        let _ = std::fs::remove_dir_all(&c.dir);
+    }
+
+    // ------------------------------------------------ v1.8.0：来源透传（C1–C3）
     /// C1：内存命中必须带出写入时的 `source`。
     #[test]
     fn get_mem_returns_source() {

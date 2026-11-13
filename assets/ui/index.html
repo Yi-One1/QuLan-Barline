@@ -107,6 +107,13 @@ h1 { font-size: 24px; line-height: 32px; font-weight: 600; margin: 0 0 4px; }
 .row, .card { transition: opacity .12s ease; }
 .row.dimmed, .card.dimmed { opacity: .45; }
 
+/* v1.11.0 / D2：黑名单「检测到的应用」里的灰态行。
+   此前 JS 给行加了 .item.dimmed（index.html 的 renderDetected），但这里只写了
+   .row.dimmed —— 选择器对不上，于是那一行看起来跟可点的一模一样，
+   用户会去点一个永远点不动的「加入」。.list 是这类行的容器。 */
+.list .item { transition: opacity .12s ease; }
+.list .item.dimmed { opacity: .45; }
+
 /* ---------------- 控件 ---------------- */
 select, input[type="text"] {
   font-family: var(--font); font-size: 13px; color: var(--text);
@@ -292,7 +299,10 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
         <div class="row">
           <div><div class="label" data-i18n="lyrics.cache.path">缓存位置</div>
             <div class="desc link" id="lyrics-cache-dir" title="">—</div></div>
-          <div class="right"><button class="btn" id="lyrics-cache-open" data-i18n="lyrics.cache.open.hint">点击打开文件夹</button></div>
+          <div class="right">
+            <button class="btn danger" id="lyrics-cache-clear" data-i18n="lyrics.cache.clear">清空缓存</button>
+            <button class="btn" id="lyrics-cache-open" data-i18n="lyrics.cache.open.hint">点击打开文件夹</button>
+          </div>
         </div>
         <div class="row">
           <!-- ⚠ #lyrics-cache-usage 刻意**不带** data-i18n：render() 会把所有
@@ -474,6 +484,8 @@ const I18N = {
     "lyrics.writeback": "歌词保存到本地", "lyrics.writeback.desc": "只要拿到歌词时它不在本地歌词目录里（在线查到、内存或磁盘缓存命中），就会保存一份到「本地歌词目录」第一个目录下的 Barline 子文件夹，文件名是「歌名 - 歌手.lrc」。只新建，绝不覆盖已有文件（手工改过的 .lrc 安全）。查询顺序为「磁盘缓存优先」时，手工改 .lrc 需等缓存过期或清理缓存才生效；切到「本地歌词文件优先」可立即生效。",
     "lyrics.local_first": "本地歌词文件优先", "lyrics.local_first.desc": "「关」（默认）：优先用磁盘缓存，重启也命中、最省事，但手工改的 .lrc 最长 30 天不生效，要等缓存过期或清理缓存。「开」：每次切歌先扫描本地歌词目录，再读内存缓存——手工改的 .lrc 立刻生效，正在播放的这一首也生效；代价是每次切歌多一次目录遍历（目录越大越慢）。",
     "lyrics.cache": "歌词磁盘缓存", "lyrics.cache.path": "缓存位置", "lyrics.cache.open.hint": "点击打开文件夹",
+    "lyrics.cache.clear": "清空缓存",
+    "lyrics.cache.clear.confirm": "清空歌词缓存？已缓存的歌词和「查不到」的记录都会删除，之后播放会重新联网查找。你自己保存的 .lrc 文件不受影响。",
     "lyrics.cache.usage": "{files} 个文件 · {size}", "lyrics.cache.usage.more": "{files}+ 个文件 · {size}",
     "lyrics.cache.scanning": "统计中…",
     "lyrics.cache.desc": "命中的歌词按歌曲缓存在这里，命中就不再联网。单条 30 天过期，总量超过 5 MB 时自动删最旧的。这个文件夹可以安全删除——删掉后下次播放会重新查找并缓存；配置文件与已经保存到本地歌词目录的 .lrc 都不受影响。",
@@ -541,6 +553,8 @@ const I18N = {
     "lyrics.writeback": "Save lyrics locally", "lyrics.writeback.desc": "Whenever lyrics are obtained and are not already in your local lyric folders (fetched online, or from the memory/disk cache), a copy is saved into the Barline subfolder of the first local lyric folder, named \"Title - Artist.lrc\". New files only — existing files are never overwritten (your manual edits are safe). With disk-cache-first order, manual .lrc edits apply only after the cache expires or is cleared; switch to local-first to apply them immediately.",
     "lyrics.local_first": "Prefer local lyric files", "lyrics.local_first.desc": "Off (default): disk cache first — fastest and survives restarts, but manual .lrc edits only take effect after the 30-day cache expires or is cleared. On: scan local lyric folders before the memory cache on every track change, so manual .lrc edits apply immediately — including the track currently playing — at the cost of one extra folder scan per track.",
     "lyrics.cache": "Lyric disk cache", "lyrics.cache.path": "Cache folder", "lyrics.cache.open.hint": "Click to open the folder",
+    "lyrics.cache.clear": "Clear cache",
+    "lyrics.cache.clear.confirm": "Clear the lyric cache? Cached lyrics and \"not found\" records will be deleted; playback will look them up online again. Your own .lrc files are not affected.",
     "lyrics.cache.usage": "{files} files · {size}", "lyrics.cache.usage.more": "{files}+ files · {size}",
     "lyrics.cache.scanning": "Counting…",
     "lyrics.cache.desc": "Matched lyrics are cached here per track, so a hit needs no network. Entries expire after 30 days, and the oldest are pruned beyond 5 MB. This folder is safe to delete — the next play simply looks up and caches again; your config and the .lrc files saved into your local lyric folder are unaffected.",
@@ -1163,6 +1177,11 @@ document.getElementById("blacklist-input").addEventListener("keydown", (e) => {
 document.getElementById("blacklist-clear").addEventListener("click", () => {
   if (confirm(t("blacklist.clear.confirm"))) set("media.blacklist_clear", true);
 });
+/* v1.11.0：清空歌词缓存。确认走 window.confirm（与黑名单清空同款，不新增弹窗样式）。
+   清完由 Rust 回推 cacheStats 覆盖上面的统计数字，这里不做本地清零。 */
+document.getElementById("lyrics-cache-clear").addEventListener("click", () => {
+  if (confirm(t("lyrics.cache.clear.confirm"))) post({ type: "action", payload: "lyricsCacheClear" });
+});
 document.getElementById("detected-refresh").addEventListener("click", requestDetect);
 
 /* ---------------- 消息接收 ---------------- */
@@ -1197,6 +1216,12 @@ if (window.chrome && chrome.webview) {
       renderDetected();
       refreshDetectedAt();
       renderCandidates();
+    } else if (msg.type === "detectFailed") {
+      // v1.11.0 / D5：枚举根本没跑起来（媒体服务未启动 / 已退出）。
+      // 请求枚举时刷新按钮会被置灰，且解除置灰只靠 mediaApps，所以这里必须补一条
+      // 退路，否则按钮永远灰着，用户只能关窗重开设置。
+      const btn = document.getElementById("detected-refresh");
+      if (btn) btn.disabled = false;
     } else if (msg.type === "toast") {
       toast(msg.payload.text);
     }

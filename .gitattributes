@@ -7,5 +7,11 @@
 *.png   binary
 *.exe   binary
 
-# PowerShell 脚本需要 UTF-8 BOM 才能被 PS 5.1 正确解析，禁止转换
-*.ps1   text eol=crlf working-tree-encoding=UTF-8-BOM
+# PowerShell 脚本：只做换行归一，**不再声明 working-tree-encoding**。
+#
+# v1.11.0：原先写的是 `text eol=crlf working-tree-encoding=UTF-8-BOM`，但
+# `scripts/build.ps1` 实际是「UTF-8 带 BOM + LF」，于是 `git add` / `git hash-object`
+# 每次都会报 `failed to encode ... from UTF-8-BOM to UTF-8`（噪音，且会让暂存行为
+# 变得不可预期）。BOM 是文件内容的一部分，不需要靠属性去"声明"——去掉编码转换后，
+# BOM 原样保留，PS 5.1 照旧能正确解析中文。
+*.ps1   text eol=crlf

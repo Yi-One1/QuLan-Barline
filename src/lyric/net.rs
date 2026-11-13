@@ -40,12 +40,17 @@ pub struct Timeouts {
     ///
     /// **为什么放进 `Timeouts` 而不是再加一个函数参数**：总预算是「这次请求愿意
     /// 等多久」的一部分，和四段超时是同一件事；放进结构体后，所有调用点
-    /// （`get` / `get_with_headers`）的签名一个都不用改，也就不会为了传参
+    /// （`get_with_headers`）的签名一个都不用改，也就不会为了传参
     /// 再造出 `get_with_headers_and_budget` 这类分叉。
     pub total_ms: u128,
 }
 
-/// `/api/get`（单曲精确查询）：实测 6.6s，给到 12s。**非歌词路径的默认值**。
+/// 通用 GET 的超时预算。
+///
+/// v1.11.0：`get()` 薄封装删掉后，生产路径全部走歌词专用预算 [`TIMEOUT_LYRIC`]，
+/// 这份「宽松预算」只剩 `net.rs` 自测在用，所以直接 `#[cfg(test)]`——
+/// 不用再靠 `#![allow(dead_code)]` 兜着（本轮清理的目标之一）。
+#[cfg(test)]
 pub const TIMEOUT_GET: Timeouts = Timeouts {
     resolve: 5_000,
     connect: 5_000,
@@ -125,12 +130,11 @@ impl Drop for Handle {
     }
 }
 
-/// 发一个 GET 请求（用 `/api/get` 的超时）。
-pub fn get(url: &str, user_agent: &str) -> Result<Response, NetError> {
-    get_with(url, user_agent, TIMEOUT_GET)
-}
-
 /// 发一个 GET 请求。`url` 必须是 `https://host/path?query` 形式。
+///
+/// v1.11.0：生产代码一律显式传超时（`get_with_headers`），这层「用默认预算」的
+/// 包装只剩测试在用，因此 `#[cfg(test)]`。
+#[cfg(test)]
 pub fn get_with(url: &str, user_agent: &str, t: Timeouts) -> Result<Response, NetError> {
     get_with_headers(url, user_agent, &[], t)
 }
@@ -432,8 +436,12 @@ mod tests {
     #[test]
     fn http_get_reads_status_and_body() {
         let port = serve_once(200, r#"{"syncedLyrics":"[00:01.00]hi"}"#);
-        let r = get(&format!("http://127.0.0.1:{port}/api/get?x=1"), "Barline/test")
-            .expect("请求失败");
+        let r = get_with(
+            &format!("http://127.0.0.1:{port}/api/get?x=1"),
+            "Barline/test",
+            TIMEOUT_GET,
+        )
+        .expect("请求失败");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("syncedLyrics"), "body = {}", r.body);
     }
@@ -446,9 +454,10 @@ mod tests {
     #[ignore = "需要联网：手动跑 cargo test lrclib_live -- --ignored --nocapture"]
     fn lrclib_live_get_returns_synced_lyrics() {
         let t0 = std::time::Instant::now();
-        let r = get(
+        let r = get_with(
             "https://lrclib.net/api/get?artist_name=Coldplay&track_name=Yellow",
             "Barline/0.0.1 (https://github.com/Yi-One1/QuLan-Barline-Next)",
+            TIMEOUT_GET,
         )
         .expect("请求失败");
         eprintln!(
@@ -464,8 +473,12 @@ mod tests {
     #[test]
     fn http_get_passes_through_404() {
         let port = serve_once(404, r#"{"code":404}"#);
-        let r = get(&format!("http://127.0.0.1:{port}/api/get"), "Barline/test")
-            .expect("请求失败");
+        let r = get_with(
+            &format!("http://127.0.0.1:{port}/api/get"),
+            "Barline/test",
+            TIMEOUT_GET,
+        )
+        .expect("请求失败");
         assert_eq!(r.status, 404);
     }
 }

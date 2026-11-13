@@ -209,6 +209,15 @@ pub fn toast_json(level: &str, text: &str) -> String {
     json!({ "type": "toast", "payload": { "level": level, "text": text } }).to_string()
 }
 
+/// 组装 `detectFailed` 消息（v1.11.0 / D5）。
+///
+/// 只干一件事：让「检测到的应用」的刷新按钮从置灰恢复。**不**复用 `mediaApps`
+/// ——那条消息会清空列表并渲染成「没检测到应用」，可这里其实一次都没枚举成功，
+/// 拿空列表冒充结果等于对用户说谎。
+pub fn detect_failed_json() -> String {
+    json!({ "type": "detectFailed" }).to_string()
+}
+
 /// 组装 `cacheStats` 消息（v1.8.0 / R2）：设置页「歌词磁盘缓存」卡片的占用统计。
 ///
 /// **刻意不进 `state`**：`state_json` 是纯函数且是热路径（每次 `set` 之后都推一次），
@@ -979,5 +988,38 @@ mod tests {
             assert!(!apply_set(&mut c, path, &json!("cloudmusic.exe")), "{path} 必须被拒绝");
         }
         assert!(c.media.blacklist.is_empty(), "被拒绝的写入不许改动配置");
+    }
+
+    /// **v1.11.0 / D6**：`BlacklistOutcome::BadPath` 的三条产出路径各钉一条。
+    ///
+    /// 这个结果在 UI 侧是「静默记日志、不打扰用户」（`app.rs` 的 `other =>` 臂），
+    /// 一旦被误改成 `Removed` / `NotFound`，用户会看到一条假的「已移除」提示，
+    /// 而配置其实没动。三条来源：值不是字符串、entry 归一化失败、path 不认识。
+    #[test]
+    fn apply_blacklist_bad_path_covers_three_sources_and_keeps_config() {
+        let mut cfg = Config::default();
+        cfg.media.blacklist.push(String::from("cloudmusic.exe"));
+        let before = cfg.media.blacklist.clone();
+        let idx = crate::media::blacklist::MediaIndex::new(&cfg.media);
+
+        for (path, value, why) in [
+            ("media.blacklist_remove", json!(42), "值不是字符串"),
+            ("media.blacklist_remove", json!(""), "entry 归一化失败"),
+            (
+                "media.blacklist_unknown",
+                json!("cloudmusic.exe"),
+                "path 不认识",
+            ),
+        ] {
+            assert_eq!(
+                apply_blacklist(&mut cfg, path, &value, &idx),
+                BlacklistOutcome::BadPath,
+                "{why}（path={path}）必须返回 BadPath"
+            );
+            assert_eq!(
+                cfg.media.blacklist, before,
+                "{why}：BadPath 不许改动配置（否则 UI 静默、配置却变了）"
+            );
+        }
     }
 }

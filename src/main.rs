@@ -12,16 +12,28 @@
 
 // 零 warning 是 M1 的硬门槛。任何新增告警都会让 `cargo build` 直接失败。
 #![deny(warnings)]
-// dead_code 整体放行。**这条 allow 早已过期，但不再用"里程碑还没到"当理由**——事实是：
-// M1–M5 全部已发布（v1.8.0），本行却一直留到现在，于是**死码不会被编译器发现**。
-// 当前被它兜住的都是「刻意留档」的东西，而不是"将来会用到"：
-//   - `media::launch::tray_click_activate`（用户裁决搁置的托盘激活实测实现，progress.md 待办 D）；
-//   - `app::start_msg_timer` / `kill_msg_timer`（成对预留的幂等入口，刻意不成单）；
-//   - `Effect::RefreshTrayMenu`（「改语言后托盘不刷新」缺口的修复挂点）。
-// 代价与纪律：**G6 这类死码清理只能靠人工 `rg` 逐符号盘点**（编译器帮不上忙），
-// 每轮清理必须自己维护清单 + 用 `rg` 反向验证零引用，不能指望 `cargo build` 报错。
-// 单独 lint 的优先级高于 lint 组，所以这一行能在 `deny(warnings)` 之下精确开口子，
-// 其余告警（unused_imports / unreachable_code / unused_variables …）仍然是 error。
+// dead_code 仍需整体放行——**但这次有实数了**。
+//
+// v1.11.0：本轮实测「摘掉这一行」时编译器一次报出 **35 项**零引用符号
+// （`cargo check` 输出，未计 `#[cfg(test)]` 内的使用），远超此前人工盘点的 6 项。
+// 这说明靠 `rg` 逐符号找死码的方法确实不可靠；但一次清 35 项属于跨模块大改，
+// 会把这轮「低风险收尾」变成高风险重构，所以本轮**只删已逐条复核的 6 项**
+// （App::sink / App::msg_hwnd / ProviderChain::new / net::get / RectF::inset /
+// provider 测试区 stub），其余 35 项连同清单列进 `deliverables/gstack/` 的分诊报告，
+// 单独立项再清。
+//
+// **坑（本轮实测踩到）**：`cargo check` **不编译 `#[cfg(test)]`**，所以「只被测试用到」
+// 的辅助函数在它的输出里也显示为「never used」。本轮按清单删掉 `net::get` 后
+// `cargo check` 依然全绿，直到 `cargo test` 才报三条 `cannot find function get`。
+// 判死码必须看**测试目标**（`-Task test` 的编译结果），否则会误删测试脚手架。
+//
+// **下一轮清理的死码清单获取方式（别再用人工 rg）**：临时注释掉本行 → `build.ps1 -Task check`
+// → 编译器把「零引用」全列出来 → 逐条判「真死 / 测试在用 / RAII 占位（如
+// `SessionSubscriptions` 的三个事件句柄必须留）」→ 清完再加回本行。
+//
+// 已知的刻意留档（带局部 `#[allow(dead_code)]` 或依赖本行）：
+//   - `media::launch::tray_click_activate`（用户裁决搁置的托盘激活实测实现）；
+//   - `app::start_msg_timer` / `kill_msg_timer`（成对预留的幂等入口，刻意不成单）。
 #![allow(dead_code)]
 // GUI 程序：不弹控制台窗口。日志一律走文件。
 #![windows_subsystem = "windows"]

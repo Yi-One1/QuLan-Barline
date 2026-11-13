@@ -66,15 +66,6 @@ impl RectF {
         px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
     }
 
-    pub fn inset(&self, d: f32) -> Self {
-        Self::new(
-            self.x + d,
-            self.y + d,
-            (self.w - 2.0 * d).max(0.0),
-            (self.h - 2.0 * d).max(0.0),
-        )
-    }
-
     pub fn is_empty(&self) -> bool {
         self.w <= 0.0 || self.h <= 0.0
     }

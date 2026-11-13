@@ -889,7 +889,6 @@ fn draw_progress(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Re
     let (layout, state, theme, lang, s) = (ctx.layout, ctx.state, &ctx.theme, ctx.lang, ctx.scale);
     let duration = state.playing.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
     let hud = state.hover == HoverState::VolumeHud;
-    let seeking = state.hover == HoverState::Seeking;
 
     // duration == 0（播放器未上报 timeline）→ 隐藏进度条（风险 R9）
     if duration <= 0 && !hud {
@@ -907,19 +906,13 @@ fn draw_progress(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) -> Re
         rt.FillRoundedRectangle(&rounded(pr.x, pr.y, pr.w, ph, radius), &track);
     }
 
-    let frac = if hud {
-        state.volume_hud.clamp(0.0, 1.0)
-    } else if seeking {
-        if duration > 0 {
-            (state.seek_preview_ms as f32 / duration as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    } else if duration > 0 {
-        (state.playing.position_now() as f32 / duration as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    // v1.11.0（D-6）：比例**只从 `AppState::progress_fraction()` 取**，渲染层不再自己算。
+    //
+    // 此前这里有一份与 `app.rs` 逐字相同的内联实现，于是「测试验的那份」和
+    // 「屏幕画的那份」是两段代码——改一处忘一处，测试全绿而屏幕画错。
+    // 唯一需要小心的是优先级：音量 HUD 必须压过歌曲进度（滚轮调音量时那条横条
+    // 显示的是音量，不是播放进度），这条规则已收进 `progress_fraction()` 的首个分支。
+    let frac = state.progress_fraction();
 
     let accent = frame.brush(Rgba::from_rgb(theme.accent, 0xFF))?;
     let fill_w = pr.w * frac;
@@ -1269,12 +1262,9 @@ fn draw_seek_bubble(rt: &ID2D1RenderTarget, frame: &mut Frame, ctx: &Ctx<'_>) ->
 
     let pill_w = 104.0 * s;
     let pill_h = 18.0 * s;
-    // 跟随拖动位置，并夹在客户区内
-    let frac = if duration > 0 {
-        (state.seek_preview_ms as f32 / duration as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    // 气泡横向位置与进度条填充**共用同一个比例来源**（v1.11.0 / D-6）：
+    // 拖动时 `progress_fraction()` 返回的就是预览比例，两者不可能算出不同位置。
+    let frac = state.progress_fraction();
     let want_x = layout.progress.x + layout.progress.w * frac - pill_w * 0.5;
     let x = want_x
         .max(2.0 * s)

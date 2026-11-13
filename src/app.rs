@@ -194,8 +194,19 @@ impl AppState {
         }
     }
 
-    /// 进度条应显示的比例（0..=1）。拖动中优先用预览值。
+    /// 进度条应填充的比例（0..=1）。**唯一出处**（v1.11.0 / D-6）。
+    ///
+    /// 渲染（`render/painter.rs::draw_progress`）与测试都调这里，不允许再出现第二份
+    /// 内联公式——两份副本的后果是「测试全绿、屏幕画错」。
+    ///
+    /// 分支优先级**不能换**：
+    /// 1. 音量 HUD：滚轮调音量时同一条横条改显音量，与歌曲进度无关（`volume_hud`）；
+    /// 2. 拖动预览：松手前用 `seek_preview_ms`，否则圆点不跟手；
+    /// 3. 正常播放位置；`duration <= 0`（播放器不报时长，如网易云）恒 0。
     pub fn progress_fraction(&self) -> f32 {
+        if self.hover == HoverState::VolumeHud {
+            return self.volume_hud.clamp(0.0, 1.0);
+        }
         let dur = self.playing.track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
         if dur <= 0 {
             return 0.0;
@@ -1614,6 +1625,25 @@ impl App {
                 self.sync_lyric_timer();
                 vec![Effect::Redraw]
             }
+            // v1.11.0：歌词缓存清空完成。三件事按顺序做：
+            // ① 重推设置页统计（走 post，不碰 last_state）；
+            // ② 提示用户「已清空」（toast 也走 post）；
+            // ③ 当前歌**立刻重查**——内存与磁盘都空了，这次请求会真正走在线，
+            //    否则用户要等下一首才看到效果，会以为按钮没生效。
+            AppEvent::LyricCacheCleared => {
+                let st = crate::lyric::cache::stats();
+                self.settings
+                    .post(&crate::settings::bridge::cache_stats_json(&st));
+                self.settings.post(&crate::settings::bridge::toast_json(
+                    "info",
+                    i18n::t(self.lang, "toast.cache.cleared"),
+                ));
+                if self.state.playing.track.is_some() {
+                    vec![Effect::Lyric(self.lyric_request(false))]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -1660,6 +1690,17 @@ impl App {
                     Effect::Relayout,
                     Effect::SaveConfig(Box::new(self.config.clone())),
                 ];
+                // v1.11.0：改语言必须**当窗生效**，两个窗口一个都不能落下。
+                //
+                // 设置页那侧本来就是即时的（前端每次收到 state 都按
+                // `c.general.language` 重算文案，见 `assets/ui/index.html`），用户看到
+                // 「立刻生效」指的就是它；但托盘菜单与小组件文案读的是 `self.lang`
+                // （全仓只在 `bootstrap` 赋过一次），不补这一步就要重启才换语言。
+                if path == "general.language" {
+                    self.lang = crate::i18n::Lang::from_serde(self.config.general.language);
+                    effects.push(Effect::RefreshTrayMenu);
+                    effects.push(Effect::Redraw);
+                }
                 if hotkey_changed {
                     effects.push(Effect::RebindHotkeys);
                 }
@@ -1739,7 +1780,6 @@ impl App {
                 crate::log_info!("设置页：打开数据目录 {}", dir.display());
             }
             // v1.8.0 / R2：统计歌词磁盘缓存的路径与占用。
-            //
             // **只在这里扫一次**（PRD A5.5）：不建目录、不递归、不改任何文件，
             // 上限 `limits::CACHE_STATS_MAX_ENTRIES`。页面只在「切到歌词分区」时
             // 发这个动作，`render()` 与 `state` 回推都不重扫。
@@ -1777,6 +1817,16 @@ impl App {
                 }
                 crate::log_info!("设置页：打开歌词缓存目录 {}", dir.display());
             }
+            // v1.11.0：清空歌词缓存。
+            //
+            // 页面侧先弹 `window.confirm`（与黑名单清空同款），确认后才发这个动作。
+            // 真正删除在歌词线程里做（`Cache` 由它独占，UI 线程直接删文件会和正在
+            // 进行的落盘/读取抢路径）；清完线程回 `AppEvent::LyricCacheCleared`，
+            // 由那条事件重推统计、提示用户、并重查当前歌。
+            "lyricsCacheClear" => match self.lyric.as_ref() {
+                Some(s) => s.clear_cache(),
+                None => crate::log_warn!("歌词服务未启动，清空缓存请求丢弃"),
+            },
             // v1.1.5 问题 3 / v1.1.7：选数据目录 → 弹窗问「迁移？删除原文件？」
             // → 选项记进配置，重启后由 storage::init_from_config 执行
             // （WebView2 / 日志句柄占用，运行中搬会损坏，必须延迟到启动）。
@@ -1924,18 +1974,25 @@ impl App {
             }
             // v1.9.0（G7）：枚举"检测到的应用"（唯一两个触发点：
             // 首次进入黑名单分区 + 点「刷新」；零定时器、零轮询）
-            "blacklistEnumerate" => match self.media.as_ref() {
-                Some(m) => m.send(MediaCommand::EnumerateApps),
-                None => {
-                    crate::log_warn!("媒体服务未启动，枚举请求丢弃");
+            "blacklistEnumerate" => {
+                // v1.11.0 / D5：两条失败路径（服务根本没起来 / 线程已退出）走同一个
+                // 收口——页面那个被置灰的刷新按钮必须能恢复，否则用户只能关窗重开。
+                let delivered = self
+                    .media
+                    .as_ref()
+                    .map(|m| m.send(MediaCommand::EnumerateApps))
+                    .unwrap_or(false);
+                if !delivered {
+                    crate::log_warn!("媒体服务未就绪或已退出，枚举请求丢弃");
                     let toast = crate::settings::bridge::toast_json(
                         "info",
                         i18n::t(self.lang, "toast.blacklist.enum_failed"),
                     );
                     // post（不碰 last_state）：枚举结果是一次点查，不是配置快照
                     self.settings.post(&toast);
+                    self.settings.post(&crate::settings::bridge::detect_failed_json());
                 }
-            },
+            }
             "ready" => {
                 // 页面加载完了：补推一次全量状态
                 self.settings.on_webview_ready();
@@ -2479,7 +2536,11 @@ impl App {
                 Effect::Relayout => self.relayout_with(RectChangeReason::Resize),
                 Effect::Redraw => self.redraw(),
                 Effect::Media(cmd) => match self.media.as_ref() {
-                    Some(m) => m.send(cmd),
+                    Some(m) => {
+                        // 播控命令的送达与否不影响状态机（乐观更新由 CommandResult 回滚），
+                        // 显式丢弃返回值，避免后来者以为这里漏处理了失败。
+                        let _ = m.send(cmd);
+                    }
                     None => crate::log_warn!("媒体线程未启动，命令 {cmd:?} 丢弃"),
                 },
                 Effect::OpenSettings => {
@@ -3287,20 +3348,10 @@ impl App {
 
     // ---------------------------------------------------------------- 诊断
 
-    /// 事件投递器（工作线程用）。
-    pub fn sink(&self) -> EventSink<AppEvent> {
-        self.sink.clone()
-    }
-
-    /// 消息窗句柄（诊断用）。
-    pub fn msg_hwnd(&self) -> HWND {
-        self.msg_hwnd
-    }
-
     /// 向媒体线程发一条命令。
     pub fn send_media(&self, cmd: MediaCommand) {
         if let Some(m) = self.media.as_ref() {
-            m.send(cmd);
+            let _ = m.send(cmd);
         }
     }
 }
@@ -3814,6 +3865,70 @@ mod tests {
         assert_eq!(s.progress_fraction(), 0.0);
     }
 
+    /// **v1.11.0 / D-6**：音量 HUD 必须压过歌曲进度与拖动预览。
+    ///
+    /// 这条优先级原先只写在 `painter.rs` 的内联公式里（D-6 合并时搬进
+    /// [`AppState::progress_fraction`]）。若有人调换分支顺序，滚轮调音量时
+    /// 进度条会突然画成歌曲进度——这条断言会先红。
+    #[test]
+    fn progress_fraction_prefers_volume_hud_over_song_progress() {
+        use crate::media::Track;
+        let mut s = AppState::default();
+        s.playing.track = Some(Track {
+            title: String::from("t"),
+            duration_ms: 100_000,
+            ..Default::default()
+        });
+        s.playing.state = PlaybackState::Paused;
+        s.playing.position_ms = 10_000;
+        s.seek_preview_ms = 50_000;
+        s.hover = HoverState::VolumeHud;
+        s.volume_hud = 0.42;
+        assert!(
+            (s.progress_fraction() - 0.42).abs() < 1e-4,
+            "HUD 态下横条必须显示音量，而不是拖动预览或播放进度"
+        );
+
+        // 播放器不报时长（网易云）时，HUD 照样要能画
+        s.playing.track = None;
+        assert!((s.progress_fraction() - 0.42).abs() < 1e-4);
+    }
+
+    /// **v1.11.0 / D-6 接线锁**：渲染层只许向唯一出处取比例，不许再内联一份公式。
+    ///
+    /// 纯函数测试抓不住「有人又在 painter 里抄一遍」——两份副本会各自演化，
+    /// 结果就是测试全绿、屏幕画错。这里直接读渲染层源码钉住。
+    ///
+    /// **断言必须切片到 `draw_progress` 函数体**（QA 实测教训）：第一版是在整份
+    /// `painter.rs` 上做子串匹配，而 `draw_seek_bubble` 也调 `state.progress_fraction()`，
+    /// 于是把 `draw_progress` 里的调用改成写死 `0.5`（进度条永远半满）测试照样绿。
+    #[test]
+    fn progress_bar_frac_comes_from_the_single_source() {
+        let src = include_str!("render/painter.rs");
+        let start = src
+            .find("fn draw_progress(")
+            .expect("draw_progress 必须存在");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("state.progress_fraction()"),
+            "draw_progress 必须调用 AppState::progress_fraction()"
+        );
+        assert!(
+            !body.contains("seek_preview_ms as f32 /"),
+            "draw_progress 不得再内联拖动预览公式（D-6 已合并到 app.rs）"
+        );
+        assert!(
+            !body.contains("volume_hud.clamp"),
+            "音量优先分支只许存在于 AppState::progress_fraction"
+        );
+    }
+
     // ================================================ QA（G3 独立验证）补充断言
     //
     // `sync_visibility` / `toggle_widget_visible` / `reduce_input(ClickDismiss)`
@@ -3966,6 +4081,84 @@ mod tests {
         assert!(
             interaction_needs_redraw(Some(HitTarget::Prev), None, &cross),
             "按下目标与悬停目标不同也必须补帧"
+        );
+    }
+
+    /// **v1.11.0**：`dispatch` 的「按下态重绘」**接线**锁。
+    ///
+    /// [`pressed_change_requests_redraw`] 钉的是纯函数，抓不到接线坏掉：
+    /// ① 空输入早退分支与正常 reduce 分支**都要**调用它（少一个就是「松手留下
+    /// 按下态」回归）；② `prev_*` 必须在 `sync_interaction()` **之前**捕获——
+    /// 那一步正是把 `interact.pressed` 写进 `state` 的地方，取晚了就变成
+    /// 「拿同步后的自己跟自己比」，恒等、永不重绘，而纯函数测试照样全绿。
+    ///
+    /// `App` 依赖真实 HWND，单测造不出来，所以这里读源码钉住（G8-② 同一手法）。
+    #[test]
+    fn dispatch_wires_pressed_state_redraw_in_both_branches() {
+        let src = include_str!("app.rs");
+        let start = src
+            .find("fn dispatch(&mut self")
+            .expect("dispatch() 必须存在");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert_eq!(
+            body.matches("interaction_needs_redraw(").count(),
+            2,
+            "空输入早退分支与正常 reduce 分支都必须判一次，少一个就是「松手不重绘」回归"
+        );
+        assert!(
+            body.contains("if inputs.is_empty()"),
+            "空输入必须早退（按下 / 抬起本来就不产生 WidgetInput）"
+        );
+
+        let prev_hover = body
+            .find("let prev_hover_target = self.state.hover_target;")
+            .expect("必须在函数开头捕获 prev_hover_target");
+        let prev_pressed = body
+            .find("let prev_pressed = self.state.pressed;")
+            .expect("必须在函数开头捕获 prev_pressed");
+        let first_sync = body
+            .find("self.sync_interaction();")
+            .expect("dispatch 必须同步交互态");
+        assert!(
+            prev_hover < first_sync && prev_pressed < first_sync,
+            "prev_* 必须在 sync_interaction() 之前捕获，否则比的是同步后的自己"
+        );
+    }
+
+    /// **v1.11.0 / D5 接线锁**：枚举失败必须真的回一条 `detectFailed` 给设置页。
+    ///
+    /// 这条路径单测造不出来（要 `App` + 真实 HWND，还得让媒体线程恰好不在），
+    /// 所以读源码钉两件事：
+    /// ① 失败值必须按 `false` 处理（`unwrap_or(false)`——手滑成 `true`，
+    ///    刷新按钮就再也不会复位）；
+    /// ② 失败分支必须真的 post `detect_failed_json()`。
+    #[test]
+    fn enumerate_failure_wires_detect_failed_back_to_settings() {
+        let src = include_str!("app.rs");
+        let start = src
+            .find("\"blacklistEnumerate\" =>")
+            .expect("设置页动作 blacklistEnumerate 必须存在");
+        let rest = &src[start..];
+        // 切到该臂的收尾大括号（12 空格缩进），别把后面的动作也算进来
+        let end = rest
+            .find("\n            }\n")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains(".unwrap_or(false)"),
+            "媒体服务缺席必须当作「未送达」，否则置灰的按钮永不复位"
+        );
+        assert!(
+            body.contains("detect_failed_json()"),
+            "枚举失败分支必须回 detectFailed，否则设置页刷新按钮永久灰死"
         );
     }
 

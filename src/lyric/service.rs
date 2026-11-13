@@ -91,6 +91,8 @@ enum Msg {
     Request(LyricRequest),
     /// 来自在线线程的查询结果（`Box` 一下：否则整个枚举按最大变体 336 字节走）
     Online(Box<OnlineOutcome>),
+    /// 清空歌词缓存（v1.11.0）：设置页按钮 → UI 线程 → 这里
+    ClearCache,
     /// 关线程（`LyricService::shutdown` 发出）
     Shutdown,
 }
@@ -176,6 +178,16 @@ impl LyricService {
         }
     }
 
+    /// 投递一次「清空缓存」（v1.11.0）。线程已退出时静默丢弃。
+    ///
+    /// 真正删除发生在歌词线程里（[`Cache::clear_all`]）：`Cache` 是它独占的，
+    /// 在 UI 线程直接删文件会和正在进行的落盘 / 读取抢同一批路径。
+    pub fn clear_cache(&self) {
+        if self.tx.send(Msg::ClearCache).is_err() {
+            crate::log_warn!("歌词线程已退出，清空缓存请求被丢弃");
+        }
+    }
+
     /// 通知退出。
     ///
     /// **刻意不 `join`**：在线查询最长 8 秒（[`ONLINE_DEADLINE_MS`]，更短的网络请求
@@ -226,6 +238,7 @@ fn run(sink: EventSink<AppEvent>, rx: Receiver<Msg>, job_tx: Sender<Msg>) {
         match rx.recv_timeout(timeout) {
             Ok(Msg::Request(req)) => worker.on_request(req),
             Ok(Msg::Online(out)) => worker.on_online(*out),
+            Ok(Msg::ClearCache) => worker.on_clear_cache(),
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => worker.on_tick(Instant::now()),
             Err(RecvTimeoutError::Disconnected) => break,
@@ -316,6 +329,17 @@ impl<O: EventOut> Worker<O> {
         // 新请求 = 换歌（或用户手动重试）：旧的重试计时一律作废
         self.pending = None;
         self.query_fast_path(req, 0);
+    }
+
+    /// v1.11.0：清空缓存并回报 UI。
+    ///
+    /// 「清完立刻重查当前歌」不在这里做——重查要走 `LyricRequest`（含代次、本地目录
+    /// 等一整套上下文），由 UI 线程收到 [`AppEvent::LyricCacheCleared`] 后重新投递，
+    /// 线程这边只负责「删干净 + 回一条事件」。
+    fn on_clear_cache(&mut self) {
+        let (files, bytes) = self.cache.clear_all();
+        crate::log_info!("设置页：清空歌词缓存 → 删除 {files} 个文件 / {bytes} 字节");
+        self.out.emit(AppEvent::LyricCacheCleared);
     }
 
     /// 毫秒级快路径：三「层」（内存 / 磁盘 / 本地）→ 负缓存 → （需要时）丢给在线线程。

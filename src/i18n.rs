@@ -155,7 +155,9 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
         (Lang::En, "toast.blacklist.unverified") => "Added. This process name hasn't been seen on this machine yet — if it doesn't take effect, use Add in \"Detected apps\" instead.",
         (Lang::Zh, "toast.blacklist.enum_failed") => "未检测到正在播放的应用",
         (Lang::En, "toast.blacklist.enum_failed") => "No playing apps detected",
-
+        // v1.11.0：歌词缓存一键清空
+        (Lang::Zh, "toast.cache.cleared") => "歌词缓存已清空，正在重新查找这首歌",
+        (Lang::En, "toast.cache.cleared") => "Lyric cache cleared — looking this track up again",
         // ---------------- 兜底 ----------------
         (_, _) => key,
     }

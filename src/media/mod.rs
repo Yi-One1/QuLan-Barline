@@ -314,12 +314,17 @@ impl MediaService {
         }
     }
 
-    /// 投递一条播控命令。UI 线程已退出 / 线程已结束时静默丢弃。
-    pub fn send(&self, cmd: MediaCommand) {
+    /// 投递一条命令。**返回是否送达**（v1.11.0 / D5）。
+    ///
+    /// 线程已退出时返回 `false`——调用方据此复位界面。此前这里静默吞掉失败，
+    /// 于是设置页点「刷新」枚举后按钮会永久置灰（页面只等 `mediaApps` 解灰，
+    /// 而枚举请求早就死在半路了）。
+    pub fn send(&self, cmd: MediaCommand) -> bool {
         match self.tx.send(cmd) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(SendError(_)) => {
                 crate::log_warn!("媒体线程已退出，命令被丢弃");
+                false
             }
         }
     }

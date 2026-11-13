@@ -151,13 +151,6 @@ pub struct ProviderChain {
 }
 
 impl ProviderChain {
-    /// 按「本地 → 在线」组链。`online` 由配置决定。
-    pub fn new(online: Box<dyn LyricProvider>) -> Self {
-        Self {
-            providers: vec![Arc::new(LocalProvider), Arc::from(online)],
-        }
-    }
-
     /// 用任意 provider 列表组链（`service` 需要把"在线"单独成链，
     /// 好在本地与在线之间插入负缓存判断）。
     pub fn with(providers: Vec<Box<dyn LyricProvider>>) -> Self {
@@ -379,15 +372,6 @@ mod tests {
                 }),
                 Err(e) => Err(e.clone()),
             }
-        }
-    }
-
-    fn stub(name: &'static str, lines: Vec<&'static str>) -> Stub {
-        Stub {
-            name,
-            enabled: true,
-            result: Ok(lines),
-            delay: Duration::ZERO,
         }
     }
 
