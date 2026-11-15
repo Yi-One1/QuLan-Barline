@@ -133,6 +133,32 @@ impl Interaction {
         self.click_timer_wanted = false;
     }
 
+    /// 会话消失 / 切歌时的**部分**复位：清掉「属于上一首歌」的指针状态，
+    /// **保留悬停**（v1.14.3 / 真人验收 Bug 2）。
+    ///
+    /// 为什么不能整份 [`Self::reset`]：v1.14.0 起「无播放」不再隐藏小组件，而是
+    /// 切成双音符图标态 —— 窗口一直在、光标很可能正压在图标上。整份复位会把
+    /// `hover` 打回 `Idle`、`hover_alpha` 归零，表现就是「悬停底板亮一下、约
+    /// 1 秒后消失」；而 `WM_MOUSEMOVE` 只在鼠标真的移动时才来，鼠标不动就一直
+    /// 不回来。现场日志显示这条事件在被过滤会话来回翻转时**每秒**重发一次，
+    /// 于是 bug 变成每秒复现一次。
+    ///
+    /// 保留的：`hover` / `hover_alpha` / `animating`（悬停画面要接着走）。
+    /// 清掉的：按下、待判定单击、拖动进度、音量 HUD —— 它们都绑在「上一首歌」
+    /// 的语义上，换了会话再保留就是误操作。
+    pub fn reset_session(&mut self) {
+        if self.hover_target.take().is_some() {
+            self.animating = true;
+        }
+        self.pressed = None;
+        self.down = None;
+        self.pending = None;
+        self.last_blank_click = None;
+        self.seeking = false;
+        self.hud_left_ms = 0;
+        self.click_timer_wanted = false;
+    }
+
     /// 是否还在动画中（App 据此决定 16ms 定时器的开停）。
     pub fn animating(&self) -> bool {
         self.animating
@@ -578,9 +604,63 @@ mod tests {
         assert!(!i.animating(), "忽略假离开不能把动画定时器又点亮");
     }
 
+    /// v1.14.3（真人验收 Bug 2）：会话消失时小组件**并没有消失**（切成图标态），
+    /// 光标可能正压在图标上，所以 `reset_session` 只清「属于上一首歌」的指针
+    /// 状态，悬停必须原样留着。
+    ///
+    /// 反例就是 bug 现场：整份 `reset()` 把 `hover` 打回 `Idle`、`hover_alpha`
+    /// 归零，而 `WM_MOUSEMOVE` 只在鼠标真的移动时才来 —— 底板「亮一下就没」，
+    /// 鼠标不动就再也不回来。
+    #[test]
+    fn session_reset_keeps_the_hover_while_the_widget_stays_visible() {
+        let l = layout();
+        let mut i = Interaction::new();
+        i.on_move(&l, 10.0, 10.0);
+        for _ in 0..20 {
+            i.on_anim_tick(16);
+        }
+        assert!((i.hover_alpha - 1.0).abs() < 1e-3, "前置：淡入应已到 1.0");
+
+        // 造一份「按着按钮没松手」的现场
+        let (cx, cy) = l.btn_toggle.center();
+        let (_out, capture) = i.on_down(&l, cx, cy);
+        assert!(capture, "前置：按下按钮应当捕获鼠标");
+        assert!(i.pointer_is_down(), "前置：应当处于按下态");
+
+        i.reset_session();
+
+        assert_eq!(i.hover, HoverState::Hover, "会话消失不该清掉悬停");
+        assert!(
+            (i.hover_alpha - 1.0).abs() < 1e-3,
+            "悬停 alpha 不许被归零（实测 {}）",
+            i.hover_alpha
+        );
+        assert!(!i.pointer_is_down(), "按下态必须清掉（那属于上一首歌）");
+        assert!(!i.is_seeking(), "拖动态必须清掉");
+        assert!(i.hover_target.is_none(), "悬停目标必须清掉");
+        assert!(!i.has_pending_click(), "待判定单击必须清掉");
+    }
+
+    /// 整份 `reset()` 仍然是「小组件真的被隐藏」时的正确动作：
+    /// 它必须把悬停一起清掉，否则再次显示时会带着旧的高亮。
+    #[test]
+    fn full_reset_still_clears_the_hover() {
+        let l = layout();
+        let mut i = Interaction::new();
+        i.on_move(&l, 10.0, 10.0);
+        for _ in 0..20 {
+            i.on_anim_tick(16);
+        }
+        i.reset();
+        assert_eq!(i.hover, HoverState::Idle);
+        assert_eq!(i.hover_alpha, 0.0);
+        assert!(!i.animating());
+    }
+
     /// 指针在小组件内部移动不重复触发 HoverEnter（PRD §4.3）。
     #[test]
-    fn internal_moves_do_not_retrigger_enter() {        let l = layout();
+    fn internal_moves_do_not_retrigger_enter() {
+        let l = layout();
         let mut i = Interaction::new();
         i.on_move(&l, 10.0, 10.0);
         for x in [20.0f32, 40.0, 80.0, 120.0] {

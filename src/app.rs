@@ -1568,11 +1568,27 @@ impl App {
                 effects
             }
             AppEvent::SessionCleared => {
+                // v1.14.3（真人验收 Bug 2）：**幂等**。这条事件是电平语义
+                //（「现在没有会话」），不是边沿语义，收到第二次就该什么都不做。
+                //
+                // 现场：用户同时开着 Edge 和夸克，两者都有 SMTC 会话、又都不在
+                // 白名单里。Windows 的「当前会话」每秒在两者之间翻一次，媒体线程
+                // 每次翻都发一条 SessionCleared（日志实测 1 秒一条）。若无条件
+                // Relayout，窗口就每秒重排一次——既白烧 CPU，又制造出假的
+                // WM_MOUSELEAVE；更致命的是下面那句复位会把悬停态清掉。
+                if self.state.playing.state == PlaybackState::NoSession
+                    && self.state.layout.form.is_icon()
+                {
+                    return Vec::new();
+                }
                 // v1.14.0：会话清空不再隐藏小组件，而是切成双音符图标态。
                 crate::log_info!("会话已清空，小组件切换为图标态");
                 self.state.playing = NowPlaying::default();
                 self.state.lyrics = LyricView::default();
-                self.interact.reset();
+                // v1.14.3：小组件并没有消失（只是切成图标态），所以只清「属于
+                // 上一首歌」的指针状态，**悬停必须保留**——整份 `reset()` 会把
+                // `hover_alpha` 归零，光标正压在图标上也会看到底板闪一下就没。
+                self.interact.reset_session();
                 self.sync_interaction();
                 vec![Effect::Relayout]
             }

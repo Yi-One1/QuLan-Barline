@@ -1043,6 +1043,18 @@ struct PollState {
     index: Arc<MediaIndex>,
     /// 上一次广播给 UI 的"被忽略会话"（diff 用；`None` = 当前无被忽略会话）
     last_ignored: Option<IgnoredSessionInfo>,
+    /// v1.14.3：`SessionCleared` 是**电平**语义而不是**边沿**语义，发过一次就该闭嘴。
+    ///
+    /// 现场（v1.14.2 真人验收 Bug 2）：用户同时开着 Edge 和夸克，两者都有 SMTC
+    /// 会话、又都不在白名单里。Windows 的「当前会话」在两者之间来回翻，每翻一次
+    /// `enter_ignored` 都因为「身份变了」再发一条 `SessionCleared`——实测**每秒
+    /// 一条**。UI 侧收到它就 `interact.reset()`，把悬停态连同 `hover_alpha` 一起
+    /// 归零，于是图标态的悬停底板「亮一下、约 1 秒后消失」，且鼠标不动就再也不
+    /// 回来（`WM_MOUSEMOVE` 不会补发）。
+    ///
+    /// `true` = UI 那边已经处于「无会话」状态，不必再通知。真接到正常会话
+    /// （[`Self::publish`] 发出 `NowPlaying`）时清回 `false`。
+    cleared_sent: bool,
     /// 上次真正发起身份重查的时刻（忽略态的 `IGNORE_RECHECK_MS` 闸）
     last_ignore_probe: Instant,
     /// 命中日志限流（按进程名分桶；`perf::RateLimiter` 的 key 是 `&'static str`，
@@ -1077,6 +1089,7 @@ impl PollState {
             session_events: None,
             index,
             last_ignored: None,
+            cleared_sent: false,
             last_ignore_probe: Instant::now(),
             last_hit: None,
             display_session: None,
@@ -1185,9 +1198,14 @@ impl PollState {
     /// 进入（或保持）忽略态的**一次性**转移（正常 → 忽略 / 忽略中身份变化复用）。
     ///
     /// 四件事，顺序固定：① `last = None`（解绑后才可能重新广播）
-    /// ② `SessionCleared`（复用既有变体：UI 侧复位 playing/lyrics 并隐藏小组件）
+    /// ② `SessionCleared`（复用既有变体：UI 侧复位 playing/lyrics 并切成图标态）
     /// ③ 命中 INFO（按进程名 60s 限流）④ `IgnoredSession(Some)`。
     /// **绝不**清 `parts` / `cadence` / `session_events`——`parts` 是唯一身份来源。
+    ///
+    /// v1.14.3：② 加 [`Self::cleared_sent`] 闸。**忽略态内部的身份翻转**
+    /// （Edge ↔ 夸克这类「两个都被过滤的会话轮流当当前会话」）只更新 ④ 的托盘
+    /// 文案，不再重发 `SessionCleared`——那条事件会把 UI 的悬停态一并清掉，
+    /// 每秒重发就是「悬停底板亮一下就没」的根因。
     fn enter_ignored(&mut self, sink: &EventSink<AppEvent>, now: Instant) {
         // ① 丢弃上一份快照；G8-①：进入空态就不再锁定任何替代会话
         // G8-④：先记住歌词钟（被拉黑的应用解绑后，同一首歌不该从 0 重唱）
@@ -1195,8 +1213,12 @@ impl PollState {
         self.last = None;
         self.cover.done = false;
         self.display_session = None;
-        // ② 复用既有 SessionCleared（UI 侧已会把 playing/lyrics 复位并隐藏小组件）
-        sink.send(AppEvent::SessionCleared);
+        // ② 复用既有 SessionCleared（UI 侧已会把 playing/lyrics 复位并切成图标态）。
+        //    只在「UI 还没被通知过」时发：电平语义，发一次就够。
+        if !self.cleared_sent {
+            sink.send(AppEvent::SessionCleared);
+            self.cleared_sent = true;
+        }
         // ③ 命中日志（限流）
         let id = self.index.identity(&self.parts.process_name, &self.parts.aumid);
         let label = if id.key.is_empty() {
@@ -1684,6 +1706,8 @@ impl PollState {
                     self.cadence = Cadence::default();
                     self.session_events = None;
                     self.display_session = None;
+                    // v1.14.3：UI 侧已进入「无会话」，后续的忽略态转移不必重发。
+                    self.cleared_sent = true;
                     sink.send(AppEvent::SessionCleared);
                 }
                 return;
@@ -1862,6 +1886,9 @@ impl PollState {
         // 再推进 last —— 顺序反了就等于没记。
         self.remember_leaving(Some(&snapshot), now);
         self.last = Some(snapshot.clone());
+        // v1.14.3：UI 重新有会话可显示了 → 下一次「被过滤」必须重新通知它复位，
+        // 否则图标态会一直停在「无会话」而实际有歌在放。
+        self.cleared_sent = false;
         sink.send(AppEvent::NowPlaying(Box::new(snapshot)));
     }
 }
@@ -6095,6 +6122,78 @@ mod g8_lyric_clock_continuity {
         assert!(st2.last.is_none(), "前置：释放必须丢弃快照");
         assert_eq!(st2.memory.len(), 1, "解绑释放必须先记住歌词钟");
         assert_eq!(st2.memory.restore(CLOUD, snap2.track_id, at(t0, 2_000)), expect);
+    }
+
+    /// **v1.14.3（真人验收 Bug 2）：忽略态内部的身份翻转不许重发 `SessionCleared`。**
+    ///
+    /// 现场：用户同时开着 Edge 和夸克，两者都有 SMTC 会话、又都不在白名单里。
+    /// Windows 的「当前会话」每秒在两者之间翻一次，`enter_ignored` 每次都因为
+    /// 「身份变了」再发一条 `SessionCleared`（实测日志 1 秒一条）。UI 收到它就
+    /// 复位悬停态 → 图标态悬停底板「亮一下、约 1 秒后消失」，鼠标不动再也不回来。
+    ///
+    /// `SessionCleared` 是**电平**语义（"现在没有会话"），不是边沿语义：UI 已经
+    /// 在无会话态时再说一遍没有任何信息量。托盘文案（`IgnoredSession`）仍要跟着
+    /// 最新的被忽略会话走，所以那条照发。
+    #[test]
+    fn flipping_between_two_ignored_sessions_clears_the_ui_only_once() {
+        let (sink, rx) = fake_sink();
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        let t0 = Instant::now();
+
+        st.parts.process_name = "msedge.exe".to_string();
+        st.parts.aumid = "MSEdge".to_string();
+        st.enter_ignored(&sink, t0);
+
+        // 系统「当前会话」翻到夸克：身份变了，但 UI 早就处于无会话态
+        st.parts.process_name = "quark.player.exe".to_string();
+        st.parts.aumid = "Quark.Player".to_string();
+        st.enter_ignored(&sink, at(t0, 1_000));
+
+        // 再翻回 Edge
+        st.parts.process_name = "msedge.exe".to_string();
+        st.parts.aumid = "MSEdge".to_string();
+        st.enter_ignored(&sink, at(t0, 2_000));
+
+        let (mut cleared, mut ignored_updates) = (0, 0);
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                AppEvent::SessionCleared => cleared += 1,
+                AppEvent::IgnoredSession(Some(_)) => ignored_updates += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            cleared, 1,
+            "SessionCleared 是电平语义：忽略态内部翻转不许重发（实测 {cleared} 条）"
+        );
+        assert_eq!(
+            ignored_updates, 3,
+            "托盘「恢复 X」的文案仍要跟着最新的被忽略会话走"
+        );
+    }
+
+    /// **反例保护**：真的显示过一首歌之后再被过滤，必须重新通知 UI 复位。
+    ///
+    /// 否则闸门会永久关死——小组件停在上一首的界面上，实际那个会话已经被过滤了。
+    #[test]
+    fn clearing_is_re_armed_after_a_real_session_is_shown_again() {
+        let (sink, rx) = fake_sink();
+        let mut st = PollState::new(Arc::new(AtomicBool::new(false)), test_index());
+        let t0 = Instant::now();
+
+        st.parts.process_name = "msedge.exe".to_string();
+        st.parts.aumid = "MSEdge".to_string();
+        st.enter_ignored(&sink, t0);
+        assert!(st.cleared_sent, "前置：首次进入忽略态必须已通知");
+
+        // 模拟「发布了一首正常会话」：`tick` 的发货点会把闸门重新打开
+        st.cleared_sent = false;
+
+        st.enter_ignored(&sink, at(t0, 5_000));
+        let cleared = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|e| matches!(e, AppEvent::SessionCleared))
+            .count();
+        assert_eq!(cleared, 2, "重新有会话可显示之后再被过滤，必须再通知一次");
     }
 
     /// **QA 补测⑤：真实播放器「换曲首帧就是 `(0, D)`」不许被上一首的旧位置污染。**
