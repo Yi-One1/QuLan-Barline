@@ -960,6 +960,19 @@ pub enum WidgetForm {
     Compact,
     /// 歌词开启：信息区宽至少 160 * scale，下行显示当前行歌词
     Lyric,
+    /// 图标态（v1.14.0）：**完全没有媒体会话**时，整条小组件收成一个 34px 小方块，
+    /// 里面只有双音符图标。除 `icon` / `icon_plate` 外所有矩形都是空矩形 ——
+    /// 于是命中测试天然返回「空白区」，右键菜单 / 双击开设置 / 悬停背景
+    /// 全部复用既有逻辑，不需要任何「图标态专用」分支。
+    Icon,
+}
+
+impl WidgetForm {
+    /// 是否图标态。**唯一判定入口**：绘制、布局、命中、可见性都从这里分流，
+    /// 不要在各处写 `form == WidgetForm::Icon`（历史上分散判定栽过跟头）。
+    pub fn is_icon(self) -> bool {
+        matches!(self, WidgetForm::Icon)
+    }
 }
 
 /// 布局结果。所有坐标都是**窗口客户区逻辑坐标**（未乘 DPI 的部分已乘好 scale）。
@@ -992,8 +1005,33 @@ pub struct WidgetLayout {
     pub hit_next: RectF,
     pub hit_progress: RectF,
     pub hit_cover: RectF,
+    // ---- 图标态（v1.14.0，其余形态下为空矩形）----
+    /// 双音符图标外框：正方形，边长 `ICON_SIDE`（24）* scale，居中于底板
+    pub icon: RectF,
+    /// 悬停底板：图标态下占**整条**宽度 × `ICON_PLATE_SIDE`（34）* scale，垂直居中
+    pub icon_plate: RectF,
 }
 ```
+
+**图标态的不变式**（`layout.rs` 的单测钉死）：除 `icon` / `icon_plate` 外，
+`main_row` / `cover` / `title` / 三按钮 / `progress` / `lyric_cur` / 全部 `hit_*`
+**必须是空矩形**。这是「图标态零专用分支」的实现基础 —— 命中测试落在空矩形上
+自然返回 `HitTarget::None`，右键菜单与双击开设置因此直接复用既有逻辑。
+
+**造型的唯一来源是 `src/render/icon_geom.rs`**，它被**双编译**：
+
+```rust
+// src/render/icon.rs
+#[path = "icon_geom.rs"]
+mod icon_geom;          // 运行时绘制（D2D）
+
+// build.rs
+include!("src/render/icon_geom.rs");   // 构建期生成 assets/icon.ico / icon_light.ico
+```
+
+同一份几何既画小组件、又生成 exe 资源与托盘用的多尺寸 ICO，所以「所有出口造型
+一致」是编译期保证的，不靠人工对齐。几何参数（符头旋转椭圆、符干、平行四边形
+符杠、下方横线、视觉居中平移 `NOTE_SHIFT_X`）与全部约束单测都在该文件里。
 
 ### 7.4 主题与背景（`src/render/theme.rs`、`src/render/sampler.rs`）
 

@@ -8,11 +8,12 @@
 | --- | --- |
 | ![设置界面](assets/screenshots/settings.png) | ![任务栏小组件](assets/screenshots/widget.png) |
 
-**最新版本 [v1.13.1](https://github.com/Yi-One1/QuLan-Barline/releases/latest)** — 单文件绿色便携（约 1.1 MB，零运行时依赖），从 [Releases](https://github.com/Yi-One1/QuLan-Barline/releases) 下载 `Barline_v1.13.1.exe` 直接运行即可。
+**最新版本 [v1.14.3](https://github.com/Yi-One1/QuLan-Barline/releases/latest)** — 单文件绿色便携（约 1.1 MB，零运行时依赖），从 [Releases](https://github.com/Yi-One1/QuLan-Barline/releases) 下载 `Barline_v1.14.3.exe` 直接运行即可。
 
 ## 功能
 
 - **任务栏条带**：内嵌任务栏（贴托盘区左侧 8px），四方位任务栏 / 多显示器 / DPI 缩放 / 自动隐藏 / Explorer 重启重挂全部自适应
+- **无播放时收成图标**：完全没有媒体会话时，整条小组件收成一个 34px 小方块，只显示「双音符 + 横线」图标；右键菜单、悬停底板、双击开设置、随背景自适应配色全部与正常小组件同一套逻辑，不是另写的一套（v1.14.0）。图标造型只有一份几何来源（`src/render/icon_geom.rs`），小组件、托盘、窗口标题栏、设置页品牌、exe 资源全部由它派生，所以各出口风格天然一致
 - **媒体信息**：通过 SMTC 读取系统媒体会话——封面、歌名、歌手、播放状态
 - **播控三键**：上一首 / 播放暂停 / 下一首，直接控制 SMTC 会话
 - **进度条**：拖动跳转，Seeking 态有跟随时间气泡
@@ -62,9 +63,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task clippy # lint
 
 ## 配置文件
 
-- 配置 / 日志 / WebView2 用户数据：`%LOCALAPPDATA%\Barline\`
+- 配置 / 日志 / WebView2 用户数据默认在 `%LOCALAPPDATA%\Barline\`，可在设置里迁移到自定义数据目录（迁移后**日志也跟着走**，排查时先确认实际路径）
   - `config.json`（损坏时自动回退默认值）
-  - `logs\barline.log`
+  - `barline.log`
   - `WebView2\`（设置页用户数据，便携不污染系统）
 
 ## 歌词缓存与来源
