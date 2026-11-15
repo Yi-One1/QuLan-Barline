@@ -199,19 +199,19 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
   <nav>
     <div class="brand">
       <!-- 品牌图标：与小组件 / 托盘 / exe 资源**同一份几何**（src/render/icon_geom.rs）。
-           坐标系 = 96 单位设计盒；viewBox 紧贴字形包围盒 14,13 68×71；
-           translate(-2.011 0) = 双音符按质量重心居中（不是外框居中）。
+           坐标系 = 96 单位设计盒；viewBox 紧贴字形包围盒 9.754,0 76.491×96。
+           符头是**旋转椭圆**（半轴 15.51 / 11.564，倾角 −45°），不是圆。
            颜色用 currentColor：浅色主题黑、深色主题白，不写死颜色。
            改动这里必须同步 icon_geom.rs —— 有一条单测会比对这两处。 -->
-      <svg class="logo" viewBox="14 13 68 71" role="img" aria-label="曲栏" data-icon="barline-note">
-        <g fill="currentColor" transform="translate(-2.011 0)">
-          <circle cx="27" cy="64" r="9.5"/>
-          <circle cx="63" cy="57" r="9.5"/>
-          <rect x="33" y="20" width="5" height="44" rx="2.5"/>
-          <rect x="69" y="13" width="5" height="44" rx="2.5"/>
-          <path d="M33 20 L74 13 L74 22 L33 29 Z"/>
+      <svg class="logo" viewBox="9.754 0 76.492 96" role="img" aria-label="曲栏" data-icon="barline-note">
+        <g fill="currentColor">
+          <ellipse cx="23.435" cy="68.11" rx="15.51" ry="11.564" transform="rotate(-45 23.435 68.11)"/>
+          <ellipse cx="72.414" cy="59.04" rx="15.51" ry="11.564" transform="rotate(-45 72.414 59.04)"/>
+          <rect x="34.092" y="13.514" width="3.628" height="54.596" rx="1.814"/>
+          <rect x="82.617" y="0.487" width="3.628" height="58.553" rx="1.814"/>
+          <path d="M34.546 13.879 L86.246 0 L86.246 13.923 L34.546 27.802 Z"/>
+          <rect x="9.754" y="90.6" width="76.492" height="5.4" rx="2.7"/>
         </g>
-        <rect x="14" y="80" width="68" height="4" rx="2" fill="currentColor"/>
       </svg>
       <span data-i18n="app.name">曲栏</span>
     </div>

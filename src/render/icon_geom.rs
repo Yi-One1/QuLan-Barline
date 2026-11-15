@@ -9,97 +9,104 @@
 //! 只要两处用同一份几何常量，就不可能出现「托盘是一个样、小组件是另一个样」。
 //! 因此本文件**只允许依赖 `core` / `std`**，不许 `use crate::…`、不许 `windows`。
 //!
-//! ## 造型
+//! ## 造型来源：用户 2026-11-16 给的参考图
 //!
-//! 逐值照抄用户拍板的「变体 3 · 双音符」SVG（96 单位设计盒）：
+//! 上一版（变体 3）被用户否掉，理由是「上方突出两个小尖尖」。根因是符干顶端
+//! 比符杠上边高出 4.5~5.4 单位，露在符杠外面。本版改为逐像素测量用户提供的
+//! 参考图（`174×180`，逐行 + 逐列扫描 + 最小二乘拟合），实测结果：
 //!
-//! ```svg
-//! <circle cx="27" cy="64" r="9.5"/>  <circle cx="63" cy="57" r="9.5"/>
-//! <rect x="33" y="20" width="5" height="44" rx="2.5"/>
-//! <rect x="69" y="13" width="5" height="44" rx="2.5"/>
-//! <path d="M33 20 L74 13 L74 22 L33 29 Z"/>
-//! <rect x="14" y="80" width="68" height="4" rx="2"/>
-//! ```
+//! | 量 | 参考图（px） | 占墨迹高 |
+//! |---|---|---|
+//! | 符头 | **椭圆** 半长轴 34.2 / 半短轴 25.5，倾角 −45° | 长短轴比 1.34 |
+//! | 符干宽 | 8.0 | 4.44% |
+//! | 符杠竖直厚 | 30.7 | 17.1% |
+//! | 符杠斜率 | −0.26846 | — |
+//! | 两符头中心距 | 108 × −20 | — |
 //!
-//! ## 居中口径（用户明确要求）
+//! **符头是椭圆，不是圆。** 这一点靠像素重合度判定，不靠肉眼也不靠二阶矩
+//! （后者会被符干遮挡带偏）：把整个音符按候选形状重画一遍与参考图逐像素比对，
+//! 椭圆 34.2/25.5 @−45° 误差 1.43%，同样外框的正圆误差 3.78% —— 差 2.6 倍。
+//! 面积也印证：实测 2772px²，内接同一外框的正圆是 2922，旋转椭圆是 2750。
 //!
-//! 双音符按**质量重心**水平居中，而不是外框居中——外框居中会让图形看起来偏右。
-//! 实测质量重心 `x = 50.011`，盒中心 48，故整体左移 `2.011` 设计单位。
-//! 下方横线**保持原图的 14..82**（用户已确认接受"右端比左端伸得多"）。
+//! **关键：符干顶端 = 符杠上边**。参考图里符干 A 顶端在 `y=30`、符干 B 在 `y=1`，
+//! 与符杠上边 `y = −0.26772x + 45.676` 在该处的取值完全吻合 —— 符干藏在符杠里，
+//! 所以看不到尖。本文件用 [`bar_top_at`] 强制这条，[`Prim::RoundRect`] 的圆角
+//! （胶囊形）保证符干顶端任何一点都不越出符杠上边。
+//!
+//! ## 居中口径
+//!
+//! **外框居中**（不是质量重心居中）。上一版按质量重心居中，那个做法对本造型不成立：
+//! 新造型的符杠又厚又长（面积占音符的 32%，重心在最右），实测音符质量重心比
+//! 外框中心偏右 **6.11 单位**。若强行让重心落在盒中心，音符要左移 6.11，而横线
+//! 若跟着音符走就会左溢出、若不跟着走就比音符右端多伸出 14 单位（图标的 15%），
+//! 两种都明显「画歪了」。参考图本身也是外框居中（左右边距各 3px），故照做。
 //!
 //! ## 小尺寸
 //!
-//! 16/20/24px 下符干只有 1.1~1.7 像素宽，按比例加粗（位置与比例不变），
-//! 32px 及以上用原权重。系数见 [`weight_factor`]。
+//! 参考图的符干只占 4.44%，16px 下只有 0.6 像素宽 —— 不加粗会断成虚线。
+//! 故 16~40px 按 [`weight_factor`] 只加粗**符干**（符杠本来就厚、符头本来就大，
+//! 不参与加粗，造型保持忠实）。缩放基准用 [`ink_bounds`] 现算，不写死。
 
-/// 设计坐标系边长（源 SVG 的 96 单位盒）。
+/// 设计坐标系边长（参考图等比映射后的 96 单位盒）。
 pub const DESIGN: f32 = 96.0;
 
-/// 符头 A（左、低）：`(cx, cy, r)`。
-pub const HEAD_A: (f32, f32, f32) = (27.0, 64.0, 9.5);
-/// 符头 B（右、高）。
-pub const HEAD_B: (f32, f32, f32) = (63.0, 57.0, 9.5);
+/// 符头 A（左、低）：`(cx, cy, 半长轴, 半短轴)`。参考图中心 `(32.5, 150)`。
+pub const HEAD_A: (f32, f32, f32, f32) = (23.435, 68.110, 15.510, 11.564);
+/// 符头 B（右、高）。参考图中心 `(140.5, 130)`。
+pub const HEAD_B: (f32, f32, f32, f32) = (72.414, 59.040, 15.510, 11.564);
 
-/// 符干 A：`(x, y, w, h)`，圆角 = w/2（胶囊）。
-pub const STEM_A: (f32, f32, f32, f32) = (33.0, 20.0, 5.0, 44.0);
-/// 符干 B。
-pub const STEM_B: (f32, f32, f32, f32) = (69.0, 13.0, 5.0, 44.0);
-
-/// 符杠中线起点（设计单位）。
-pub const BAR_FROM: (f32, f32) = (33.0, 24.5);
-/// 符杠中线终点。
-pub const BAR_TO: (f32, f32) = (74.0, 17.5);
-/// 符杠厚度（垂直于中线）。
-pub const BAR_THICK: f32 = 9.0;
-
-/// 下方横线：`(x, y, w, h)`，圆角 = h/2。
-pub const RULE: (f32, f32, f32, f32) = (14.0, 80.0, 68.0, 4.0);
-
-/// 字形包围盒在 **k = 1**（≥32px）时的取值 `(x0, y0, x1, y1)`：横线 14..82、音符 13..84。
+/// 符头椭圆的倾角（**度**，正值 = 顺时针，与 D2D 的 `rotation` 同向）。
 ///
-/// 注意：小尺寸加粗后包围盒会变大（16px → 高 72.2），实际缩放一律用
-/// [`ink_bounds`] 现算，不要用这组常量。
-pub const BBOX_AT_UNIT_WEIGHT: (f32, f32, f32, f32) = (14.0, 13.0, 82.0, 84.0);
+/// −45° = 长轴指向右上，也就是经典音符头的方向。参考图实测值。
+pub const HEAD_ROT_DEG: f32 = -45.0;
 
-/// 双音符（两符头 + 两符干 + 符杠）的质量重心 x，设计单位。
-///
-/// 横线**不计入**：它是独立的装饰线，且本身关于盒中心对称。
-pub fn mass_centroid_x() -> f32 {
-    let pi = core::f32::consts::PI;
-    let mut total = 0.0f32;
-    let mut acc = 0.0f32;
-
-    for (cx, _cy, r) in [HEAD_A, HEAD_B] {
-        let a = pi * r * r;
-        total += a;
-        acc += a * cx;
-    }
-    for (x, _y, w, h) in [STEM_A, STEM_B] {
-        let a = w * h;
-        total += a;
-        acc += a * (x + w * 0.5);
-    }
-    // 符杠是平行四边形：面积 = 底 × 竖直高；重心 = 四顶点均值 = 中线中点。
-    let dx = BAR_TO.0 - BAR_FROM.0;
-    let dy = BAR_TO.1 - BAR_FROM.1;
-    let a = (dx * dx + dy * dy).sqrt() * BAR_THICK;
-    total += a;
-    acc += a * ((BAR_FROM.0 + BAR_TO.0) * 0.5);
-
-    acc / total
+/// 符头椭圆的长短轴比（给单测与文档用）。
+pub fn head_axis_ratio() -> f32 {
+    HEAD_A.2 / HEAD_A.3
 }
 
-/// 让双音符质量重心落在设计盒中心所需的水平平移（负值 = 左移）。
-pub fn center_shift_x() -> f32 {
-    DESIGN * 0.5 - mass_centroid_x()
+/// 符干宽（k = 1）。
+pub const STEM_W: f32 = 3.628;
+/// 符干 A 的**左边缘** x（中心 = 左边缘 + `STEM_W` / 2）。
+pub const STEM_A_X: f32 = 34.092;
+/// 符干 B 的**左边缘** x。
+pub const STEM_B_X: f32 = 82.617;
+
+/// 符杠左端 x（= 符干 A 左边缘附近，参考图实测 57/174）。
+pub const BAR_X0: f32 = 34.546;
+/// 符杠右端 x（= 符干 B 右边缘，参考图实测 171/174）。
+pub const BAR_X1: f32 = 86.246;
+/// 符杠**上边**在 `BAR_X0` 处的 y。
+pub const BAR_TOP_LEFT: f32 = 13.879;
+/// 符杠上边斜率（参考图最小二乘拟合 −0.26846）。
+pub const BAR_SHEAR: f32 = -0.26846;
+/// 符杠**竖直**厚度（不是垂直于轴线的厚度）。
+pub const BAR_THICK: f32 = 13.923;
+
+/// 下方横线：`(x, y, w, h)`，圆角 = h/2。宽度与音符墨迹等宽（参考图无横线，
+/// 比例沿用上一版：横线是独立装饰，左右端分别对齐音符墨迹的左右端）。
+pub const RULE: (f32, f32, f32, f32) = (9.754, 90.600, 76.492, 5.400);
+
+/// 符杠上边在 `x` 处的 y。符干顶端与它对齐，所以看不到「小尖尖」。
+pub fn bar_top_at(x: f32) -> f32 {
+    BAR_TOP_LEFT + BAR_SHEAR * (x - BAR_X0)
 }
 
-/// 小尺寸加粗系数（用户拍板的 A 方案：同造型，按尺寸微加粗）。
+/// 小尺寸符干加粗系数。
 ///
-/// 断点之间线性插值，区间外取端点值。24px 是小组件图标态的实际尺寸，
-/// 32px 及以上回到原权重。
+/// 参考图符干只占墨迹高的 4.44%，落位到 16px 只有 0.6px。断点之间线性插值，
+/// 区间外取端点值。目标：符干落位后 ≥ 1.4~1.6px（低于这个值抗锯齿会把它糊成灰线）。
+///
+/// 只加粗符干 —— 符杠（17.1%）与符头（33.9%）本来就粗，跟着加粗会失真。
 pub fn weight_factor(px: f32) -> f32 {
-    const TABLE: [(f32, f32); 4] = [(16.0, 1.60), (20.0, 1.32), (24.0, 1.12), (32.0, 1.00)];
+    const TABLE: [(f32, f32); 6] = [
+        (16.0, 2.40),
+        (20.0, 2.11),
+        (24.0, 1.76),
+        (32.0, 1.32),
+        (40.0, 1.06),
+        (48.0, 1.00),
+    ];
     if px <= TABLE[0].0 {
         return TABLE[0].1;
     }
@@ -114,94 +121,107 @@ pub fn weight_factor(px: f32) -> f32 {
     TABLE[TABLE.len() - 1].1
 }
 
-/// 一个图元（设计单位，已含质量重心平移）。
+/// 一个图元（设计单位）。
 ///
 /// 故意只用三种基元：Direct2D 侧分别对应 `FillEllipse` / `FillRoundedRectangle`
 /// / 剪切后的 `FillRectangle`，不需要引入 `ID2D1PathGeometry`。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Prim {
-    /// 圆（符头）。
-    Circle { cx: f32, cy: f32, r: f32 },
-    /// 圆角矩形（符干 / 横线），圆角半径 = `r`。
+    /// 旋转椭圆（符头）。`rot` 单位是**度**，正值顺时针。
+    ///
+    /// 符头不是圆：参考图实测长短轴比 1.34、倾角 −45°。用像素重合度验证过，
+    /// 正圆的误差是椭圆的 2.6 倍。
+    Ellipse { cx: f32, cy: f32, rx: f32, ry: f32, rot: f32 },
+    /// 圆角矩形（符干 / 横线），圆角半径 = `r`。符干取 `r = w/2`（胶囊形）：
+    /// 顶端收成半圆，保证加粗后任何一点都不越出符杠上边。
     RoundRect { x: f32, y: f32, w: f32, h: f32, r: f32 },
     /// 平行四边形（符杠）：`(x, y)` 是**左上角**，左右两端垂直，上边斜率为 `shear`。
     ///
-    /// 为什么不是「旋转矩形」：源图 `M33 20 L74 13 L74 22 L33 29 Z` 的左右两端是
-    /// **竖直**的（x 恒为 33 / 74），旋转矩形的两端会垂直于符杠轴线、斜 9.69°，
-    /// 128px 下端点偏 2.23px。用剪切矩阵可以逐值复现原图。
+    /// 为什么不是「旋转矩形」：参考图的符杠左右两端是**竖直**的（x 恒为 57 / 171），
+    /// 旋转矩形的两端会垂直于符杠轴线、斜 15.03°，128px 下端点偏 4.1px。
+    /// 用剪切矩阵可以逐值复现参考图。
     Beam { x: f32, y: f32, w: f32, h: f32, shear: f32 },
 }
 
-/// 符杠上边斜率（`(13−20)/(74−33)`）。平行四边形与剪切矩阵共用。
-pub fn beam_shear() -> f32 {
-    (BAR_TO.1 - BAR_FROM.1) / (BAR_TO.0 - BAR_FROM.0)
+/// 椭圆旋转后的**轴对齐半宽**。
+fn ellipse_half_w(rx: f32, ry: f32, rot_deg: f32) -> f32 {
+    let t = rot_deg.to_radians();
+    let (s, c) = (t.sin(), t.cos());
+    (rx * rx * c * c + ry * ry * s * s).sqrt()
 }
 
-/// 按目标像素尺寸产出全部图元（设计单位，已含平移与加粗）。
+/// 椭圆旋转后的**轴对齐半高**。
+fn ellipse_half_h(rx: f32, ry: f32, rot_deg: f32) -> f32 {
+    let t = rot_deg.to_radians();
+    let (s, c) = (t.sin(), t.cos());
+    (rx * rx * s * s + ry * ry * c * c).sqrt()
+}
+
+/// 一根符干：**外缘（右缘）固定，向内加粗**，顶端严格落在符杠上边。
+///
+/// 为什么向内加粗：参考图里符干 B 的右缘正好是音符墨迹的右缘（与符杠右端重合），
+/// 向两侧加粗会让它在小尺寸下探出符杠右端，右边界随尺寸漂移，
+/// 横线也就对不齐了。固定外缘后墨迹包围盒在所有尺寸下都是同一个。
+fn stem(x_left: f32, head_cy: f32, k: f32) -> Prim {
+    let w = STEM_W * k;
+    let right = x_left + STEM_W;
+    let cx = right - w * 0.5;
+    let top = bar_top_at(cx);
+    Prim::RoundRect {
+        x: right - w,
+        y: top,
+        w,
+        h: head_cy - top,
+        r: w * 0.5,
+    }
+}
+
+/// 按目标像素尺寸产出全部图元（设计单位，已含加粗）。
 ///
 /// 顺序固定：两符头 → 两符干 → 符杠 → 横线。顺序不影响并集结果，
 /// 但固定下来可以让单测逐项比对。
 pub fn prims(px: f32) -> [Prim; 6] {
     let k = weight_factor(px);
-    let sh = center_shift_x();
-
-    // 符头半径随加粗同步微增，否则「粗符干 + 小符头」会看着像两根柱子。
-    let head_r = |r: f32| r * (1.0 + 0.08 * (k - 1.0));
-
-    let stem = |s: (f32, f32, f32, f32)| {
-        let (x, y, w, h) = s;
-        let cx = x + w * 0.5 + sh;
-        let nw = w * k;
-        Prim::RoundRect {
-            x: cx - nw * 0.5,
-            y,
-            w: nw,
-            h,
-            r: nw * 0.5,
-        }
-    };
-
     let (rx, ry, rw, rh) = RULE;
 
     [
-        Prim::Circle {
-            cx: HEAD_A.0 + sh,
+        Prim::Ellipse {
+            cx: HEAD_A.0,
             cy: HEAD_A.1,
-            r: head_r(HEAD_A.2),
+            rx: HEAD_A.2,
+            ry: HEAD_A.3,
+            rot: HEAD_ROT_DEG,
         },
-        Prim::Circle {
-            cx: HEAD_B.0 + sh,
+        Prim::Ellipse {
+            cx: HEAD_B.0,
             cy: HEAD_B.1,
-            r: head_r(HEAD_B.2),
+            rx: HEAD_B.2,
+            ry: HEAD_B.3,
+            rot: HEAD_ROT_DEG,
         },
-        stem(STEM_A),
-        stem(STEM_B),
-        // 符杠：竖直厚度 9 → 9k（每边外扩 4.5(k−1)），左右两端恒在 x=33 / x=74
+        stem(STEM_A_X, HEAD_A.1, k),
+        stem(STEM_B_X, HEAD_B.1, k),
         Prim::Beam {
-            x: BAR_FROM.0 + sh,
-            y: BAR_FROM.1 - 4.5 * (k - 1.0),
-            w: BAR_TO.0 - BAR_FROM.0,
-            h: BAR_THICK * k,
-            shear: beam_shear(),
+            x: BAR_X0,
+            y: BAR_TOP_LEFT,
+            w: BAR_X1 - BAR_X0,
+            h: BAR_THICK,
+            shear: BAR_SHEAR,
         },
         Prim::RoundRect {
             x: rx,
-            y: ry + rh * 0.5 - rh * k * 0.5,
+            y: ry,
             w: rw,
-            h: rh * k,
-            r: rh * k * 0.5,
+            h: rh,
+            r: rh * 0.5,
         },
     ]
 }
 
 /// 给定尺寸下的**墨迹包围盒** `(x0, y0, x1, y1)`（设计单位）。
 ///
-/// 必须按加粗后的实际图元算，不能写死 k=1 的 `BBOX`：
-/// 16px 时 k=1.60，横线底边从 84 撑到 `80+2+(4k)/2 = 85.2`，整体墨迹高从 71
-/// 变成 72.2；用 71 当缩放基准会把横线下缘裁掉 0.25px（ICO 上肉眼可见）。
-///
-/// 顶边**不受加粗影响**：最上端是符干 B 的 `y = 13`（矩形只横向变粗，y 不动），
-/// 符杠加粗后左端上边是 `24.5−4.5(k−1) = 21.8`、右端 `14.8`，仍低于 13。
+/// 必须按加粗后的实际图元算：符干加粗只改宽度（不影响包围盒），但缩放基准
+/// 一旦写死就会在小尺寸下裁边。现算最稳。
 pub fn ink_bounds(px: f32) -> (f32, f32, f32, f32) {
     let mut x0 = f32::MAX;
     let mut y0 = f32::MAX;
@@ -209,7 +229,11 @@ pub fn ink_bounds(px: f32) -> (f32, f32, f32, f32) {
     let mut y1 = f32::MIN;
     for p in prims(px) {
         let (a, b, c, d) = match p {
-            Prim::Circle { cx, cy, r } => (cx - r, cy - r, cx + r, cy + r),
+            Prim::Ellipse { cx, cy, rx, ry, rot } => {
+                let hw = ellipse_half_w(rx, ry, rot);
+                let hh = ellipse_half_h(rx, ry, rot);
+                (cx - hw, cy - hh, cx + hw, cy + hh)
+            }
             Prim::RoundRect { x, y, w, h, .. } => (x, y, x + w, y + h),
             Prim::Beam { x, y, w, h, shear } => {
                 // 平行四边形：左上 (x, y)、右上 (x+w, y+w*shear)、左下 (x, y+h)
@@ -225,7 +249,7 @@ pub fn ink_bounds(px: f32) -> (f32, f32, f32, f32) {
     (x0, y0, x1, y1)
 }
 
-/// 设计单位 → 目标矩形的映射（等比，按包围盒高度对齐，中心对齐）。
+/// 设计单位 → 目标矩形的映射（等比，按墨迹包围盒居中）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
     pub scale: f32,
@@ -236,8 +260,7 @@ pub struct Placement {
 impl Placement {
     /// 把图标放进 `(x, y, w, h)` 这个矩形。
     ///
-    /// 缩放基准取**加粗后的墨迹包围盒**（[`ink_bounds`]），而不是写死的 71：
-    /// 小尺寸加粗会把墨迹撑到 72.2，用 71 会裁掉横线下缘。
+    /// 缩放基准取**加粗后的墨迹包围盒**（[`ink_bounds`]），而不是任何写死的常数。
     pub fn fit(x: f32, y: f32, w: f32, h: f32) -> Self {
         let side = if w < h { w } else { h };
         let (bx0, by0, bx1, by1) = ink_bounds(side);
@@ -269,10 +292,15 @@ impl Placement {
 /// 判断设计单位下的一点是否落在某个图元内部。
 fn inside(p: &Prim, x: f32, y: f32) -> bool {
     match *p {
-        Prim::Circle { cx, cy, r } => {
-            let dx = x - cx;
-            let dy = y - cy;
-            dx * dx + dy * dy <= r * r
+        Prim::Ellipse { cx, cy, rx, ry, rot } => {
+            // 反向旋转到椭圆的局部坐标，再做轴对齐的椭圆判别
+            let t = -rot.to_radians();
+            let (s, c) = (t.sin(), t.cos());
+            let (dx, dy) = (x - cx, y - cy);
+            let lx = dx * c - dy * s;
+            let ly = dx * s + dy * c;
+            let (ux, uy) = (lx / rx, ly / ry);
+            ux * ux + uy * uy <= 1.0
         }
         Prim::RoundRect { x: rx, y: ry, w, h, r } => {
             if x < rx || x > rx + w || y < ry || y > ry + h {
@@ -398,204 +426,291 @@ fn bmp_payload(size: u32, ink: (u8, u8, u8), sub: u32) -> Vec<u8> {
     out.extend_from_slice(&1u16.to_le_bytes()); // planes
     out.extend_from_slice(&32u16.to_le_bytes()); // bpp
     out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
-    out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes());
-    out.extend_from_slice(&[0u8; 16]); // 分辨率 + 调色板数
+    out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // 图像大小
+    out.extend_from_slice(&[0u8; 16]); // 分辨率 + 调色板
 
-    // 像素自下而上（rasterize 已是 BGRA 直通 alpha）
+    // XOR 位图：BMP 自下而上，写 BGRA
     for y in (0..h).rev() {
-        let row = &rgba[y * w * 4..(y + 1) * w * 4];
-        out.extend_from_slice(row);
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            out.extend_from_slice(&[rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]);
+        }
     }
-    out.extend_from_slice(&vec![0u8; mask_len]);
+    out.extend(std::iter::repeat_n(0u8, mask_len));
     out
 }
-
-// ------------------------------------------------------------------ 测试
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 质量重心必须落在设计盒中心 —— 这是用户「不许偏右」要求的可反向验证形式。
+    /// 设计盒边长必须能容纳墨迹（防止有人改常量时把图形撑出盒外）。
     #[test]
-    fn mass_centroid_sits_at_design_center_after_shift() {
-        let shifted = mass_centroid_x() + center_shift_x();
-        assert!(
-            (shifted - DESIGN * 0.5).abs() < 1e-4,
-            "平移后重心 = {shifted}，必须等于 {}",
-            DESIGN * 0.5
-        );
+    fn ink_fits_the_design_box() {
+        let (x0, y0, x1, y1) = ink_bounds(32.0);
+        assert!(x0 >= -0.01 && y0 >= -0.5, "左上越界 ({x0}, {y0})");
+        assert!(x1 <= DESIGN + 0.01 && y1 <= DESIGN + 0.01, "右下越界 ({x1}, {y1})");
     }
 
-    /// 重心数值本身钉死：改任何一个形状的坐标，这条必须先红。
-    #[test]
-    fn mass_centroid_value_is_pinned() {
-        let c = mass_centroid_x();
-        assert!((c - 50.011).abs() < 0.01, "质量重心 = {c}，应为 50.011");
-        assert!(
-            (center_shift_x() + 2.011).abs() < 0.01,
-            "平移 = {}",
-            center_shift_x()
-        );
-    }
-
-    /// 栅格化后（真实像素）的重心也要落在画布中心附近。
+    /// **用户指出的「两个小尖尖」的回归锁。**
     ///
-    /// 容差 0.35px：24px 画布上抗锯齿会带来不到半像素的偏差，超过即说明
-    /// 「设计单位对了但映射错了」（例如按包围盒宽度而不是高度缩放）。
+    /// 符干顶端必须严格落在符杠上边，不能高出一点点。上一版高出 4.5~5.4 单位，
+    /// 在任务栏上就是两个尖。这条同时盯住两根符干。
     #[test]
-    fn raster_mass_centroid_is_centered_at_24px() {
-        let size = 24u32;
-        let px = rasterize(size, (0, 0, 0), 8);
-        let mut total = 0.0f32;
-        let mut sx = 0.0f32;
-        for y in 0..size {
-            for x in 0..size {
-                let a = px[((y * size + x) * 4 + 3) as usize] as f32;
-                total += a;
-                sx += a * (x as f32 + 0.5);
-            }
-        }
-        let cx = sx / total;
-        assert!((cx - 12.0).abs() < 0.35, "24px 实际重心 x = {cx}，应接近 12");
-    }
-
-    /// 每个尺寸都必须画出东西（防止缩放系数算成 0 → 空图）。
-    #[test]
-    fn every_ico_size_has_ink() {
-        for sz in ICO_SIZES {
-            let px = rasterize(sz, (0, 0, 0), 4);
-            let covered = px.chunks(4).filter(|p| p[3] > 0).count();
-            let ratio = covered as f32 / (sz * sz) as f32;
-            assert!(
-                ratio > 0.08 && ratio < 0.65,
-                "{sz}px 覆盖率 {ratio:.3} 不合理（应 0.08~0.65）"
-            );
-        }
-    }
-
-    /// ICO 结构自检：头、目录项、偏移都能对上。
-    #[test]
-    fn ico_header_and_offsets_are_consistent() {
-        let sizes = [16u32, 24, 32];
-        let bytes = ico_bytes(&sizes, (0, 0, 0), 2);
-        assert_eq!(&bytes[0..2], &[0, 0]);
-        assert_eq!(&bytes[2..4], &[1, 0]);
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]) as usize, sizes.len());
-
-        for (i, sz) in sizes.iter().enumerate() {
-            let e = 6 + i * 16;
-            assert_eq!(bytes[e] as u32, *sz, "目录项 {i} 宽度");
-            let len = u32::from_le_bytes([bytes[e + 8], bytes[e + 9], bytes[e + 10], bytes[e + 11]]);
-            let off = u32::from_le_bytes([bytes[e + 12], bytes[e + 13], bytes[e + 14], bytes[e + 15]]);
-            assert!(
-                off as usize + len as usize <= bytes.len(),
-                "目录项 {i} 越界"
-            );
-            // BMP 负载以 40 字节的 BITMAPINFOHEADER 开头
-            assert_eq!(
-                u32::from_le_bytes([
-                    bytes[off as usize],
-                    bytes[off as usize + 1],
-                    bytes[off as usize + 2],
-                    bytes[off as usize + 3]
-                ]),
-                40
-            );
-        }
-    }
-
-    /// 加粗只影响小尺寸：32px 起必须回到原权重。
-    #[test]
-    fn weight_factor_only_thickens_small_sizes() {
-        assert!((weight_factor(32.0) - 1.0).abs() < 1e-6);
-        assert!((weight_factor(256.0) - 1.0).abs() < 1e-6);
-        assert!(weight_factor(16.0) > weight_factor(24.0));
-        assert!(weight_factor(24.0) > weight_factor(32.0));
-    }
-
-    /// 加粗不能改变位置：16px 与 256px 的符头/符干中心线必须完全相同。
-    #[test]
-    fn weight_does_not_move_anything() {
-        let small = prims(16.0);
-        let large = prims(256.0);
-        for i in [0usize, 1] {
-            let (a, b) = match (small[i], large[i]) {
-                (Prim::Circle { cx: a, .. }, Prim::Circle { cx: b, .. }) => (a, b),
-                _ => panic!("前两个图元必须是符头"),
-            };
-            assert!((a - b).abs() < 1e-5, "符头 {i} 被加粗挪动了：{a} vs {b}");
-        }
-        for i in [2usize, 3] {
-            let (a, b) = match (small[i], large[i]) {
-                (Prim::RoundRect { x: ax, w: aw, .. }, Prim::RoundRect { x: bx, w: bw, .. }) => {
-                    (ax + aw * 0.5, bx + bw * 0.5)
+    fn stem_tops_sit_exactly_on_the_beam_top_edge() {
+        let p = prims(32.0);
+        for (i, (stem, head)) in [(p[2], HEAD_A), (p[3], HEAD_B)].iter().enumerate() {
+            match *stem {
+                Prim::RoundRect { x, y, w, .. } => {
+                    let cx = x + w * 0.5;
+                    let expected = bar_top_at(cx);
+                    assert!(
+                        (y - expected).abs() < 1e-4,
+                        "符干 {} 顶端 y = {y}，符杠上边 = {expected}（高出的部分就是尖尖）",
+                        if i == 0 { "A" } else { "B" }
+                    );
+                    // 且必须真的往下连到符头
+                    assert!(head.1 > y, "符干必须延伸到符头中心");
                 }
-                _ => panic!("中间两个图元必须是符干"),
-            };
-            assert!((a - b).abs() < 1e-5, "符干 {i} 被加粗挪动了：{a} vs {b}");
-        }
-    }
-
-    /// 横线必须严格保持原图的 14..82（用户已确认接受左右不对称，禁止"修正"）。
-    #[test]
-    fn rule_keeps_the_source_geometry() {
-        let p = prims(32.0); // 32px 权重 1.0，与设计单位一一对应
-        match p[5] {
-            Prim::RoundRect { x, w, .. } => {
-                assert!((x - RULE.0).abs() < 1e-5, "横线左端 = {x}，应为 {}", RULE.0);
-                assert!((w - RULE.2).abs() < 1e-5, "横线宽 = {w}，应为 {}", RULE.2);
+                _ => panic!("第 {} 个图元必须是符干", i + 3),
             }
-            _ => panic!("第 6 个图元必须是横线"),
         }
     }
 
-    /// 符杠必须是平行四边形：左右两端**竖直**（x 恒为 33 / 74），上边斜率 −7/41。
+    /// 所有 ICO 尺寸下，符干顶端都不能越出符杠上边（含加粗后）。
+    ///
+    /// 胶囊形符干的顶点在中心，加粗只会向两侧扩，所以顶端 y 不随 k 变。
+    #[test]
+    fn no_stem_pokes_above_the_beam_at_any_size() {
+        for sz in ICO_SIZES {
+            let p = prims(sz as f32);
+            let beam_top = match p[4] {
+                Prim::Beam { y, .. } => y,
+                _ => unreachable!(),
+            };
+            let _ = beam_top;
+            for stem in [p[2], p[3]] {
+                if let Prim::RoundRect { x, y, w, .. } = stem {
+                    let cx = x + w * 0.5;
+                    assert!(
+                        y >= bar_top_at(cx) - 1e-4,
+                        "{sz}px：符干顶端 {y} 高于符杠上边 {}",
+                        bar_top_at(cx)
+                    );
+                    // 符干在符杠右端附近时，上边比左端更高 —— 也要满足
+                    let top_right = BAR_TOP_LEFT + (BAR_X1 - BAR_X0) * BAR_SHEAR;
+                    assert!(y >= top_right - 1e-4 || y >= bar_top_at(cx) - 1e-4);
+                }
+            }
+        }
+    }
+
+    /// **像素级回归**：栅格化后不许有任何墨迹高于符杠上边。
+    ///
+    /// 上面两条查的是常量；这条查的是**真的画出来的像素**。16/24/32px 各查一遍，
+    /// 任何一次「符干探出符杠」都会在这里被抓到。
+    #[test]
+    fn raster_has_no_ink_above_the_beam_top_edge() {
+        for sz in [16u32, 20, 24, 32, 48, 128] {
+            let place = Placement::fit(0.0, 0.0, sz as f32, sz as f32);
+            let buf = rasterize(sz, (0, 0, 0), 6);
+            for py in 0..sz {
+                for px in 0..sz {
+                    let a = buf[((py * sz + px) * 4 + 3) as usize];
+                    if a < 40 {
+                        continue;
+                    }
+                    let dx = (px as f32 + 0.5 - place.ox) / place.scale;
+                    let dy = (py as f32 + 0.5 - place.oy) / place.scale;
+                    if dx < BAR_X0 - 1.0 || dx > BAR_X1 + 1.0 {
+                        continue; // 符杠范围外只有符头，另有约束
+                    }
+                    let top = bar_top_at(dx);
+                    // 允许半个像素的抗锯齿误差（像素中心落在边界上）
+                    let tol = 0.75 / place.scale;
+                    assert!(
+                        dy >= top - tol,
+                        "{sz}px：({px},{py}) 的墨迹在设计坐标 y={dy:.2}，高于符杠上边 {top:.2} —— 这就是小尖尖"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 符杠必须是平行四边形：左右两端**竖直**，上边斜率 = 参考图拟合值。
     #[test]
     fn beam_is_a_parallelogram_with_vertical_ends() {
         let p = prims(32.0);
-        let sh = center_shift_x();
         match p[4] {
             Prim::Beam { x, y, w, h, shear } => {
-                assert!((x - (BAR_FROM.0 + sh)).abs() < 1e-5, "左端 x = {x}");
-                assert!((w - (BAR_TO.0 - BAR_FROM.0)).abs() < 1e-5, "宽 = {w}");
-                assert!((y - BAR_FROM.1).abs() < 1e-5, "左端上边 y = {y}");
-                assert!((h - BAR_THICK).abs() < 1e-5, "32px 竖直厚度应回到 9");
+                assert!((x - BAR_X0).abs() < 1e-5, "左端 x = {x}");
+                assert!((x + w - BAR_X1).abs() < 1e-5, "右端 x = {}", x + w);
+                assert!((y - BAR_TOP_LEFT).abs() < 1e-5, "上边左端 y = {y}");
+                assert!((h - BAR_THICK).abs() < 1e-5, "竖直厚度 = {h}");
+                assert!((shear - BAR_SHEAR).abs() < 1e-6, "斜率 = {shear}");
                 let top_right = y + w * shear;
                 assert!(
-                    (top_right - BAR_TO.1).abs() < 1e-3,
-                    "右端上边 y = {top_right}，应为 {}",
-                    BAR_TO.1
+                    (top_right - bar_top_at(BAR_X1)).abs() < 1e-3,
+                    "右端上边 = {top_right}"
                 );
-                assert!((shear + 7.0 / 41.0).abs() < 1e-6, "斜率 = {shear}");
             }
             _ => panic!("第 5 个图元必须是符杠"),
         }
     }
 
-    /// k = 1 时墨迹包围盒必须等于原图的 14 / 13 / 82 / 84。
-    #[test]
-    fn ink_bounds_at_unit_weight_match_the_source() {
-        let (x0, y0, x1, y1) = ink_bounds(32.0);
-        assert!((x0 - 14.0).abs() < 1e-4, "左 {x0}");
-        assert!((y0 - 13.0).abs() < 1e-3, "上 {y0}");
-        assert!((x1 - 82.0).abs() < 1e-4, "右 {x1}");
-        assert!((y1 - 84.0).abs() < 1e-4, "下 {y1}");
-    }
-
-    /// 加粗会把墨迹撑大（16px 高 72.2），缩放必须跟着它走，否则端点被裁。
+    /// 造型比例必须等于参考图实测值（用户给的就是这把尺子）。
     ///
-    /// 这条是「ICO 上横线下缘少一行像素」的可反向验证形式：
-    /// 把 `Placement::fit` 改回用固定的 71，下面 `bounds_stay_inside_the_canvas` 会红。
+    /// 归一化基准是**音符自身**的高/宽，不是含横线的整体墨迹 ——
+    /// 参考图没有横线，拿整体去比会得出错误结论。
     #[test]
-    fn ink_bounds_grow_with_weight() {
-        let (_, y0, _, y1) = ink_bounds(16.0);
-        assert!(((y1 - y0) - 72.2).abs() < 0.01, "16px 墨迹高 = {}", y1 - y0);
-        let (_, y0, _, y1) = ink_bounds(32.0);
-        assert!(((y1 - y0) - 71.0).abs() < 0.01, "32px 墨迹高 = {}", y1 - y0);
+    fn proportions_match_the_reference_measurements() {
+        let hh = ellipse_half_h(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        let note_top = bar_top_at(BAR_X1);
+        let note_h = (HEAD_A.1 + hh) - note_top;
+        let note_w = RULE.2;
+
+        let head_w = ellipse_half_w(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG) * 2.0;
+        let head_h = hh * 2.0;
+        // 参考图（px）：符头 60.3×60.3、符干 8、符杠 30.7、音符 168.67×180.35
+        assert!((head_w / note_h - 60.3 / 180.35).abs() < 0.01, "符头宽占比");
+        assert!((head_h / note_h - 60.3 / 180.35).abs() < 0.01, "符头高占比");
+        assert!((STEM_W / note_h - 8.0 / 180.35).abs() < 0.004, "符干占比");
+        assert!((BAR_THICK / note_h - 30.7 / 180.35).abs() < 0.005, "符杠厚度占比");
+        assert!((note_w / note_h - 168.67 / 180.35).abs() < 0.01, "音符宽高比");
+        assert!(
+            ((HEAD_B.0 - HEAD_A.0) / note_h - 108.0 / 180.35).abs() < 0.01,
+            "符头中心距"
+        );
+        assert!(
+            ((HEAD_A.1 - HEAD_B.1) / note_h - 20.0 / 180.35).abs() < 0.01,
+            "符头高度差"
+        );
     }
 
-    /// 每个 ICO 尺寸下，墨迹映射后必须严格落在画布内（不许裁边）。
+    /// 符头必须是**椭圆**，不是圆：长短轴比 1.34、倾角 −45°。
+    ///
+    /// 用户专门指出过这一点。这条把「有人把椭圆改回圆」钉死。
+    #[test]
+    fn head_is_a_tilted_ellipse_not_a_circle() {
+        assert!(
+            (head_axis_ratio() - 1.34).abs() < 0.02,
+            "长短轴比 = {}，参考图实测 1.34",
+            head_axis_ratio()
+        );
+        assert!((HEAD_ROT_DEG + 45.0).abs() < 0.5, "倾角应为 −45°");
+        // 椭圆投影到轴对齐后的外框必须接近正方形（参考图 60.3 x 60.3）
+        let hw = ellipse_half_w(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        let hh = ellipse_half_h(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        assert!((hw - hh).abs() < 0.3, "外框 {hw:.2} x {hh:.2} 应该接近正方形");
+        // 且不能退化成圆
+        assert!(HEAD_A.2 - HEAD_A.3 > 3.0, "半轴差太小，又变回圆了");
+    }
+
+    /// 椭圆的旋转必须真的生效（判别式对旋转敏感）。
+    #[test]
+    fn rotated_ellipse_membership_follows_the_tilt() {
+        let e = Prim::Ellipse {
+            cx: 0.0,
+            cy: 0.0,
+            rx: 20.0,
+            ry: 10.0,
+            rot: -45.0,
+        };
+        // 长轴方向（−45°）上远处属于椭圆
+        let d = 18.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!(inside(&e, d, -d), "长轴方向 18 应命中");
+        // 短轴方向（+45°）上同样距离应落空
+        assert!(!inside(&e, d, d), "短轴方向 18 不该命中");
+        // 不转的话 (+45°) 也会命中 —— 证明旋转确实起作用
+        let axis_aligned = Prim::Ellipse {
+            cx: 0.0,
+            cy: 0.0,
+            rx: 20.0,
+            ry: 10.0,
+            rot: 0.0,
+        };
+        assert!(!inside(&axis_aligned, d, d), "轴对齐椭圆在 (d,d) 不该命中");
+        assert!(inside(&axis_aligned, 18.0, 0.0), "轴对齐椭圆在长轴应命中");
+    }
+
+    /// 横线在音符下方，且左右端分别对齐音符墨迹的左右端。
+    #[test]
+    fn rule_sits_below_the_note_and_spans_its_width() {
+        let (x0, y0, x1, y1) = ink_bounds(32.0);
+        let (rx, ry, rw, rh) = RULE;
+        assert!((ry - (y1 - rh)).abs() < 1e-4, "横线底边必须就是墨迹底边");
+        assert!((rx - x0).abs() < 1e-4, "横线左端 {} 应等于墨迹左端 {x0}", rx);
+        assert!((rx + rw - x1).abs() < 1e-4, "横线右端应等于墨迹右端 {x1}");
+        // 音符最低点（符头 A 的下缘）到横线顶之间必须留空隙
+        let note_bottom = HEAD_A.1 + ellipse_half_h(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        assert!(ry > note_bottom + 4.0, "横线与符头之间必须有可见间隙");
+        let _ = y0;
+    }
+
+    /// 加粗只作用于小尺寸，48px 及以上回到原权重。
+    #[test]
+    fn weight_factor_only_thickens_small_sizes() {
+        assert!(weight_factor(16.0) > weight_factor(20.0));
+        assert!(weight_factor(20.0) > weight_factor(24.0));
+        assert!(weight_factor(24.0) > weight_factor(32.0));
+        assert!((weight_factor(48.0) - 1.0).abs() < 1e-6);
+        assert!((weight_factor(128.0) - 1.0).abs() < 1e-6);
+        // 目标：16~24px 的符干落位后至少 1.35px
+        for sz in [16.0f32, 20.0, 24.0] {
+            let (_, _, _, y1) = ink_bounds(sz);
+            let (_, y0, _, _) = ink_bounds(sz);
+            let span = (y1 - y0).max(ink_bounds(sz).2 - ink_bounds(sz).0);
+            let px_w = STEM_W * weight_factor(sz) * sz / span;
+            assert!(px_w >= 1.35, "{sz}px 符干只有 {px_w:.2}px，会糊成灰线");
+        }
+    }
+
+    /// 加粗只向内长，外缘（右缘）固定 —— 否则符干 B 会探出符杠右端。
+    #[test]
+    fn weight_grows_inwards_and_keeps_the_outer_edge() {
+        let thin = prims(128.0);
+        let thick = prims(16.0);
+        for (a, b) in [(thin[2], thick[2]), (thin[3], thick[3])] {
+            if let (
+                Prim::RoundRect { x: xa, w: wa, .. },
+                Prim::RoundRect { x: xb, w: wb, .. },
+            ) = (a, b)
+            {
+                assert!((xa + wa - (xb + wb)).abs() < 1e-4, "符干外缘必须固定");
+                assert!(wb > wa, "小尺寸符干必须更粗");
+                assert!(xb < xa, "加粗必须向内（向左）长");
+            } else {
+                panic!("符干必须是圆角矩形");
+            }
+        }
+        // 符头与符杠不受加粗影响
+        assert_eq!(thin[0], thick[0]);
+        assert_eq!(thin[1], thick[1]);
+        assert_eq!(thin[4], thick[4]);
+        assert_eq!(thin[5], thick[5]);
+    }
+
+    /// 墨迹包围盒必须在**所有**尺寸下都一致（加粗不能改变外框）。
+    ///
+    /// 这条是上面「向内加粗」的可见后果：外框稳定，横线才能对得齐音符。
+    #[test]
+    fn ink_bounds_are_identical_at_every_size() {
+        let base = ink_bounds(128.0);
+        for sz in ICO_SIZES {
+            let b = ink_bounds(sz as f32);
+            for (i, (a, c)) in [(base.0, b.0), (base.1, b.1), (base.2, b.2), (base.3, b.3)]
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    (a - c).abs() < 0.02,
+                    "{sz}px 的第 {i} 个边界从 {a} 变成 {c} —— 加粗改动了外框"
+                );
+            }
+        }
+    }
+
+    /// 每个 ICO 尺寸下墨迹都必须落在画布内（不许裁边）。
     #[test]
     fn bounds_stay_inside_the_canvas() {
         for sz in ICO_SIZES {
@@ -610,5 +725,37 @@ mod tests {
                 "{sz}px 右下越界 ({rx:.2}, {by:.2})"
             );
         }
+    }
+
+    /// 每个尺寸都要真的画出东西（防止加粗/缩放的边界情况把图形算成空）。
+    #[test]
+    fn every_ico_size_has_ink() {
+        for sz in ICO_SIZES {
+            let buf = rasterize(sz, (0, 0, 0), 4);
+            let ink = buf.chunks_exact(4).filter(|p| p[3] > 128).count();
+            let ratio = ink as f32 / (sz * sz) as f32;
+            assert!(ratio > 0.05, "{sz}px 只有 {ratio:.3} 的像素是墨迹");
+            assert!(ratio < 0.6, "{sz}px 墨迹占 {ratio:.3}，糊成一块了");
+        }
+    }
+
+    /// ICO 目录头与偏移必须自洽（Explorer 靠它找每一帧）。
+    #[test]
+    fn ico_header_and_offsets_are_consistent() {
+        let bytes = ico_bytes(&ICO_SIZES, (0, 0, 0), 2);
+        assert_eq!(&bytes[0..4], &[0, 0, 1, 0], "ICO 魔数");
+        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        assert_eq!(count, ICO_SIZES.len());
+        let mut expect_off = 6 + 16 * count;
+        for i in 0..count {
+            let e = 6 + 16 * i;
+            assert_eq!(bytes[e] as u32, ICO_SIZES[i], "第 {i} 帧宽度");
+            assert_eq!(bytes[e + 6], 32, "必须 32bpp");
+            let len = u32::from_le_bytes([bytes[e + 8], bytes[e + 9], bytes[e + 10], bytes[e + 11]]) as usize;
+            let off = u32::from_le_bytes([bytes[e + 12], bytes[e + 13], bytes[e + 14], bytes[e + 15]]) as usize;
+            assert_eq!(off, expect_off, "第 {i} 帧偏移");
+            expect_off += len;
+        }
+        assert_eq!(bytes.len(), expect_off, "总长度");
     }
 }

@@ -6,12 +6,13 @@
 //! 「exe / 托盘 / 设置页里的图标」不可能画成两个样。
 //!
 //! 三种基元对应三种 D2D 调用：
-//! - `Prim::Circle` → `FillEllipse`
+//! - `Prim::Ellipse` → `SetTransform`（绕中心旋转）+ `FillEllipse` + 复位
 //! - `Prim::RoundRect` → `FillRoundedRectangle`
-//! - `Prim::Bar` → `SetTransform`（绕中心旋转）+ `FillRectangle` + 复位
+//! - `Prim::Beam` → `SetTransform`（竖直剪切）+ `FillRectangle` + 复位
 //!
-//! 符杠用旋转矩阵而不是「逐行 FillRectangle」：它是唯一带斜边的形状，
-//! 逐行拼会在斜边上留下台阶。
+//! 符杠用剪切矩阵而不是「逐行 FillRectangle」：它是唯一带斜边的形状，
+//! 逐行拼会在斜边上留下台阶。符头是**旋转椭圆**（长短轴比 1.34、倾角 −45°），
+//! 用旋转矩阵而不是把椭圆硬掰成轴对齐——后者在 128px 下轮廓差 3px 以上。
 
 use windows::core::Result;
 use windows::Win32::Graphics::Direct2D::ID2D1RenderTarget;
@@ -41,16 +42,14 @@ pub fn draw(rt: &ID2D1RenderTarget, frame: &mut Frame, rect: RectF, color: Rgba)
         // brush 由本帧持有，生命周期覆盖调用；SetTransform 在 Bar 分支里成对复位。
         unsafe {
             match prim {
-                Prim::Circle { cx, cy, r } => {
+                Prim::Ellipse { cx, cy, rx, ry, rot } => {
+                    let (dcx, dcy) = (place.x(cx), place.y(cy));
+                    rt.SetTransform(&rotation_matrix(dcx, dcy, rot));
                     rt.FillEllipse(
-                        &ellipse(
-                            place.x(cx),
-                            place.y(cy),
-                            r * place.scale,
-                            r * place.scale,
-                        ),
+                        &ellipse(dcx, dcy, rx * place.scale, ry * place.scale),
                         &brush,
                     );
+                    rt.SetTransform(&Matrix3x2::identity());
                 }
                 Prim::RoundRect { x, y, w, h, r } => {
                     rt.FillRoundedRectangle(
@@ -75,6 +74,25 @@ pub fn draw(rt: &ID2D1RenderTarget, frame: &mut Frame, rect: RectF, color: Rgba)
         }
     }
     Ok(())
+}
+
+/// 以 `(cx, cy)` 为中心、旋转 `deg` 度（正值顺时针）的矩阵。
+///
+/// 符头是旋转椭圆（长短轴比 1.34、倾角 −45°）。手写矩阵而不是用
+/// `Matrix3x2::rotation` 之外的东西：D2D 的变换是行向量约定 `[x y 1] × M`，
+/// 绕**原点**旋转后再补平移，平移量取「中心 − 旋转后的中心」，
+/// 这样中心点严格不动（下面的单测直接验证这一点）。
+fn rotation_matrix(cx: f32, cy: f32, deg: f32) -> Matrix3x2 {
+    let t = deg.to_radians();
+    let (s, c) = (t.sin(), t.cos());
+    Matrix3x2 {
+        M11: c,
+        M12: s,
+        M21: -s,
+        M22: c,
+        M31: cx - (cx * c - cy * s),
+        M32: cy - (cx * s + cy * c),
+    }
 }
 
 /// 以 `x0` 那条竖线为不动线的竖直剪切矩阵：`y' = y + shear · (x − x0)`。
@@ -109,18 +127,24 @@ mod tests {
     /// 剪切不动线（符杠左端）必须原地不动。
     #[test]
     fn shear_matrix_keeps_its_anchor_line_fixed() {
-        let m = shear_matrix(33.0, -7.0 / 41.0);
-        let (x, y) = apply(&m, 33.0, 20.0);
-        assert!((x - 33.0).abs() < 1e-4 && (y - 20.0).abs() < 1e-4, "锚点被挪到 ({x}, {y})");
+        use crate::render::icon_geom::{BAR_SHEAR, BAR_TOP_LEFT, BAR_X0};
+        let m = shear_matrix(BAR_X0, BAR_SHEAR);
+        let (x, y) = apply(&m, BAR_X0, BAR_TOP_LEFT);
+        assert!(
+            (x - BAR_X0).abs() < 1e-4 && (y - BAR_TOP_LEFT).abs() < 1e-4,
+            "锚点被挪到 ({x}, {y})"
+        );
     }
 
-    /// 右端（x = 74）必须上移 7 —— 这正是源图 `L74 13` 的位置。
+    /// 右端必须上移到符杠上边在该处的 y —— 这就是「两端竖直、上边是斜线」。
     #[test]
-    fn shear_matrix_lifts_the_right_end_by_seven_units() {
-        let m = shear_matrix(33.0, -7.0 / 41.0);
-        let (x, y) = apply(&m, 74.0, 20.0);
-        assert!((x - 74.0).abs() < 1e-4, "x 不该被剪切：{x}");
-        assert!((y - 13.0).abs() < 1e-4, "右端 y = {y}，应为 13");
+    fn shear_matrix_lifts_the_right_end_to_the_beam_top() {
+        use crate::render::icon_geom::{bar_top_at, BAR_SHEAR, BAR_TOP_LEFT, BAR_X0, BAR_X1};
+        let m = shear_matrix(BAR_X0, BAR_SHEAR);
+        let (x, y) = apply(&m, BAR_X1, BAR_TOP_LEFT);
+        assert!((x - BAR_X1).abs() < 1e-4, "x 不该被剪切：{x}");
+        let want = bar_top_at(BAR_X1);
+        assert!((y - want).abs() < 1e-4, "右端 y = {y}，应为 {want}");
     }
 
     /// 剪切只改 y，不改 x（平行四边形左右两端竖直）。
@@ -130,6 +154,32 @@ mod tests {
         for x in [10.0f32, 30.0, 51.0] {
             let (ox, _) = apply(&m, x, 5.0);
             assert!((ox - x).abs() < 1e-5, "x 被改成了 {ox}");
+        }
+    }
+
+    /// 旋转矩阵必须让椭圆中心严格不动，且长轴方向被转过去。
+    #[test]
+    fn rotation_matrix_keeps_the_centre_and_turns_the_major_axis() {
+        let m = rotation_matrix(100.0, 50.0, -45.0);
+        let (x, y) = apply(&m, 100.0, 50.0);
+        assert!((x - 100.0).abs() < 1e-3 && (y - 50.0).abs() < 1e-3, "中心被挪到 ({x}, {y})");
+
+        // 长轴（+x 方向）转 −45° 后应指向右上（屏幕坐标 y 向下，所以 y 变小）
+        let (ux, uy) = apply(&m, 110.0, 50.0);
+        assert!(ux > 100.0, "长轴应指向右侧");
+        assert!(uy < 50.0, "长轴应指向右上，实际 y = {uy}");
+        // 与 x 轴的夹角应接近 45°
+        let ang = (uy - 50.0).atan2(ux - 100.0).to_degrees();
+        assert!((ang + 45.0).abs() < 0.5, "长轴倾角 = {ang}°，应为 −45°");
+    }
+
+    /// 0° 旋转必须等价于恒等变换（防止矩阵写反）。
+    #[test]
+    fn rotation_matrix_at_zero_is_identity() {
+        let m = rotation_matrix(37.0, 11.0, 0.0);
+        for (x, y) in [(0.0f32, 0.0f32), (37.0, 11.0), (90.0, -4.0)] {
+            let (ox, oy) = apply(&m, x, y);
+            assert!((ox - x).abs() < 1e-4 && (oy - y).abs() < 1e-4, "({x},{y}) -> ({ox},{oy})");
         }
     }
 
@@ -154,12 +204,41 @@ mod tests {
         );
     }
 
-    /// 设置页品牌图标必须与 `icon_geom` **同源**：同一组坐标 + 同一个质量重心平移。
+    /// 从 `svg` 里找到含 `tag` 的那一段，读它的数值属性。
+    fn attr(svg: &str, tag: &str, name: &str) -> f32 {
+        let start = svg.find(tag).unwrap_or_else(|| panic!("缺少 {tag}"));
+        let seg = &svg[start..];
+        let key = format!("{name}=\"");
+        let i = seg
+            .find(&key)
+            .unwrap_or_else(|| panic!("{tag} 缺少属性 {name}"));
+        let rest = &seg[i + key.len()..];
+        let j = rest.find('"').expect("属性值未闭合");
+        rest[..j]
+            .parse()
+            .unwrap_or_else(|_| panic!("{tag} 的 {name} 不是数字：{}", &rest[..j]))
+    }
+
+    /// 把一段字符串里的所有数字抽出来（用于解析 `d` / `rotate(...)`）。
+    fn nums(s: &str) -> Vec<f32> {
+        s.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .filter(|t| !t.is_empty() && *t != "-" && *t != ".")
+            .filter_map(|t| t.parse().ok())
+            .collect()
+    }
+
+    fn close(a: f32, b: f32, tol: f32, what: &str) {
+        assert!((a - b).abs() <= tol, "{what}：HTML={a} 几何={b}");
+    }
+
+    /// 设置页品牌图标必须与 `icon_geom` **同源**。
     ///
     /// 这是「软件所有地方的双音符风格一致」在设置页那一侧的守卫：
     /// 改了 `icon_geom` 而忘了改 HTML（或反过来），这条立刻红。
     #[test]
     fn settings_brand_svg_matches_the_geometry() {
+        use crate::render::icon_geom as g;
+
         let html = include_str!("../../assets/ui/index.html");
         let at = html
             .find("data-icon=\"barline-note\"")
@@ -168,29 +247,80 @@ mod tests {
         let svg_end = html[at..].find("</svg>").map(|i| at + i).expect("svg 必须闭合");
         let svg = &html[svg_start..svg_end];
 
-        // 平移量必须等于 icon_geom 算出来的值
-        let shift = format!(
-            "translate({:.3} 0)",
-            crate::render::icon_geom::center_shift_x()
-        );
-        assert!(
-            svg.contains(&shift),
-            "品牌图标的平移量应为 {shift}（质量重心居中），实际：{svg}"
-        );
-
-        // 六个子形状逐值比对（与源 SVG 一字不差）
-        for needle in [
-            "cx=\"27\" cy=\"64\" r=\"9.5\"",
-            "cx=\"63\" cy=\"57\" r=\"9.5\"",
-            "x=\"33\" y=\"20\" width=\"5\" height=\"44\" rx=\"2.5\"",
-            "x=\"69\" y=\"13\" width=\"5\" height=\"44\" rx=\"2.5\"",
-            "M33 20 L74 13 L74 22 L33 29 Z",
-            "x=\"14\" y=\"80\" width=\"68\" height=\"4\" rx=\"2\"",
-        ] {
-            assert!(svg.contains(needle), "品牌图标缺少形状 {needle}");
+        // 1) 两个符头必须是**旋转椭圆**，且半轴/倾角与几何一致
+        let first = svg.find("<ellipse").expect("必须有椭圆符头");
+        let second = first + svg[first + 1..].find("<ellipse").expect("必须有两个符头") + 1;
+        for (i, (tag, head)) in [(&svg[first..], g::HEAD_A), (&svg[second..], g::HEAD_B)]
+            .iter()
+            .enumerate()
+        {
+            close(attr(tag, "<ellipse", "cx"), head.0, 0.02, "符头 cx");
+            close(attr(tag, "<ellipse", "cy"), head.1, 0.02, "符头 cy");
+            close(attr(tag, "<ellipse", "rx"), head.2, 0.02, "符头 rx");
+            close(attr(tag, "<ellipse", "ry"), head.3, 0.02, "符头 ry");
+            let rot = nums(&tag[tag.find("rotate(").expect("椭圆必须带 rotate")..]);
+            close(rot[0], g::HEAD_ROT_DEG, 0.5, &format!("符头 {} 倾角", i + 1));
         }
 
-        // 颜色必须跟随主题，不许写死（用户要求「黑白、随主题」）
+        // 2) 符干：顶端必须等于符杠上边（用户指出的「小尖尖」在设置页也不许出现）
+        let stems: Vec<&str> = svg
+            .match_indices("<rect")
+            .map(|(i, _)| &svg[i..])
+            .filter(|s| attr(s, "<rect", "rx") < 2.5)
+            .collect();
+        assert!(stems.len() >= 2, "必须有两条符干");
+        for (tag, x, head_cy) in [
+            (stems[0], g::STEM_A_X, g::HEAD_A.1),
+            (stems[1], g::STEM_B_X, g::HEAD_B.1),
+        ] {
+            close(attr(tag, "<rect", "x"), x, 0.02, "符干左缘");
+            close(attr(tag, "<rect", "width"), g::STEM_W, 0.02, "符干宽");
+            let top = attr(tag, "<rect", "y");
+            let cx = x + g::STEM_W * 0.5;
+            close(top, g::bar_top_at(cx), 0.02, "符干顶端必须贴在符杠上边");
+            close(top + attr(tag, "<rect", "height"), head_cy, 0.05, "符干底端应到符头中心");
+        }
+
+        // 3) 符杠：平行四边形，四个角与几何一致
+        let d_start = svg.find("<path d=\"").expect("必须有符杠 path") + 9;
+        let d = &svg[d_start..d_start + svg[d_start..].find('"').unwrap()];
+        let p = nums(d);
+        assert_eq!(p.len(), 8, "符杠路径应有 4 个点");
+        let (bx0, bt) = (g::BAR_X0, g::BAR_TOP_LEFT);
+        let tr = g::bar_top_at(g::BAR_X1);
+        for (got, want, what) in [
+            (p[0], bx0, "左上 x"),
+            (p[1], bt, "左上 y"),
+            (p[2], g::BAR_X1, "右上 x"),
+            (p[3], tr, "右上 y"),
+            (p[4], g::BAR_X1, "右下 x"),
+            (p[5], tr + g::BAR_THICK, "右下 y"),
+            (p[6], bx0, "左下 x"),
+            (p[7], bt + g::BAR_THICK, "左下 y"),
+        ] {
+            close(got, want, 0.05, what);
+        }
+
+        // 4) 横线
+        let rule = svg
+            .match_indices("<rect")
+            .map(|(i, _)| &svg[i..])
+            .find(|s| attr(s, "<rect", "y") > 80.0)
+            .expect("必须有横线");
+        close(attr(rule, "<rect", "x"), g::RULE.0, 0.02, "横线 x");
+        close(attr(rule, "<rect", "y"), g::RULE.1, 0.02, "横线 y");
+        close(attr(rule, "<rect", "width"), g::RULE.2, 0.02, "横线宽");
+        close(attr(rule, "<rect", "height"), g::RULE.3, 0.02, "横线厚");
+
+        // 5) viewBox 必须紧贴墨迹包围盒
+        let vb = nums(&svg[svg.find("viewBox=\"").expect("必须有 viewBox") + 9..]);
+        let (ix0, iy0, ix1, iy1) = g::ink_bounds(32.0);
+        close(vb[0], ix0, 0.05, "viewBox x");
+        close(vb[1], iy0, 0.05, "viewBox y");
+        close(vb[2], ix1 - ix0, 0.05, "viewBox 宽");
+        close(vb[3], iy1 - iy0, 0.05, "viewBox 高");
+
+        // 6) 颜色必须跟随主题，不许写死
         assert!(svg.contains("currentColor"), "品牌图标颜色必须用 currentColor");
         assert!(!svg.contains("#2C2C2A"), "品牌图标不许写死颜色");
     }
