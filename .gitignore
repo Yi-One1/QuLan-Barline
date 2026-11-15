@@ -13,3 +13,8 @@ scripts/_fade*.bmp
 
 # M5 便携版交付物（可由 release 构建复现，不入库）
 /deliverables/
+
+# 工作过程产物（AI 会话的预览图 / 临时校验脚本 / 会话记忆）——不入库
+/.workbuddy-ai/
+# 逐日工作日志（含本机路径与使用习惯），只留在本地，不进公开仓库
+/.workbuddy/memory/

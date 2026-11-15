@@ -10,7 +10,7 @@ import time
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = r"E:\APP\WorkBuddy\工作空间\曲栏Barline"
+ROOT = os.path.dirname(HERE)  # 仓库根 = scripts/ 的父目录（不写死本机路径）
 EXE = os.path.join(ROOT, "target", "release", "barline.exe")
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)

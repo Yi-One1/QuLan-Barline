@@ -14,8 +14,12 @@ import time
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = r"E:\APP\WorkBuddy\工作空间\曲栏Barline"
+ROOT = os.path.dirname(HERE)  # 仓库根 = scripts/ 的父目录（不写死本机路径）
 EXE = os.path.join(ROOT, "target", "release", "barline.exe")
+BARLINE_DATA = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local")), "Barline"
+)
+CFG = os.path.join(BARLINE_DATA, "config.json")
 
 spec = importlib.util.spec_from_file_location("acc", os.path.join(HERE, "m2-accept.py"))
 acc = importlib.util.module_from_spec(spec)
@@ -24,7 +28,6 @@ spec.loader.exec_module(acc)
 
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
-CFG = r"C://Users//caihongyi//AppData//Local//Barline//config.json"
 
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)

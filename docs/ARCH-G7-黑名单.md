@@ -1457,7 +1457,7 @@ fn blacklist_keys_are_bilingual_and_non_empty() {
 
 ## 9. 任务列表（按依赖排序）
 
-> **给工程师的话**：每个任务都自包含。工作目录 `E:\AI工作空间\曲栏Barline`。
+> **给工程师的话**：每个任务都自包含。工作目录 `<仓库根>`。
 > 构建只走 `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check|clippy|test|build`，
 > **禁止裸 cargo**（`progress.md` §2.1 铁律 1）；不启动 exe；不 commit；不动 `deliverables/`。
 > 行号是 **v1.4.4** 的，若 G3~G6 已合入请按"锚点"定位。

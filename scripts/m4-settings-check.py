@@ -14,9 +14,9 @@ import time
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = r"E:\APP\WorkBuddy\工作空间\曲栏Barline"
+ROOT = os.path.dirname(HERE)  # 仓库根 = scripts/ 的父目录（不写死本机路径）
 EXE = os.path.join(ROOT, "target", "release", "barline.exe")
-SHOTS = os.path.join(ROOT, "docs", "screenshots")
+SHOTS = os.path.join(ROOT, "assets", "screenshots")
 
 spec = importlib.util.spec_from_file_location("acc", os.path.join(HERE, "m2-accept.py"))
 acc = importlib.util.module_from_spec(spec)

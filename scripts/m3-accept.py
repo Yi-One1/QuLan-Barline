@@ -15,11 +15,14 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = r"E:\APP\WorkBuddy\工作空间\曲栏Barline"
-SHOTS = os.path.join(ROOT, "docs", "screenshots")
+ROOT = os.path.dirname(HERE)  # 仓库根 = scripts/ 的父目录（不写死本机路径）
+SHOTS = os.path.join(ROOT, "assets", "screenshots")
 EXE = os.path.join(ROOT, "target", "release", "barline.exe")
-CFG = r"C:\Users\caihongyi\AppData\Local\Barline\config.json"
-LRC_DIR = r"C:\Users\caihongyi\AppData\Local\Barline\lyrics"
+BARLINE_DATA = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local")), "Barline"
+)
+CFG = os.path.join(BARLINE_DATA, "config.json")
+LRC_DIR = os.path.join(BARLINE_DATA, "lyrics")
 
 spec = importlib.util.spec_from_file_location("acc", os.path.join(HERE, "m2-accept.py"))
 acc = importlib.util.module_from_spec(spec)
@@ -247,7 +250,7 @@ def main():
     print("本地歌词：%s" % lrc_path)
 
     # 清空歌词缓存：否则阶段 1 会命中上一轮的磁盘缓存，看不到"本地文件命中"这条链路
-    cache_dir = r"C://Users//caihongyi//AppData//Local//Barline//lyrics-cache"
+    cache_dir = os.path.join(BARLINE_DATA, "lyrics-cache")
     if os.path.isdir(cache_dir):
         for f in os.listdir(cache_dir):
             try:

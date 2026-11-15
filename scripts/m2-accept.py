@@ -19,10 +19,14 @@ import time
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = r"E:\APP\WorkBuddy\工作空间\曲栏Barline"
-SHOTS = os.path.join(ROOT, "docs", "screenshots")
+ROOT = os.path.dirname(HERE)  # 仓库根 = scripts/ 的父目录（不写死本机路径）
+SHOTS = os.path.join(ROOT, "assets", "screenshots")
 EXE = os.path.join(ROOT, "target", "release", "barline.exe")
-LOG = r"C:\Users\caihongyi\AppData\Local\Barline\barline.log"
+# 数据目录默认在 %LOCALAPPDATA%\Barline；若在设置里迁移过数据目录，改这里。
+BARLINE_DATA = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local")), "Barline"
+)
+LOG = os.path.join(BARLINE_DATA, "barline.log")
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 

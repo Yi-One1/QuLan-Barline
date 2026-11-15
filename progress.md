@@ -15,7 +15,7 @@
 1. **截至 v1.13.1 的全部工作已验收闭环**：G1~G7、G8 ①~⑥（多会话 / 歌词钟 / 双击开设置 / 暂停不漂移）、白名单与媒体筛选、分区记忆、清空缓存、改语言当窗生效、SemVer 2.0.0 规则落地。
 2. **「无播放显示双音符图标」已按变体 3 重做完毕并逐组真人验收**（不是 04:00 那次被整体回滚的版本，是全新一轮）：
    - `0a75d82` v1.14.0 — 图标态 + `WidgetForm::Icon` + 双音符几何（单一来源 `src/render/icon_geom.rs`，被 `src/render/icon.rs` 与 `build.rs` **双编译**，所以小组件 / 托盘 / 窗口标题栏 / 设置页品牌 / exe 资源造型天然一致）。
-   - `5864055` v1.14.0 — 符头改为**旋转椭圆**（−45°），按用户参考图 `D:\桌面\download.webp` 逐像素重测造型；符干顶端对齐符杠上边（消掉「两个小尖尖」）。
+   - `5864055` v1.14.0 — 符头改为**旋转椭圆**（−45°），按用户参考图 `<用户桌面>\download.webp` 逐像素重测造型；符干顶端对齐符杠上边（消掉「两个小尖尖」）。
    - `4333cd1` v1.14.1 — 图标态悬停底板「亮一下就没」第一版修复（`cursor_in_widget` 假 `WM_MOUSELEAVE` 守卫）。**不是根因**，守卫保留。
    - `ab1364a` v1.14.2 — 视觉居中：音符整体左移 `NOTE_SHIFT_X = −4.82`，下方横线**不参与平移**、加宽到 86.132 并保持水平居中（用户拍板的 D 方案）。
    - `601a253` v1.14.3 — 悬停底板「亮一下就没」**真正根因**修复，见 §B-6。
@@ -40,7 +40,7 @@
 6. **悬停底板「亮一下就没」的根因（v1.14.3，已修）** —— 两次假设都错了，记下来免得再走一遍：
    - **真因 1（media 层）**：`SessionCleared` 是**电平**语义（"现在没有会话"），却被当边沿语义发。`enter_ignored()` 只按「忽略身份变了」判重；两个都被过滤的会话（现场是 `msedge.exe` + `quark.player.exe`）轮流当 Windows「当前会话」时，身份**每秒变一次** → 每秒发一条 `SessionCleared`。修法：`PollState` 新增 `cleared_sent` 闸，忽略态内部翻转只更新托盘文案；真发布 `NowPlaying` 后清回 `false`。
    - **真因 2（ui 层）**：`SessionCleared` 无条件 `interact.reset()` → `hover = Idle`、`hover_alpha = 0`。v1.14.0 起「无播放」不隐藏小组件而是切图标态，窗口一直在、光标可能正压着图标，整份复位等于掐掉悬停；`WM_MOUSEMOVE` 只在鼠标真动时才来，所以再也不回来。修法：新增 `Interaction::reset_session()`，只清 pressed/down/pending/seeking/hud/hover_target，**保留 hover**。
-   - **排查教训**：日志有**两份**，活动的是 `<数据目录>\barline.log`（本机 `E:\APP\曲栏Barline\数据目录\barline.log`），`%LOCALAPPDATA%\Barline\barline.log` 只有启动几行、是残留 —— **看错文件会得出完全相反的结论**（04:00 那次就误判成「悬停没被清掉」）。另外诊断日志只在 `hover_alpha >= 0.9` 时打，`reset()` 路径把 alpha 归零 → **静默**，所以"没有日志"不等于"没发生"。
+   - **排查教训**：日志有**两份**，活动的是 `<数据目录>\barline.log`（本机 `<数据目录>\barline.log`），`%LOCALAPPDATA%\Barline\barline.log` 只有启动几行、是残留 —— **看错文件会得出完全相反的结论**（04:00 那次就误判成「悬停没被清掉」）。另外诊断日志只在 `hover_alpha >= 0.9` 时打，`reset()` 路径把 alpha 归零 → **静默**，所以"没有日志"不等于"没发生"。
 
 ### C. 未完成的待办（新对话从这里开工）
 
@@ -75,7 +75,7 @@
 </g>
 ```
 
-3. **用户参考图** `D:\桌面\download.webp`（符头椭圆判定的依据：椭圆 34.2/25.5 @ −45° 像素误差 1.43%，正圆 3.78%，差 2.6 倍）。
+3. **用户参考图** `<用户桌面>\download.webp`（符头椭圆判定的依据：椭圆 34.2/25.5 @ −45° 像素误差 1.43%，正圆 3.78%，差 2.6 倍）。
 4. **图标造型的关键常量**（`src/render/icon_geom.rs`，改造型只改这里）：符头 A `(23.435, 68.110, 15.510, 11.564)`、符头 B `(72.414, 59.040, …)`、旋转 −45°、符干宽 3.628、符杠 `BAR_X0 34.546 / BAR_X1 86.246 / BAR_TOP_LEFT 13.879 / BAR_SHEAR −0.26846 / BAR_THICK 13.923`、横线 `RULE = (4.934, 90.600, 86.132, 5.400)`、视觉居中 `NOTE_SHIFT_X = −4.82`（让整幅墨迹面积重心落在盒中心；横线**不参与平移**）。
 5. **调试资产**：废弃方案的设计规范在 `deliverables/gstack/icon-spec-idle-2026-11-14.md`（不进 git），**已作废，别拿它当权威**。预览脚本在 `.workbuddy-ai/preview/`（`gen_ico_verify.py` / `check_ico_metrics.py` / `cmp_note_only.py` / `gen_centering*.py` / `gen_final_1142.py`）。
 6. **团队状态**：团队 `gstack-idle-icon-v115` 的两位成员（QA、设计）已因 429 额度中断，本轮未正式 TeamDelete；新对话可重新建团队，不要假设旧成员还在。
@@ -89,7 +89,7 @@ Windows 任务栏「媒体小组件」：**Rust + Direct2D 逐像素透明分层
 | 项 | 值 |
 |---|---|
 | 栈 | Rust 1.99.1 (MSVC) + `windows` 0.62.2 + Direct2D / DWM / SMTC + WebView2 |
-| 仓库 | `E:\AI工作空间\曲栏Barline`（2026-11-03 迁入，旧路径 `E:\APP\WorkBuddy\工作空间\曲栏Barline` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
+| 仓库 | `<仓库根>`（2026-11-03 迁入，旧路径 `<旧工作区>` 已废弃）· 远端 `https://github.com/Yi-One1/QuLan-Barline.git` · 分支 **main** |
 | 当前版本 | **v1.13.1**（`Cargo.toml` 1 处 + `assets/barline.rc` 4 处：`FILEVERSION`/`PRODUCTVERSION` 数字版 + `FileVersion`/`ProductVersion` 字符串，**共 5 处必须同步**） |
 | 质量 | 测试 **673**（672 passed + 1 ignored 联网用例）· clippy **0 警告** · release 包 1,191,936 B（v1.13.1） |
 | 构建 | `powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Task check\|clippy\|test\|build`（**禁止裸 cargo**） |
@@ -423,7 +423,7 @@ git push --force origin refs/tags/v1.12.0   # 若写了 | tail，退出码是 ta
   - **A-2 的处置修正（工程师判断正确，我采纳）**：`compute`/`compute_ex`（44 处调用点）与 `file_name_for`（16 处测试引用）**不删测试，改迁调用点到正式路径 `compute_full(...)` / 私有 `build_file_name()`** —— 那些测试锁的是布局几何契约与落盘命名契约，按字面「删符号连带删测试」会一次抹掉两块核心覆盖。符号确实删干净（零残留），测试反而更强（不再有"只服务测试"的入口）。
   - **D 档改写 15 处**：`event.rs:203` 的「300ms 去抖」（实际是同步写盘 + 原子 rename）、`config/mod.rs:181` 的「重启后恢复」（6 字段零读写）、`event.rs:9-11` 的「M2–M5 预留」（实为已被方法直调取代的残骸）、`HostMsg` 已搬迁、`layout.rs` 的「与调用点零改动」等。**W13 从恒真断言改为哨兵文件 + 目录条目数**、**W14 把「目录不存在/目录空」拆成两条**、**s1 从自指改为字面量** `"测试曲目α - 无名歌手α.lrc"`。**D-6 不做**（`State::progress_fraction` 与 `painter.rs:911-923` 两份进度实现合并属行为重构、会改像素，留档下轮）。
   - **交付数据**：`515 个 #[test] / 514 passed / 0 failed / 1 ignored`（v1.8.0 基线 523 → -8，**消失的 8 条逐条对上被删符号，零放宽，5 处断言增强**）；check/clippy/test 全绿、clippy **0 警告**；版本 5 处 + `Cargo.lock`；包体 **1,092,096 B**（比 v1.8.0 小 32.5 KB）；exe **36 个只增不删**。
-  - **QA `PASS-WITH-NOTES` / 路由 `NoOne` / 14 项全 PASS**：最硬的一条是**用用户真实的 `config.json`（带全部已删键）实跑**——`serde_json::from_slice::<Config>` 成功，`local_dirs`（`E:\APP\曲栏Barline\本地歌词目录`）/ `storage.data_dir` / `hotkeys` / `background_mode` / `write_back` **全部值都对**，回写后不再出现已删键；反向验证加 `#[serde(deny_unknown_fields)]` → 兼容性测试立刻变红（证明它真被锁住）。另用 `dead_code` 探针做 **HEAD vs 当前树的集合对比：当前死码是 HEAD 的严格子集、零新增**。
+  - **QA `PASS-WITH-NOTES` / 路由 `NoOne` / 14 项全 PASS**：最硬的一条是**用用户真实的 `config.json`（带全部已删键）实跑**——`serde_json::from_slice::<Config>` 成功，`local_dirs`（`<本地歌词目录>`）/ `storage.data_dir` / `hotkeys` / `background_mode` / `write_back` **全部值都对**，回写后不再出现已删键；反向验证加 `#[serde(deny_unknown_fields)]` → 兼容性测试立刻变红（证明它真被锁住）。另用 `dead_code` 探针做 **HEAD vs 当前树的集合对比：当前死码是 HEAD 的严格子集、零新增**。
   - **方法论教训（重要）**：QA 第一轮用 `rg` 查残留，**环境里没有 `rg`**，命令报错后所有项都打印 0 —— **一次全面的假绿**。它自己发现并换成 Grep 引擎重做了全部检查。**「工具不存在 → 检查静默通过」与「测试全绿但功能没做」是同一类失效**，凡是靠外部命令做判定，必须验证命令本身能跑通（`rg --version`）。
   - **留档（不阻塞）**：① **pre-existing 死码 30 项**（HEAD 就存在，不属本轮清单，下轮候选：`app::sink/msg_hwnd/is_enabled`、`LOG_MAX_BYTES`、`net::as_str/get/get_with`、`provider::{new,query,query_with_source}`、`media::LyricSource::Wasapi` + `Track.source`、`layout::{inset,lyric_w,edge}` 等）；② **语言切换需重启**（设置页改 `general.language` 后 `App::lang` 不更新、托盘不刷新，`Effect::RefreshTrayMenu` 是挂点）；③ D-6 两份进度实现；④ 截图删除后 `README.md` 与 6 份报告的图片引用已失效（README 已换成「截图归档于 git 历史」的说明，`git show 890c07f^:docs/screenshots/` 可取回）。
   - **`#![allow(dead_code)]` 的真相**：`src/main.rs` 的注释原写「M5 收尾时应移除」，实际 M1–M5 全发布后它仍在 → **死码不会被编译器发现，G6 这类清理只能靠人工逐符号盘点**。已把注释改成如实表述并列出三条真正被兜住的留档项。
@@ -459,7 +459,7 @@ git push --force origin refs/tags/v1.12.0   # 若写了 | tail，退出码是 ta
 - 歌词未覆盖：冷门曲/UP 主原创/BGM、只有 `plainLyrics` 无时间轴、中外文歌名差异过大。
 - **待验证项**：v1.4.4 多显示器 `widget_monitor` 在「窗口被第三方跨屏搬走」场景下仍可能短暂陈旧（自愈，可焊死在 `ensure_on_top` 漂移分支，零成本）。
 
-- **2026-11-11 G9 迁出**：任务栏前景自适应功能已迁出为独立项目 **ShadeBar**（`E:\AI工作空间\随影ShadeBar`，远端 `https://github.com/Yi-One1/ShadeBar`），本仓库不再保留相关文件与文档；git 历史保留（未 rewrite）。
+- **2026-11-11 G9 迁出**：任务栏前景自适应功能已迁出为独立项目 **ShadeBar**（`<另一个项目目录>`，远端 `https://github.com/Yi-One1/ShadeBar`），本仓库不再保留相关文件与文档；git 历史保留（未 rewrite）。
 
 #### 已裁决不再议（L2 · 不是任务）
 
@@ -488,7 +488,7 @@ git push --force origin refs/tags/v1.12.0   # 若写了 | tail，退出码是 ta
 ## 4. 其他需记录
 
 ### 4.1 本机环境（踩过的坑）
-- **数据目录已被用户改到** `E:\APP\曲栏Barline\数据目录`；日志跟在那里（不是 `%LOCALAPPDATA%\Barline`）。**排查前先确认日志在哪** —— `%LOCALAPPDATA%\Barline\barline.log` 里只有启动几行，是历史残留，照它排查会得出完全相反的结论（v1.14.3 踩过）。
+- **数据目录已被用户改到** `<数据目录>`；日志跟在那里（不是 `%LOCALAPPDATA%\Barline`）。**排查前先确认日志在哪** —— `%LOCALAPPDATA%\Barline\barline.log` 里只有启动几行，是历史残留，照它排查会得出完全相反的结论（v1.14.3 踩过）。
 - 构建首选 PowerShell 工具跑 `build.ps1`；Bash 里调 powershell 会被拦。
 - **`build.ps1` 报 `NativeCommandError` 时的手工注入法**（cargo 的 `Compiling …` 走 stderr 被 PS 5.1 当错误）：
   ```powershell
