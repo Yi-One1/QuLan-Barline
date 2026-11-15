@@ -1,7 +1,7 @@
 # 曲栏 Barline — 交接文档（progress.md）
 
 > **用途**：新开对话 / 接手者的唯一入口。只读这一份即可恢复上下文；细节再查 `docs/`（PRD / ARCHITECTURE / QA 报告）。
-> **最后更新**：2026-11-16 06:20 · 当前 **v1.14.3**（710 项测试：709 passed + 1 ignored，clippy 0 警告）· 本地 `main` 领先 `origin/main` **6 个提交、尚未推送、未打 tag** · 图标功能已于 11-16 凌晨整体重做并逐组真人验收 · 版权人统一实名 `Yi One` · 清单口径见 §3.5 / §3.6。
+> **最后更新**：2026-11-16 06:40 · 当前 **v1.14.3**（710 项测试：709 passed + 1 ignored，clippy 0 警告）· 本地 `main` 与 `origin/main` **一致（`b93ed8f`）已推送** · **未打 tag、未建 Release**（待用户手动发布）· 图标功能已逐组真人验收 · 版权人统一实名 `Yi One` · 清单口径见 §3.5 / §3.6。
 
 
 ---
@@ -20,6 +20,10 @@
    - `ab1364a` v1.14.2 — 视觉居中：音符整体左移 `NOTE_SHIFT_X = −4.82`，下方横线**不参与平移**、加宽到 86.132 并保持水平居中（用户拍板的 D 方案）。
    - `601a253` v1.14.3 — 悬停底板「亮一下就没」**真正根因**修复，见 §B-6。
 3. **图标功能的两条验收线均已通过**：① 音符造型（椭圆符头 / 无尖尖 / 小尺寸加粗 / 视觉居中）② 悬停底板稳定性。
+4. **发布前收尾（2026-11-16 06:40）**：
+   - `25bd7e4` — **隐私清理**：`scripts/*.py` 里 11 处硬编码本机路径（含真实用户名 `C:\Users\<名>\...` 与早已失效的旧工作区路径）改成运行时推导（`os.path.dirname(HERE)` / `%LOCALAPPDATA%`）；文档里 15 处盘符路径脱敏成 `<数据目录>` / `<仓库根>` / `<用户桌面>` 等占位符；`.workbuddy/memory/` 10 个逐日工作日志 `git rm --cached` 移出仓库（磁盘保留）；`.gitignore` 增加 `/.workbuddy/` 与 `/.workbuddy-ai/`。
+   - `b93ed8f` — **设置页截图更新**：旧图左上角还是单音符品牌图标、分区名还是「黑名单」，换成 v1.14 实拍（用户自截）。
+   - 已推送 `origin/main`（`56a996d..b93ed8f`），GitHub API 复核远端 HEAD = `b93ed8f892cd8`；远端根目录确认**不含** `.workbuddy` / `.workbuddy-ai` / `deliverables`，`scripts/m2-accept.py` 原始内容确认无用户名。
 
 ### B. 关键决策
 
@@ -46,11 +50,11 @@
 
 | # | 待办 | 要点 |
 |---|---|---|
-| 1 | **推送与发布** | 本地 `main` 领先 `origin/main` 6 个提交（`afe0278` → `601a253`），**未推送、未打 tag、未建 Release**。待用户拍板后按 §2.7「先 tag 再 Release」执行。push 遇代理 502 见 §4.1。 |
+| 1 | **打 tag + 建 Release（只剩这两步）** | 代码已推送（`origin/main` = `b93ed8f`）。**未打 `v1.14.3` tag、未建 Release**，由用户手动发布。Release 文案已备好：`deliverables/RELEASE-NOTES-v1.14.3.md`（不进 git）。资产文件名用 `Barline_v1.14.3.exe`，与上一个 Release 的 `Barline_v1.13.1.exe` 保持一致。 |
 | 2 | **`clippy --all-targets` 存量 lint** | 57 条，全在旧测试代码里（`blacklist.rs` / `painter.rs` / `app.rs` 测试区 / `layout.rs` / `defaults.rs` / `hotkey.rs` / `storage.rs` / `main.rs`），与 v1.14.x 改动无关。`cargo clippy -- -D warnings`（项目实际门禁）是 0 警告。是否单开一组清理由用户定。 |
-| 3 | **`deliverables/` 里的废弃包** | `曲栏_Barline_v1.14.0.exe` / `v1.14.1.exe` / `v1.14.2.exe` 是中间构建物（不进 git），是否删除由用户决定。现行包是 `曲栏_Barline_v1.14.3.exe`。 |
+| 3 | **`deliverables/` 里的废弃包** | `曲栏_Barline_v1.14.0.exe` / `v1.14.1.exe` / `v1.14.2.exe` 是中间构建物（不进 git）。按「只增不删」惯例暂留，删不删由用户定。现行包是 `曲栏_Barline_v1.14.3.exe`。 |
 | 4 | **本地备份分支处置** | `backup/pre-rollback-20261116`（`224ca99`）确认不再需要后由用户决定是否删除；**不要**误当现行代码。 |
-| 5 | **`target/debug/incremental` 与 `.workbuddy-ai/`** | 是否加进 `.gitignore` 由用户决定（`.workbuddy-ai/` 目前是 untracked，会一直出现在 `git status` 里）。 |
+| 5 | **磁盘上的工作过程产物（暂不删）** | `target/` 5.1 GB（debug 2.0G / release 2.8G / deadcode-probe 270M 是构建缓存，删了要重编 3~6 分钟）+ 散落的 `qa_*.txt` / `g8*.txt` / `*.diff` / `*_smtc*.rs` 备份约 5 MB（纯文本，删了零影响）+ `.workbuddy-ai/` 1.2 MB（图标预览图与临时校验脚本）。用户 2026-11-16 决定「有影响就不删」，故**全部保留**；已用 `.gitignore` 挡在仓库外。 |
 | 6 | **设置页改语言需重启才生效** | 历史遗留：`general.language` 改后 `App::lang` 不更新、托盘菜单不刷新；修复挂点 = `Effect::RefreshTrayMenu`（保留未删）。 |
 | 7 | 「清空歌词缓存」一键按钮（v1.8.0 只给了「点击打开文件夹」） | 低优先级。 |
 
@@ -58,7 +62,7 @@
 
 ### D. 其它需记录
 
-1. **当前 Git 状态**：`main` = `601a253`（v1.14.3），`origin/main` = `56a996d`（v1.13.1），**本地领先 6 个提交**；`git status` 除 `.workbuddy-ai/` 外干净。现存 tag：v1.9.0 / v1.10.0 / v1.11.0 / v1.12.0 / v1.13.0 / v1.13.1（**无 v1.14.x**）。`origin` 是 SSH（`git@github.com:Yi-One1/QuLan-Barline.git`）。
+1. **当前 Git 状态**：`main` = `b93ed8f`（v1.14.3），`origin/main` = `b93ed8f`，**本地与远端一致**；`git status` 干净（`.workbuddy/` 与 `.workbuddy-ai/` 已进 `.gitignore`）。现存 tag：v1.9.0 / v1.10.0 / v1.11.0 / v1.12.0 / v1.13.0 / v1.13.1（**无 v1.14.x**，等用户发 Release 时创建）。`origin` 是 SSH（`git@github.com:Yi-One1/QuLan-Barline.git`）。
 2. **用户提供的变体 3 SVG 原文**（造型的权威出处；实际实现已在此基础上按参考图 `download.webp` 把圆改成 −45° 旋转椭圆、符干顶端贴符杠上边、横线加宽，逐值定义在 `src/render/icon_geom.rs`）：
 
 ```svg
