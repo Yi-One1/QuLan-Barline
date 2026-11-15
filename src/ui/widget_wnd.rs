@@ -22,10 +22,11 @@ use windows::Win32::UI::Shell::{
     ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE, ABN_WINDOWARRANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, LoadCursorW, RegisterClassW,
-    RegisterWindowMessageW, SetWindowLongPtrW, GWLP_USERDATA, IDC_ARROW, MA_NOACTIVATE, WNDCLASSW,
-    WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE,
-    WM_THEMECHANGED, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowLongPtrW, GetWindowRect, LoadCursorW,
+    RegisterClassW, RegisterWindowMessageW, SetWindowLongPtrW, GWLP_USERDATA, IDC_ARROW,
+    MA_NOACTIVATE, WNDCLASSW, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 use crate::app::App;
@@ -250,10 +251,30 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
 fn point_in_window(hwnd: HWND, pt: windows::Win32::Foundation::POINT) -> bool {
     let mut r = windows::Win32::Foundation::RECT::default();
     // SAFETY: r 是本地结构体；hwnd 由我们保存。
-    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r) }.is_err() {
+    if unsafe { GetWindowRect(hwnd, &mut r) }.is_err() {
         return false;
     }
     pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+}
+
+/// 光标**此刻**是否落在小组件窗口内（屏幕坐标）。
+///
+/// 用途：`WM_MOUSELEAVE` 不能无条件相信。`WS_EX_LAYERED` +
+/// `UpdateLayeredWindow` 的窗口每次重设分层表面、以及每秒一次 `SetWindowPos`
+/// 置顶之后，系统都会重新做一次「光标下是哪个窗口」的判定，并在光标其实**没动**
+/// 的情况下也可能补投一条 `WM_MOUSELEAVE`。而 `WM_MOUSEMOVE` 只在鼠标真的移动时
+/// 才来，假离开之后没有任何消息能把悬停补回来 —— 表现就是 v1.14.0 真人验收
+/// Bug 1：「悬停背景亮一下、约 1 秒后消失，鼠标不动就一直不回来」。
+///
+/// 所以真相以「光标现在在不在矩形里」为准，消息只当触发信号。
+pub fn cursor_in_widget(hwnd: HWND) -> bool {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    // SAFETY: pt 是本地栈变量；GetCursorPos 只写它，且不需要窗口句柄有效。
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        // 查不到光标位置时按「在外面」处理：宁可多收一次离开，也不要卡住悬停。
+        return false;
+    }
+    point_in_window(hwnd, pt)
 }
 
 // ------------------------------------------------------------------ 窗口过程

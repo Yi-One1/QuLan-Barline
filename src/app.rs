@@ -19,6 +19,7 @@
 //! 3. **主题不再每次重排都被重置**（M1 的 `state.theme = Theme::default()` 会抹掉采样结果）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
@@ -713,6 +714,11 @@ impl App {
             self.sync_capture_freeze();
         }
 
+        // v1.14.1（真人验收 Bug 1）：悬停态自愈兜底。
+        // 放在冻结早返回**之前**：全屏遮挡时指针本来就不在小组件上，
+        // 这一支正好把残留的悬停底板收掉。
+        self.reconcile_hover_with_cursor();
+
         // ---- v1.5.6 / G3.5-A：全屏遮挡态 ----
         // 冻结期间这一 tick 只做上面那一次 `foreground_info()`（纯本地、微秒级）
         // 外加一次**只读**的 `GetWindowLongPtrW` Z 序对账。
@@ -1228,7 +1234,28 @@ impl App {
                 Some(LRESULT(0))
             }
             widget_wnd::WM_MOUSELEAVE => {
-                let inputs = self.interact.on_leave();
+                // v1.14.1（真人验收 Bug 1）：分层窗口在重设表面 / 每秒置顶之后会
+                // 补投**假**的 WM_MOUSELEAVE（光标其实还在里面）。判据换成光标
+                // 实际位置，假离开一律忽略 —— 否则悬停底板会「亮一下、约 1 秒后
+                // 消失」，而鼠标不动就再也不会回来。
+                let inside = self
+                    .widget
+                    .as_ref()
+                    .map(|h| widget_wnd::cursor_in_widget(h.hwnd()))
+                    .unwrap_or(false);
+                if inside {
+                    // 系统在投递 WM_MOUSELEAVE 时已经取消了 TME_LEAVE 跟踪，
+                    // 忽略之后必须**重新武装**，否则真离开时这条消息就再也不来。
+                    if !SPURIOUS_LEAVE_LOGGED.swap(true, Ordering::Relaxed) {
+                        crate::log_info!(
+                            "收到假的 WM_MOUSELEAVE（光标仍在窗口内）→ 已忽略并重新武装；\
+                             这条只报一次，之后同类消息静默忽略"
+                        );
+                    }
+                    self.request_mouse_leave();
+                    return Some(LRESULT(0));
+                }
+                let inputs = self.interact.on_leave_checked(false);
                 self.dispatch(inputs);
                 widget_wnd::uninstall_wheel_hook();
                 self.interact.wheel_hooked = false;
@@ -3196,13 +3223,53 @@ impl App {
         self.interact.hover != HoverState::Idle
     }
 
+    /// 悬停态**自愈**：1s 心跳顺手对一次光标位置（v1.14.1 / 真人验收 Bug 1）。
+    ///
+    /// 为什么需要第二道：假 `WM_MOUSELEAVE` 被忽略之后要重新武装 `TME_LEAVE`，
+    /// 万一那次武装失败，或者用户在「武装 → 真的移开」之间的空档里移开，
+    /// `WM_MOUSELEAVE` 就永远不会再来，悬停底板会一直亮着。这里用一次
+    /// `GetCursorPos`（纯本地、微秒级）把「亮着但光标早就不在」纠正回来。
+    ///
+    /// 拖动 / 按下期间不判：按下拖动本来就会把指针带出窗口，那不是离开。
+    fn reconcile_hover_with_cursor(&mut self) {
+        if !self.is_hovering() || self.interact.is_seeking() || self.interact.pointer_is_down() {
+            return;
+        }
+        let inside = match self.widget.as_ref() {
+            Some(h) => widget_wnd::cursor_in_widget(h.hwnd()),
+            None => return,
+        };
+        if inside {
+            return;
+        }
+        crate::log_debug!("悬停自愈：光标已不在小组件内 → 补发离开");
+        let inputs = self.interact.on_leave();
+        self.dispatch(inputs);
+        widget_wnd::uninstall_wheel_hook();
+        self.interact.wheel_hooked = false;
+    }
+
     /// 把 `Interaction` 的内部状态同步进 `AppState`，并按需启停定时器。
     fn sync_interaction(&mut self) {
+        let prev_hover = self.state.hover;
         self.state.hover = self.interact.hover;
         self.state.hover_alpha = self.interact.hover_alpha;
         self.state.pressed = self.interact.pressed;
         self.state.hover_target = self.interact.hover_target;
         self.state.volume_hud_left_ms = self.interact.hud_left_ms;
+
+        // v1.14.1（真人验收 Bug 1）诊断：图标态下「底板还亮着就掉了」是那条 bug
+        // 的现场，值得留一条 INFO；正常态淡出是预期行为，不记（避免日志噪音）。
+        if prev_hover != HoverState::Idle
+            && self.interact.hover == HoverState::Idle
+            && self.state.layout.form.is_icon()
+            && self.interact.hover_alpha >= 0.9
+        {
+            crate::log_info!(
+                "图标态悬停被清掉：alpha={:.2}（正常淡出是从 1.0 往下走的）",
+                self.interact.hover_alpha
+            );
+        }
 
         // 16ms 动画定时器：只在真的需要推进时存在（悬停淡入淡出 / 歌词高度过渡）
         if self.interact.animating() || self.lyric_anim.is_some() || self.lyric_fade_active() {
@@ -3630,6 +3697,12 @@ fn probe_geometry(config: &Config) -> Option<TaskbarGeometry> {
 /// 这不是卡顿。v1.4.4 起 `WM_RBUTTONUP` 分支在弹菜单**之前**就显式
 /// `Span::finish()`，菜单模态时间不再计入；看到 `msg.mouse` 慢记录时请先确认
 /// 日志里没有菜单相关行，再怀疑真的卡。
+/// v1.14.1（真人验收 Bug 1）诊断：假 `WM_MOUSELEAVE` 是否已经报过。
+///
+/// 只报**第一次**：这个事件如果成立就是每秒一次的频率，全报会把日志刷满；
+/// 报一次足以证明「这条消息真的会假」，之后安静地忽略即可。
+static SPURIOUS_LEAVE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 fn is_mouse_message(msg: u32) -> bool {
     use windows::Win32::UI::WindowsAndMessaging as wam;
     matches!(

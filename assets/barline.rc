@@ -29,12 +29,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "Yi One"
       VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
-      VALUE "FileVersion",      "1.14.0"
+      VALUE "FileVersion",      "1.14.1"
       VALUE "InternalName",     "barline"
       VALUE "LegalCopyright",   "MIT License. Yi One."
       VALUE "OriginalFilename", "barline.exe"
       VALUE "ProductName",      "曲栏 Barline"
-      VALUE "ProductVersion",   "1.14.0"
+      VALUE "ProductVersion",   "1.14.1"
     END
   END
   BLOCK "VarFileInfo"

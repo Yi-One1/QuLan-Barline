@@ -155,6 +155,14 @@ impl Interaction {
         self.seeking
     }
 
+    /// 指针是否正按着（左键按下未抬起）。
+    ///
+    /// 用途：悬停自愈兜底必须放过「按着拖动出窗口」这一种，否则拖到窗口外就被
+    /// 判成离开（`on_leave` 自己也有 `seeking` 守卫，这里是第二道）。
+    pub fn pointer_is_down(&self) -> bool {
+        self.down.is_some()
+    }
+
     // ------------------------------------------------------------ 鼠标进入 / 移动
 
     /// `WM_MOUSEMOVE`。
@@ -193,6 +201,26 @@ impl Interaction {
         }
 
         out
+    }
+
+    /// `WM_MOUSELEAVE`，但**先验证光标是不是真的出去了**。
+    ///
+    /// `cursor_inside` 由调用方用 `GetCursorPos` + 窗口矩形现场算出来。
+    ///
+    /// 为什么不能无条件相信这条消息：`WS_EX_LAYERED` + `UpdateLayeredWindow`
+    /// 的窗口，每次重设分层表面、以及每秒一次 `SetWindowPos` 置顶之后，系统都会
+    /// 重新判定「光标下是哪个窗口」，在光标其实没动的情况下也可能补投一条
+    /// `WM_MOUSELEAVE`。而 `WM_MOUSEMOVE` 只在鼠标**真的移动**时才来 —— 假离开
+    /// 之后没有任何消息能把悬停补回来，用户看到的就是「悬停背景亮一下、约 1 秒
+    /// 后消失，鼠标不动就一直不回来」（v1.14.0 真人验收 Bug 1）。
+    ///
+    /// 所以判据改成「光标现在在不在里面」：在里面 → 假离开，返回空 Vec，
+    /// 调用方负责重新武装 `TME_LEAVE`；在外面 → 走正常 [`Self::on_leave`]。
+    pub fn on_leave_checked(&mut self, cursor_inside: bool) -> Vec<WidgetInput> {
+        if cursor_inside {
+            return Vec::new();
+        }
+        self.on_leave()
     }
 
     /// `WM_MOUSELEAVE`。
@@ -505,10 +533,54 @@ mod tests {
         assert_eq!(i.hover, HoverState::Idle);
     }
 
+    /// v1.14.1（真人验收 Bug 1）：光标仍在窗口内的 `WM_MOUSELEAVE` 是**假离开**，
+    /// 必须忽略 —— 否则悬停底板会「亮一下、约 1 秒后消失」，而鼠标不动就再也
+    /// 不会回来（没有 `WM_MOUSEMOVE` 能把悬停补上）。
+    #[test]
+    fn spurious_leave_is_ignored_while_the_cursor_is_still_inside() {
+        let l = layout();
+        let mut i = Interaction::new();
+        i.on_move(&l, 10.0, 10.0);
+        assert_eq!(i.hover, HoverState::Hover);
+
+        // 假离开：光标其实还在窗口里
+        let out = i.on_leave_checked(true);
+        assert!(out.is_empty(), "假离开不许派发 HoverLeave");
+        assert_eq!(i.hover, HoverState::Hover, "假离开之后悬停必须保持");
+        assert!(i.animating(), "悬停淡入不该被打断");
+
+        // 淡入走完之后再来一次假离开，仍要保持悬停
+        for _ in 0..20 {
+            i.on_anim_tick(16);
+        }
+        assert!((i.hover_alpha - 1.0).abs() < 1e-3, "淡入应已到 1.0");
+        assert!(i.on_leave_checked(true).is_empty());
+        assert_eq!(i.hover, HoverState::Hover);
+
+        // 真离开：光标确实出去了
+        let out = i.on_leave_checked(false);
+        assert_eq!(out, vec![WidgetInput::HoverLeave]);
+        assert_eq!(i.hover, HoverState::Idle);
+    }
+
+    /// 假离开被忽略后 `animating()` 必须归 false（16ms 定时器要能停），
+    /// 否则「空闲 CPU ≈ 0」这条约束会被一个悬停卡死。
+    #[test]
+    fn ignoring_a_spurious_leave_does_not_keep_the_anim_timer_alive() {
+        let l = layout();
+        let mut i = Interaction::new();
+        i.on_move(&l, 10.0, 10.0);
+        for _ in 0..20 {
+            i.on_anim_tick(16);
+        }
+        assert!(!i.animating(), "淡入结束后不该还在动画");
+        i.on_leave_checked(true);
+        assert!(!i.animating(), "忽略假离开不能把动画定时器又点亮");
+    }
+
     /// 指针在小组件内部移动不重复触发 HoverEnter（PRD §4.3）。
     #[test]
-    fn internal_moves_do_not_retrigger_enter() {
-        let l = layout();
+    fn internal_moves_do_not_retrigger_enter() {        let l = layout();
         let mut i = Interaction::new();
         i.on_move(&l, 10.0, 10.0);
         for x in [20.0f32, 40.0, 80.0, 120.0] {
