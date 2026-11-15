@@ -116,6 +116,14 @@ pub mod limits {
     pub const COVER_SIDE: f32 = 32.0;
     /// 封面圆角（逻辑像素）
     pub const COVER_RADIUS: f32 = 4.0;
+    /// 图标态：双音符边长（逻辑像素）。用户拍板 24px —— 介于封面 32 与按钮 16 之间。
+    pub const ICON_SIDE: f32 = 24.0;
+    /// 图标态：小方块总宽 / 悬停底板边长（逻辑像素）。
+    ///
+    /// 用户拍板 34px「贴满」：底板横向撑满小方块，右边缘仍距托盘区 8px。
+    pub const ICON_BOX_W: f32 = 34.0;
+    /// 图标态：悬停底板圆角（逻辑像素）。与正常态悬停背景的 8px 同族，略小以适应 34px 方块。
+    pub const ICON_PLATE_RADIUS: f32 = 6.0;
     /// 按钮图标边长
     pub const BTN_ICON: f32 = 16.0;
     /// 按钮命中区边长（PRD：≥ 28×28）

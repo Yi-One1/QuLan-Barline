@@ -126,14 +126,26 @@ pub enum WidgetForm {
     Compact,
     /// 歌词开启：信息区宽至少 160 * scale，下行显示当前行歌词
     Lyric,
+    /// 图标态（v1.14.0）：**完全没有媒体会话**时，整条小组件收成一个 34px 小方块，
+    /// 里面只有双音符图标。除图标与悬停底板外，所有矩形都是空矩形——
+    /// 于是命中测试天然返回「空白区」，右键菜单 / 双击开设置 / 悬停背景
+    /// 全部复用既有逻辑，不需要任何「图标态专用」分支。
+    Icon,
 }
 
 impl WidgetForm {
+    /// 是否图标态。**唯一判定入口**：绘制、布局、命中、可见性都从这里分流，
+    /// 不要在各处写 `form == WidgetForm::Icon`（历史上分散判定栽过跟头）。
+    pub fn is_icon(self) -> bool {
+        matches!(self, WidgetForm::Icon)
+    }
+
     /// 信息区最小宽度（逻辑像素，未乘 scale）。`Compact`（歌词关闭）为 0。
     pub fn lyric_w(self) -> f32 {
         match self {
             WidgetForm::Compact => 0.0,
             WidgetForm::Lyric => limits::LYRIC_W,
+            WidgetForm::Icon => 0.0,
         }
     }
 
@@ -180,6 +192,12 @@ pub struct WidgetLayout {
     pub dismiss: RectF,
     /// 右上角关闭 × 的**命中**矩形（边长 [`limits::DISMISS_HIT`] * scale，贴右边缘、y 从 0）
     pub hit_dismiss: RectF,
+    /// 图标态的双音符矩形（边长 [`limits::ICON_SIDE`] * scale，居中于小方块）。
+    /// 非图标态为空矩形。
+    pub icon: RectF,
+    /// 图标态的悬停底板矩形（[`limits::ICON_BOX_W`] 见方，垂直居中）。
+    /// 非图标态为空矩形。
+    pub icon_plate: RectF,
 
     // ---- 文本缓存（M1 报告 §5.9：截断结果缓存进布局，避免每帧建 TextLayout）----
     /// 已截断的歌名（含省略号）
@@ -227,6 +245,10 @@ impl WidgetLayout {
     /// 与真实窗口对不上。
     pub fn fixed_width(&self) -> f32 {
         let s = self.effective_scale();
+        if self.form.is_icon() {
+            // 图标态没有封面/文本/按钮/关闭×，整条就是一个小方块。
+            return limits::ICON_BOX_W * s;
+        }
         limits::CONTENT_PAD * s
             + limits::COVER_SIDE * s
             + limits::COVER_TEXT_GAP * s
@@ -247,6 +269,39 @@ impl WidgetLayout {
     /// **不**做 1px 内缩（内缩会让 6px 字形在 0x14 的淡底上看起来偏位）。
     pub fn dismiss_bg_rect(&self) -> RectF {
         self.hit_dismiss
+    }
+}
+
+/// 图标态布局：34px 小方块 + 居中的 24px 双音符 + 横向贴满的悬停底板。
+///
+/// 三条硬约束（都有单测）：
+/// 1. 宽度**只**由 [`limits::ICON_BOX_W`] 决定，与文本、歌词开关、任务栏厚度无关；
+/// 2. 双音符在小方块里**水平与垂直都居中**（视觉居中由 `icon_geom` 的质量重心负责，
+///    这里只负责把它摆到方块中心）；
+/// 3. 除 `main_row` / `icon` / `icon_plate` 外，所有矩形必须是空矩形——
+///    否则图标态会突然冒出可点的按钮。
+fn icon_layout(edge: TaskbarEdge, s: f32, bar_thickness: i32) -> WidgetLayout {
+    let mh = bar_thickness.max(1);
+    let h = mh as f32;
+    let w = (limits::ICON_BOX_W * s).round().max(1.0);
+    let plate_h = (limits::ICON_BOX_W * s).min(h);
+    let side = limits::ICON_SIDE * s;
+
+    WidgetLayout {
+        form: WidgetForm::Icon,
+        edge,
+        scale: s,
+        width: w as i32,
+        height: mh,
+        main_row: RectF::new(0.0, 0.0, w, h),
+        icon_plate: RectF::new(0.0, ((h - plate_h) * 0.5).max(0.0), w, plate_h),
+        icon: RectF::new(
+            ((w - side) * 0.5).max(0.0),
+            ((h - side) * 0.5).max(0.0),
+            side.min(w),
+            side.min(h),
+        ),
+        ..Default::default()
     }
 }
 
@@ -271,6 +326,16 @@ pub fn compute_full(
     lyric_w_logical: f32,
 ) -> WidgetLayout {
     let s = if scale > 0.0 { scale } else { 1.0 };
+
+    // ---- 图标态（v1.14.0）：整条收成 34px 小方块，其余矩形全部留空 ----
+    //
+    // 早返回是**故意**的：图标态没有封面/文本/按钮/关闭×/进度条，
+    // 让下面那套排版逻辑跑一遍只会产出一堆互相矛盾的中间值。
+    // 留空的矩形使 `hit_test` 天然落到 `HitTarget::None`，
+    // 「空白区双击开设置 / 右键菜单 / 悬停背景」因此无需任何新分支。
+    if form.is_icon() {
+        return icon_layout(edge, s, bar_thickness);
+    }
 
     let pad = limits::CONTENT_PAD * s;
     let cover_side = limits::COVER_SIDE * s;
@@ -447,6 +512,9 @@ pub fn compute_full(
         hit_cover,
         dismiss,
         hit_dismiss,
+        // 图标态专用字段：正常形态下必须是空矩形（图标态的早返回分支已经填好）
+        icon: RectF::EMPTY,
+        icon_plate: RectF::EMPTY,
         title_text: String::new(),
         artist_text: String::new(),
         text_key: 0,
@@ -497,6 +565,104 @@ mod tests {
         let wide = compute_full(TaskbarEdge::Bottom, WidgetForm::Lyric, 1.0, 48, 4000.0, 0.0, WidgetForm::Lyric.lyric_w());
         assert_eq!(wide.width, 174 + 340);
     }
+
+    // ---------------------------------------------------------------- 图标态（v1.14.0）
+
+    fn icon_layout_at(scale: f32, bar: i32) -> WidgetLayout {
+        compute_full(TaskbarEdge::Bottom, WidgetForm::Icon, scale, bar, 0.0, 0.0, 0.0)
+    }
+
+    /// 图标态宽度只由 `ICON_BOX_W` 决定：与文本自然宽、歌词最小宽**完全无关**，
+    /// 而且必须绕过 `WIDGET_MIN_W = 200`（否则会得到一条 200px 的空白条）。
+    #[test]
+    fn icon_form_width_is_34px_whatever_the_content() {
+        let a = compute_full(TaskbarEdge::Bottom, WidgetForm::Icon, 1.0, 48, 0.0, 0.0, 0.0);
+        let b = compute_full(TaskbarEdge::Bottom, WidgetForm::Icon, 1.0, 48, 4000.0, 3000.0, 160.0);
+        assert_eq!(a.width, 34, "图标态宽度必须是 34");
+        assert_eq!(b.width, 34, "文本/歌词宽不得影响图标态宽度");
+        assert_eq!(a.height, 48);
+        assert_eq!(a.form, WidgetForm::Icon);
+        assert!(a.form.is_icon());
+    }
+
+    /// 图标态除主行 / 图标 / 底板外，**所有矩形必须为空**。
+    ///
+    /// 这条挡的是「图标态突然冒出可点按钮 / 可拖进度条」——那会让空白区双击、
+    /// 悬停判定全部错位。
+    #[test]
+    fn icon_form_has_no_interactive_rects() {
+        let l = icon_layout_at(1.0, 48);
+        for (name, r) in [
+            ("cover", l.cover),
+            ("title", l.title),
+            ("artist", l.artist),
+            ("btn_prev", l.btn_prev),
+            ("btn_toggle", l.btn_toggle),
+            ("btn_next", l.btn_next),
+            ("progress", l.progress),
+            ("lyric_cur", l.lyric_cur),
+            ("hit_prev", l.hit_prev),
+            ("hit_toggle", l.hit_toggle),
+            ("hit_next", l.hit_next),
+            ("hit_progress", l.hit_progress),
+            ("hit_cover", l.hit_cover),
+            ("dismiss", l.dismiss),
+            ("hit_dismiss", l.hit_dismiss),
+        ] {
+            assert!(r.is_empty(), "{name} 在图标态必须是空矩形，实际 {r:?}");
+        }
+        // 主行铺满整个客户区（悬停 / 双击都靠它）
+        assert_eq!(l.main_row, RectF::new(0.0, 0.0, 34.0, 48.0));
+    }
+
+    /// 双音符在 34×48 的方块里必须**水平垂直都居中**。
+    #[test]
+    fn icon_glyph_is_centred_in_the_box() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let l = icon_layout_at(scale, 48);
+            let (gx, gy) = l.icon.center();
+            assert!(
+                (gx - l.width as f32 * 0.5).abs() < 0.01,
+                "scale={scale}: 图标中心 x={gx}，方块中心={}",
+                l.width as f32 * 0.5
+            );
+            assert!(
+                (gy - l.height as f32 * 0.5).abs() < 0.01,
+                "scale={scale}: 图标中心 y={gy}，方块中心={}",
+                l.height as f32 * 0.5
+            );
+            assert!(
+                (l.icon.w - 24.0 * scale).abs() < 0.01,
+                "scale={scale}: 图标边长应为 24*scale"
+            );
+        }
+    }
+
+    /// 悬停底板：横向贴满小方块、纵向居中、边长 = 34*scale（超过条带厚度时收敛到厚度）。
+    #[test]
+    fn icon_plate_fills_width_and_is_vertically_centred() {
+        let l = icon_layout_at(1.0, 48);
+        assert_eq!(l.icon_plate.x, 0.0);
+        assert!((l.icon_plate.w - 34.0).abs() < 0.01);
+        assert!((l.icon_plate.h - 34.0).abs() < 0.01);
+        assert!((l.icon_plate.y - 7.0).abs() < 0.01, "底板 y 应为 (48−34)/2 = 7");
+
+        // 薄任务栏（30px）：底板收敛到 30，仍然垂直居中
+        let thin = icon_layout_at(1.0, 30);
+        assert!((thin.icon_plate.h - 30.0).abs() < 0.01, "薄任务栏底板应收到 30");
+        assert!(thin.icon_plate.y.abs() < 0.01);
+    }
+
+    /// 竖排任务栏：布局按 (height, width) 转置，图标态仍是「厚度 × 34」一格。
+    #[test]
+    fn icon_form_works_on_vertical_taskbars() {
+        let l = compute_full(TaskbarEdge::Left, WidgetForm::Icon, 1.0, 48, 0.0, 0.0, 0.0);
+        assert_eq!(l.width, 34);
+        assert_eq!(l.height, 48);
+        // 转置后窗口宽 = 48、高 = 34（由调用方按 edge 决定）
+        assert!(l.edge.is_vertical());
+    }
+
 
     #[test]
     fn cover_inside_main_row_and_vertically_centered() {

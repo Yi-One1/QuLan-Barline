@@ -21,10 +21,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
-    GetWindowLongPtrW, LoadImageW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenuEx, GWLP_USERDATA, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_ENABLED,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetSystemMetrics, GetWindowLongPtrW, LoadImageW, PostMessageW, RegisterClassW,
+    SetForegroundWindow, TrackPopupMenuEx, GWLP_USERDATA, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED,
+    MF_ENABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SM_CXSMICON, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 use crate::event::TrayCommand;
@@ -35,8 +36,11 @@ use crate::platform::wide::to_wide;
 pub const TRAY_CLASS_NAME: PCWSTR = w!("BarlineTrayWnd");
 /// 托盘图标 id（`Shell_NotifyIconW` 的 `uID`）。
 const TRAY_UID: u32 = 1;
-/// 图标资源 id（`assets/barline.rc` 里写死为 1）。
-const ICON_RESOURCE_ID: usize = 1;
+/// 图标资源 id（`assets/barline.rc`）：**1 = 深色字形**（给浅色任务栏），
+/// **2 = 浅色字形**（给深色任务栏）。两个 ICO 都由 `build.rs` 用同一份
+/// `render::icon_geom` 生成，所以托盘上的双音符与小组件里的逐像素同源。
+const ICON_DARK_ID: usize = 1;
+const ICON_LIGHT_ID: usize = 2;
 /// 菜单命令 id。
 const CMD_OPEN: usize = 101;
 const CMD_TOGGLE: usize = 102;
@@ -71,11 +75,50 @@ pub fn clamp_label(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// 按「任务栏是否深色」选图标资源 id。
+///
+/// 纯函数：深色任务栏必须配**浅色字形**，否则黑色图标在深色托盘上等于隐形。
+/// 单测锁住这条映射，避免以后又变成「只有一个图标、谁都不换」。
+pub fn icon_id_for(dark_taskbar: bool) -> usize {
+    if dark_taskbar {
+        ICON_LIGHT_ID
+    } else {
+        ICON_DARK_ID
+    }
+}
+
+/// 按任务栏明暗与当前 DPI 加载托盘图标。
+///
+/// 尺寸取 `SM_CXSMICON`（100% DPI 是 16，150% 是 24）。旧代码写死 16×16，
+/// 高 DPI 下 Windows 只能把 16px 位图拉大 → 托盘里的双音符发虚。
+fn load_icon(hinstance: HINSTANCE, dark: bool) -> isize {
+    // SAFETY: GetSystemMetrics 无参数副作用，返回当前 DPI 下的小图标边长。
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+    // SAFETY: 图标资源由本模块的 exe 持有，进程存活期间一直有效；
+    // 资源 id 由 `icon_id_for` 决定，恒为 1 或 2。
+    unsafe {
+        LoadImageW(
+            Some(hinstance),
+            PCWSTR(icon_id_for(dark) as *const u16),
+            IMAGE_ICON,
+            size,
+            size,
+            LR_DEFAULTCOLOR,
+        )
+    }
+    .map(|h| h.0 as isize)
+    .unwrap_or(0)
+}
+
 /// 托盘图标句柄 + 宿主窗口。
 pub struct Tray {
     hwnd: HWND,
     icon: isize,
     added: bool,
+    /// 实例句柄：主题切换时要重新 `LoadImageW`。
+    hinstance: HINSTANCE,
+    /// 当前图标是按「深色任务栏」选的（即用的是浅色字形）。
+    dark: bool,
 }
 
 /// 托盘菜单「显示/隐藏小组件」的勾选态：**小组件正在显示 → 打钩**。
@@ -131,25 +174,17 @@ impl Tray {
                 );
             }
         }
-        // SAFETY: 图标资源由本模块的 exe 持有，进程存活期间一直有效。
-        let icon = unsafe {
-            LoadImageW(
-                Some(hinstance),
-                PCWSTR(ICON_RESOURCE_ID as *const u16),
-                IMAGE_ICON,
-                16,
-                16,
-                LR_DEFAULTCOLOR,
-            )
-        }
-        .map(|h| h.0 as isize)
-        .unwrap_or(0);
+        // 图标按任务栏明暗二选一（v1.14.0）：深色任务栏用浅色字形，反之用深色。
+        let dark = crate::platform::system_taskbar_theme_dark();
+        let icon = load_icon(hinstance, dark);
 
         crate::log_debug!("托盘窗口已创建：hwnd=0x{:X} icon={icon}", hwnd.0 as usize);
         Ok(Self {
             hwnd,
             icon,
             added: false,
+            hinstance,
+            dark,
         })
     }
 
@@ -186,6 +221,30 @@ impl Tray {
             self.added = false;
             self.add(lang);
         }
+    }
+
+    /// 系统 / 任务栏明暗变化后重挑图标（v1.14.0）。
+    ///
+    /// 由 `WM_SETTINGCHANGE` 调用：用户在系统设置里切「浅色 / 深色」后，
+    /// 托盘里的双音符必须在 1 秒内换到对比色那一版，否则黑图标贴在深色
+    /// 托盘上就是一团看不见的方块。明暗没变时零动作（不重建、不刷新）。
+    pub fn sync_theme(&mut self, lang: Lang) {
+        let dark = crate::platform::system_taskbar_theme_dark();
+        if dark == self.dark {
+            return;
+        }
+        let icon = load_icon(self.hinstance, dark);
+        if icon == 0 {
+            crate::log_warn!("主题切换后重新加载托盘图标失败，保持原图");
+            return;
+        }
+        self.dark = dark;
+        self.icon = icon;
+        crate::log_info!(
+            "任务栏明暗变化 → 托盘图标换成{}字形",
+            if dark { "浅色" } else { "深色" }
+        );
+        self.refresh(lang);
     }
 
     /// `NIM_DELETE`：退出前必须调，否则通知区留一个死图标。

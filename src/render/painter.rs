@@ -114,6 +114,18 @@ pub fn paint(
         let hit_brush = frame.brush(Rgba::new(0, 0, 0, 1))?;
         rt.FillRectangle(&d2d_rect(0.0, 0.0, w, h), &hit_brush);
 
+        // ---- 图标态（v1.14.0）：只有悬停底板 + 双音符，其余一律不画 ----
+        //
+        // 早返回是故意的：图标态没有封面/文字/按钮/×/进度条/歌词/HUD，
+        // 让后面那套绘制跑一遍只会画出一堆空矩形，还多花几毫秒。
+        // 底板与图标的矩形都来自 `layout`，颜色来自主题——所以「随背景自适应」
+        // 与正常态**完全同源**，不是另一套。
+        if ctx.layout.form.is_icon() {
+            draw_icon_state(&rt, frame, ctx, hover_a)?;
+            rt.EndDraw(None, None)?;
+            return Ok(());
+        }
+
         // ---- 2. 背景（常规 idle_bg / 悬停 hover_bg 插值）----
         // v1.1.12：常规态也可能半透明——只有「不悬停 且 常规透明」才整块跳过
         // （此前守卫只看 hover_a，把常规半透明整帧吞掉 = 问题 1/2 的根因）
@@ -181,6 +193,36 @@ fn draw_background(
     Ok(())
 }
 
+// ------------------------------------------------------------------ 图标态
+
+/// 图标态：34×34 悬停底板 + 居中的 24px 双音符（v1.14.0）。
+///
+/// 底板颜色与正常态悬停背景**同一个来源**（`idle_bg → hover_bg` 按悬停进度插值），
+/// 因此「常规透明 / 悬停半透明」这些外观配置在图标态下同样生效，不是另一套。
+/// 图标墨色用 `theme.text`：随壁纸亮度自适应黑/白，与歌名文字同源。
+fn draw_icon_state(
+    rt: &ID2D1RenderTarget,
+    frame: &mut Frame,
+    ctx: &Ctx<'_>,
+    alpha: f32,
+) -> Result<()> {
+    let (layout, theme, s) = (ctx.layout, &ctx.theme, ctx.scale);
+
+    let plate = layout.icon_plate;
+    let bg = crate::render::theme::mix_rgba(theme.idle_bg, theme.hover_bg, alpha);
+    if !plate.is_empty() && bg.a > 0 {
+        // 圆角不得超过高度一半，否则 D2D 会画出畸形圆角
+        let radius = (limits::ICON_PLATE_RADIUS * s).min(plate.h * 0.5);
+        let brush = frame.brush(bg)?;
+        // SAFETY: 栈上圆角矩形，尺寸来自布局，恒落在客户区内。
+        unsafe {
+            rt.FillRoundedRectangle(&rounded(plate.x, plate.y, plate.w, plate.h, radius), &brush);
+        }
+    }
+
+    crate::render::icon::draw(rt, frame, layout.icon, Rgba::from_rgb(theme.text, 0xFF))
+}
+
 // ------------------------------------------------------------------ 封面
 
 /// 画封面：真实位图优先，缺失时渐变占位 + 音符图标（PRD P0-03：不出现白块 / 黑块）。
@@ -229,29 +271,18 @@ fn draw_cover(
             rt.FillRoundedRectangle(&rounded(c.x, c.y, c.w, c.h, radius), &grad);
         }
 
-        // 音符图标（不引入图标字体 / PNG）：符头椭圆 + 符干 + 符尾
-        let fg = frame.brush(Rgba::new(0xFF, 0xFF, 0xFF, 0xC8))?;
-        let (cx, cy) = c.center();
-        let unit = c.w / 32.0;
-        // SAFETY: 全部是几何图元，坐标由布局推导，恒为有限值。
-        unsafe {
-            rt.FillEllipse(
-                &ellipse(cx - 4.0 * unit, cy + 5.0 * unit, 4.2 * unit, 3.2 * unit),
-                &fg,
-            );
-            rt.FillRectangle(
-                &d2d_rect(cx - 0.4 * unit, cy - 9.0 * unit, 1.6 * unit, 14.0 * unit),
-                &fg,
-            );
-            rt.FillRectangle(
-                &d2d_rect(cx + 1.0 * unit, cy - 9.0 * unit, 5.0 * unit, 1.5 * unit),
-                &fg,
-            );
-            rt.FillRectangle(
-                &d2d_rect(cx + 4.4 * unit, cy - 9.0 * unit, 1.6 * unit, 4.0 * unit),
-                &fg,
-            );
-        }
+        // 音符占位（不引入图标字体 / PNG）：**与图标态、托盘、exe 资源同一份几何**
+        // （`render::icon_geom`），这里只换颜色与尺寸 —— 这是「所有地方风格一致」
+        // 在代码层面的落点。占位面积取封面的 58%，四周留出渐变底色。
+        let fg = Rgba::new(0xFF, 0xFF, 0xFF, 0xC8);
+        let side = c.w * 0.58;
+        let note = crate::render::layout::RectF::new(
+            c.x + (c.w - side) * 0.5,
+            c.y + (c.h - side) * 0.5,
+            side,
+            side,
+        );
+        crate::render::icon::draw(rt, frame, note, fg)?;
     }
 
     // ---- G4：封面悬停 = 恒暗蒙层 + 恒亮双箭头 ----

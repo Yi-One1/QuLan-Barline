@@ -124,13 +124,34 @@ pub fn pick_folder(parent: windows::Win32::Foundation::HWND, title: &str) -> Opt
 /// 命令行——本机安全钩子会拦截）。读不到（老系统 / 值缺失）按浅色处理，
 /// 即 Windows 出厂默认 `AppsUseLightTheme = 1`。
 pub fn system_app_theme_dark() -> bool {
+    // 缺省 = 浅色（Windows 出厂默认 AppsUseLightTheme = 1）
+    !read_personalize_flag("AppsUseLightTheme").unwrap_or(true)
+}
+
+/// 任务栏 / 托盘区的明暗（`SystemUsesLightTheme`）。
+///
+/// 与 [`system_app_theme_dark`] 是两个**不同**的开关：Windows 允许「应用深色 +
+/// 任务栏浅色」。托盘图标贴在任务栏上，所以必须读这一项，否则会出现
+/// 「浅色任务栏 + 白色字形」= 图标消失。
+/// 读不到时回退到应用模式（老系统上两者通常一致）。
+pub fn system_taskbar_theme_dark() -> bool {
+    match read_personalize_flag("SystemUsesLightTheme") {
+        Some(light) => !light,
+        None => system_app_theme_dark(),
+    }
+}
+
+/// 读 `HKCU\…\Themes\Personalize` 下的一个 DWORD 开关。
+///
+/// 返回 `None` = 读不到（值缺失 / 老系统 / 注册表不可访问），由调用方决定兜底。
+fn read_personalize_flag(name: &str) -> Option<bool> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
     let subkey = crate::platform::wide::to_wide(
         "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
     );
-    let value = crate::platform::wide::to_wide("AppsUseLightTheme");
+    let value = crate::platform::wide::to_wide(name);
     let mut data: u32 = 1; // 缺省 = 浅色
     let mut size = core::mem::size_of::<u32>() as u32;
     // SAFETY: 两个宽字符串以 NUL 结尾且在本调用期间存活；出参都是本地变量。
@@ -146,9 +167,9 @@ pub fn system_app_theme_dark() -> bool {
         )
     };
     if hr != ERROR_SUCCESS {
-        return false;
+        return None;
     }
-    data == 0 // 0 = 深色应用模式
+    Some(data != 0)
 }
 
 /// 把窗口强行提到前台。

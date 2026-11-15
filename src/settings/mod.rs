@@ -135,8 +135,19 @@ impl SettingsService {
             lpfnWndProc: Some(settings_proc),
             hInstance: hinstance,
             lpszClassName: class,
-            // SAFETY: 取 exe 里的图标资源（id=1），进程存活期间有效。
-            hIcon: unsafe { LoadIconW(Some(hinstance), PCWSTR(1 as *const u16)) }.unwrap_or_default(),
+            // SAFETY: 取 exe 里的图标资源，进程存活期间有效。
+            // v1.14.0：按**应用**明暗选字形（1 = 深色字形 / 2 = 浅色字形）——
+            // 设置窗口是 Mica 标题栏，跟随 `AppsUseLightTheme` 而不是任务栏。
+            hIcon: unsafe {
+                LoadIconW(
+                    Some(hinstance),
+                    PCWSTR(
+                        crate::ui::tray::icon_id_for(crate::platform::system_app_theme_dark())
+                            as *const u16,
+                    ),
+                )
+            }
+            .unwrap_or_default(),
             ..Default::default()
         };
         // SAFETY: wc 是本地栈结构体、字段已填全；重复注册返回 0 不视为错误。

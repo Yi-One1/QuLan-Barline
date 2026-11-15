@@ -8,6 +8,8 @@
 
 pub mod cover_cache;
 pub mod d2d;
+pub mod icon;
+pub mod icon_geom;
 pub mod layout;
 pub mod painter;
 pub mod sampler;

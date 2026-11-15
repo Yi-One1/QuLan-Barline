@@ -1,8 +1,12 @@
 ﻿#pragma code_page(65001)
 // 曲栏 Barline —— Win32 资源脚本
 // 路径相对于「构建脚本的工作目录」，即 crate 根目录（embed-resource 不切换 cwd）。
-// 图标 ID 固定为 1，托盘与 exe 图标都取它。
+// 图标 ID：1 = 深色字形（给浅色背景），2 = 浅色字形（给深色背景）。
+// 两个 ICO 都由 build.rs 用 src/render/icon_geom.rs 的同一份几何生成，
+// 与小组件里画的双音符严格同源（用户要求「所有地方风格一致」）。
+// 选哪个由调用方按系统/任务栏明暗决定：托盘与设置窗口标题栏都会切换。
 1 ICON "assets/icon.ico"
+2 ICON "assets/icon_light.ico"
 
 // 24 = RT_MANIFEST，ID 1 = 应用清单（CREATEPROCESS_MANIFEST_RESOURCE_ID）
 1 24 "assets/app.manifest"
@@ -25,12 +29,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "Yi One"
       VALUE "FileDescription",  "曲栏 Barline — Windows 任务栏媒体播控小组件"
-      VALUE "FileVersion",      "1.13.1"
+      VALUE "FileVersion",      "1.14.0"
       VALUE "InternalName",     "barline"
       VALUE "LegalCopyright",   "MIT License. Yi One."
       VALUE "OriginalFilename", "barline.exe"
       VALUE "ProductName",      "曲栏 Barline"
-      VALUE "ProductVersion",   "1.13.1"
+      VALUE "ProductVersion",   "1.14.0"
     END
   END
   BLOCK "VarFileInfo"

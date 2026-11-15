@@ -60,10 +60,8 @@ nav .brand {
   padding: 10px 12px 16px; font-size: 15px; font-weight: 600;
 }
 nav .brand .logo {
-  width: 24px; height: 24px; border-radius: 6px;
-  background: var(--accent); color: #fff;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-weight: 700;
+  width: 24px; height: 24px; flex: 0 0 24px; display: block;
+  color: var(--text);
 }
 nav button {
   position: relative; display: flex; align-items: center; gap: 10px;
@@ -199,7 +197,24 @@ input.slider { width: 140px; accent-color: var(--accent); cursor: pointer; flex:
 <body>
 <div class="app">
   <nav>
-    <div class="brand"><span class="logo">曲</span><span data-i18n="app.name">曲栏</span></div>
+    <div class="brand">
+      <!-- 品牌图标：与小组件 / 托盘 / exe 资源**同一份几何**（src/render/icon_geom.rs）。
+           坐标系 = 96 单位设计盒；viewBox 紧贴字形包围盒 14,13 68×71；
+           translate(-2.011 0) = 双音符按质量重心居中（不是外框居中）。
+           颜色用 currentColor：浅色主题黑、深色主题白，不写死颜色。
+           改动这里必须同步 icon_geom.rs —— 有一条单测会比对这两处。 -->
+      <svg class="logo" viewBox="14 13 68 71" role="img" aria-label="曲栏" data-icon="barline-note">
+        <g fill="currentColor" transform="translate(-2.011 0)">
+          <circle cx="27" cy="64" r="9.5"/>
+          <circle cx="63" cy="57" r="9.5"/>
+          <rect x="33" y="20" width="5" height="44" rx="2.5"/>
+          <rect x="69" y="13" width="5" height="44" rx="2.5"/>
+          <path d="M33 20 L74 13 L74 22 L33 29 Z"/>
+        </g>
+        <rect x="14" y="80" width="68" height="4" rx="2" fill="currentColor"/>
+      </svg>
+      <span data-i18n="app.name">曲栏</span>
+    </div>
     <button data-group="group-appearance" class="active"><span class="ico">◐</span><span data-i18n="nav.appearance">外观</span></button>
     <button data-group="group-lyrics"><span class="ico">♪</span><span data-i18n="nav.lyrics">歌词</span></button>
     <button data-group="group-volume"><span class="ico">🔊</span><span data-i18n="nav.volume">音量</span></button>

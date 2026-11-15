@@ -41,7 +41,7 @@ use crate::media::{self, IgnoredSessionInfo, MediaService, Ms, NowPlaying, Playb
 use crate::platform::dpi::scale_for;
 use crate::platform::wake::{EventSink, WakeHwnd, WM_BARLINE_APPBAR};
 use crate::platform::wide::to_wide;
-use crate::render::layout::{self, WidgetForm, WidgetLayout};
+use crate::render::layout::{self, TaskbarEdge, WidgetForm, WidgetLayout};
 use crate::render::sampler::{CoverageMap, SampleRequest, Sampler};
 use crate::render::text::TextKind;
 use crate::render::theme::{BackgroundMode, Theme};
@@ -176,9 +176,9 @@ impl AppState {
         if self.taskbar_collapsed {
             return false;
         }
-        if self.playing.state == PlaybackState::NoSession {
-            return false;
-        }
+        // v1.14.0：`NoSession` **不再隐藏**——改为显示双音符图标态（用户拍板）。
+        // 隐藏只剩两个来源：用户手动隐藏、任务栏自动收起。
+        // 图标态本身是 `WidgetForm::Icon`，由 `relayout_with` 决定形态。
         true
     }
 
@@ -1541,7 +1541,8 @@ impl App {
                 effects
             }
             AppEvent::SessionCleared => {
-                crate::log_info!("会话已清空，小组件隐藏");
+                // v1.14.0：会话清空不再隐藏小组件，而是切成双音符图标态。
+                crate::log_info!("会话已清空，小组件切换为图标态");
                 self.state.playing = NowPlaying::default();
                 self.state.lyrics = LyricView::default();
                 self.interact.reset();
@@ -2787,11 +2788,14 @@ impl App {
         // v1.1.1：行数固定单行，config 里的旧 two_line 字段只读不用于布局
         // 竖排任务栏（左右）在 M4 一律降级为紧凑态：内容旋转（§10.4）尚未实现，
         // 不降级的话两行信息区会沿条带厚度方向展开，直接压到桌面上。
-        let form = if geo.edge.is_vertical() {
-            WidgetForm::Compact
-        } else {
-            WidgetForm::from_lyric_enabled(self.config.lyrics.enabled)
-        };
+        // v1.14.0：形态选择统一走 `form_for`（纯函数，可穷举验证）。
+        // 图标态在最前面：完全没有媒体会话 → 34px 小方块，与任务栏朝向无关。
+        // 有会话但暂停/停止时**不**走这里——用户拍板「暂停仍显示完整小组件」。
+        let form = form_for(
+            self.state.playing.state,
+            geo.edge,
+            self.config.lyrics.enabled,
+        );
 
         // 文本自然宽度（歌名 / 歌手分开量）→ 决定信息区宽
         let lang = self.lang;
@@ -3536,6 +3540,24 @@ impl App {
 ///
 /// 抽成纯函数是为了可单测：只有显示的会话真的命中黑名单时才回落空态；
 /// 拉黑一个「没在显示」的应用不该让小组件消失（G8-① 的核心场景）。
+/// 形态选择：**唯一入口**（v1.14.0 起「图标态」也走这里）。
+///
+/// 抽成纯函数是为了能穷举，而不是只能通过 `App`（需要真实 Win32 句柄）间接验证：
+/// - **完全没有媒体会话** → 图标态，与任务栏朝向无关（方块转置后仍是 34×厚度 一格）；
+/// - 竖排任务栏 → 紧凑态（内容旋转 90° 未实现，一律降级）；
+/// - 其它 → 按歌词开关。
+///
+/// 注意：**有会话但暂停/停止不走进图标态**——用户拍板暂停时仍显示完整小组件。
+fn form_for(state: PlaybackState, edge: TaskbarEdge, lyrics_enabled: bool) -> WidgetForm {
+    if state == PlaybackState::NoSession {
+        WidgetForm::Icon
+    } else if edge.is_vertical() {
+        WidgetForm::Compact
+    } else {
+        WidgetForm::from_lyric_enabled(lyrics_enabled)
+    }
+}
+
 fn displayed_session_hit(index: &MediaIndex, playing: &NowPlaying) -> bool {
     let s = &playing.session;
     // v1.12.0：判据统一为 `is_filtered`（拉黑 ∪ 白名单外）——白名单变更后同样要
@@ -4065,11 +4087,79 @@ mod tests {
         );
     }
 
+    /// v1.14.0：形态选择真值表——`NoSession` 一律图标态，其余状态绝不进图标态。
     #[test]
-    fn no_session_is_not_visible() {
+    fn form_for_truth_table() {
+        use crate::render::layout::TaskbarEdge;
+        // 无会话：不论任务栏朝向、不论歌词开关，都是图标态
+        for edge in [
+            TaskbarEdge::Bottom,
+            TaskbarEdge::Top,
+            TaskbarEdge::Left,
+            TaskbarEdge::Right,
+        ] {
+            for lyrics in [false, true] {
+                assert_eq!(
+                    form_for(PlaybackState::NoSession, edge, lyrics),
+                    WidgetForm::Icon,
+                    "无会话必须是图标态：edge={edge:?} lyrics={lyrics}"
+                );
+            }
+        }
+        // 暂停 / 播放 / 兜底会话：一律不是图标态
+        for state in [
+            PlaybackState::Paused,
+            PlaybackState::Playing,
+            PlaybackState::Fallback,
+        ] {
+            assert_eq!(
+                form_for(state, TaskbarEdge::Bottom, false),
+                WidgetForm::Compact,
+                "{state:?} 不该进图标态"
+            );
+            assert_eq!(
+                form_for(state, TaskbarEdge::Bottom, true),
+                WidgetForm::Lyric
+            );
+            // 竖排任务栏一律降级紧凑态（内容旋转未实现）
+            assert_eq!(
+                form_for(state, TaskbarEdge::Left, true),
+                WidgetForm::Compact
+            );
+        }
+    }
+
+    /// v1.14.0 接线锁：`relayout_with` 必须经 `form_for` 决定形态。
+    ///
+    /// 这条是**源码静态断言**：把 `form_for(...)` 换回手写 if 链、或把 `NoSession`
+    /// 分支删掉，图标态就会静默消失（而所有纯函数单测仍全绿）。
+    #[test]
+    fn relayout_wires_the_form_through_form_for() {
+        let src = include_str!("app.rs");
+        let at = src
+            .find("fn relayout_with(")
+            .expect("relayout_with 必须存在");
+        let body = &src[at..];
+        let end = body.find("\n    pub fn ").unwrap_or(body.len().min(6000));
+        let body = &body[..end];
+        assert!(
+            body.contains("form_for("),
+            "relayout_with 必须通过 form_for 选形态，否则图标态不会生效"
+        );
+        assert!(
+            !body.contains("WidgetForm::from_lyric_enabled("),
+            "relayout_with 里不许再直接调 from_lyric_enabled（绕过了图标态判定）"
+        );
+    }
+
+    /// v1.14.0：没有媒体会话时**不再隐藏**，改为显示双音符图标态（用户拍板）。
+    ///
+    /// 隐藏只剩两个来源：用户手动隐藏、任务栏自动收起。
+    #[test]
+    fn no_session_shows_the_icon_instead_of_hiding() {
         let s = AppState::default();
         assert_eq!(s.playing.state, PlaybackState::NoSession);
-        assert!(!s.compute_visible());
+        assert!(s.compute_visible(), "无会话时必须显示图标态，而不是隐藏");
     }
 
     #[test]
@@ -5019,11 +5109,13 @@ mod marquee_tests {
                         before,
                         "取消 frozen 后也必须恒等：hidden={hidden} collapsed={collapsed} state={state:?}"
                     );
-                    // 安全方向回归：结论仍只由三条既有门控决定。
-                    let want = !hidden && !collapsed && state != PlaybackState::NoSession;
+                    // 安全方向回归：结论仍只由两条门控决定。
+                    // v1.14.0：`NoSession` 已从门控里摘掉（改为图标态），
+                    // 可见性因此与播放态无关。
+                    let want = !hidden && !collapsed;
                     assert_eq!(
                         before, want,
-                        "门控结论只由 user_hidden / taskbar_collapsed / NoSession 决定"
+                        "门控结论只由 user_hidden / taskbar_collapsed 决定"
                     );
                 }
             }
@@ -5035,9 +5127,9 @@ mod marquee_tests {
         // 回归 2：frozen=true 仍必须可见（绝不 SW_HIDE）
         s.frozen = true;
         assert!(s.compute_visible(), "全屏遮挡态窗口仍 visible");
-        // 回归 3：NoSession 仍必须不可见（不被 frozen 覆盖）
+        // 回归 3：NoSession 也必须可见（v1.14.0 起它是图标态，不再隐藏）
         s.playing.state = PlaybackState::NoSession;
-        assert!(!s.compute_visible());
+        assert!(s.compute_visible(), "无会话 = 图标态，必须可见");
     }
 
     /// 冻结判定与 v1.4.4 心跳跳过判据**同源**（不许两套逻辑漂移）。
@@ -5325,15 +5417,16 @@ mod marquee_tests {
         s.frozen = true;
         s.z_demoted = true;
         assert!(s.compute_visible());
-        // 三条既有门控仍然生效，一条都不放宽。
+        // 两条既有门控仍然生效，一条都不放宽。
         s.user_hidden = true;
         assert!(!s.compute_visible());
         s.user_hidden = false;
         s.taskbar_collapsed = true;
         assert!(!s.compute_visible());
         s.taskbar_collapsed = false;
+        // v1.14.0：NoSession 不再隐藏（改为图标态），frozen 下同样可见
         s.playing.state = PlaybackState::NoSession;
-        assert!(!s.compute_visible());
+        assert!(s.compute_visible());
     }
 
     /// v1.5.6：`apply_fullscreen_occlusion` 幂等（连续同 want 只一组副作用）。
@@ -5540,9 +5633,9 @@ mod qa_g35_regression {
                         st.taskbar_collapsed = collapsed;
                         st.frozen = frozen;
                         st.playing.state = state;
-                        let want = !user_hidden
-                            && !collapsed
-                            && state != PlaybackState::NoSession;
+                        // v1.14.0：`NoSession` 已从门控摘掉（改为图标态），
+                        // 可见性只由 user_hidden / taskbar_collapsed 决定。
+                        let want = !user_hidden && !collapsed;
                         assert_eq!(
                             st.compute_visible(),
                             want,
@@ -5607,9 +5700,14 @@ mod qa_g35_regression {
     /// 原 4 条阻断断言（用户隐藏 / 任务栏收起 / 无会话 / 几何不可用）逐条保留，
     /// 并新增遮挡态下 4 条同强度断言，断言数只增不减。
     ///
-    /// E6（v1.5.6）：等价的可见性门控测试——4 条阻断断言强度不降。
-    /// 几何不可用 / Ctrl+Alt+H 主动隐藏 / 任务栏收起 / 无会话时一律不得显示；
+    /// E6（v1.5.6）：等价的可见性门控测试。
+    /// 几何不可用 / Ctrl+Alt+H 主动隐藏 / 任务栏收起时一律不得显示；
     /// 全屏遮挡态（frozen=true）不改变任何一条结论。
+    ///
+    /// **v1.14.0 改写**：「无会话 → 不得显示」这一条被用户拍板推翻——无会话现在
+    /// 显示双音符图标态，所以这里改为「无会话 → 仍允许显示」。阻断项由 4 条
+    /// 降为 3 条（用户隐藏 / 任务栏收起 / 几何不可用），并新增一条「无会话仍显示」
+    /// 的正向断言，断言总数不变。
     #[test]
     fn qa_visibility_gate_blocks_user_hidden_collapsed_and_no_session() {
         fn gate(geometry_present: bool, st: &AppState) -> bool {
@@ -5629,7 +5727,7 @@ mod qa_g35_regression {
         st.taskbar_collapsed = false;
 
         st.playing.state = PlaybackState::NoSession;
-        assert!(!gate(true, &st), "无会话时不得显示");
+        assert!(gate(true, &st), "无会话时显示图标态（v1.14.0），不得隐藏");
         st.playing.state = PlaybackState::Playing;
 
         assert!(!gate(false, &st), "几何不可用时不得显示");
@@ -5645,7 +5743,7 @@ mod qa_g35_regression {
         assert!(!gate(true, &st), "遮挡态下任务栏收起仍然生效");
         st.taskbar_collapsed = false;
         st.playing.state = PlaybackState::NoSession;
-        assert!(!gate(true, &st), "遮挡态下无会话仍然生效");
+        assert!(gate(true, &st), "遮挡态下无会话同样显示图标态（v1.14.0）");
     }
 
     /// 改写理由（**v1.5.5 契约 → v1.5.6 契约**）：旧契约钉死
