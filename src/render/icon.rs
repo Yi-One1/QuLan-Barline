@@ -248,13 +248,14 @@ mod tests {
         let svg = &html[svg_start..svg_end];
 
         // 1) 两个符头必须是**旋转椭圆**，且半轴/倾角与几何一致
+        //    （cx 含 v1.14.2 的视觉居中平移 NOTE_SHIFT_X）
         let first = svg.find("<ellipse").expect("必须有椭圆符头");
         let second = first + svg[first + 1..].find("<ellipse").expect("必须有两个符头") + 1;
         for (i, (tag, head)) in [(&svg[first..], g::HEAD_A), (&svg[second..], g::HEAD_B)]
             .iter()
             .enumerate()
         {
-            close(attr(tag, "<ellipse", "cx"), head.0, 0.02, "符头 cx");
+            close(attr(tag, "<ellipse", "cx"), head.0 + g::NOTE_SHIFT_X, 0.02, "符头 cx");
             close(attr(tag, "<ellipse", "cy"), head.1, 0.02, "符头 cy");
             close(attr(tag, "<ellipse", "rx"), head.2, 0.02, "符头 rx");
             close(attr(tag, "<ellipse", "ry"), head.3, 0.02, "符头 ry");
@@ -273,9 +274,10 @@ mod tests {
             (stems[0], g::STEM_A_X, g::HEAD_A.1),
             (stems[1], g::STEM_B_X, g::HEAD_B.1),
         ] {
-            close(attr(tag, "<rect", "x"), x, 0.02, "符干左缘");
+            close(attr(tag, "<rect", "x"), x + g::NOTE_SHIFT_X, 0.02, "符干左缘");
             close(attr(tag, "<rect", "width"), g::STEM_W, 0.02, "符干宽");
             let top = attr(tag, "<rect", "y");
+            // 平移是横向的，符杠上边在**未平移坐标系**里查表
             let cx = x + g::STEM_W * 0.5;
             close(top, g::bar_top_at(cx), 0.02, "符干顶端必须贴在符杠上边");
             close(top + attr(tag, "<rect", "height"), head_cy, 0.05, "符干底端应到符头中心");
@@ -286,14 +288,15 @@ mod tests {
         let d = &svg[d_start..d_start + svg[d_start..].find('"').unwrap()];
         let p = nums(d);
         assert_eq!(p.len(), 8, "符杠路径应有 4 个点");
-        let (bx0, bt) = (g::BAR_X0, g::BAR_TOP_LEFT);
-        let tr = g::bar_top_at(g::BAR_X1);
+        let bx0 = g::BAR_X0 + g::NOTE_SHIFT_X;
+        let bx1 = g::BAR_X1 + g::NOTE_SHIFT_X;
+        let (bt, tr) = (g::BAR_TOP_LEFT, g::bar_top_at(g::BAR_X1));
         for (got, want, what) in [
             (p[0], bx0, "左上 x"),
             (p[1], bt, "左上 y"),
-            (p[2], g::BAR_X1, "右上 x"),
+            (p[2], bx1, "右上 x"),
             (p[3], tr, "右上 y"),
-            (p[4], g::BAR_X1, "右下 x"),
+            (p[4], bx1, "右下 x"),
             (p[5], tr + g::BAR_THICK, "右下 y"),
             (p[6], bx0, "左下 x"),
             (p[7], bt + g::BAR_THICK, "左下 y"),

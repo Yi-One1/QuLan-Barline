@@ -33,13 +33,21 @@
 //! 所以看不到尖。本文件用 [`bar_top_at`] 强制这条，[`Prim::RoundRect`] 的圆角
 //! （胶囊形）保证符干顶端任何一点都不越出符杠上边。
 //!
-//! ## 居中口径
+//! ## 居中口径（v1.14.2 起）
 //!
-//! **外框居中**（不是质量重心居中）。上一版按质量重心居中，那个做法对本造型不成立：
-//! 新造型的符杠又厚又长（面积占音符的 32%，重心在最右），实测音符质量重心比
-//! 外框中心偏右 **6.11 单位**。若强行让重心落在盒中心，音符要左移 6.11，而横线
-//! 若跟着音符走就会左溢出、若不跟着走就比音符右端多伸出 14 单位（图标的 15%），
-//! 两种都明显「画歪了」。参考图本身也是外框居中（左右边距各 3px），故照做。
+//! **音符左移、横线居中**，两条各管一件事：
+//!
+//! 1. 本造型的符杠又厚又长（占音符面积约 29%）且重心在最右，按墨迹外框居中时
+//!    音符的**面积重心比盒中心偏右 4.82 单位**，看着「往右坠」—— 这是用户在
+//!    v1.14.1 验收里指出的「水平方向不居中」。
+//! 2. 直接让重心居中（音符左移 4.82）是对的，但**横线不能跟着移**：横线是整幅图
+//!    里唯一水平且左右对称的元素，它居中才能当「视觉基准线」。若横线跟着音符走，
+//!    墨迹外框就变成 4.93 / 14.57 的不对称边距，比原来更歪。
+//! 3. 所以横线**按盒宽居中**（左右边距各 [`RULE_MARGIN`]），并加宽到刚好盖住
+//!    左移后的音符左缘；音符单独按 [`NOTE_SHIFT_X`] 左移。
+//!
+//! 结果是：外框（= 横线）严格居中，音符在框内光学居中，两者都不歪。
+//! 用户 2026-11-16 拍板：「只平移双音符，下方的横线始终水平居中，横线需要长一点」。
 //!
 //! ## 小尺寸
 //!
@@ -83,14 +91,45 @@ pub const BAR_SHEAR: f32 = -0.26846;
 /// 符杠**竖直**厚度（不是垂直于轴线的厚度）。
 pub const BAR_THICK: f32 = 13.923;
 
-/// 下方横线：`(x, y, w, h)`，圆角 = h/2。宽度与音符墨迹等宽（参考图无横线，
-/// 比例沿用上一版：横线是独立装饰，左右端分别对齐音符墨迹的左右端）。
-pub const RULE: (f32, f32, f32, f32) = (9.754, 90.600, 76.492, 5.400);
+/// 下方横线：`(x, y, w, h)`，圆角 = h/2。
+///
+/// **横线不参与音符的平移**，它在 96 盒里始终水平居中（左右边距相等）。
+/// 宽度取「刚好盖住左移后的音符左缘」：`x = 音符左缘`，于是右端同样留
+/// `RULE_MARGIN`，横线居中、音符左移，音符不会再探出横线左端。
+pub const RULE_MARGIN: f32 = 4.934;
+pub const RULE: (f32, f32, f32, f32) = (
+    RULE_MARGIN,
+    90.600,
+    DESIGN - 2.0 * RULE_MARGIN,
+    5.400,
+);
 
 /// 符杠上边在 `x` 处的 y。符干顶端与它对齐，所以看不到「小尖尖」。
+///
+/// 注意：这是**参考图坐标系**（未平移）的函数。`prims()` 输出的符干/符杠已经
+/// 整体平移了 [`NOTE_SHIFT_X`]，所以拿平移后的 `cx` 反查时要先减去平移量，
+/// 见 `stem_tops_sit_exactly_on_the_beam_top_edge`。
 pub fn bar_top_at(x: f32) -> f32 {
     BAR_TOP_LEFT + BAR_SHEAR * (x - BAR_X0)
 }
+
+/// 视觉居中：**音符（不含横线）**整体左移的设计单位数。
+///
+/// 为什么需要它：本造型的符杠又厚又长（占音符面积约 29%）且重心在最右，
+/// 按墨迹外框居中时，面积重心比盒中心偏右 **4.82** 单位，看着「往右坠」。
+///
+/// 为什么不把横线一起移：横线是唯一一条水平的、左右对称的元素，它居中才能
+/// 充当「视觉基准线」；横线跟着音符走的话，整幅图的墨迹外框又变成不对称的了
+/// （左右边距 4.93 / 14.57），反而更歪。**用户 2026-11-16 拍板：只平移双音符，
+/// 横线始终水平居中**。
+///
+/// −4.82 = 让**整幅墨迹（音符 + 横线）**的面积重心落在盒中心（128px 栅格实测
+/// 重心在 52.815，盒心 48），也正是用户 2026-11-16 从四档预览里选定的那一档。
+///
+/// 注意口径：单看**双音符自己**，平移后它的面积重心落在 49.08 —— 还偏右 1.08。
+/// 再往左 1.08 会让音符探出横线左端（横线得继续加宽），且与用户选定的预览
+/// 档位不符，故止步于此。要改这个数请先看 `note_is_shifted_left_while_the_rule_stays_centred`。
+pub const NOTE_SHIFT_X: f32 = -4.82;
 
 /// 小尺寸符干加粗系数。
 ///
@@ -176,33 +215,36 @@ fn stem(x_left: f32, head_cy: f32, k: f32) -> Prim {
     }
 }
 
-/// 按目标像素尺寸产出全部图元（设计单位，已含加粗）。
+/// 按目标像素尺寸产出全部图元（设计单位，已含加粗与音符平移）。
 ///
 /// 顺序固定：两符头 → 两符干 → 符杠 → 横线。顺序不影响并集结果，
 /// 但固定下来可以让单测逐项比对。
+///
+/// **前 5 项（音符）整体加 [`NOTE_SHIFT_X`]，最后一项（横线）不动。**
 pub fn prims(px: f32) -> [Prim; 6] {
     let k = weight_factor(px);
     let (rx, ry, rw, rh) = RULE;
+    let d = NOTE_SHIFT_X;
 
     [
         Prim::Ellipse {
-            cx: HEAD_A.0,
+            cx: HEAD_A.0 + d,
             cy: HEAD_A.1,
             rx: HEAD_A.2,
             ry: HEAD_A.3,
             rot: HEAD_ROT_DEG,
         },
         Prim::Ellipse {
-            cx: HEAD_B.0,
+            cx: HEAD_B.0 + d,
             cy: HEAD_B.1,
             rx: HEAD_B.2,
             ry: HEAD_B.3,
             rot: HEAD_ROT_DEG,
         },
-        stem(STEM_A_X, HEAD_A.1, k),
-        stem(STEM_B_X, HEAD_B.1, k),
+        shift_x(stem(STEM_A_X, HEAD_A.1, k), d),
+        shift_x(stem(STEM_B_X, HEAD_B.1, k), d),
         Prim::Beam {
-            x: BAR_X0,
+            x: BAR_X0 + d,
             y: BAR_TOP_LEFT,
             w: BAR_X1 - BAR_X0,
             h: BAR_THICK,
@@ -216,6 +258,27 @@ pub fn prims(px: f32) -> [Prim; 6] {
             r: rh * 0.5,
         },
     ]
+}
+
+/// 图元整体横移（只用于把音符挪到视觉居中位置）。
+fn shift_x(p: Prim, d: f32) -> Prim {
+    match p {
+        Prim::Ellipse { cx, cy, rx, ry, rot } => Prim::Ellipse {
+            cx: cx + d,
+            cy,
+            rx,
+            ry,
+            rot,
+        },
+        Prim::RoundRect { x, y, w, h, r } => Prim::RoundRect { x: x + d, y, w, h, r },
+        Prim::Beam { x, y, w, h, shear } => Prim::Beam {
+            x: x + d,
+            y,
+            w,
+            h,
+            shear,
+        },
+    }
 }
 
 /// 给定尺寸下的**墨迹包围盒** `(x0, y0, x1, y1)`（设计单位）。
@@ -456,6 +519,9 @@ mod tests {
     ///
     /// 符干顶端必须严格落在符杠上边，不能高出一点点。上一版高出 4.5~5.4 单位，
     /// 在任务栏上就是两个尖。这条同时盯住两根符干。
+    ///
+    /// 注意 `bar_top_at()` 吃的是**参考图坐标系**的 x，而 `prims()` 已把音符
+    /// 整体平移了 [`NOTE_SHIFT_X`]，所以要先反平移再查表。
     #[test]
     fn stem_tops_sit_exactly_on_the_beam_top_edge() {
         let p = prims(32.0);
@@ -463,7 +529,7 @@ mod tests {
             match *stem {
                 Prim::RoundRect { x, y, w, .. } => {
                     let cx = x + w * 0.5;
-                    let expected = bar_top_at(cx);
+                    let expected = bar_top_at(cx - NOTE_SHIFT_X);
                     assert!(
                         (y - expected).abs() < 1e-4,
                         "符干 {} 顶端 y = {y}，符杠上边 = {expected}（高出的部分就是尖尖）",
@@ -493,13 +559,15 @@ mod tests {
                 if let Prim::RoundRect { x, y, w, .. } = stem {
                     let cx = x + w * 0.5;
                     assert!(
-                        y >= bar_top_at(cx) - 1e-4,
+                        y >= bar_top_at(cx - NOTE_SHIFT_X) - 1e-4,
                         "{sz}px：符干顶端 {y} 高于符杠上边 {}",
-                        bar_top_at(cx)
+                        bar_top_at(cx - NOTE_SHIFT_X)
                     );
                     // 符干在符杠右端附近时，上边比左端更高 —— 也要满足
                     let top_right = BAR_TOP_LEFT + (BAR_X1 - BAR_X0) * BAR_SHEAR;
-                    assert!(y >= top_right - 1e-4 || y >= bar_top_at(cx) - 1e-4);
+                    assert!(
+                        y >= top_right - 1e-4 || y >= bar_top_at(cx - NOTE_SHIFT_X) - 1e-4
+                    );
                 }
             }
         }
@@ -522,10 +590,12 @@ mod tests {
                     }
                     let dx = (px as f32 + 0.5 - place.ox) / place.scale;
                     let dy = (py as f32 + 0.5 - place.oy) / place.scale;
-                    if dx < BAR_X0 - 1.0 || dx > BAR_X1 + 1.0 {
+                    // 符杠（含平移）的横向范围
+                    let (bl, br) = (BAR_X0 + NOTE_SHIFT_X - 1.0, BAR_X1 + NOTE_SHIFT_X + 1.0);
+                    if dx < bl || dx > br {
                         continue; // 符杠范围外只有符头，另有约束
                     }
-                    let top = bar_top_at(dx);
+                    let top = bar_top_at(dx - NOTE_SHIFT_X);
                     // 允许半个像素的抗锯齿误差（像素中心落在边界上）
                     let tol = 0.75 / place.scale;
                     assert!(
@@ -541,10 +611,11 @@ mod tests {
     #[test]
     fn beam_is_a_parallelogram_with_vertical_ends() {
         let p = prims(32.0);
+        let d = NOTE_SHIFT_X;
         match p[4] {
             Prim::Beam { x, y, w, h, shear } => {
-                assert!((x - BAR_X0).abs() < 1e-5, "左端 x = {x}");
-                assert!((x + w - BAR_X1).abs() < 1e-5, "右端 x = {}", x + w);
+                assert!((x - (BAR_X0 + d)).abs() < 1e-5, "左端 x = {x}");
+                assert!((x + w - (BAR_X1 + d)).abs() < 1e-5, "右端 x = {}", x + w);
                 assert!((y - BAR_TOP_LEFT).abs() < 1e-5, "上边左端 y = {y}");
                 assert!((h - BAR_THICK).abs() < 1e-5, "竖直厚度 = {h}");
                 assert!((shear - BAR_SHEAR).abs() < 1e-6, "斜率 = {shear}");
@@ -567,7 +638,10 @@ mod tests {
         let hh = ellipse_half_h(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
         let note_top = bar_top_at(BAR_X1);
         let note_h = (HEAD_A.1 + hh) - note_top;
-        let note_w = RULE.2;
+        // 音符自身宽度（左符头最左 → 符杠右端）。**不能拿横线宽代替**：
+        // v1.14.2 起横线为了让开左移后的音符而加宽，比音符本身更宽。
+        let note_left = HEAD_A.0 - ellipse_half_w(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        let note_w = BAR_X1 - note_left;
 
         let head_w = ellipse_half_w(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG) * 2.0;
         let head_h = hh * 2.0;
@@ -645,6 +719,58 @@ mod tests {
         let note_bottom = HEAD_A.1 + ellipse_half_h(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
         assert!(ry > note_bottom + 4.0, "横线与符头之间必须有可见间隙");
         let _ = y0;
+    }
+
+    /// **v1.14.2 居中口径的回归锁**（用户 2026-11-16 拍板）。
+    ///
+    /// 三条一起成立才算对：
+    /// 1. 横线在 96 盒里**水平居中**（左右边距相等）；
+    /// 2. 音符整体左移了 [`NOTE_SHIFT_X`]；
+    /// 3. 横线**完全盖住**音符（音符不许探出横线左右任何一端）。
+    #[test]
+    fn note_is_shifted_left_while_the_rule_stays_centred() {
+        let (rx, _, rw, _) = RULE;
+        let (rl, rr) = (rx, rx + rw);
+        assert!(
+            (rl - (DESIGN - rr)).abs() < 1e-3,
+            "横线必须水平居中：左 {rl:.3} / 右 {:.3}",
+            DESIGN - rr
+        );
+
+        let d = NOTE_SHIFT_X;
+        assert!(d < 0.0, "音符必须左移");
+        // 音符的左右极值（含平移）
+        let hw = ellipse_half_w(HEAD_A.2, HEAD_A.3, HEAD_ROT_DEG);
+        let note_left = HEAD_A.0 + d - hw;
+        let note_right = BAR_X1 + d;
+        assert!(
+            note_left >= rl - 1e-3,
+            "音符左缘 {note_left:.3} 探出了横线左端 {rl:.3}"
+        );
+        assert!(
+            note_right <= rr + 1e-3,
+            "音符右缘 {note_right:.3} 超出了横线右端 {rr:.3}"
+        );
+
+        // 且平移后音符的重心确实更靠近盒中心（不是白移的）
+        let centre = (note_left + note_right) * 0.5;
+        let mid = (rl + rr) * 0.5;
+        assert!(
+            centre < mid,
+            "音符必须落在横线中心的左侧（音符中点 {centre:.2} / 盒中心 {mid:.2}）"
+        );
+    }
+
+    /// 平移量本身：128px 栅格实测「音符 + 横线」整体墨迹的面积重心偏右 4.82。
+    ///
+    /// 这条锁住「数字不能随手改」——改大了音符会探出横线左端（上一条抓），
+    /// 改小了又会回到「往右坠」。
+    #[test]
+    fn note_shift_matches_the_measured_area_centroid() {
+        assert!(
+            (NOTE_SHIFT_X + 4.82).abs() < 0.01,
+            "平移量 {NOTE_SHIFT_X} 应等于 128px 栅格实测的整体重心偏移 −4.82"
+        );
     }
 
     /// 加粗只作用于小尺寸，48px 及以上回到原权重。
